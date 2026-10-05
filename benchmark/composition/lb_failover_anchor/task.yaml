@@ -1,0 +1,838 @@
+task_name: lb_failover_anchor
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-LBFailover
+pattern_version: '1.0'
+seed:
+  vip: 10.0.100.1
+  assign: round_robin
+  flow_table_capacity: unbounded
+  eviction_policy: none
+  persistence_strict: false
+  port_down:
+  - 3
+  liveness_source: control_plane_table
+  cascaded_backup: false
+  ttl_decrement_strict: true
+  faithfulness: D5.0_pin_then_static_path
+description: |
+  A switch s1 fronts a single virtual service address (a VIP) with three
+  real back-end servers and distributes incoming TCP connections across
+  them, preserving each connection's chosen back-end for the life of the
+  connection. Each back-end is reachable over two egress ports — a primary
+  and a backup — and when a back-end's primary port is down, the switch
+  must keep sending that back-end's traffic out the back-end's backup port.
+  The load-balancing decision and the up/down path decision are independent:
+  failing a port over to its backup never changes which back-end a
+  connection is bound to.
+
+  ## Topology and roles
+
+    - s1.p1 — connection point facing clients.
+    - The advertised service address (the VIP) is 10.0.100.1. No host owns
+      this address; the switch terminates traffic addressed to it and
+      re-targets it to a back-end.
+    - Three back-end servers, each reachable over a PRIMARY and a BACKUP
+      egress port. The "next-hop MAC" is the Ethernet destination to use on
+      that port:
+
+      | back-end | address    | primary port | primary next-hop MAC | backup port | backup next-hop MAC |
+      |----------|------------|--------------|----------------------|-------------|---------------------|
+      | B0       | 10.0.2.10  | s1.p2        | 08:00:00:00:02:0a    | s1.p5       | 08:00:00:00:05:0a   |
+      | B1       | 10.0.2.20  | s1.p3        | 08:00:00:00:03:0b    | s1.p6       | 08:00:00:00:06:0b   |
+      | B2       | 10.0.2.30  | s1.p4        | 08:00:00:00:04:0c    | s1.p7       | 08:00:00:00:07:0c   |
+
+  ## Port liveness
+
+  The following egress port is DOWN (this is control-plane information you
+  are given; you choose how to represent it): **s1.p3**. All other ports are
+  up. Because s1.p3 is B1's primary port, traffic bound to B1 must leave over
+  B1's backup port s1.p6 (with B1's backup next-hop MAC). B0 and B2 use their
+  primary ports normally.
+
+  ## Eligibility
+
+  A packet is eligible for load balancing only when ALL of the following
+  hold; the checks short-circuit in the order listed, and a packet that
+  fails an earlier check is never inspected further and never affects any
+  internal state the switch keeps:
+
+    1. The packet is an IPv4 datagram.
+    2. The packet's IPv4 destination address equals the VIP.
+    3. The IPv4 payload is TCP.
+
+  A frame that is not IPv4 (e.g. an ARP frame), an IPv4 packet whose
+  destination is anything other than the VIP, and an IPv4 packet to the VIP
+  that is not TCP must each be discarded.
+
+  ## TTL
+
+  Read the IPv4 time-to-live first. If TTL == 0 the packet is discarded
+  (and affects no state). Otherwise, when the packet is forwarded, its TTL
+  is decremented by EXACTLY one on egress; a packet arriving with TTL == 1
+  is forwarded with egress TTL == 0 (decrement once, do not drop it, do not
+  decrement it twice).
+
+  ## Connection identity
+
+  Two TCP packets belong to the SAME connection iff they agree on the
+  5-tuple (IPv4 source, IPv4 destination, TCP source port, TCP destination
+  port, IPv4 protocol). Any difference in any component is a different
+  connection.
+
+  ## Back-end assignment
+
+  The switch keeps an internal record of which back-end each connection is
+  bound to. The first time a packet of a given connection is admitted, the
+  switch chooses a back-end as follows:
+
+    - The switch maintains a single integer "selector" initialised to zero
+      on power-on, advanced by exactly one immediately after each
+      first-of-a-connection admission. The selector advances ONLY on
+      first-of-a-connection admissions; it MUST NOT advance on subsequent
+      packets of an existing connection, and MUST NOT advance on discarded
+      packets.
+    - A first-of-a-connection packet is bound to back-end number
+      (selector value AT THE TIME OF THIS ADMISSION, taken modulo three),
+      where back-end 0 is B0, 1 is B1, 2 is B2. Concretely: the first new
+      connection on a fresh switch goes to B0, the second to B1, the third
+      to B2, the fourth wraps back to B0, and so on.
+
+  The binding MUST be remembered. Every subsequent packet of an
+  already-bound connection MUST be sent to the SAME back-end as the
+  connection's first packet, regardless of how many other connections were
+  admitted in between.
+
+  Back-end selection does NOT depend on port liveness: a connection that the
+  selector binds to B1 is bound to B1 even though B1's primary port is down —
+  it is sent to B1 over B1's backup port, NOT reassigned to B0 or B2.
+
+  ## On forwarding
+
+  When an admitted packet is forwarded to its bound back-end, the packet
+  observed on the chosen egress port MUST satisfy ALL of:
+
+    - **Destination back-end (DNAT).** Its IPv4 destination address is
+      replaced by the bound back-end's address (one of 10.0.2.10 / 10.0.2.20
+      / 10.0.2.30). This is the same address whether the packet leaves over
+      the primary or the backup port — the path does not change the back-end.
+
+    - **Egress port.** It leaves over the bound back-end's primary port if
+      that port is up, otherwise over the bound back-end's backup port.
+
+    - **Ethernet rewrite.** Its Ethernet source is set to the packet's prior
+      Ethernet destination, and its Ethernet destination is set to the
+      next-hop MAC of the chosen port (the primary next-hop MAC if leaving
+      over the primary port, the backup next-hop MAC if leaving over the
+      backup port).
+
+    - **TTL.** Its IPv4 TTL is exactly one less than on ingress, and the
+      datagram remains a well-formed IPv4 packet an unmodified downstream
+      receiver would accept (the header checksum is valid on egress).
+
+    - **Everything else preserved.** All other fields are byte-identical to
+      the received packet — in particular the IPv4 SOURCE address, the TCP
+      source and destination ports, the TCP sequence numbers, and any
+      payload. Only the IPv4 destination is rewritten.
+
+  Discarded packets produce NO output and MUST NOT alter any internal state
+  (neither the per-connection bindings nor the selector).
+
+  ## Control plane
+
+  The VIP / back-end relationship, the per-back-end primary/backup ports and
+  next-hop MACs, the down-port set, and the round-robin policy are all given
+  above; you choose how much lives in control-plane tables versus fixed
+  switch logic.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+      p6: 6
+      p7: 7
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: b0_primary
+  - from: s1.p3
+    to: b1_primary
+  - from: s1.p4
+    to: b2_primary
+  - from: s1.p5
+    to: b0_backup
+  - from: s1.p6
+    to: b1_backup
+  - from: s1.p7
+    to: b2_backup
+hosts:
+  client:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  b0_primary:
+    ip: 10.0.2.10/24
+    mac: 08:00:00:00:02:0a
+    port: s1.p2
+  b1_primary:
+    ip: 10.0.2.20/24
+    mac: 08:00:00:00:03:0b
+    port: s1.p3
+  b2_primary:
+    ip: 10.0.2.30/24
+    mac: 08:00:00:00:04:0c
+    port: s1.p4
+  b0_backup:
+    ip: 10.0.2.10/24
+    mac: 08:00:00:00:05:0a
+    port: s1.p5
+  b1_backup:
+    ip: 10.0.2.20/24
+    mac: 08:00:00:00:06:0b
+    port: s1.p6
+  b2_backup:
+    ip: 10.0.2.30/24
+    mac: 08:00:00:00:07:0c
+    port: s1.p7
+test_cases:
+- name: first_flow_pins_b0_primary
+  visibility: public
+  description: 'Fresh switch: the first new connection to the VIP binds to B0 (selector 0) and leaves over B0''s primary port s1.p2 with DNAT to 10.0.2.10 and the primary next-hop MAC.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: second_flow_pins_b1_uses_backup
+  visibility: public
+  description: After one warm-up connection (selector advanced to 1), a second distinct connection binds to B1. B1's primary port s1.p3 is DOWN, so the packet leaves over B1's BACKUP port s1.p6 — still DNAT'd to B1's address 10.0.2.20 (the failover changes the port + MAC, not the back-end). The composition's signature pin-survives-failover check.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:0b
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: third_flow_pins_b2_primary
+  visibility: public
+  description: After two warm-up connections (selector at 2), a third connection binds to B2 and leaves over B2's primary port s1.p4 (up).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:0c
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: existing_flow_same_backend_b0
+  visibility: hidden
+  description: A connection bound to B0 on its first packet is sent to B0 (primary port s1.p2) again on a later packet — the binding is followed, the selector does not re-pick.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: existing_flow_on_b1_backup_consistent
+  visibility: hidden
+  description: A connection bound to B1 (whose primary is down) is sent to B1's backup port s1.p6 again on a later packet, still DNAT'd to 10.0.2.20 — existing-flow consistency holds over a failed-primary back-end.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:0b
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: wrapped_selector_new_flow_b1_not_rebalanced
+  visibility: hidden
+  description: Four warm-up connections advance the selector to 4 (B0,B1,B2,B0); the fifth new connection binds to B1 (4 mod 3 = 1) and leaves over B1's backup port s1.p6 with DNAT to 10.0.2.20. A new flow that lands on a down-primary back-end is NOT rebalanced to a back-end with a live primary.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:0b
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: binding_survives_intervening_new_flows
+  visibility: hidden
+  description: B0's connection is opened, then two other new connections (→B1,→B2) are admitted; a later packet of the B0 connection still goes to B0 (primary s1.p2). The binding survives intervening admissions.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: only_dst_rewritten_src_preserved
+  visibility: hidden
+  description: A B0-bound packet keeps its IPv4 SOURCE unchanged and only rewrites the IPv4 destination to the back-end (DNAT) — no SNAT, with a valid egress checksum and TTL decrement.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ttl_one_forwards_to_zero
+  visibility: hidden
+  description: A first connection with TTL=1 binds to B0 and is forwarded over s1.p2 with egress TTL=0 (decrement once, do not drop).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: ttl_zero_drop
+  visibility: hidden
+  description: A packet to the VIP with TTL=0 is dropped and affects no state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 5007
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: non_vip_dropped
+  visibility: hidden
+  description: A TCP packet to a non-VIP address (10.0.9.9) is not load-balanced → dropped (the LB admits only VIP traffic).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5008
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: non_tcp_to_vip_dropped
+  visibility: hidden
+  description: A UDP packet to the VIP is not TCP → dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5009
+        dport: 53
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_dropped
+  visibility: hidden
+  description: An ARP frame is not IPv4 → dropped (no eligibility, no state change).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.100.1
+  expected:
+    behavior: drop
+- name: drop_does_not_corrupt_next_forward
+  visibility: hidden
+  description: A dropped non-IPv4 frame precedes a valid first connection; the connection still forwards normally to B0 (the prior drop did not corrupt the per-packet decision or advance the selector).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.100.1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5010
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.src:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1

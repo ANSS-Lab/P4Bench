@@ -1,0 +1,114 @@
+{
+  "oracle_hash": "22602265752775161d543120cbe01a499fe480e8fe2a55ec8a4335a657ccef70",
+  "instance": "runtime_meta_anchor-default",
+  "ran_at": "2026-06-16T23:49:34.963360Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "mirror_basic",
+        "status": "pass"
+      },
+      {
+        "example_id": "count_only_no_mirror",
+        "status": "pass"
+      },
+      {
+        "example_id": "unmonitored_ingress_no_mirror",
+        "status": "pass"
+      },
+      {
+        "example_id": "unruled_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "fib_miss_flood",
+        "status": "pass"
+      },
+      {
+        "example_id": "fib_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "mirror_rule_unsampled_no_mirror",
+        "status": "pass"
+      },
+      {
+        "example_id": "count_sampling_third_selected",
+        "status": "pass"
+      },
+      {
+        "example_id": "mon_match_five_tuple_misses_rule",
+        "status": "pass"
+      },
+      {
+        "example_id": "mirror_with_alt_granularity_hash_truncation",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_mirror_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "forward_unmodified_under_mirror": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_monotonicity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "conditional_clone_only_on_sampled_path": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mirror_copy_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_mirror_loop",
+      "forward_unmodified_under_mirror",
+      "counter_monotonicity",
+      "conditional_clone_only_on_sampled_path",
+      "mirror_copy_fidelity"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc3176"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,539 @@
+task_name: gtpu_encap_ceiling
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-GTPUEncap
+pattern_version: '1.0'
+
+seed:
+  n3_ports: [1]
+  n6_ports: [2]
+  ul_session_entries:
+    - {teid: 256, n6_egress_port: 2, n6_dst_mac: "08:00:00:00:00:02", n6_src_mac: "aa:bb:cc:00:00:02"}
+  dl_bearer_entries:
+    - {ue_ip: "10.45.0.1", egress_teid: 512, gnb_ip: "192.168.10.1", qfi: 9}
+    - {ue_ip: "10.45.0.2", egress_teid: 513, gnb_ip: "192.168.10.1", qfi: 5}
+  n3_nexthop_entries:
+    - {gnb_ip: "192.168.10.1", n3_egress_port: 1, outer_dst_mac: "5e:00:00:00:00:01", outer_src_mac: "aa:bb:cc:00:00:01"}
+  upf_n3_ip: "192.168.10.254"
+  outer_udp_dst_port: 2152
+  outer_udp_src_port_mode: hash_inner_5tuple
+  gtpu_ext_header_handling: pdu_session_container
+  qfi_policy: set_from_bearer
+  dscp_copy_policy: copy_inner_to_outer
+  teid_validation_strict: true
+  end_marker_handling: drop
+  inner_ttl_handling: preserve
+  mtu_enforcement: ignore
+
+description: |
+  A switch s1 is the user-plane function (UPF) of a 4G/5G mobile core,
+  sitting between the radio-access side and the data network, and acts
+  as a GTP-U tunnel endpoint per 3GPP TS 29.281. Port s1.p1 faces the
+  base station (gNB) and carries GTP-U-encapsulated traffic; port s1.p2
+  faces the data network and carries bare IP traffic. The switch
+  performs two directional functions: it strips the GTP-U tunnel off
+  uplink traffic from the gNB and forwards the inner packet to the data
+  network (decap); and it wraps downlink traffic from the data network
+  in a GTP-U tunnel toward the gNB (encap).
+
+  ## What a GTP-U packet looks like on the wire
+
+  A GTP-U user-data packet is built as
+
+    outer Ethernet / outer IPv4 / UDP / GTP-U / [extension headers] / inner IPv4 / inner payload
+
+  with these requirements per 3GPP TS 29.281:
+
+    - Outer UDP destination port is 2152.
+    - The GTP-U header's first 8 octets are mandatory: a flags byte
+      (the high 3 bits are the Version and MUST be 1; the next bit is
+      the Protocol Type and MUST be 1; the low 3 bits are the
+      Extension-header / Sequence-number / N-PDU flags), a 1-octet
+      Message Type (255 for a user-data G-PDU), a 2-octet Length, and a
+      4-octet Tunnel Endpoint Identifier (TEID).
+    - The **Length** field is the number of octets that follow the
+      first 8 mandatory octets — this INCLUDES any optional 4-octet
+      field and any extension-header octets, as well as the inner
+      packet. It is NOT the inner packet length alone and NOT the whole
+      outer packet length.
+    - The payload carried inside a G-PDU (a "T-PDU") is an IP packet.
+      There is no inner Ethernet header inside the tunnel.
+    - When an extension header is present, the Extension-header flag is
+      set, a 4-octet optional field follows the mandatory header (its
+      last octet is the Next-Extension-Header Type), and then the
+      extension header itself follows. The 5G PDU Session Container
+      extension header has Next-Extension-Header Type 0x85; it is a
+      4-octet block carrying the 6-bit QoS Flow Identifier (QFI) and is
+      terminated by a Next-Extension-Header Type of 0x00.
+
+  ## Configuration available to the switch (provisioned by the control plane)
+
+    - This UPF's GTP-U endpoint IP on the gNB-facing side is
+      192.168.10.254.
+    - An uplink tunnel table maps a received TEID to the egress
+      decision toward the data network (egress port + the L2 rewrite
+      for the now-exposed inner packet).
+    - A downlink bearer table maps a destination user-equipment (UE) IP
+      address to that bearer's egress TEID, the gNB's IP address, and
+      the bearer's QFI.
+    - A next-hop table maps the gNB IP address to the egress port and
+      the outer L2 rewrite (the next-hop MAC and this switch's own port
+      MAC).
+
+  ## Per-packet behaviour
+
+  Every ingress frame falls into exactly one of the cases below.
+
+   1. **Uplink decap** (a GTP-U packet arrives on the gNB-facing port
+      s1.p1):
+
+      a. The frame is a GTP-U packet if its outer UDP destination port
+         is 2152 and a GTP-U header is present; otherwise it is not for
+         this UPF and is dropped.
+
+      b. **Header validation.** If the GTP-U Version is not 1 or the
+         Protocol Type bit is not 1, the packet MUST be dropped as
+         malformed.
+
+      c. If the GTP-U Message Type is the End Marker (254) rather than a
+         user-data G-PDU (255), the packet MUST be dropped — an End
+         Marker is tunnel signalling and MUST NOT be delivered to the
+         data network as user data.
+
+      d. The outer IPv4 destination MUST be this UPF's endpoint IP
+         (192.168.10.254); otherwise drop.
+
+      e. Look up the received TEID in the uplink tunnel table. On miss,
+         drop.
+
+      f. Strip the outer Ethernet, outer IPv4, UDP, and the entire
+         GTP-U header (including any optional field and extension
+         headers). The packet that emerges is the inner IP T-PDU. Apply
+         the L2 rewrite from the matched entry (new source and
+         destination MAC) and forward it on the egress port toward the
+         data network. The inner IP header and its payload — including
+         the inner TTL — MUST be delivered byte-for-byte unchanged.
+
+   2. **Downlink encap** (a bare IP packet arrives on the data-network
+      port s1.p2):
+
+      a. Look up the packet's destination IP (a UE address) in the
+         downlink bearer table. On miss, drop.
+
+      b. The bearer entry yields the egress TEID, the gNB IP, and the
+         QFI. Look the gNB IP up in the next-hop table to obtain the
+         egress port and the outer L2 rewrite.
+
+      c. **Construct every field of the new outer headers explicitly**
+         (no uninitialised bytes). The output frame's layer order MUST
+         be outer Ethernet / outer IPv4 / UDP / GTP-U / PDU Session
+         Container / inner IPv4 / inner payload, with:
+
+           - Outer Ethernet: source MAC = this switch's own egress-port
+             MAC; destination MAC = the gNB next-hop MAC;
+             ether-type = 0x0800.
+           - Outer IPv4: version=4, IHL=5, ECN=0; the DSCP MUST be
+             copied from the inner packet's DSCP; total-length covers
+             the whole outer packet; flags = DF set; fragment-offset=0;
+             TTL=64; protocol=17 (UDP); source = this UPF's endpoint IP;
+             destination = the gNB IP. The outer IPv4 header checksum
+             MUST be correctly computed from the new fields.
+           - UDP: destination port = 2152; UDP length covers the UDP
+             header plus everything after it; checksum = 0. The UDP
+             source port MUST be derived from a hash of the inner
+             packet's 5-tuple so the transport network can spread
+             bearers across paths.
+           - GTP-U: Version=1, Protocol Type=1, Extension-header flag=1,
+             Message Type=255, TEID = the bearer's egress TEID, and the
+             Length field set per the rule above (it MUST count the
+             optional and extension-header octets in addition to the
+             inner packet).
+           - PDU Session Container extension header (Next-Extension
+             type 0x85): carries the bearer's QFI; terminated by a
+             Next-Extension type of 0x00.
+
+      d. **Inner packet is opaque.** The inner IP header and payload —
+         including the inner TTL — MUST NOT be modified by the encap
+         step. GTP-U is tunnel transport, not an IP forwarding hop.
+
+      e. Forward the resulting packet on the egress port toward the gNB.
+
+  Grounding: 3GPP TS 29.281 (GTPv1-U); P4-UPF (ONF Aether / SD-Fabric).
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+
+hosts:
+  h1:
+    ip: 192.168.10.1/24
+    mac: "5e:00:00:00:00:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.6.6/24
+    mac: "08:00:00:00:00:02"
+    port: s1.p2
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: gtpu_decap_basic
+    visibility: public
+    description: |
+      Uplink decap. A G-PDU arrives on the gNB-facing port (s1.p1):
+      outer IPv4(dst = UPF endpoint 192.168.10.254) / UDP(dport 2152) /
+      GTP-U(version 1, PT 1, message type 255, TEID 256) wrapping an
+      inner IPv4/TCP T-PDU (UE 10.45.0.1 → data network 10.0.6.6). The
+      switch MUST strip the outer stack, rewrite the L2 header toward
+      the data network, and forward the bare inner IP packet on s1.p2
+      with the inner IPv4 fields (including TTL) unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 1, pt: 1, e: 0, msgtype: 255, teid: 256, length: 40}
+        - IP:    {src: "10.45.0.1", dst: "10.0.6.6", ttl: 60}
+        - TCP:   {sport: 40000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "aa:bb:cc:00:00:02"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:00:02"}
+        IP.src:    {action: change_to, value: "10.45.0.1"}
+        IP.dst:    {action: change_to, value: "10.0.6.6"}
+        IP.ttl:    {action: change_to, value: 60}
+
+  - name: gtpu_encap_basic
+    visibility: public
+    description: |
+      Downlink encap. A bare IPv4/TCP packet arrives on the
+      data-network port (s1.p2) destined to UE 10.45.0.1. The switch
+      MUST wrap it in outer Ethernet / IPv4(src = UPF 192.168.10.254,
+      dst = gNB 192.168.10.1, proto 17) / UDP(dport 2152) / GTP-U(TEID
+      512, message type 255) / PDU Session Container(QFI 9), and forward
+      it out the gNB-facing port s1.p1 with the inner packet unchanged.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 58}
+        - TCP:   {sport: 80, dport: 33000, flags: "SA"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[1].IP.src:                  {action: change_to, value: "192.168.10.254"}
+        layers[1].IP.dst:                  {action: change_to, value: "192.168.10.1"}
+        layers[1].IP.proto:                {action: change_to, value: 17}
+        layers[1].IP.ttl:                  {action: change_to, value: 64}
+        layers[2].UDP.dport:               {action: change_to, value: 2152}
+        layers[3].GTPU.version:            {action: change_to, value: 1}
+        layers[3].GTPU.msgtype:            {action: change_to, value: 255}
+        layers[3].GTPU.teid:               {action: change_to, value: 512}
+        layers[5].GTPUPduSession.qfi:      {action: change_to, value: 9}
+        layers[6].IP.dst:                  {action: change_to, value: "10.45.0.1"}
+
+  - name: gtpu_encap_basic_ue2
+    visibility: public
+    description: |
+      Downlink encap to a SECOND UE bearer. A bare IPv4/TCP packet to
+      UE 10.45.0.2 MUST be encapsulated with that bearer's egress TEID
+      (513) and QFI (5) — verifying the encap action is parameterised by
+      the matched bearer rather than baked in.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.2", ttl: 58}
+        - TCP:   {sport: 80, dport: 44000, flags: "SA"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[1].IP.dst:             {action: change_to, value: "192.168.10.1"}
+        layers[2].UDP.dport:          {action: change_to, value: 2152}
+        layers[3].GTPU.teid:          {action: change_to, value: 513}
+        layers[5].GTPUPduSession.qfi: {action: change_to, value: 5}
+
+  - name: gtpu_encap_all_outer_fields_set
+    visibility: hidden
+    description: |
+      Outer-header completeness check. After encap, EVERY field of the
+      new outer headers MUST be a defined value — none left as the
+      uninitialised default that header-validity tricks leave behind.
+      Asserts every outer field the spec pins, including the GTP-U flags
+      byte (version / PT / extension flag / message type) and the
+      Length field (48 = 40-byte inner T-PDU + 4 optional + 4 PDU
+      Session Container octets).
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 58}
+        - TCP:   {sport: 81, dport: 33001, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[0].Ether.src:          {action: change_to, value: "aa:bb:cc:00:00:01"}
+        layers[0].Ether.dst:          {action: change_to, value: "5e:00:00:00:00:01"}
+        layers[0].Ether.type:         {action: change_to, value: 2048}
+        layers[1].IP.version:         {action: change_to, value: 4}
+        layers[1].IP.ihl:             {action: change_to, value: 5}
+        layers[1].IP.proto:           {action: change_to, value: 17}
+        layers[1].IP.ttl:             {action: change_to, value: 64}
+        layers[1].IP.src:             {action: change_to, value: "192.168.10.254"}
+        layers[1].IP.dst:             {action: change_to, value: "192.168.10.1"}
+        layers[2].UDP.dport:          {action: change_to, value: 2152}
+        layers[2].UDP.sport:          {action: change_to_range, min: 49152, max: 65535}
+        layers[3].GTPU.version:       {action: change_to, value: 1}
+        layers[3].GTPU.pt:            {action: change_to, value: 1}
+        layers[3].GTPU.e:             {action: change_to, value: 1}
+        layers[3].GTPU.msgtype:       {action: change_to, value: 255}
+        layers[3].GTPU.teid:          {action: change_to, value: 512}
+        layers[3].GTPU.length:        {action: change_to, value: 48}
+        layers[5].GTPUPduSession.qfi: {action: change_to, value: 9}
+
+  - name: gtpu_length_field_correct
+    visibility: hidden
+    description: |
+      GTP-U Length-field check (3GPP TS 29.281 §5). The Length field
+      MUST equal the octet count AFTER the first 8 mandatory octets:
+      with the PDU Session Container present that is the inner T-PDU
+      length (40 bytes for this header-only inner IPv4/TCP) plus the
+      4-octet optional field plus the 4-octet container = 48. Catches an
+      implementation that sets Length to the inner total length, the whole outer
+      packet length, or forgets the extension-header octets.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 64}
+        - TCP:   {sport: 82, dport: 33002, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[3].GTPU.length: {action: change_to, value: 48}
+        layers[3].GTPU.teid:   {action: change_to, value: 512}
+
+# --- G2: robustness / boundary ---
+
+  - name: decap_unknown_teid_drop
+    visibility: hidden
+    description: |
+      A well-formed G-PDU arrives on the gNB-facing port with a TEID
+      (999) that is not provisioned in the uplink tunnel table. It MUST
+      be dropped — an unknown TEID has no tunnel endpoint at this UPF.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 1, pt: 1, e: 0, msgtype: 255, teid: 999, length: 40}
+        - IP:    {src: "10.45.0.1", dst: "10.0.6.6", ttl: 60}
+        - TCP:   {sport: 40001, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: encap_unknown_ue_drop
+    visibility: hidden
+    description: |
+      A bare downlink IP packet arrives on the data-network port
+      destined to 10.99.9.9, which is not a provisioned UE bearer. It
+      MUST be dropped (no tunnel to build).
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.99.9.9", ttl: 58}
+        - TCP:   {sport: 80, dport: 33003, flags: "SA"}
+    expected:
+      behavior: drop
+
+  - name: gtpu_end_marker_not_forwarded
+    visibility: hidden
+    description: |
+      A GTP-U End Marker (message type 254) arrives on the gNB-facing
+      port with a known TEID (256). It MUST be dropped, not decapsulated
+      and forwarded to the data network — an End Marker is tunnel
+      signalling, not user data.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 1, pt: 1, e: 0, msgtype: 254, teid: 256, length: 0}
+    expected:
+      behavior: drop
+
+  - name: malformed_gtpu_version_drop
+    visibility: hidden
+    description: |
+      A GTP-U packet arrives on the gNB-facing port with Version 0
+      (not the required 1), otherwise well-formed with a known TEID. It
+      MUST be dropped as malformed (3GPP TS 29.281 §5).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 0, pt: 1, e: 0, msgtype: 255, teid: 256, length: 40}
+        - IP:    {src: "10.45.0.1", dst: "10.0.6.6", ttl: 60}
+        - TCP:   {sport: 40002, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: non_gtpu_udp_on_n3_drops
+    visibility: hidden
+    description: |
+      A non-GTP-U UDP packet (destination port 53, DNS) arrives on the
+      gNB-facing port. It is not GTP-U traffic this UPF terminates and
+      MUST be dropped (or at minimum not decapsulated).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 5353, dport: 53}
+    expected:
+      behavior: drop
+
+# --- G3: security / structural bug checks ---
+
+  - name: decap_outer_headers_truly_stripped
+    visibility: hidden
+    description: |
+      Information-leakage check. After decap, the output's first IPv4
+      header MUST be the INNER T-PDU — the outer IPv4, UDP, and GTP-U
+      headers MUST be absent. Verified by asserting the first IP source
+      is the inner UE address (10.45.0.1), not the outer gNB address.
+      Leaked outer headers would expose the operator's transport
+      topology and TEIDs to the data network.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 1, pt: 1, e: 0, msgtype: 255, teid: 256, length: 40}
+        - IP:    {src: "10.45.0.1", dst: "10.0.6.6", ttl: 55}
+        - TCP:   {sport: 40003, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "aa:bb:cc:00:00:02"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:00:02"}
+        IP.src: {action: change_to, value: "10.45.0.1"}
+        IP.dst: {action: change_to, value: "10.0.6.6"}
+        IP.ttl: {action: change_to, value: 55}
+
+  - name: decap_inner_is_ip_not_ethernet
+    visibility: hidden
+    description: |
+      GTP-U-specific structural check. The GTP-U payload is an IP
+      T-PDU, NOT an inner Ethernet frame. After decap and the L2
+      rewrite, the bytes immediately after the (single, rewritten)
+      Ethernet header MUST be the inner IPv4 header (protocol 6 = TCP),
+      not a second Ethernet header. Catches an implementation that copies a
+      VXLAN-style inner-Ethernet parser.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "5e:00:00:00:00:01", dst: "aa:bb:cc:00:00:01"}
+        - IP:    {src: "192.168.10.1", dst: "192.168.10.254", ttl: 64, proto: 17}
+        - UDP:   {sport: 2152, dport: 2152, chksum: 0}
+        - GTPU:  {version: 1, pt: 1, e: 0, msgtype: 255, teid: 256, length: 40}
+        - IP:    {src: "10.45.0.1", dst: "10.0.6.6", ttl: 53}
+        - TCP:   {sport: 40004, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        layers[0].Ether.src: {action: change_to, value: "aa:bb:cc:00:00:02"}
+        layers[1].IP.src:    {action: change_to, value: "10.45.0.1"}
+        layers[1].IP.proto:  {action: change_to, value: 6}
+
+  - name: encap_inner_ttl_preservation
+    visibility: hidden
+    description: |
+      GTP-U is tunnel transport, not an IP forwarding hop — the inner
+      IPv4 TTL MUST NOT be decremented by the encap action. The output's
+      inner IPv4 TTL MUST equal the ingress TTL (7), while the new outer
+      IPv4 TTL is the independent transport value (64).
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 7}
+        - TCP:   {sport: 83, dport: 33004, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[1].IP.ttl: {action: change_to, value: 64}
+        layers[6].IP.ttl: {action: change_to, value: 7}
+        layers[3].GTPU.teid: {action: change_to, value: 512}
+
+  - name: qfi_set_from_bearer
+    visibility: hidden
+    description: |
+      5G QoS-marking check. The encapped G-PDU MUST carry a PDU Session
+      Container extension header (extension flag set) whose QFI equals
+      the matched bearer's QFI (9), terminated by a Next-Extension type
+      of 0x00. Catches an implementation that adds the container but leaves the
+      QFI uninitialised or hard-codes it.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 58}
+        - TCP:   {sport: 84, dport: 33005, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[3].GTPU.e:                  {action: change_to, value: 1}
+        layers[5].GTPUPduSession.qfi:      {action: change_to, value: 9}
+        layers[5].GTPUPduSession.next_ext: {action: change_to, value: 0}
+
+  - name: encap_inner_udp_emit_order
+    visibility: hidden
+    description: |
+      Deparser emit-order check with a UDP inner payload. A downlink
+      IPv4/UDP packet to UE 10.45.0.1 MUST be encapsulated with the
+      outer stack in the order outer-Ether / outer-IP / outer-UDP /
+      GTP-U / PDU Session Container / inner-IP / inner-UDP. The inner IP
+      (layer index 6) MUST carry protocol 17 and destination 10.45.0.1,
+      proving the outer UDP (index 2) and inner UDP (index 7) are kept
+      distinct and the emit order is correct.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:00:02", dst: "aa:bb:cc:00:00:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.45.0.1", ttl: 58}
+        - UDP:   {sport: 7000, dport: 4000}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        layers[2].UDP.dport: {action: change_to, value: 2152}
+        layers[3].GTPU.teid: {action: change_to, value: 512}
+        layers[6].IP.proto:  {action: change_to, value: 17}
+        layers[6].IP.dst:    {action: change_to, value: "10.45.0.1"}

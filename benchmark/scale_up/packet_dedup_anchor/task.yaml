@@ -1,0 +1,192 @@
+task_name: packet_dedup_anchor
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-PacketDedup
+pattern_version: '1.0'
+
+seed:
+  dedup_capacity: unbounded
+  eviction: none
+  forward_port: 2
+  faithfulness: D8.0_exact_set
+
+description: |
+  Implement a data-plane duplicate-packet suppressor on a single switch s1.
+  The switch keeps state about which packets it has already seen and forwards
+  each packet's FIRST occurrence while DROPPING later duplicates (replays).
+
+  ## Packet identity
+
+  Two packets count as the same datagram when they share all three of: the IPv4
+  source address, the IPv4 destination address, and the IPv4 Identification
+  field. Nothing else distinguishes them — in particular a retransmit that
+  differs only in TTL (or in its L4 ports) is still the same datagram.
+
+  ## Required behaviour
+
+   - A frame that is not IPv4 is dropped.
+   - The first packet seen for a given identity is forwarded, unchanged, out
+     s1.p2.
+   - Any later packet with an identity already seen is dropped.
+   - Distinct identities are independent: admitting one never suppresses a packet
+     of a different identity.
+
+  ## Topology
+
+  One switch s1; admitted packets egress s1.p2.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.1.1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "10.0.2.2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "10.0.3.3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: first_packet_forward
+    visibility: public
+    description: |
+      The first packet of an identity (no prior occurrence).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: duplicate_dropped
+    visibility: public
+    description: |
+      The same datagram (src 10.0.1.1, dst 10.0.2.2, IP id 1000) was already
+      seen; here it is resent with a different TTL.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+          - UDP:   {sport: 5000, dport: 9000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 63}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: drop
+
+  - name: distinct_id_forward
+    visibility: public
+    description: |
+      A packet with the same src/dst but a different IP id (2000 ≠ 1000).
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+          - UDP:   {sport: 5000, dport: 9000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 2000, ttl: 64}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: distinct_src_forward
+    visibility: hidden
+    description: |
+      Same dst and IP id but a different source → different key → forward.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+          - UDP:   {sport: 5000, dport: 9000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:09", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.9", dst: "10.0.2.2", id: 1000, ttl: 64}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+# --- G2 ---
+
+  - name: triple_replay_dropped
+    visibility: hidden
+    description: |
+      After two prior occurrences of a key, a third copy is still a duplicate
+      → drop.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+          - UDP:   {sport: 5000, dport: 9000}
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 60}
+          - UDP:   {sport: 5000, dport: 9000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 55}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: drop
+
+  - name: duplicate_dropped_distinct_dst_still_new
+    visibility: hidden
+    description: |
+      Same src and IP id as a seen key but a different destination → new key →
+      forward (distinct-key independence).
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", id: 1000, ttl: 64}
+          - UDP:   {sport: 5000, dport: 9000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", id: 1000, ttl: 64}
+        - UDP:   {sport: 5000, dport: 9000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+# --- G3 ---
+
+  - name: drop_non_ipv4
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) is not de-duplicated → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.2", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop

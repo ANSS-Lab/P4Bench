@@ -1,0 +1,127 @@
+{
+  "oracle_hash": "c74caefca3c0b71bcdec8b7d5a8a2b3d188aa74d8f8a56c41cd8630267e59141",
+  "instance": "flow_sampler_anchor_mut1-loosen_sample_rate",
+  "ran_at": "2026-06-17T14:16:59.844039Z",
+  "canonical_examples": {
+    "passed": 14,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_forward_not_sampled",
+        "status": "pass"
+      },
+      {
+        "example_id": "single_ipv4_below_period_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "nth_packet_fires_mirror",
+        "status": "pass"
+      },
+      {
+        "example_id": "one_below_period_no_fire",
+        "status": "pass"
+      },
+      {
+        "example_id": "one_past_period_back_to_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "second_period_fires_again",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_interleaved_does_not_advance",
+        "status": "pass"
+      },
+      {
+        "example_id": "rate_knob_N2_fires_on_second",
+        "status": "pass"
+      },
+      {
+        "example_id": "rate_knob_N16_no_fire_at_four",
+        "status": "pass"
+      },
+      {
+        "example_id": "per_port_independent_counters_no_fire",
+        "status": "pass"
+      },
+      {
+        "example_id": "per_port_single_port_fires",
+        "status": "pass"
+      },
+      {
+        "example_id": "sample_header_none_plain_clone",
+        "status": "pass"
+      },
+      {
+        "example_id": "sample_header_rate_seq_tagged_clone",
+        "status": "pass"
+      },
+      {
+        "example_id": "hash_algo_crc16_per_flow_fires",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "forward_always": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "sample_spacing_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "sample_is_copy_not_move": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "per_scope_independence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "forward_always",
+      "counter_quantum_one",
+      "sample_spacing_correctness",
+      "sample_is_copy_not_move",
+      "per_scope_independence"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC3176",
+      "RFC7014"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

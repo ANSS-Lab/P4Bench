@@ -1,0 +1,758 @@
+# P-PortRangeClassifier — Multi-field L4 port-RANGE classifier (range match_kind)
+#
+# TPL v1.0 task pattern.
+#
+# Differentiation from P-ACL (same design-space cell D7:security / P4:policy /
+# redesign): P-ACL is TCAM-style *ternary wildcard/priority* classification —
+# its key fields are masked bit-patterns. P-PortRangeClassifier is *range-
+# interval* classification — its distinguishing key field is an L4 port
+# interval [low, high] matched with the v1model `range` match_kind, which is
+# the ONLY match_kind that expresses an arbitrary numeric interval natively (a
+# ternary mask only covers prefix-decomposable ranges; exact/lpm cannot express
+# an interval at all). This pattern is the vehicle for the `range` match_kind
+# language feature; it is NOT a generalisation of P-ACL and the two should
+# not be consolidated.
+
+pattern_id: P-PortRangeClassifier
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D6:qos, D7:security]                   # DiffServ MF service classifier (RFC 2475 / D6:qos, the load-bearing
+                                                        # anchor character) + firewall / packet-filter deny variants (RFC 2979 / D7:security)
+  prescriptive: [P4:policy]                             # composite-condition match-action; "ACLs, classification" (P4)
+target_capability: redesign                             # programmability redesigns the previously fixed-function MF classifier (P4 → redesign)
+summary: >
+  A multi-field (MF) classifier whose rules match IPv4 TCP/UDP packets on
+  numeric L4 port INTERVALS — well-known / registered / dynamic port bands or
+  application service-class ranges — and steer each packet to the matched
+  class's egress port (RFC 2475 MF classifier; RFC 2979 packet filter). The
+  distinguishing feature is the `range` match_kind: a closed interval
+  [low, high] supplied by the control plane, which a ternary mask cannot
+  express for an arbitrary interval. First-match is BY PRIORITY among
+  overlapping ranges; unmatched packets fall to a default class (or are
+  denied). Anchor instances classify a handful of disjoint port ranges into
+  distinct egress ports; the parameter-rebinding mutation surface lifts rule count, match-field
+  breadth (add source-port + protocol + packet-length range), class count,
+  overlap depth, the action set (deny block-ranges, DSCP remark), and the
+  default-action policy independently, so one audited oracle covers a 3-class
+  service classifier through a 64-rule overlapping-range firewall.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                            # MF classification is mature engineering — no research-publication slot.
+                                                        # This is a publication-record gap; grounding leans on
+                                                        # the DiffServ architecture RFC, the firewall-requirements RFC, the P4
+                                                        # spec, and the bug taxonomy.
+
+  rfcs:
+    - id: RFC2475
+      sections: ["1.2", "2.3.1"]
+      role: normative_behaviour
+      grounds: range_classification
+      quote: >-
+        a multi-field (MF) classifier which selects packets based on the
+        content of some arbitrary number of header fields; typically some
+        combination of source address, destination address, DS field,
+        protocol ID, source port and destination port.
+      quote_source: patterns/P-PortRangeClassifier/grounding/RFC2475.txt
+      relevance: |
+        The canonical normative definition of the multi-field (MF)
+        classifier (§1.2). The "source port and destination port"
+        fields it names are exactly the L4 intervals this pattern
+        matches as numeric RANGES (well-known / registered / dynamic
+        port bands). §2.3.1 grounds two further pattern decisions:
+        "Classifiers must be configured by some management procedure"
+        → the control-plane-installed rule set (the `bucket` entity,
+        no per-flow state); "steer packets matching some specified
+        rule to an element of a traffic conditioner" → first-match-by-
+        priority steering to a class. RFC 2475 does NOT mandate
+        inclusive vs exclusive interval bounds — the pattern adopts a
+        closed interval [low, high] because that is what the v1model
+        `range` match_kind realises (see v1model cite); the
+        range_boundary_inclusive invariant pins this down.
+
+    - id: RFC2979
+      sections: ["2"]
+      role: threat_model
+      grounds: deny_and_default_deny
+      quote: >-
+        Firewalls typically base some of their decisions on IP source and
+        destination addresses and port numbers.
+      quote_source: patterns/P-PortRangeClassifier/grounding/RFC2979.txt
+      relevance: |
+        Behaviour of and Requirements for Internet Firewalls. Motivates
+        the permit (pass-through unchanged) / deny (drop) decision pair
+        and the "decisions based on ... port numbers" framing of a
+        packet-filter classifier — the substrate for the deny
+        block-range action and the default-deny strictness variant.
+        RFC 2979 is about firewall transparency principles, not range
+        syntax, so it is a supporting threat/domain source, not the
+        load-bearing one (that is RFC 2475 for the MF classifier and
+        v1model.p4 for the range match_kind).
+
+
+  posts:
+    - url: https://github.com/p4lang/p4c/blob/main/p4include/v1model.p4
+      role: normative_behaviour
+      grounds: range_match_kind
+      quote: >-
+        match_kind { range, optional, selector }
+      quote_source: patterns/P-PortRangeClassifier/grounding/v1model_match_kind.txt
+      relevance: |
+        The P4-16 v1model architecture's additional match_kind
+        declarations (v1model.p4 lines 49-54), the normative data-plane
+        basis for the `range` match_kind. A table key field declared
+        `range` matches a value against a closed interval [low, high]
+        supplied by the control plane — the construct this pattern
+        forces and which P-ACL (ternary) does not exercise. The
+        evaluation entry installer realises a range key from the SUT
+        entries shape "match": {"<field>": {"range": [low, high]}},
+        emitted as `table_add ... <low>-><high> ... <priority>`; this is
+        the harness dependency the pattern relies on (see bridging_notes).
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Decisions are derived from
+      hdr.ipv4 (protocol), hdr.tcp/udp (src/dst ports), optionally
+      hdr.ipv4.totalLen, and std.ingress_port. Like P-ACL this is a
+      pure match-action pattern — no per-flow registers, no state
+      writes — but the match is interval membership, not a wildcard
+      mask.
+
+  bucket:                                  # plays the TPL `bucket` role — the control-plane rule set
+    keyed_by_tuple: [rule_id]
+    attrs:
+      priority:    int
+      dport_lo:    int                     # closed-interval lower bound on the L4 dst port
+      dport_hi:    int                     # closed-interval upper bound on the L4 dst port
+      sport_range: "(int, int) | any"      # optional source-port interval (when match_field_breadth includes it)
+      proto:       "int | any"             # optional exact protocol (6=TCP, 17=UDP)
+      len_range:   "(int, int) | any"      # optional packet-length interval (widest breadth)
+      action:      "enum {forward, deny, mark}"
+      action_args: "dict[arg, value]"      # forward/mark: {class_port}; mark: {dscp}
+    capacity: ${rule_count_capacity}
+    notes: |
+      The MF range-rule set. One bucket holds the entire control-plane-
+      installed table. First-match is BY PRIORITY: among all rules whose
+      interval(s) admit the packet, the rule with the largest `priority`
+      wins. Each rule's port match is a CLOSED interval [dport_lo,
+      dport_hi]; ties on priority among overlapping intervals are
+      forbidden by priority_correctness. |rules| ≤ ${rule_count_capacity}.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  range_rules:
+    type: list[range_rule]
+    constraint: |
+      every entry has priority:int ∈ [1, 2^31 - 1]; 0 ≤ dport_lo ≤
+      dport_hi ≤ 65535; action ∈ allowed-by-${action_breadth};
+      class_port ∈ the ${class_count} configured egress ports; no two
+      entries share both (priority, interval) (uniqueness).
+    notes: |
+      Control-plane-installed range rules — the (priority, port
+      interval, optional fields, action) tuples the data plane
+      consults. |range_rules| ≤ ${rule_count_capacity}; the number of
+      pairwise-overlapping intervals is ${overlap_depth}.
+
+  rule_count_capacity:
+    type: int | unbounded
+    range: "[8, 65536]"
+    default: 64
+    notes: |
+      Maximum number of range rules the table can host. Realistic
+      service classifiers sit between a handful (edge QoS) and a few
+      thousand (datacenter policy). shrink_rule_capacity_4x exercises
+      this axis; at low bounds the implementation can no longer afford a
+      separate range entry per micro-interval and must coalesce.
+
+  match_field_breadth:
+    type: enum
+    values: [dport, dport_proto, sport_dport_proto, sport_dport_proto_len]
+    default: dport
+    notes: |
+      Width of the classifier key. `dport`: a single range field on the
+      L4 destination port (the canonical service-class classifier).
+      `dport_proto`: + an exact protocol field (TCP vs UDP). `sport_
+      dport_proto`: + a second range field on the source port. `sport_
+      dport_proto_len`: + a third range field on hdr.ipv4.totalLen
+      (packet-size policy). Each step adds a field the parser must
+      extract; the +sport and +len steps add a SECOND/THIRD `range`
+      key field to the same table, which stresses the SUT's multi-range-
+      key handling (and the harness's multi-range install).
+
+  class_count:
+    type: int
+    range: "[2, 16]"
+    default: 3
+    notes: |
+      Number of distinct service classes, each bound to its own egress
+      port. The anchor's 3 classes map well-known (0-1023), registered
+      (1024-49151), and dynamic (49152-65535) port bands to three ports
+      — but seeds choose application-meaningful bands freely. Higher
+      class_count means more distinct egress decisions to get right and
+      more ranges to lay out without gaps/overlaps.
+
+  overlap_depth:
+    type: int
+    range: "[0, 32]"
+    default: 0
+    notes: |
+      Number of range rules that pairwise OVERLAP another rule's
+      interval at a different priority. At 0 the ranges are disjoint and
+      priority is irrelevant (every packet matches ≤1 rule). Raising it
+      forces correct priority resolution among overlapping intervals
+      (e.g., a broad 1024-65535 → bulk class plus a narrow 8080-8080 →
+      web class at higher priority). This is the range analogue of
+      P-ACL's overlapping-mask priority stress.
+
+  action_breadth:
+    type: enum
+    values: [classify_forward, classify_forward_deny, classify_forward_deny_mark]
+    default: classify_forward
+    notes: |
+      The action set the data plane realises. classify_forward: every
+      matched range steers to its class egress port (pure classifier).
+      classify_forward_deny: adds a `deny` action for blocked port
+      ranges (the firewall packet-filter, RFC 2979). classify_forward_
+      deny_mark: adds DSCP remark on the matched class (preserving the
+      2 ECN bits), the DiffServ-edge variant.
+
+  default_action:
+    type: enum
+    values: [forward_default_class, deny]
+    default: forward_default_class
+    notes: |
+      Behaviour on table miss (no range admits the packet, or the packet
+      has no L4 port). forward_default_class steers to the Best-Effort /
+      default class port; deny drops. The implementation MUST declare the table's
+      `default_action` — omission is the common v1model "missing
+      default_action crash" compile-failure pattern.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics, BY PRIORITY within range_rules (not declaration
+# order). The rules below are the case split over the matched rule's ACTION.
+
+rules:
+
+  - id: R0_no_l4_port_default
+    when: "¬header_present(tcp) ∧ ¬header_present(udp)"
+    then:
+      - drop                                                       # when ${default_action} == deny
+    notes: |
+      Packets with no L4 port (ICMP, ARP, IPv6, raw L2, or a non-TCP/UDP
+      IPv4 protocol) have no key for a port-range classifier. They take
+      the ${default_action} branch (drop shown for default-deny;
+      forward-to-default-class for default-permit, see R3b). The implementation
+      MUST guard the L4-port read with isValid()/header_present — reading
+      hdr.tcp.dstPort on a packet that never extracted TCP returns
+      garbage (the "Read from invalid header" bug), which would
+      mis-classify the packet into whatever range the garbage lands in.
+
+  - id: R1_range_match_forward
+    when: |
+      (header_present(tcp) ∨ header_present(udp))
+        ∧ exists(bucket, highest_priority_range_match(range_rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, forward)
+    given:
+      bucket: by_highest_priority_range(range_rules, packet, ${match_field_breadth})
+    then:
+      - forward(bucket.action_args.class_port)
+    notes: |
+      The packet's L4 dst port (and any configured extra fields) falls
+      within the highest-priority matching rule's CLOSED interval, whose
+      action is forward → steer to that class's egress port, headers
+      unchanged. "Range match" means dport_lo ≤ hdr.l4.dstPort ≤
+      dport_hi (inclusive both ends) ∧ (sport in sport_range when
+      configured) ∧ (proto == proto when configured) ∧ (len in len_range
+      when configured).
+
+  - id: R2_range_match_deny
+    when: |
+      (header_present(tcp) ∨ header_present(udp))
+        ∧ exists(bucket, highest_priority_range_match(range_rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, deny)
+    enforced_when: "${action_breadth} ∈ {classify_forward_deny, classify_forward_deny_mark}"
+    given:
+      bucket: by_highest_priority_range(range_rules, packet, ${match_field_breadth})
+    then:
+      - drop
+    notes: |
+      The matched rule's action is deny (a blocked port range, e.g.
+      Telnet 23 or an ephemeral-port exfil band) → silent drop. Distinct
+      from R0/R3 default handling because R2 fires on an EXPLICIT deny
+      interval, not a table miss.
+
+  - id: R3_range_match_mark
+    when: |
+      (header_present(tcp) ∨ header_present(udp))
+        ∧ exists(bucket, highest_priority_range_match(range_rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, mark)
+    enforced_when: "${action_breadth} == classify_forward_deny_mark"
+    given:
+      bucket: by_highest_priority_range(range_rules, packet, ${match_field_breadth})
+    then:
+      - set(hdr.ipv4.diffserv, bucket.action_args.dscp)
+      - forward(bucket.action_args.class_port)
+    notes: |
+      The matched rule rewrites the 6-bit DSCP (upper 6 bits of the IPv4
+      DS/TOS byte) to the class codepoint — PRESERVING the lower 2 ECN
+      bits — then steers to the class port. Requires IPv4 header-checksum
+      recomputation (the most common silent implementation bug).
+
+  - id: R4_no_match_default_forward
+    when: |
+      (header_present(tcp) ∨ header_present(udp))
+        ∧ ¬exists(bucket, highest_priority_range_match(range_rules, packet, ${match_field_breadth}))
+        ∧ ${default_action} == forward_default_class
+    then:
+      - forward(default_class_port)
+    notes: |
+      No range admits the packet → steer to the default / Best-Effort
+      class port. Catches an implementation that leaves the table default at
+      NoAction (silent black-hole) when the seed expects a default class.
+
+  - id: R4b_no_match_default_deny
+    when: |
+      (header_present(tcp) ∨ header_present(udp))
+        ∧ ¬exists(bucket, highest_priority_range_match(range_rules, packet, ${match_field_breadth}))
+        ∧ ${default_action} == deny
+    then:
+      - drop
+    notes: |
+      Table miss on a default-deny classifier silently drops. The implementation
+      MUST realise this via `default_action = drop;` / `const
+      default_action`; omission is the common v1model
+      missing-default_action bug.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: range_boundary_inclusive
+    clause: stability
+    target: chosen_rule
+    while: "R1..R3 fires"
+    notes: |
+      THE range-specific correctness property. The interval is CLOSED:
+      a packet whose port == dport_lo OR == dport_hi MUST match the
+      rule, and a packet whose port == dport_lo - 1 OR == dport_hi + 1
+      MUST NOT (assuming no other rule covers it). Implementation bugs it
+      catches: (i) a strict `>`/`<` comparison instead of `>=`/`<=`
+      (off-by-one at the bound); (ii) a ternary-prefix expansion of the
+      interval that over-covers (a /N prefix wider than the interval) or
+      under-covers (misses a boundary value); (iii) the range match_kind
+      installed with exclusive bounds. Witness in the oracle's
+      invariant_log: (port, dport_lo, dport_hi, matched?) at each bound.
+
+  - id: priority_correctness
+    clause: stability
+    target: chosen_rule
+    while: "R1..R3 fires"
+    enforced_when: "${overlap_depth} >= 1"
+    notes: |
+      P4Runtime §9.1 — among all rules whose intervals admit the packet,
+      the rule with the largest priority MUST win. Implementation bug it catches:
+      installing the range table without an explicit priority (or as
+      list order), so the first-installed overlapping range wins instead
+      of the highest-priority one. Dormant at overlap_depth 0 (disjoint
+      ranges ⇒ at most one match) — recorded as such, not fabricated.
+
+  - id: default_action_correctness
+    clause: stability
+    target: decision
+    while: "R0, R4, R4b fire"
+    notes: |
+      When no range matches (or the packet has no L4 port), the decision
+      MUST equal ${default_action}. Catches setting the table default to
+      NoAction when the seed declares a default class or deny.
+
+  - id: classify_routes_to_named_port
+    clause: stability
+    target: egress_port
+    while: "R1 fires (forward branch)"
+    notes: |
+      A classified-forward packet MUST egress the matched rule's
+      class_port, NOT a downstream routing decision. Catches an implementation
+      that computes egress via a later forwarder and ignores the
+      classifier's class assignment.
+
+  - id: classify_header_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.diffserv, hdr.ipv4.totalLen, hdr.ipv4.ttl)"
+    while: "R1 fires (forward branch)"
+    free_under: []
+    notes: |
+      The pure classify-forward action MUST NOT modify headers — this is
+      what distinguishes it from the mark action. Catches an implementation that
+      folds a DSCP rewrite into the forward path by accident. Under the
+      mark variant (R3), hdr.ipv4.diffserv is the only field that may
+      change (and only its upper 6 bits; the 2 ECN bits are preserved).
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Single-pass, stateless: a classified packet MUST NOT be
+      recirculated through the classifier stage. An implementation that
+      recirculates to re-classify on the assigned class introduces a
+      loop the harness's bounded-step trace cap surfaces.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The v1model bug
+# taxonomy guides what to probe.
+
+test_scaffolding:
+
+  G1:
+    - id: in_range_forward_to_class
+      generate: |
+        Install one forward range rule [lo, hi] → class port X. Send a
+        TCP/UDP packet whose dst port is strictly inside (lo < p < hi);
+        assert forward out port X with all headers preserved (R1;
+        classify_header_preservation + classify_routes_to_named_port).
+
+    - id: boundary_inclusive_both_ends
+      generate: |
+        With the same rule [lo, hi] → X, send TWO packets: dst port == lo
+        and dst port == hi. Assert BOTH egress port X (R1; closed
+        interval). The range-specific golden case — distinguishes a
+        correct `>=`/`<=` from an off-by-one `>`/`<`.
+
+    - id: per_class_range_branch
+      requires: "${class_count} >= 2"
+      generate: |
+        Install one forward rule per class, mapping a disjoint port band
+        to a distinct class port (e.g. 0-1023→P1, 1024-49151→P2,
+        49152-65535→P3). Send one packet per band; assert each egresses
+        its own class port. Mirrors G1-P1-T3 (one test per action) and
+        G1-P1-T1 (one test per (in,out) path).
+
+    - id: deny_block_range
+      requires: "${action_breadth} ∈ {classify_forward_deny, classify_forward_deny_mark}"
+      generate: |
+        Install a deny rule over a blocked band (e.g. 23-23 Telnet, or an
+        ephemeral exfil band). Send a packet with a dst port inside it;
+        assert drop (R2). Contrast with an adjacent allowed port that
+        forwards.
+
+  G2:
+    - id: default_on_table_miss
+      generate: |
+        Install rules whose intervals are disjoint from the packet's dst
+        port. Send the packet; assert the outcome equals ${default_action}
+        (forward_default_class ⇒ egress default port; deny ⇒ drop). Tests
+        default_action_correctness; bug it catches: "Default action miss"
+        / "Missing default_action crash" (omitting `default_action`).
+
+    - id: non_l4_packet_no_garbage
+      generate: |
+        Send a packet with NO L4 port header (ICMP, ARP, or IPv4
+        proto≠6/17). Assert it takes the ${default_action} branch and is
+        NOT mis-classified into some range. Tests R0 + the "Read from
+        invalid header" bug — the implementation must guard the port read with
+        isValid()/header_present rather than reading garbage.
+
+    - id: rule_capacity_overflow
+      requires: "${rule_count_capacity} != unbounded"
+      generate: |
+        Install ${rule_count_capacity} distinct range rules; attempt one
+        more. Assert the install is rejected or an observable
+        misclassification results (control-plane reject, or a port that
+        should now hit the new rule taking the default instead).
+
+  G3:
+    - id: boundary_off_by_one_bypass
+      generate: |
+        Install a forward (or allow) rule [lo, hi]. Send packets with
+        dst port == lo - 1 and == hi + 1 (the two just-outside values),
+        with NO other rule covering them. Assert BOTH take the
+        ${default_action} branch — they MUST NOT match the interval.
+        Catches: strict-vs-inclusive boundary off-by-one, and a ternary-
+        prefix expansion that over-covers the interval (the security
+        failure mode of approximating a range with a too-wide mask).
+        Generalises the bug taxonomy's TTL=0/TTL=1 boundary rule.
+
+    - id: overlapping_range_priority_inversion
+      requires: "${overlap_depth} >= 1"
+      generate: |
+        Install two OVERLAPPING ranges at non-equal priorities,
+        constructed so a list-order-wins implementation fires the wrong one:
+        priority 10 → bulk class on 1024-65535, priority 100 → web class
+        on 8080-8080. Send a packet to port 8080. Assert it routes to the
+        web class (higher priority), not the bulk class. Common v1model bugs
+        "Priority inversion (ternary)" / "Rule deviation".
+
+    - id: default_deny_bypass
+      requires: "${default_action} == deny"
+      generate: |
+        Install a small allow-range allow-list. Send a packet whose dst
+        port is just outside every allow-range; assert drop
+        (${default_action}). The allow-list MUST NOT leak adjacent ports.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: shrink_rule_capacity_4x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} > 32"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 8 ∧ |${range_rules}| ≤ ${rule_count_capacity}"
+    notes: |
+      Tighten the rule-count axis; the implementation can no longer afford a
+      separate range entry per micro-interval and must coalesce adjacent
+      classes. Pairs with enlarge_rule_capacity_2x.
+
+  - id: enlarge_rule_capacity_2x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} < 32768"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${rule_count_capacity} ≤ 65536"
+    notes: |
+      Loosen the rule-count axis. Mirror of shrink_rule_capacity_4x
+      (doubling, since the pass-rate response to capacity is monotone-
+      but-saturating).
+
+  - id: expand_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ sport_dport_proto_len"
+    effect: |
+      ${match_field_breadth} ← next of
+      {dport → dport_proto → sport_dport_proto → sport_dport_proto_len}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${range_rules} is well-formed over the new breadth"
+    notes: |
+      Widen the classifier key. +proto adds an exact field; +sport and
+      +len each add a SECOND/THIRD `range` key field to the table —
+      forcing multi-range-key handling. Pairs with
+      shrink_match_field_breadth.
+
+  - id: shrink_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ dport"
+    effect: |
+      ${match_field_breadth} ← previous of
+      {dport ← dport_proto ← sport_dport_proto ← sport_dport_proto_len}
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${range_rules} is well-formed over the new breadth"
+    notes: |
+      Narrow the classifier key one step. Pairs with
+      expand_match_field_breadth.
+
+  - id: expand_class_count
+    applicable_when: "${class_count} < 16"
+    effect: "${class_count} ← min(${class_count} * 2, 16)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${class_count} ≤ 16 ∧ |${range_rules}| ≤ ${rule_count_capacity}"
+    notes: |
+      Add service classes (and the egress ports + ranges that realise
+      them). More distinct egress decisions to get right and more bands
+      to lay out without gaps. Pairs with contract_class_count.
+
+  - id: contract_class_count
+    applicable_when: "${class_count} > 2"
+    effect: "${class_count} ← max(${class_count} / 2, 2)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${class_count} ≥ 2"
+    notes: |
+      Collapse service classes. Pairs with expand_class_count.
+
+  - id: expand_action_breadth
+    applicable_when: "${action_breadth} ≠ classify_forward_deny_mark"
+    effect: |
+      ${action_breadth} ← next of
+      {classify_forward → classify_forward_deny → classify_forward_deny_mark}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${range_rules} has action ∈ allowed-by-new-action_breadth"
+    notes: |
+      Widen the action set. +deny adds R2 and the default-deny pathway;
+      +mark adds R3 (DSCP rewrite + ECN preservation + checksum
+      recompute). Pairs with contract_action_breadth.
+
+  - id: contract_action_breadth
+    applicable_when: "${action_breadth} ≠ classify_forward"
+    effect: |
+      ${action_breadth} ← previous of
+      {classify_forward ← classify_forward_deny ← classify_forward_deny_mark}
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${range_rules} has action ∈ allowed-by-new-action_breadth"
+    notes: |
+      Narrow the action set. Pairs with expand_action_breadth.
+
+  - id: flip_default_to_deny
+    applicable_when: "${default_action} == forward_default_class"
+    effect: "${default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${range_rules} contains ≥ 1 forward entry"
+    notes: |
+      Flip the default-action policy to deny — activates the
+      allow-list-over-default-deny firewall semantics and requires the
+      implementation to declare `default_action = drop`. Pairs with
+      flip_default_to_forward.
+
+  - id: flip_default_to_forward
+    applicable_when: "${default_action} == deny"
+    effect: "${default_action} ← forward_default_class"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${range_rules} contains ≥ 1 deny entry ∨ true"
+    notes: |
+      Flip the default-action policy back to default-class forwarding.
+      Pairs with flip_default_to_deny.
+
+  - id: inject_overlapping_ranges
+    applicable_when: "${overlap_depth} < 16"
+    effect: |
+      ${overlap_depth} ← min(${overlap_depth} * 2 + 1, 32) ∧
+      regenerate ${range_rules} so ${overlap_depth} pairs of intervals
+      overlap at non-equal priorities; add the G3 test
+      `overlapping_range_priority_inversion` if not present.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${overlap_depth} ≥ 1 ∧ |${range_rules}| ≤ ${rule_count_capacity}"
+    notes: |
+      Test-rigor harden. Enriches the rule set with overlapping
+      intervals so priority_correctness becomes load-bearing. Catches a
+      implementation that relies on install order rather than the priority field.
+      Pairs with flatten_to_disjoint_ranges.
+
+  - id: flatten_to_disjoint_ranges
+    applicable_when: "${overlap_depth} > 0"
+    effect: |
+      ${overlap_depth} ← 0 ∧ regenerate ${range_rules} so every interval
+      is pairwise disjoint (each packet matches ≤ 1 rule); remove G3
+      `overlapping_range_priority_inversion` if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${range_rules}| ≥ 1"
+    notes: |
+      Test-rigor ease. Disjoint intervals make priority irrelevant, so
+      priority_correctness passes trivially (it goes dormant). Pairs with
+      inject_overlapping_ranges.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Anchor (dport, classify_forward, default forward, class_count 3,
+            capacity 64, overlap_depth 0):
+      - One table whose key uses the v1model `range` match_kind:
+          key = {
+            hdr.ipv4.protocol: exact;     // only if breadth ≥ dport_proto
+            l4_dstPort:        range;      // the distinguishing field
+          }
+        where l4_dstPort is a metadata bit<16> the parser fills from
+        hdr.tcp.dstPort or hdr.udp.dstPort (guarded by isValid()).
+        actions = { set_class(bit<9> port); @defaultonly NoAction; }
+        size = ${rule_count_capacity};
+        default_action = set_class(default_class_port);   // or drop;
+      - set_class action: standard_metadata.egress_spec = port.
+      - Each rule is installed as a range entry; with the eval harness
+        the SUT's entries file uses the shape
+          "match": { "<key field>": {"range": [low, high]} },
+          "priority": <p>
+        which the installer emits as
+          table_add <t> <a> <low>-><high> => <port> <priority>
+        (range fields carry a priority, like ternary, P4Runtime §9.1).
+        HARNESS DEPENDENCY: range-entry install support was added to
+        evaluation/switch_runner.py for this pattern; a range key field
+        sent as a bare [low, high] LIST (the ternary shape) would be
+        mis-installed as value&&&mask — emit the {"range": [...]} dict.
+
+    +proto / +sport / +len (wider breadth):
+      - +proto: add `hdr.ipv4.protocol: exact` to the key.
+      - +sport: add a SECOND `range` field on the source port.
+      - +len:  add a THIRD `range` field on hdr.ipv4.totalLen.
+        A table with multiple range fields still installs each field in
+        its own `low->high` slot with one trailing priority.
+
+    +deny (classify_forward_deny):
+      - Add a `deny()` action doing mark_to_drop(standard_metadata);
+        install deny ranges at appropriate priority.
+
+    +mark (classify_forward_deny_mark):
+      - Add `mark(bit<6> dscp)` that sets hdr.ipv4.diffserv[7:2] = dscp
+        WITHOUT touching the 2 ECN bits [1:0], then sets egress port.
+      - MyComputeChecksum MUST recompute the IPv4 header checksum on the
+        mark path; forgetting it is the #1 silent bug.
+
+    Default-deny (default_action deny):
+      - Two-stage acceptable: the range table sets a class, and a
+        catch-all default_action = drop denies the miss.
+
+  Relationship to P-ACL (do NOT consolidate):
+    P-ACL is ternary wildcard/priority classification — its key is a
+    masked bit-pattern; it cannot express an arbitrary port interval
+    without prefix-expanding it into many ternary rows (and that
+    expansion is exactly the boundary-bug source range_boundary_inclusive
+    catches). P-PortRangeClassifier centres the `range` match_kind, a
+    construct P-ACL never exercises. They share the design-space cell
+    (D7/P4/redesign) but probe different language features; keep both.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Reading hdr.tcp.dstPort / hdr.udp.dstPort without an isValid()
+      guard — a non-TCP/UDP packet then classifies on garbage. The
+      `non_l4_packet_no_garbage` G2 case catches it.
+
+    * Approximating the range with a ternary mask or a strict `>`/`<`
+      comparison — over/under-covers the interval at the bounds. The
+      `boundary_inclusive_both_ends` G1 and `boundary_off_by_one_bypass`
+      G3 cases catch it.
+
+    * Installing overlapping ranges without an explicit priority (or as
+      list order) — the wrong rule wins. `overlapping_range_priority_
+      inversion` catches it.
+
+    * Omitting `default_action` — the common v1model missing-
+      default_action compile/black-hole bug. `default_on_table_miss` catches it.
+
+    * Folding a DSCP rewrite into the pure-forward path, or clobbering
+      the ECN bits on the mark path. classify_header_preservation and the
+      mark-path DSCP/ECN discipline catch these.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. Schema, parameter bindings, and oracle audit must pass validation.
+
+    2. The oracle MUST read the range-rule set, class ports, action
+       breadth, and default_action from runtime `state["config"]` (the
+       parametric-source contract) so parameter rebinds of the
+       ranges/breadth/default reuse the same audited module. At least one
+       canonical_examples.yaml entry must straddle a range BOUNDARY (port
+       == lo, == hi, == lo-1, == hi+1) so an off-by-one or constant-baked
+       oracle is caught by the oracle audit.
+
+    3. Confirm the harness installs the seed's range entries: the SUT/
+       reference entries file must use the {"range": [low, high]} match
+       shape with a `priority`. Cross-check by hand-running the public
+       tests through the oracle — a range
+       entry mis-shaped as a [low, high] list silently mis-installs.
+
+    4. P-PortRangeClassifier shares the D7/P4/redesign cell with P-ACL;
+       when a mutation widens this to wildcard-mask matching rather than
+       intervals, prefer a P-ACL instance — they are deliberately separate
+       feature vehicles.

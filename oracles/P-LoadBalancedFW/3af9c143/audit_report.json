@@ -1,0 +1,110 @@
+{
+  "oracle_hash": "8607b28c4452e326caaf9637958dcf8bc354c0e2b0484d7fa8438edcfb2c4801",
+  "instance": "lb_fw_anchor-default",
+  "ran_at": "2026-05-30T00:04:23.790654Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "nonsyn_no_conntrack_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_pinned_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "established_flow_reuse",
+        "status": "pass"
+      },
+      {
+        "example_id": "backend_return_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "untracked_return_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "distinct_flow_distinct_pin",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "admit_precedes_pin": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "sticky_backend": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "reverse_path_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "admit_precedes_pin",
+      "sticky_backend",
+      "reverse_path_consistency",
+      "no_orphan",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer, NSDI 2016",
+      "Miao et al., SilkRoad: Making Stateful Layer-4 Load Balancing Fast and Cheap Using Switching ASICs, SIGCOMM 2017",
+      "RFC5382",
+      "RFC1812",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

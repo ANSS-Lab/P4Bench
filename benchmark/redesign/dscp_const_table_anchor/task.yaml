@@ -1,0 +1,440 @@
+task_name: dscp_const_table_anchor
+task_type: full_program
+complexity: low
+source: rfc
+pattern: P-DSCPConstTable
+pattern_version: '1.0'
+seed:
+  classes:
+  - codepoint: EF
+    dscp: 46
+    egress_port: s1.p2
+  - codepoint: AF11
+    dscp: 10
+    egress_port: s1.p3
+  - codepoint: BE
+    dscp: 0
+    egress_port: s1.p4
+  default_egress_port: s1.p4
+description: |
+  Implement a Differentiated Services classifier on a single switch s1, per the
+  RFC 2475 Behaviour-Aggregate (BA) classifier and RFC 2474 DS field. The switch
+  classifies each IPv4 packet by the 6-bit DSCP carried in the high six bits of
+  its DS (TOS) byte, and forwards it out the egress port bound to that traffic
+  class. There is no per-flow state, and the codepoint→class mapping is FIXED
+  (it is standardised protocol semantics, not a runtime-tunable policy).
+
+  ## Classification map (fixed)
+
+   - DSCP 46  (Expedited Forwarding, EF)   → forward out s1.p2
+   - DSCP 10  (Assured Forwarding, AF11)   → forward out s1.p3
+   - DSCP 0   (Best Effort, BE / CS0)      → forward out s1.p4
+   - any other DSCP value                  → forward out s1.p4 (default class)
+
+  ## Per-packet processing
+
+  For each arriving IPv4 packet:
+
+   1. Extract the DSCP — the TOP SIX bits of the DS/TOS byte. The low two bits
+      (the ECN / currently-unused field) MUST be IGNORED for classification:
+      two packets with the same DSCP but different low-two-bit values belong to
+      the same class.
+   2. Look the DSCP up in the fixed map and forward the packet out the mapped
+      class's egress port, UNCHANGED — this is a classifier, not a marker or a
+      routing hop: the IPv4 source, destination, TTL, and the whole DS/TOS byte
+      (including the DSCP) are left intact, as are the Ethernet addresses.
+   3. If the DSCP is not in the map, forward the packet out the default class's
+      egress port (s1.p4).
+
+  A frame with no IPv4 header (e.g. ARP) has no DS field to classify on and is
+  forwarded out the default class's egress port (s1.p4); it MUST NOT be
+  classified on a garbage value.
+
+  ## Required behaviour / invariants
+
+   - Classification uses ONLY the top six bits of the DS byte; the low two bits
+     are ignored and preserved.
+   - A classified packet leaves on its class's egress port with ALL HEADERS
+     UNCHANGED (no DSCP rewrite).
+   - Every packet is assigned a class; an unmapped codepoint and a non-IPv4
+     frame both take the default class.
+   - The switch must declare an explicit default behaviour for unmapped
+     codepoints — it must not silently black-hole them.
+
+  ## Topology
+
+  One switch s1, four ports. Ingress is s1.p1; classified packets leave on
+  s1.p2 (EF), s1.p3 (AF11), or s1.p4 (BE / default).
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: ef_to_class_p2
+  visibility: public
+  description: EF (DSCP 46, TOS 184) → forward out s1.p2, headers unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 184
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: af11_to_class_p3
+  visibility: public
+  description: AF11 (DSCP 10, TOS 40) → forward out s1.p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: be_to_class_p4
+  visibility: public
+  description: BE (DSCP 0, TOS 0) → forward out s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: ef_tcp_proto_agnostic
+  visibility: hidden
+  description: EF over TCP (TOS 184) → s1.p2. The BA classifier keys on DSCP only, not the L4 protocol.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 184
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: ecn_bits_ignored_ef
+  visibility: hidden
+  description: EF with ECN=11 set (TOS 187 = 46<<2 | 3) → still s1.p2. Classification ignores the low 2 bits.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 187
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: unmapped_cs6_to_default
+  visibility: hidden
+  description: CS6 (DSCP 48, TOS 192) is unmapped → default class s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 192
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: unmapped_af22_to_default
+  visibility: hidden
+  description: AF22 (DSCP 20, TOS 80) is unmapped → default class s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 80
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: non_ipv4_arp_to_default
+  visibility: hidden
+  description: A non-IPv4 frame (ARP) has no DS field → default class s1.p4; must not classify on garbage.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 10.0.2.2
+        psrc: 10.0.1.1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+- name: ef_dscp_not_remarked
+  visibility: hidden
+  description: EF packet (TOS 184) → s1.p2 with IP.tos UNCHANGED — the BA classifier forwards, it does NOT remark the DSCP.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 184
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: ecn_smuggle_no_reclassify
+  visibility: hidden
+  description: EF with ECN=01 (TOS 185) → s1.p2 (same as ECN=0); the ECN bits neither change the class nor are rewritten on egress.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 185
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: be_ecn_ignored
+  visibility: hidden
+  description: BE with ECN=10 (TOS 2) → s1.p4 (DSCP 0, class unchanged by ECN).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 2
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: af11_header_preservation
+  visibility: hidden
+  description: AF11 (TOS 40) → s1.p3 with IPv4 src/dst/TTL/TOS and Ether src all UNCHANGED. Catches a TTL-decrement or MAC-rewrite.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged

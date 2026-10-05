@@ -1,0 +1,123 @@
+{
+  "oracle_hash": "9a18f64f2280841e837d347ece08b1da8adbe46507bd967e6e06740446497d67",
+  "instance": "dhcp_relay_anchor-default",
+  "ran_at": "2026-06-13T23:11:06.205023Z",
+  "canonical_examples": {
+    "passed": 13,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_udp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_dhcp_udp_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "short_payload_on_dhcp_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "reply_on_access_port_non_dhcp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_relay_to_server_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_hops_exceeded_strict_limit_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_unconfigured_iface_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_on_server_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "reply_relay_to_client_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_option82_insert_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "request_multi_server_giaddr_select_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "reply_zero_giaddr_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "giaddr_stamp_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "hops_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "forward_redirect_to_server": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "reply_redirect_to_client": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stateless_no_binding": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "giaddr_stamp_correctness",
+      "hops_quantum_one",
+      "forward_redirect_to_server",
+      "reply_redirect_to_client",
+      "stateless_no_binding"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2131",
+      "RFC1542"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

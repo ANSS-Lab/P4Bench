@@ -1,0 +1,146 @@
+{
+  "oracle_hash": "ed1734bcf3718c11625a86abc21fcfda409330785c4c94a4a2fd416fd618b104",
+  "instance": "dns_lb_disc-default",
+  "ran_at": "2026-06-17T01:28:31.049089Z",
+  "canonical_examples": {
+    "passed": 19,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "route_a_query",
+        "status": "pass"
+      },
+      {
+        "example_id": "route_aaaa_query_qtype_split",
+        "status": "pass"
+      },
+      {
+        "example_id": "rewrite_dnat_query",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_forward_unclassified",
+        "status": "pass"
+      },
+      {
+        "example_id": "qtype_miss_falls_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_non_dns_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_qr_response_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_qdcount_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "malformed_pointer_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "name_exceeds_parse_bound_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "malformed_pointer_lax_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_drop_unclassified",
+        "status": "pass"
+      },
+      {
+        "example_id": "blocklist_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "tld_only_match",
+        "status": "pass"
+      },
+      {
+        "example_id": "case_norm_on_uppercase_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "case_norm_off_uppercase_misses_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "qname_exceeds_max_label_count_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "qname_within_raised_max_label_count_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "qtype_match_disabled_aaaa_routes_via_a_row",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "classification_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "dns_payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "envelope_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "parser_depth_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "classification_determinism",
+      "dns_payload_persistence",
+      "parser_depth_safety"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc1035"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

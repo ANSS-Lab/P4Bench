@@ -1,0 +1,285 @@
+{
+  "oracle_hash": "78163195d36f38d5c7a7258c5833031807f647ae2683ebea357c6c2c593ef14a",
+  "instance": "upf_router_anchor-default",
+  "ran_at": "2026-06-17T04:32:36.145663Z",
+  "canonical_examples": {
+    "passed": 27,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "unbound_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_inner_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_inner_route_added_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_unknown_teid_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_teid_admitted_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_unknown_ue_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_bearer_added_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_ext_none_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_ext_pdu_session_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_qfi_none_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_dscp_none_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_dscp_copy_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_udpck_zero_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_udpck_compute_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_srcport_fixed_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_srcport_hash_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_martian_off_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_martian_on_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_noroute_silent",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_noroute_icmp",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_noroute_da_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "transit_noroute_da_icmp",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_strict_false_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_strict_malformed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_mtu_ignore_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_oversize_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "decap_routes_inner": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "encap_preserves_inner_ttl": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_ttl_decremented_on_decap": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "origination_vs_transit_outer_ttl": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_inner_header_disjointness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "upf_transit_dichotomy": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "underlay_route_for_every_gnb": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "outer_header_field_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "gtpu_length_field_correct": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "gtpu_header_wellformed_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "qfi_set_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_ipv4_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_ipv4_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_quantum_one": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "decap_routes_inner",
+      "encap_preserves_inner_ttl",
+      "inner_ttl_decremented_on_decap",
+      "origination_vs_transit_outer_ttl",
+      "outer_inner_header_disjointness",
+      "upf_transit_dichotomy",
+      "underlay_route_for_every_gnb",
+      "outer_header_field_completeness",
+      "gtpu_length_field_correct",
+      "gtpu_header_wellformed_on_tx",
+      "qfi_set_on_tx",
+      "lpm_longest_match_correctness",
+      "outer_ipv4_checksum_validity",
+      "inner_ipv4_checksum_validity",
+      "ecmp_flow_consistency",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "contra_nsdi20",
+      "3gpp_ts_29281",
+      "RFC1812",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

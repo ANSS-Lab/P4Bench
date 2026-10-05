@@ -1,0 +1,1143 @@
+task_name: rate_feedback_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-RateFeedback
+pattern_version: '1.0'
+seed:
+  feedback_header: rcp_rate
+  feedback_semantics: rcp_rate
+  faithfulness: D5.0_rcp_single_rate
+  signal_keying: per_egress_port
+  n_signal_classes: 8
+  aggregation_mode: packet_count
+  aggregation_window: 64
+  aggregate_lower_better: true
+  path_min_strict: true
+  target_rate: 1000000
+  default_action: forward
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: host
+    to: s1.p1
+  - from: s1.p2
+    to: link2
+  - from: s1.p3
+    to: link3
+hosts:
+  host:
+    note: feedback senders + ordinary traffic; ingress on s1.p1
+  link2:
+    note: outgoing link for 10.0.2.0/24; congestion class 2; s1.p2
+  link3:
+    note: outgoing link for 10.0.3.0/24; congestion class 3; s1.p3
+description: |-
+  Implement an explicit-rate congestion-feedback stamper for BMv2 (v1model). The
+  switch tracks how much feedback-carrying traffic it has handled for each of its
+  outgoing links, turns that into a locally advertised "fair rate" for the link,
+  and writes that rate into a feedback field carried by passing packets — but
+  only ever to LOWER the field, never to raise it, so the most-congested switch
+  along a path is the one whose rate the receiver ends up seeing.
+
+  Topology: traffic arrives on port 1. The destination IPv4 address selects an
+  outgoing port: 10.0.1.0/24 leaves on port 1, 10.0.2.0/24 on port 2,
+  10.0.3.0/24 on port 3. A packet whose destination matches no route is dropped.
+  The outgoing port also identifies which link's congestion the packet
+  contributes to and is rated against.
+
+  Feedback packets are identified by a small shim carried on UDP destination
+  port 9999: its first four bytes are a 32-bit advertised-rate value (field name
+  RCPFeedback.value). A packet that is not UDP, or is UDP on any other
+  destination port, carries no feedback field.
+
+  Required behaviour, per packet:
+
+  - Ordinary traffic. A packet with no feedback shim is forwarded on its normal
+    forwarding decision, completely unmodified. Non-IPv4 frames are dropped.
+
+  - Congestion accounting. For a feedback-carrying packet, the switch counts it
+    against its outgoing link's load and from that accumulated load derives the
+    link's currently advertised rate, by this exact deterministic rule (so the same
+    packet train always yields the same advertised rate, run to run):
+      - Each outgoing link keeps a load count that starts at 0. Handling a
+        feedback-carrying packet for the link increments that link's load count by
+        1 BEFORE the advertised rate is computed, so the first feedback packet on a
+        cold link is rated at load 1. The count rolls back to 0 once it has counted
+        64 packets for the link and then resumes counting. Each link's load count
+        is independent: one link's traffic must not affect another link's rate.
+      - The advertised rate is target_rate / (1 + load), using integer (floored)
+        division, with target_rate = 1000000, then clamped to a minimum of 1. So
+        the rate gets smaller as the link accumulates more load, and it never
+        collapses to 0, underflows, or wraps to an enormous value under heavy load.
+        (A cold link's first feedback packet is rated at load 1 and so advertises
+        1000000 / 2 = 500000.)
+
+  - Rate stamping. The switch compares the feedback field the packet already
+    carries with its own advertised rate for the packet's outgoing link. If the
+    switch's rate is more restrictive (lower) than the value in the field, it
+    overwrites the field with its own rate. If the field already carries a value
+    at least as restrictive (equal or lower) — i.e. some earlier, busier hop
+    already wrote it — the switch leaves the field untouched. The switch must
+    never increase the field. Either way the packet is forwarded on its normal
+    forwarding decision; the rate accounting and stamping never change which port
+    a packet leaves on and never drop it.
+
+  Both the P4 program and any table entries are yours to author. The observable
+  behaviour the switch must get right is the value left in the feedback field
+  after each packet, the choice never to raise that value, and that each
+  outgoing link's congestion is accounted independently.
+test_cases:
+- name: stamp_switch_value_on_uncongested_field
+  visibility: public
+  goal_class: G1
+  description: A feedback packet arrives on a cold link (this switch has seen no prior feedback traffic for the outgoing link) carrying a high (least-restrictive) advertised-rate value. The switch computes its own lower advertised rate for the link and overwrites the feedback field with that smaller value, then forwards the packet on its normal outgoing port. No other field changes.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 500000
+- name: preserve_more_restrictive_upstream_value
+  visibility: public
+  goal_class: G1
+  description: A feedback packet arrives on a cold link carrying a value that is ALREADY more restrictive (smaller) than this switch's advertised rate — an upstream bottleneck wrote it. The switch leaves the field UNCHANGED (it never raises it) and forwards the packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 10
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: ordinary_packet_forwarded_unmodified
+  visibility: public
+  goal_class: G1
+  description: An ordinary packet (no feedback shim) to a routable destination is forwarded on its normal outgoing port with no field modified.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: {}
+- name: signal_grows_lowers_advertised_value
+  visibility: hidden
+  goal_class: G1
+  description: After the switch has handled several feedback packets for an outgoing link, a further feedback packet on that link with a least-restrictive field is stamped with a SMALLER value than a cold link would stamp — the advertised rate tracks the accumulated load downward.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.77
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 200000
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+- name: per_class_signal_isolation
+  visibility: hidden
+  goal_class: G2
+  description: After warming one outgoing link (port 2) with feedback traffic, a feedback packet for a DIFFERENT outgoing link (port 3) with a least-restrictive field is stamped with that link's own (near-cold) advertised value — one link's accumulated load does not bleed into another link's rate.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 500000
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+- name: equal_value_preserved
+  visibility: hidden
+  goal_class: G2
+  description: A feedback packet whose carried value exactly equals the switch's advertised rate for a cold link is left UNCHANGED (the fold overwrites only when strictly more restrictive). Forwarded normally.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: advertised_value_floor_no_underflow
+  visibility: hidden
+  goal_class: G2
+  description: After driving an outgoing link's load very high, a further feedback packet with a least-restrictive field is stamped with a small SATURATED value (a sane floor), never an enormous wrapped value — the advertised rate does not underflow at heavy load.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 23809
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+- name: no_route_drop
+  visibility: hidden
+  goal_class: G2
+  description: A feedback packet whose destination matches no route is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: drop
+- name: adversary_cannot_raise_field
+  visibility: hidden
+  goal_class: G3
+  description: An adversarial sender presents a feedback packet whose field is ALREADY far more restrictive (much smaller) than the switch's value, trying to coerce the switch into raising it to a faster rate. The switch PRESERVES the smaller value — it never increases the field — even against a crafted small value.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: deterministic_stamp_not_qdepth
+  visibility: hidden
+  goal_class: G3
+  description: The same single feedback packet on a cold link is stamped to a fixed deterministic value derived from the packet-count signal, not from a queue-depth read (which would be ~0 and run-varying). The expected stamp is bit-identical run to run.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40001
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 500000
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) carries no forwarding class and is dropped before any signal update.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.9.9
+        pdst: 10.0.2.50
+  expected:
+    behavior: drop
+- name: udp_non_feedback_port_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A UDP packet on a non-feedback destination port (53, not the feedback demux port) carries no feedback field and is forwarded unmodified — the feedback path is keyed on the specific demux port, not on UDP in general.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: {}
+- name: preserve_branch_then_stamp_branch_consistent
+  visibility: hidden
+  goal_class: G3
+  description: Following a preserve (no-rewrite) packet, a subsequent feedback packet on the same cold-ish link whose field exceeds the advertised value is still correctly stamped — the no-rewrite branch does not corrupt the deparsed feedback header for the later rewrite branch.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 5000000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 333333
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 10

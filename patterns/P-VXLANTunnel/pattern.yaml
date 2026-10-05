@@ -1,0 +1,1515 @@
+# P-VXLANTunnel — Virtual eXtensible LAN (VXLAN) VTEP encap/decap (RFC 7348)
+#
+# TPL v1.0 task pattern. Fills the most-omitted
+# "every fabric has it" production NF in the v1 corpus: a stateless
+# L3-VTEP that encapsulates inner Ethernet frames into outer
+# Ether/IPv4/UDP/VXLAN on the access→uplink path, and strips the outer
+# stack on the uplink→access path. Sibling to P-IPv4Routing under the
+# same (D5:routing × P1:forwarding) cell — exercises a *different*
+# capability surface: outer-header CONSTRUCTION (encap) and PARSER
+# DEPTH (Eth-in-IP-in-UDP-in-VXLAN-in-Eth) that P-IPv4Routing skips by
+# operating purely on the LPM table. target_capability = redesign:
+# VXLAN is a fixed-function ASIC primitive (modern merchant silicon
+# implements it in baked-in form) being moved into programmable
+# logic-level iteration. Extracted from RFC 7348 (canonical) + the
+# p4lang basic_tunnel-equivalent tutorial topology.
+
+pattern_id: P-VXLANTunnel
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D2:tunnel, D5:routing]                       # headline: overlay encap/decap at the VTEP boundary (tunnel — same family as P-SRv6Endpoint/P-GREKeyTunnel); secondary: underlay-FIB overlay forwarding (routing)
+  prescriptive: [P13:encap-decap, P1:forwarding]              # headline: outer Eth/IPv4/UDP/VXLAN construction + strip (encap-decap); secondary: match-action table lookups (forwarding)
+
+target_capability: redesign                                   # VXLAN is an ASIC-fixed-function tunnel primitive being moved into programmable logic
+
+summary: >
+  A stateless L3-VTEP for VXLAN (RFC 7348). On the access→uplink path
+  the switch resolves the access port's VNI binding, looks up the
+  inner destination MAC in the per-VNI MAC→remote-VTEP table, builds
+  the outer Ethernet+IPv4+UDP+VXLAN stack (I-flag set, reserved bits
+  zero, UDP destination port 4789), resolves the remote VTEP IP in
+  the underlay FIB for the egress port and outer L2 rewrite, and
+  forwards. On the uplink→access path it identifies VXLAN traffic by
+  outer UDP destination port, validates the VXLAN flags (I-flag MUST
+  be 1, reserved fields MUST be zero on transmission and SHOULD be
+  ignored on receipt — strict mode treats nonzero reserved as a
+  drop), strips the four outer layers, and looks up (VNI, inner
+  destination MAC) in the local-delivery table to pick the access
+  egress port. VNI isolation is enforced as an invariant: a frame
+  decapsulated under VNI X MUST NOT be delivered to an access port
+  bound to VNI Y. The pattern's headline capability is *outer-header
+  construction* — assignments to every field of newly-validated
+  outer headers (`setValid()` does not initialise) is the canonical
+  silent-bug surface the v1model bug taxonomy ranks alongside conditional-deparser
+  faults, and the test scaffolding probes it as a G1-P4-T3 first-
+  class case. Faithfulness anchors at D5.0 (a minimal happy-path
+  encap/decap with a single VNI, fixed outer source port, and
+  zero-UDP-checksum on transmit) and ladders through D5.1 (full
+  RFC 7348 §5 validation cascade and per-flow outer source port
+  hashing for ECMP entropy), D5.2 (head-end replication for
+  BUM / unknown-unicast under multi-tenant VNI isolation), and
+  D5.3 (multi-VNI scale with strict cross-VNI isolation and
+  control-plane-supplied MAC→VTEP table at realistic data-centre
+  fan-out).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # VXLAN tunneling is engineering-mature and absent from the SIGCOMM/NSDI/CoNEXT 2017–2026 corpus by construction; the protocol's authoritative source is its RFC. This exact publication-record gap is the motivation for the prescriptive axis.
+
+  rfcs:
+    - cite: rfc7348
+      title: "Virtual eXtensible Local Area Network (VXLAN): A Framework for Overlaying Virtualized Layer 2 Networks over Layer 3 Networks"
+      sections: ["§4.1 unicast over VXLAN", "§4.2 broadcast/multicast over VXLAN", "§4.3 fragmentation and MTU", "§5 frame format"]
+      quote: "the I flag MUST be set to 1 for a valid VXLAN Network ID (VNI). The other 7 bits (designated \"R\") are reserved fields and MUST be set to zero on transmission and ignored on receipt."
+      quote_source: "RFC 7348 §5 VXLAN Header / Flags (verbatim; cached at patterns/P-VXLANTunnel/grounding/rfc7348.txt). Grounds the vxlan_i_flag_set_on_tx invariant + R2 encap stamp, and the strict reserved-bits-zero decap drop (R3 under flag_strictness==strict)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      role: normative_behaviour
+      relevance: |
+        The protocol's authoritative source. The pattern's rule sequence
+        preserves the MUST/SHOULD clauses that bind data-plane behaviour,
+        drawn verbatim from §5 (frame format) and §4 (forwarding):
+
+          - §5 VXLAN header — "Flags (8 bits): where the I flag MUST be
+            set to 1 for a valid VXLAN Network ID (VNI). The other 7 bits
+            (designated 'R') are reserved fields and MUST be set to zero
+            on transmission and ignored on receipt." VNI is 24 bits; the
+            two 8-bit and 24-bit reserved blocks "MUST be set to zero on
+            transmission and ignored on receipt". The pattern's
+            `${flag_strictness} == strict` binding turns the
+            ignore-on-receipt SHOULD into a drop-on-receipt rule (R3) —
+            this is the harder variant and the one a security-conscious
+            data-centre operator would deploy.
+
+          - §5 outer UDP — "IANA has assigned the value 4789 for the
+            VXLAN UDP port, and this value SHOULD be used by default as
+            the destination UDP port." Source port "RECOMMENDED that the
+            value be in the dynamic/private port range 49152-65535", and
+            "It is recommended that the UDP source port number be
+            calculated using a hash of fields from the inner packet —
+            one example being a hash of the inner Ethernet frame's
+            headers." The pattern's `${outer_udp_src_port_mode}` enum
+            exposes the hash-vs-fixed choice; the
+            `${outer_udp_dst_port}` parameter exposes the
+            configurability the SHOULD-be-default carries.
+
+          - §5 UDP checksum — "It SHOULD be transmitted as zero. When a
+            packet is received with a UDP checksum of zero, it MUST be
+            accepted for decapsulation." On non-zero transmit: "MUST be
+            correctly calculated across the entire packet including the
+            IP header, UDP header, VXLAN header, and encapsulated MAC
+            frame." On non-zero receive: "MAY choose to verify the
+            checksum value. If it chooses to perform such verification,
+            and the verification fails, the packet MUST be dropped."
+            The pattern exposes the transmit choice as
+            `${outer_udp_checksum_mode}` and the receive verification
+            as `${verify_outer_udp_checksum_on_rx}`; the
+            `decap_zero_udp_checksum_accepted` G1 test pins the
+            zero-checksum-MUST-accept clause.
+
+          - §4.1 unicast — "verifies the validity of the VNI and
+            whether or not there is a VM on that VNI using a MAC
+            address that matches the inner destination MAC address.
+            If so, the packet is stripped of its encapsulating
+            headers and passed on to the destination VM." The
+            pattern's R1 decap rule realises this lookup as
+            `(vni, inner_dmac) → access_port` via the
+            `vni_mac_local_fib` entity (the bucket whose entries
+            the seed populates at instantiation).
+
+          - §4.1 VNI scope — "The VNI identifies the scope of the
+            inner MAC frame originated by the individual VM. Thus,
+            you could have overlapping MAC addresses across segments
+            but never have traffic 'cross over' since the traffic is
+            isolated using the VNI." Pinned by the
+            `vni_isolation` invariant; harder mode
+            (`${vni_isolation_strict} == true`) escalates "not
+            delivered" into "explicitly dropped at the decap egress
+            gate" so a misconfigured local-delivery table cannot
+            silently leak.
+
+          - §4.3 fragmentation — "VTEPs MUST NOT fragment VXLAN
+            packets. Intermediate routers may fragment encapsulated
+            VXLAN packets due to the larger frame size. The
+            destination VTEP MAY silently discard such VXLAN
+            fragments." The pattern's R5 enforces the encap-side
+            MUST-NOT-fragment by dropping frames whose post-encap
+            size would exceed `${outer_mtu}` when
+            `${mtu_enforcement} == strict_drop_oversize`.
+
+          - §4.2 BUM — broadcast/multicast/unknown-unicast on the
+            inner frame is mapped to an outer IP multicast group at
+            the management layer, or to head-end replication when
+            the operator chooses unicast replication. The pattern's
+            `${bum_handling}` enum exposes the three choices
+            (`drop`, `head_end_replication`, `ingress_multicast_group`)
+            with `drop` at D5.0 and `head_end_replication` from D5.2
+            onwards.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model realisation — `setValid()` on the new
+        outer Ether/IP/UDP/VXLAN headers, the explicit per-field
+        assignment that turns a uninitialised-header bug into a
+        compile-clean silent failure, `update_checksum` on the new
+        outer IPv4 header, and the parser cascade for the inner-
+        in-outer header stack — is widely-known P4-on-v1model
+        practice rather than RFC-cited. These bridging notes are
+        flagged `[common-knowledge baseline]` in `bridging_notes:`
+        rather than re-attributed to the RFC.
+
+  tutorials:
+    - url: https://github.com/p4lang/tutorials/tree/master/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        A local equivalent of the p4lang/tutorials
+        `basic_tunnel` exercise — a three-host, single-switch
+        topology with an Ethernet/MyTunnel/IPv4 parse graph and two
+        forwarding paths (IPv4 LPM vs MyTunnel-exact). The
+        anchor P-VXLANTunnel instance uses the same three-host
+        topology shape and the same access/uplink port partitioning;
+        it differs from `basic_mytunnel` by replacing the 4-byte
+        MyTunnel header with the RFC 7348 8-byte VXLAN header and
+        adding the outer IPv4+UDP construction step the MyTunnel
+        task elides. The anchor MUST behaviourally subsume that
+        tunnel task on its plain-pass-through cases.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. All forwarding decisions are
+      derived from header fields, the ingress port, and the
+      control-plane-installed mapping tables. The pattern is
+      stateless — no `flow` or `connection` rows are maintained,
+      which is what differentiates it from P-NAT44 / P-StatefulLB
+      under the same `redesign` axis.
+
+  link:                                                       # port-keyed access/uplink role and access-VNI binding
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      role:          "enum {access, uplink}"                  # access ports carry inner-only traffic; uplink ports carry VXLAN-encapped traffic
+      access_vni:    "int | none"                             # set iff role == access; the VNI this access port is configured to serve
+    populated_from:
+      access_rows: ${access_port_bindings}                    # one row per (port, vni) pair under role=access
+      uplink_rows: ${uplink_ports}                            # one row per port under role=uplink
+    notes: |
+      The port-role binding maps every ingress port to either an
+      "access" role (the port faces a tenant VM / hypervisor and
+      sees raw inner Ethernet) or an "uplink" role (the port faces
+      the underlay fabric and sees outer Ether/IPv4/UDP/VXLAN). At
+      the anchor a port is either purely access or purely
+      uplink; D5.3 ladders to mixed-role ports for richer
+      topologies. Per-port-role gating is what lets R1 (encap on
+      access) and R2 (decap on uplink) be first-match-disjoint
+      rather than relying on header validity alone.
+
+  vni_mac_remote_fib:                                         # TPL `bucket` — aggregate state across a class of flows (per-VNI per-MAC mapping to remote VTEPs)
+    type: bucket
+    keyed_by_tuple: [vni, inner_dmac]
+    attrs:
+      remote_vtep_ip:  address
+    capacity: ${vni_mac_remote_fib_capacity}
+    populated_from: ${vni_mac_remote_fib_entries}             # rows the seed installs
+    notes: |
+      The (VNI, inner-destination-MAC) → remote-VTEP-IP table that
+      drives the encap path. Control-plane-installed (RFC 7348
+      §4.1 explicitly leaves the population mechanism unspecified;
+      operators run either flood-and-learn from §4.1's data-plane
+      learning or BGP-EVPN from the overlay control plane). At
+      D5.0 the table is small (a handful of inner MACs across one
+      or two VNIs); D5.3 ladders to realistic data-centre scale.
+
+  vni_mac_local_fib:                                          # `bucket` — per-VNI per-MAC mapping to local access ports (decap target)
+    type: bucket
+    keyed_by_tuple: [vni, inner_dmac]
+    attrs:
+      access_egress_port: port
+    populated_from: ${vni_mac_local_fib_entries}              # rows the seed installs
+    notes: |
+      The (VNI, inner-destination-MAC) → local-access-port table
+      that drives the decap path. The vni_isolation invariant is
+      defined against this entity: a frame decapsulated with
+      VNI = V MUST only ever pick an access_egress_port whose
+      port_role.access_vni == V (i.e., a port bound to the SAME
+      VNI under the link entity).
+
+  underlay_fib:                                               # `bucket` — remote-VTEP-IP → underlay nexthop
+    type: bucket
+    keyed_by_tuple: [remote_vtep_ip]
+    attrs:
+      uplink_egress_port: port
+      outer_dst_mac:      address                             # the next-underlay-hop MAC (RFC 1812-style L2 rewrite)
+      outer_src_mac:      address                             # this VTEP's own port MAC
+    populated_from: ${underlay_fib_entries}                   # rows the seed installs
+    notes: |
+      Underlay-side resolution. After the encap path picks a
+      remote VTEP IP, this table picks the uplink port and the
+      outer Ethernet rewrite. Singletons at the anchor; ECMP
+      groups are out of scope here (P-IPv4Routing covers underlay
+      multipathing — instances of P-VXLANTunnel compose with
+      P-IPv4Routing transitively rather than re-encoding ECMP in
+      this pattern).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  access_port_bindings:
+    type: list[access_port_binding_entry]
+    constraint: |
+      every entry has port:int ∈ [1, 511] (BMv2 simple_switch port range);
+      access_vni:int ∈ [1, 16777215] (RFC 7348 §5 VNI range); ports are
+      unique across the list; no port appears as both access and uplink.
+    notes: |
+      The (ingress_port → access_vni) bindings that populate the `link`
+      entity's `port_role.access_vni` attribute under `role == access`.
+      Drives R2's `port_role.access_vni` resolution on the encap path
+      and the egress-side recheck in the `vni_isolation` invariant.
+      Bound by the seed; the harness installs the corresponding
+      port-role table at task start.
+
+  uplink_ports:
+    type: list[int]
+    constraint: |
+      every entry is a port number in [1, 511]; disjoint from
+      access_port_bindings ports.
+    notes: |
+      Set of ingress ports configured as uplinks (underlay-facing).
+      Populates the `link` entity's `port_role.role == uplink` rows.
+      R1 / R3 / R4 fire only when `ingress(uplink)` evaluates true,
+      which is true iff the ingress port is listed here.
+
+  vni_mac_remote_fib_entries:
+    type: list[vni_mac_remote_entry]
+    constraint: |
+      every entry has vni:int ∈ [1, 16777215]; inner_dmac:address;
+      remote_vtep_ip:address; (vni, inner_dmac) is unique across the
+      list; every remote_vtep_ip MUST resolve in
+      underlay_fib_entries.
+    notes: |
+      The (vni, inner_dmac) → remote_vtep_ip rows that populate the
+      `vni_mac_remote_fib` bucket. Drives R2's encap-path lookup
+      `vni_mac_remote_fib by_key(port_role.access_vni, ethernet.dst)`.
+      Bound by the seed.
+
+  vni_mac_local_fib_entries:
+    type: list[vni_mac_local_entry]
+    constraint: |
+      every entry has vni:int ∈ [1, 16777215]; inner_dmac:address;
+      access_egress_port:int ∈ [1, 511]; (vni, inner_dmac) is unique
+      across the list; every access_egress_port MUST appear in
+      access_port_bindings; when vni_isolation_strict, every entry's
+      access_port_bindings[access_egress_port].access_vni MUST equal
+      the entry's vni.
+    notes: |
+      The (vni, inner_dmac) → access_egress_port rows that populate
+      the `vni_mac_local_fib` bucket. Drives R1's decap-path lookup
+      and is the surface the `vni_crosswire_attempt_blocked` G3 test
+      maliciously violates.
+
+  underlay_fib_entries:
+    type: list[underlay_fib_entry]
+    constraint: |
+      every entry has remote_vtep_ip:address; uplink_egress_port:int
+      ∈ uplink_ports; outer_dst_mac:address; outer_src_mac:address;
+      remote_vtep_ip is unique across the list.
+    notes: |
+      Underlay nexthop resolution rows that populate the
+      `underlay_fib` bucket. Drives R2's `underlay_fib by_key(
+      vni_mac_remote_fib.remote_vtep_ip)` lookup and supplies the
+      outer Ethernet rewrite the encap action stamps.
+
+  local_vtep_ip:
+    type: address
+    notes: |
+      The IPv4 address of this VTEP — the outer source IP on every
+      encap-path packet, and the outer destination IP that uplink
+      traffic targets to reach this VTEP. Anchor instances bind
+      this to a private RFC 1918 address in the underlay subnet.
+
+  outer_udp_dst_port:
+    type: int
+    range: "[1, 65535]"
+    default: 4789
+    notes: |
+      RFC 7348 §5 IANA assignment is 4789; "this value SHOULD be
+      used by default as the destination UDP port" with the SHOULD
+      because some early implementations used 8472. Exposed as a
+      parameter for the same reason §5 calls it out: the
+      destination port "SHOULD be configurable" for interop. The
+      encap path uses this verbatim and the decap path's R1
+      matcher tests outer_udp.dst == ${outer_udp_dst_port}.
+
+  outer_udp_src_port_mode:
+    type: enum
+    values: [fixed, hash_inner_3tuple, hash_inner_5tuple]
+    default: fixed
+    notes: |
+      RFC 7348 §5 RECOMMENDS computing the UDP source port from
+      "a hash of fields from the inner packet — one example being
+      a hash of the inner Ethernet frame's headers" so the
+      underlay's ECMP can spread overlay flows across underlay
+      paths. `fixed` is the anchor simplification; the two
+      hash modes ladder to D5.1 entropy.
+
+  outer_udp_src_port_fixed_value:
+    type: int
+    range: "[49152, 65535]"
+    default: 49152
+    enforced_when: "${outer_udp_src_port_mode} == fixed"
+    notes: |
+      The literal UDP source port to stamp when
+      `${outer_udp_src_port_mode} == fixed`. RFC 7348 §5
+      RECOMMENDS the dynamic/private port range [49152, 65535];
+      the constraint here enforces it on the seed.
+
+  outer_udp_checksum_mode:
+    type: enum
+    values: [zero_on_tx, computed_on_tx]
+    default: zero_on_tx
+    notes: |
+      RFC 7348 §5: "It SHOULD be transmitted as zero." `zero_on_tx`
+      honours the SHOULD verbatim (and is the anchor default).
+      `computed_on_tx` lifts to the MUST-correctly-cover-IP+UDP+
+      VXLAN+inner clause that fires only when the implementation
+      *chooses* to transmit a non-zero checksum — the harder
+      implementation because BMv2's UDP checksum extern over a multi-layer
+      stack is finicky.
+
+  verify_outer_udp_checksum_on_rx:
+    type: bool
+    default: false
+    notes: |
+      RFC 7348 §5: "When a decapsulating end point receives a
+      packet with a non-zero checksum, it MAY choose to verify the
+      checksum value." `false` (the default) honours the
+      zero-MUST-accept clause unconditionally; `true` adds the
+      MAY-verify-and-MUST-drop-on-mismatch path that decap rule
+      R2 then enforces.
+
+  flag_strictness:
+    type: enum
+    values: [strict, lax]
+    default: strict
+    notes: |
+      Whether the decap path enforces the I-flag = 1 MUST and the
+      reserved-bits-zero ignored-on-receipt SHOULD as a drop
+      condition (`strict`) or accepts the packet regardless of
+      flag setting (`lax`). RFC 7348 §5 spells the I-flag MUST in
+      transmit terms and the receive-side check as "ignore" — a
+      lax decoder honours that ignore literally; a strict decoder
+      treats anomalous flag settings as a malformed-packet drop
+      because no legitimate sender would emit them. `strict` is
+      the security-conscious default this pattern starts with.
+
+  vni_isolation_strict:
+    type: bool
+    default: true
+    notes: |
+      Whether VNI isolation is enforced as a positive check at
+      the decap egress gate. `true` (the default) means the
+      decap-path egress-port pick MUST land on a port whose
+      `port_role.access_vni` equals the received VNI, otherwise
+      drop — even if `vni_mac_local_fib` somehow contains a
+      cross-VNI binding. `false` trusts the table to be
+      well-formed and skips the egress-side recheck, which is
+      cheaper but lets a single cross-wired control-plane install
+      breach tenant isolation.
+
+  bum_handling:
+    type: enum
+    values: [drop, head_end_replication, ingress_multicast_group]
+    default: drop
+    notes: |
+      How the encap path handles broadcast/unknown-unicast/
+      multicast on the inner frame when `(vni, inner_dmac)` is
+      not present in `vni_mac_remote_fib`. RFC 7348 §4.2 names
+      the multicast-group mapping the §4.2 spec describes;
+      head-end replication is the BGP-EVPN production
+      alternative; `drop` is the anchor simplification that
+      keeps the surface stateless. D5.2+ instances lift to
+      `head_end_replication`.
+
+  bum_replication_targets:
+    type: list[address]
+    constraint: "every entry is a remote VTEP IP that resolves in ${underlay_fib}; non-empty when ${bum_handling} == head_end_replication"
+    default: []
+    enforced_when: "${bum_handling} == head_end_replication"
+    notes: |
+      Per-VNI replication list for head-end replication mode. At
+      `${bum_handling} == head_end_replication` the encap path
+      emits one outer-encapsulated copy per listed remote VTEP IP
+      (RFC 7348 §4.2 alternative to multicast).
+
+  mtu_enforcement:
+    type: enum
+    values: [ignore, strict_drop_oversize]
+    default: strict_drop_oversize
+    notes: |
+      RFC 7348 §4.3: "VTEPs MUST NOT fragment VXLAN packets."
+      `strict_drop_oversize` (the default) implements the MUST by
+      dropping any encap-path frame whose post-encap size would
+      exceed `${outer_mtu}`; `ignore` lets the underlay handle it
+      and is the easier (less-strict) variant.
+
+  outer_mtu:
+    type: int
+    range: "[576, 9216]"
+    default: 1500
+    notes: |
+      The outer MTU the encap path checks against under
+      `${mtu_enforcement} == strict_drop_oversize`. 1500 is the
+      anchor Ethernet default; 9000+ jumbo is the realistic
+      data-centre choice and is what an instance at D5.2+ uses to
+      keep the 50-byte VXLAN encap overhead from hitting the MTU
+      ceiling for line-rate inner frames.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${outer_udp_src_port_mode} != fixed"
+    notes: |
+      Hash function used to derive the outer UDP source port from
+      the inner header tuple when
+      `${outer_udp_src_port_mode} ∈ {hash_inner_3tuple,
+      hash_inner_5tuple}`. RFC 7348 §5 cites "a hash of the inner
+      Ethernet frame's headers" as the example. `xor_fold` is the
+      cheapest but weakest — used to harden the panel via
+      `swap_hash_to_xor_fold`.
+
+  vni_mac_remote_fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of (VNI, inner_dmac) entries the encap-side
+      table supports. Realistic data-centre fabrics sit in the
+      10⁴–10⁵ range; `shrink_vni_mac_capacity_4x` exercises this
+      axis from the anchor's `unbounded` baseline.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of inner flow-tuples used by the G1 traffic
+      tests. `uniform` is the anchor default;
+      `raise_workload_skew` ladders through `zipfian` (heavy-
+      hitter VMs dominating one VNI) and `adversarial`
+      (deliberately-collision-prone tuples that stress
+      `${hash_algo}` quality on the outer-source-port hash).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_encap_decap, D5.1_full_rfc7348_validation, D5.2_bum_replication, D5.3_multitenant_strict]
+    default: D5.0_anchor_encap_decap
+    notes: |
+      The faithfulness ladder for this pattern. D5.0 is the
+      minimal-happy-path encap/decap (lax flags, fixed outer src
+      port, zero UDP checksum, single VNI, BUM = drop,
+      MTU = ignore). D5.1 lifts to the full RFC 7348 §5
+      validation cascade (strict flags, per-flow outer src port
+      hashing, MTU = strict_drop_oversize). D5.2 adds
+      head-end replication for BUM. D5.3 raises VNI count and
+      strict cross-VNI isolation under data-centre fan-out.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+
+rules:
+
+  - id: R0_non_routable_drop
+    when: |
+      ¬header_present(ethernet)
+      ∨ ¬header_present(ipv4)
+      ∨ ( ingress(uplink) ∧ ¬header_present(udp) )
+    then:
+      - drop
+    notes: |
+      The pattern handles IPv4 traffic on access ports (raw inner
+      frames) and VXLAN-over-IPv4 on uplink ports (outer
+      Eth/IPv4/UDP/VXLAN). Anything that fails to parse to IPv4
+      (ARP, IPv6, LLDP, etc.) is out of scope; anything on an
+      uplink port that fails to parse the outer UDP is treated as
+      non-VXLAN underlay traffic the VTEP does not handle. Drop
+      in both cases.
+
+  - id: R1_decap_path
+    when: |
+      ingress(uplink)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(vxlan)
+        ∧ ( ${flag_strictness} == lax
+            ∨ ( vxlan.i_flag == 1 ∧ vxlan.reserved == 0 ) )
+        ∧ ( ¬${verify_outer_udp_checksum_on_rx}
+            ∨ udp.checksum == 0
+            ∨ udp.checksum_valid )
+        ∧ exists(vni_mac_local_fib, (vxlan.vni, inner_ethernet.dst))
+        ∧ ( ¬${vni_isolation_strict}
+            ∨ port_role(vni_mac_local_fib.access_egress_port).access_vni == vxlan.vni )
+    given:
+      port_role:        by_key(standard_metadata.ingress_port)
+      vni_mac_local_fib: by_key(vxlan.vni, inner_ethernet.dst)
+    then:
+      - "set(outer_ethernet.valid, false)"                    # strip outer Ether
+      - "set(outer_ipv4.valid, false)"                        # strip outer IPv4
+      - "set(udp.valid, false)"                               # strip outer UDP
+      - "set(vxlan.valid, false)"                             # strip VXLAN
+      - forward(vni_mac_local_fib.access_egress_port)
+    notes: |
+      RFC 7348 §4.1 decap path: identify VXLAN by outer UDP dst
+      port match, validate the flag cascade per
+      `${flag_strictness}`, optionally verify the outer UDP
+      checksum per `${verify_outer_udp_checksum_on_rx}` (RFC 7348
+      §5 zero-checksum MUST be accepted; non-zero MAY be verified
+      and MUST drop on fail), look up (VNI, inner_dmac) in the
+      local-delivery table to pick the access egress port, then
+      strip all four outer layers and forward the inner frame.
+      The `${vni_isolation_strict}` conjunct in the `when` clause
+      pins the §4.1 VNI-scope MUST: even if the local table somehow
+      contains a cross-VNI binding, the egress-side recheck under
+      strict isolation refuses to deliver. Implementation anti-pattern: a
+      single egress assignment without the four explicit
+      `setInvalid` clauses leaves outer headers in the deparser's
+      emit list — the `vxlan_decap_outer_stripped` test catches it.
+
+  - id: R2_encap_path
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet)
+        ∧ ¬header_present(vxlan)                              # belt-and-braces: access ports do not receive VXLAN
+        ∧ exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ exists(underlay_fib, vni_mac_remote_fib.remote_vtep_ip)
+        ∧ ( ${mtu_enforcement} == ignore
+            ∨ encapsulated_size(packet) ≤ ${outer_mtu} )
+    given:
+      port_role:           by_key(standard_metadata.ingress_port)
+      vni_mac_remote_fib:  by_key(port_role.access_vni, ethernet.dst)
+      underlay_fib:        by_key(vni_mac_remote_fib.remote_vtep_ip)
+    then:
+      # 1. Stamp the new VXLAN header (8 bytes per RFC 7348 §5)
+      - "set(vxlan.valid, true)"
+      - "set(vxlan.i_flag, 1)"                                # §5 MUST: I flag SET on valid VNI
+      - "set(vxlan.reserved_flags, 0)"                        # §5 MUST: 7 R bits zero on transmission
+      - "set(vxlan.reserved_24bit, 0)"                        # §5 MUST: 24-bit reserved zero
+      - "set(vxlan.reserved_8bit, 0)"                         # §5 MUST: 8-bit reserved zero
+      - "set(vxlan.vni, port_role.access_vni)"
+      # 2. Stamp the new outer UDP header
+      - "set(udp.valid, true)"
+      - "set(udp.dst, ${outer_udp_dst_port})"
+      - "set(udp.src, outer_udp_src(${outer_udp_src_port_mode}, ${outer_udp_src_port_fixed_value}, ${hash_algo}, inner_packet))"
+      - "set(udp.length, vxlan_payload_length(packet))"
+      - "set(udp.checksum, outer_udp_checksum(${outer_udp_checksum_mode}, packet))"
+      # 3. Stamp the new outer IPv4 header
+      - "set(outer_ipv4.valid, true)"
+      - "set(outer_ipv4.version, 4)"
+      - "set(outer_ipv4.ihl, 5)"
+      - "set(outer_ipv4.dscp, 0)"
+      - "set(outer_ipv4.ecn, 0)"
+      - "set(outer_ipv4.total_length, outer_ipv4_total_length(packet))"
+      - "set(outer_ipv4.identification, 0)"
+      - "set(outer_ipv4.flags, df_bit_only)"                  # set DF; do-not-fragment by VTEP per §4.3
+      - "set(outer_ipv4.frag_offset, 0)"
+      - "set(outer_ipv4.ttl, 64)"
+      - "set(outer_ipv4.protocol, 17)"                        # UDP
+      - "set(outer_ipv4.src, ${local_vtep_ip})"
+      - "set(outer_ipv4.dst, vni_mac_remote_fib.remote_vtep_ip)"
+      - "set(outer_ipv4.header_checksum, outer_ipv4_checksum_recompute())"
+      # 4. Stamp the new outer Ethernet header
+      - "set(outer_ethernet.valid, true)"
+      - "set(outer_ethernet.src, underlay_fib.outer_src_mac)"
+      - "set(outer_ethernet.dst, underlay_fib.outer_dst_mac)"
+      - "set(outer_ethernet.ether_type, 0x0800)"              # IPv4
+      # 5. Forward on the underlay egress port
+      - forward(underlay_fib.uplink_egress_port)
+    notes: |
+      RFC 7348 §5 (frame format) + §4.1 (unicast forwarding). The
+      action body is the dense per-field assignment pattern; the
+      `outer_header_field_completeness` invariant pins that EVERY
+      field of each newly-validated outer header is explicitly
+      assigned (the common v1model cross-cutting `setValid()`-without-
+      assignment bug is what makes this list verbose by design —
+      forgetting any one assignment leaves a garbage field that
+      compiles cleanly). Implementation: typical four-table layout — port
+      → VNI on `port_role`, (VNI, inner_dmac) → remote VTEP on
+      `vni_mac_remote_fib`, remote VTEP → underlay-port + outer-
+      MAC on `underlay_fib`, plus the outer-header builder action
+      that sets every field. Forgetting `update_checksum` over
+      the outer IPv4 is the most common silent failure
+      (`checksum_recompute_on_outer_ipv4` G3 case catches it).
+
+  - id: R3_decap_malformed_drop
+    when: |
+      ingress(uplink)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(vxlan)
+        ∧ ${flag_strictness} == strict
+        ∧ ( vxlan.i_flag != 1 ∨ vxlan.reserved != 0 )
+    then:
+      - drop
+    notes: |
+      RFC 7348 §5 strict-validation path: any VXLAN-looking
+      packet whose I-flag is not 1 or whose reserved bits are
+      non-zero is treated as malformed under `flag_strictness ==
+      strict` and dropped. The §5 spec lets the receiver "ignore"
+      reserved fields; the security-conscious operator chooses to
+      treat them as a malformed-packet signal instead. R3 fires
+      AFTER R1 in declared order: if R1's `when` already accepted
+      (strict mode AND well-formed flags), control never reaches
+      R3. R3 is the explicit-drop disjoint partner.
+
+  - id: R4_decap_unknown_vni_drop
+    when: |
+      ingress(uplink)
+        ∧ header_present(vxlan)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ ¬exists(vni_mac_local_fib, (vxlan.vni, inner_ethernet.dst))
+    then:
+      - drop
+    notes: |
+      RFC 7348 §4.1 — "verifies the validity of the VNI and
+      whether or not there is a VM on that VNI using a MAC address
+      that matches the inner destination MAC address. If so, the
+      packet is stripped..." (implying: otherwise it is not
+      decapsulated). Unknown (VNI, inner_dmac) pairs at the decap
+      side are dropped silently; the alternative is to flood, but
+      flooding is an inner-overlay design choice the spec leaves
+      to the deployment. The pattern's anchor drops; richer
+      rungs could add an unknown-unicast flood operator.
+
+  - id: R5a_encap_bum_drop
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet)
+        ∧ ¬exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ${bum_handling} == drop
+    given:
+      port_role:  by_key(standard_metadata.ingress_port)
+    then:
+      - drop
+    notes: |
+      RFC 7348 §4.2 BUM under `${bum_handling} == drop`: the
+      anchor L3-VTEP-without-overlay-BUM-support behaviour.
+      An inner frame whose (VNI, inner_dmac) is not present in
+      the remote-MAC FIB is dropped silently.
+
+  - id: R5b_encap_bum_replicate
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet)
+        ∧ ¬exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ${bum_handling} == head_end_replication
+    given:
+      port_role:  by_key(standard_metadata.ingress_port)
+    then:
+      - "emit(outer_encap_template(packet, port_role.access_vni, t)) for t in ${bum_replication_targets}"
+    notes: |
+      RFC 7348 §4.2 head-end replication: one outer-encapsulated
+      copy per remote VTEP listed in `${bum_replication_targets}`
+      with the same per-field assignment pattern as R2's encap
+      action, parameterised by each replica's remote_vtep_ip.
+      The `emit` postcondition is the
+      canonical way to originate a derived packet — what BMv2
+      typically implements as a `clone3` per target.
+
+  - id: R5c_encap_bum_multicast
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet)
+        ∧ ¬exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ${bum_handling} == ingress_multicast_group
+    given:
+      port_role:  by_key(standard_metadata.ingress_port)
+    then:
+      - "forward(vni_multicast_group(port_role.access_vni))"
+    notes: |
+      RFC 7348 §4.2 multicast-group BUM path: the outer
+      destination is an IP multicast group provisioned at the
+      management layer for this VNI; the underlay's PIM tree
+      delivers one copy to every VTEP that has joined the
+      (*,G) for this VNI's group. `forward(group)` (the TPL
+      `forward(port_or_group)` postcondition) is the
+      canonical postcondition for replicated egress.
+
+  - id: R6_encap_oversize_drop
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet)
+        ∧ ${mtu_enforcement} == strict_drop_oversize
+        ∧ encapsulated_size(packet) > ${outer_mtu}
+    then:
+      - drop
+    notes: |
+      RFC 7348 §4.3: "VTEPs MUST NOT fragment VXLAN packets."
+      A frame whose post-encap size would exceed `${outer_mtu}`
+      is dropped at the VTEP under strict MTU enforcement (the
+      RFC's "MAY silently discard such VXLAN fragments" applies
+      to the *destination* VTEP on receive of an underlay-
+      fragmented VXLAN frame; the encap-side MUST-NOT-fragment
+      is enforced here). R6 fires only when neither R2 (because
+      its `when` guard rules out oversize under strict mode) nor
+      R5 (because the dst exists in the remote FIB and R5 only
+      handles BUM) accepts the packet — i.e., it is the explicit
+      partner of R2's MTU guard.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The decap path
+      strips outer headers and forwards on an access port; the
+      encap path stamps outer headers and forwards on an uplink
+      port. There is no recirculation in this pattern at the
+      anchor; D5.2's head-end replication is a one-shot
+      replication (each replica emits and exits) and is bounded
+      by `len(${bum_replication_targets})`.
+
+  - id: vni_isolation
+    clause: persistence
+    target: "(decap_egress_port, vxlan.vni)"
+    while: "rule R1 fires"
+    free_under: []
+    enforced_when: "${vni_isolation_strict}"
+    notes: |
+      RFC 7348 §4.1 VNI scope MUST: "you could have overlapping
+      MAC addresses across segments but never have traffic 'cross
+      over' since the traffic is isolated using the VNI." A
+      decapsulated frame with VNI = V MUST be delivered only to
+      an access port whose `port_role.access_vni == V`. Implementation
+      anti-pattern: keying the local-delivery table on
+      `inner_dmac` alone (forgetting the VNI component of the
+      key) — collides across tenants and breaches isolation.
+      `vni_crosswire_attempt` G3 test catches it.
+
+  - id: inner_payload_persistence
+    clause: persistence
+    target: "(inner_ethernet, inner_ipv4_payload)"
+    while: "rule R1 fires"
+    free_under: []
+    notes: |
+      RFC 7348 (the protocol is a transparent L2 overlay) — the
+      inner Ethernet header and everything beneath it MUST be
+      delivered to the access port byte-for-byte identical to
+      what was inside the received outer frame. Implementation anti-
+      pattern: applying an L3 forwarder's TTL-decrement /
+      Ether-rewrite to the inner frame on the decap path —
+      conflates VXLAN-decap with IPv4-forward.
+
+  - id: outer_header_field_completeness
+    clause: stability
+    target: "(outer_ethernet.*, outer_ipv4.*, udp.*, vxlan.*)"
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      Every field of each newly-validated outer header on the
+      encap path is explicitly assigned, not left to the
+      `setValid()` default (which leaves fields uninitialised).
+      This invariant is the formal pin on the common v1model cross-
+      cutting `setValid()`-without-assignment bug — the test
+      guide calls VXLAN encap out as the canonical example of this
+      bug under G1-P4-T3. The
+      `vxlan_encap_all_outer_fields_set` test enumerates every
+      field.
+
+  - id: outer_ipv4_checksum_validity
+    clause: stability
+    target: outer_ipv4.header_checksum
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      The newly-stamped outer IPv4 header MUST carry a valid
+      header checksum — computed from scratch because there is
+      no prior valid checksum to update incrementally. Implementation
+      anti-pattern: omitting `update_checksum` for the outer
+      IPv4 (the common v1model cross-cutting checksum-miss bug) — BMv2
+      emits the packet as-is and the receiving VTEP / underlay
+      router silently drops it.
+
+  - id: vxlan_i_flag_set_on_tx
+    clause: stability
+    target: vxlan.i_flag
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      RFC 7348 §5 MUST: "the I flag MUST be set to 1 for a
+      valid VXLAN Network ID (VNI)." This invariant pins the
+      transmit-side MUST as a stability property independent of
+      `${flag_strictness}` (which gates the *receive* side).
+
+  - id: no_vtep_fragmentation
+    clause: stability
+    target: forward_decision
+    while: "rule R2 fires ∧ encapsulated_size(packet) > ${outer_mtu}"
+    enforced_when: "${mtu_enforcement} == strict_drop_oversize"
+    notes: |
+      RFC 7348 §4.3 — "VTEPs MUST NOT fragment VXLAN packets."
+      Under strict MTU enforcement the encap path's R2 guard
+      and R6's explicit drop together pin: no packet whose
+      encapsulated size exceeds `${outer_mtu}` is ever
+      forwarded by R2. The decap-side counterpart ("MAY
+      silently discard such VXLAN fragments") is implicit in
+      the pattern's stateless decap — it does not reassemble
+      fragments, so a fragmented outer simply fails to parse to
+      a complete VXLAN header at R1's `header_present(vxlan)`
+      guard.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: vxlan_encap_basic
+      generate: |
+        Send an inner Ethernet+IPv4+TCP frame on an access port whose
+        `port_role.access_vni == V`. Pre-install (V, inner_dmac) →
+        remote_vtep_ip in `vni_mac_remote_fib`, and
+        remote_vtep_ip → (uplink_port, outer_src_mac, outer_dst_mac)
+        in `underlay_fib`. Assert the egress packet on uplink_port
+        is the original inner frame wrapped in outer
+        Ether(src=outer_src_mac, dst=outer_dst_mac, type=0x0800) /
+        IPv4(src=${local_vtep_ip}, dst=remote_vtep_ip, proto=17) /
+        UDP(dst=${outer_udp_dst_port}) / VXLAN(I=1, vni=V).
+        (Anchor — mirrors the basic_mytunnel twin's `tunnel_to_port2`
+        test in spirit, lifted to RFC 7348 framing.)
+
+    - id: vxlan_decap_basic
+      generate: |
+        Send a frame on an uplink port consisting of outer
+        Ether/IPv4/UDP(dst=${outer_udp_dst_port})/VXLAN(I=1, vni=V)
+        wrapping an inner Ether+IPv4+TCP frame. Pre-install (V,
+        inner_dmac) → access_port_X in `vni_mac_local_fib` and bind
+        port_role(access_port_X).access_vni = V. Assert the egress
+        packet on access_port_X equals the inner frame BYTE-FOR-BYTE
+        (no outer headers present) and that the inner Ether/IPv4
+        fields are unmodified. (G1-P4-T4 instance —
+        `vxlan_decap_outer_stripped` example under G1-P4.)
+
+    - id: vxlan_encap_all_outer_fields_set
+      generate: |
+        Same setup as `vxlan_encap_basic`, but assert each of the
+        following outer fields individually in the egress packet
+        rather than only the layer-presence:
+          outer_ethernet.src, outer_ethernet.dst, outer_ethernet.ether_type,
+          outer_ipv4.version, outer_ipv4.ihl, outer_ipv4.ttl,
+          outer_ipv4.protocol, outer_ipv4.src, outer_ipv4.dst,
+          outer_ipv4.total_length, outer_ipv4.header_checksum (validity),
+          udp.dst, udp.src (in 49152..65535 when src_port_mode == fixed),
+          udp.length, vxlan.i_flag (== 1), vxlan.vni (== V),
+          vxlan.reserved_flags (== 0), vxlan.reserved_24bit (== 0),
+          vxlan.reserved_8bit (== 0).
+        (G1-P4-T3 instance — `vxlan_encap_all_outer_fields_set`
+        example under G1-P4. Catches the
+        `setValid()` without per-field assignment bug.)
+
+    - id: decap_zero_udp_checksum_accepted
+      generate: |
+        Send a VXLAN-encapsulated frame on an uplink port with
+        outer_udp.checksum = 0 and otherwise well-formed. Assert
+        the packet is decapsulated normally (RFC 7348 §5:
+        "when a packet is received with a UDP checksum of zero,
+        it MUST be accepted for decapsulation"). Verify the
+        check holds REGARDLESS of
+        `${verify_outer_udp_checksum_on_rx}` — the MUST-accept
+        clause is unconditional for the zero-checksum case.
+
+    - id: encap_outer_src_port_in_dynamic_range
+      requires: "${outer_udp_src_port_mode} != fixed"
+      generate: |
+        Send 100 inner frames across distinct flow-tuples through
+        the encap path. Assert every egress outer_udp.src falls
+        within [49152, 65535] (RFC 7348 §5 RECOMMENDED dynamic
+        port range) AND that at least 10 distinct values are
+        observed (confirms the hash actually varies). Tests the
+        D5.1 outer-source-port entropy claim.
+
+  G2:
+    - id: malformed_i_flag_drop_under_strict
+      requires: "${flag_strictness} == strict"
+      generate: |
+        Send a VXLAN frame on an uplink port whose vxlan.i_flag == 0
+        (otherwise well-formed). Assert drop under
+        `${flag_strictness} == strict`. RFC 7348 §5 MUST: "the I
+        flag MUST be set to 1 for a valid VXLAN Network ID (VNI)";
+        the strict decoder treats a zero I-flag as the explicit
+        malformed-packet signal it is.
+
+    - id: malformed_reserved_bits_drop_under_strict
+      requires: "${flag_strictness} == strict"
+      generate: |
+        Send a VXLAN frame on an uplink port with one or more
+        reserved bits non-zero (R-flags != 0, or one of the 24/8-bit
+        reserved blocks != 0). Assert drop under strict flag
+        validation. RFC 7348 §5 reserved-bits-zero clause.
+
+    - id: encap_mtu_overflow_drop
+      requires: "${mtu_enforcement} == strict_drop_oversize"
+      generate: |
+        Send an inner frame whose post-encap size would exceed
+        `${outer_mtu}` (e.g., inner_frame_size = outer_mtu - 49,
+        which leaves no room for the 50-byte VXLAN+UDP+outer-IP+
+        outer-Eth overhead). Assert the encap path drops it.
+        RFC 7348 §4.3 "VTEPs MUST NOT fragment VXLAN packets."
+
+    - id: non_vxlan_udp_on_uplink_passes_through
+      generate: |
+        Send a non-VXLAN UDP packet on an uplink port (e.g.,
+        outer_udp.dst = 53 for DNS). Assert: either the packet is
+        not decapsulated (no outer-header strip; the underlay
+        treats it as transit) or, in the pattern's strict
+        VTEP-only mode, dropped because the uplink port is
+        VXLAN-only. Either behaviour distinguishes the VTEP path
+        from a generic UDP forwarder.
+
+    - id: encap_unknown_dst_under_bum_drop
+      requires: "${bum_handling} == drop"
+      generate: |
+        Send an inner frame whose (port_role.access_vni,
+        ethernet.dst) is NOT present in `vni_mac_remote_fib`.
+        Assert drop. RFC 7348 §4.2 unknown-unicast handling under
+        the `drop` mode of `${bum_handling}`.
+
+    - id: encap_unknown_dst_under_replication
+      requires: "${bum_handling} == head_end_replication"
+      generate: |
+        Send an inner frame whose (port_role.access_vni,
+        ethernet.dst) is NOT present in `vni_mac_remote_fib`.
+        Assert one outer-encapsulated copy is emitted toward each
+        remote VTEP in `${bum_replication_targets}` (per-replica
+        outer Ether/IPv4 differs by the underlay nexthop; outer
+        UDP and VXLAN are identical with vni = port_role.access_vni
+        and i_flag = 1). RFC 7348 §4.2 head-end replication path.
+
+  G3:
+    - id: vni_crosswire_attempt_blocked
+      requires: "${vni_isolation_strict}"
+      generate: |
+        Maliciously install a (VNI=A, inner_dmac=M) →
+        access_port_for_VNI_B entry in `vni_mac_local_fib` — i.e., a
+        cross-VNI binding that should never exist. Send a VXLAN
+        frame on uplink with vxlan.vni = A and inner_ethernet.dst =
+        M. Assert drop (the egress-side recheck
+        `port_role(access_egress_port).access_vni == vxlan.vni`
+        catches the mismatch even though the lookup itself succeeds).
+        RFC 7348 §4.1 VNI-scope MUST under strict isolation. Implementation
+        anti-pattern: keying the local-delivery table on inner_dmac
+        alone and forgetting the per-VNI partitioning — the SUT
+        passes the happy-path test but fails this one.
+
+    - id: outer_headers_truly_stripped_on_decap
+      generate: |
+        Send a VXLAN frame on uplink as in `vxlan_decap_basic`, but
+        assert the egress packet on the access port has NO outer
+        Ethernet, NO outer IPv4, NO UDP, and NO VXLAN layers —
+        verified by parsing the egress bytes top-to-bottom and
+        confirming the first Ethernet layer matches the *inner*
+        Ethernet MACs. (G3-P4-T3 information-leakage probe under
+        G3-P4: leaked outer headers
+        expose tunnel topology to the tenant VM, even when the
+        rest of the decap is functionally correct.)
+
+    - id: checksum_recompute_on_outer_ipv4
+      generate: |
+        Same setup as `vxlan_encap_basic`. After encap, validate
+        the outer IPv4 header checksum from the egress packet
+        bytes (recompute Σ over the 20-byte outer header and
+        compare to outer_ipv4.header_checksum). Assert match.
+        Catches the common v1model cross-cutting bug where the SUT calls
+        `setValid()` on the outer IPv4 and assigns every field
+        BUT forgets to wire `update_checksum` for it — BMv2
+        emits the packet with an arbitrary stale value in the
+        checksum field; downstream routers silently drop.
+
+    - id: conditional_deparser_emit_order
+      generate: |
+        Run both the encap and decap paths in the same test
+        run (one inner-on-access frame followed by one
+        VXLAN-on-uplink frame against the same SUT). Assert
+        the encap-path egress packet's layer order is
+        Ether/IPv4/UDP/VXLAN/inner-Ether/inner-IPv4/... and
+        the decap-path egress packet's layer order is
+        inner-Ether/inner-IPv4/... only. Catches the common v1model
+        conditional-deparser bug where the SUT emits the outer
+        stack on the wrong path because the deparser's
+        `emit(hdr.X)` calls are not conditioned on `hdr.X.isValid()`.
+
+    - id: encap_path_inner_ttl_preservation
+      generate: |
+        Send an inner IPv4 frame on access with inner_ipv4.ttl =
+        64. Assert that after encap on the uplink side the
+        inner_ipv4.ttl is still 64 (the encap-side VTEP MUST NOT
+        decrement the inner TTL — the encap is L2 overlay
+        transport, not L3 forwarding). Catches the implementation that
+        conflates VXLAN encap with IPv4 forwarding by reusing a
+        common "TTL--" action across both paths.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Five harden operators paired with five ease counterparts; every operator
+# declares `direction` so difficulty recalibration can
+# pick from the matching pool depending on whether r > r* + δ (harden)
+# or r < r* − δ (ease).
+
+mutation_operators:
+
+  - id: tighten_flag_validation
+    applicable_when: "${flag_strictness} == lax"
+    effect: "${flag_strictness} ← strict"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${flag_strictness} == strict"
+    kind: parameter
+    notes: |
+      Activates R3 and the G2 `malformed_i_flag_drop_under_strict`
+      / `malformed_reserved_bits_drop_under_strict` cases. Catches
+      implementations that ignore the I-flag (RFC 7348 §5 MUST) and emit
+      decapsulated payload regardless.
+
+  - id: relax_flag_validation
+    applicable_when: "${flag_strictness} == strict"
+    effect: "${flag_strictness} ← lax"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${flag_strictness} == lax"
+    kind: parameter
+    notes: |
+      Paired counterpart of `tighten_flag_validation`. R3 is
+      gated off; the strict-mode malformed-flag G2 tests are
+      skipped (their `requires:` guard is false). Used by
+      difficulty recalibration to back off a hardened instance
+      when its pass rate dips below the target.
+
+  - id: enable_strict_vni_isolation
+    applicable_when: "${vni_isolation_strict} == false"
+    effect: "${vni_isolation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${vni_isolation_strict} == true"
+    kind: parameter
+    notes: |
+      Activates the `vni_isolation` invariant and the
+      `vni_crosswire_attempt_blocked` G3 test. Catches the
+      implementation that keys the local-delivery table on inner_dmac
+      alone (forgetting per-VNI partitioning) — the SUT passes
+      happy-path tests but fails the cross-wire probe.
+
+  - id: disable_strict_vni_isolation
+    applicable_when: "${vni_isolation_strict} == true"
+    effect: "${vni_isolation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${vni_isolation_strict} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_strict_vni_isolation`.
+      The egress-side VNI-recheck is dropped; the
+      `vni_crosswire_attempt_blocked` G3 test's `requires:`
+      guard goes false and the test is skipped.
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_encap_decap,
+                          D5.1_full_rfc7348_validation,
+                          D5.2_bum_replication}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_full_rfc7348_validation then
+          ${flag_strictness} ← strict ∧
+          ${outer_udp_src_port_mode} ← hash_inner_5tuple ∧
+          ${mtu_enforcement} ← strict_drop_oversize ) ∧
+      ( if ${faithfulness}_post == D5.2_bum_replication then
+          ${bum_handling} ← head_end_replication ) ∧
+      ( if ${faithfulness}_post == D5.3_multitenant_strict then
+          ${vni_isolation_strict} ← true ∧
+          ${access_port_bindings} ← multi_vni_expansion(${access_port_bindings}) )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_encap_decap ∧
+      ( ${faithfulness} ≠ D5.2_bum_replication
+        ∨ |${bum_replication_targets}| ≥ 1 ) ∧
+      ( ${faithfulness} ≠ D5.3_multitenant_strict
+        ∨ distinct_vni_count(${access_port_bindings}) ≥ 2 )
+    kind: parameter
+    notes: |
+      Lift the faithfulness ladder by one rung. D5.0 → D5.1
+      flips on the full RFC 7348 §5 validation cascade and the
+      per-flow outer-source-port hashing for ECMP entropy.
+      D5.1 → D5.2 adds head-end BUM replication. D5.2 → D5.3
+      raises the multi-tenant scale with strict cross-VNI
+      isolation under data-centre fan-out.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_full_rfc7348_validation,
+                          D5.2_bum_replication,
+                          D5.3_multitenant_strict}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_encap_decap then
+          ${flag_strictness} ← lax ∧
+          ${outer_udp_src_port_mode} ← fixed ∧
+          ${mtu_enforcement} ← ignore ∧
+          ${bum_handling} ← drop ) ∧
+      ( if ${faithfulness}_post == D5.1_full_rfc7348_validation then
+          ${bum_handling} ← drop )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_multitenant_strict
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps
+      the ladder back one rung and reverts the entailed
+      parameter bindings.
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: |
+      ${outer_udp_src_port_mode} != fixed ∧
+      ${hash_algo} ∈ {crc16, crc32}
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    kind: parameter
+    notes: |
+      Weaker hash on the outer-source-port computation. Hardens
+      the panel against implementations that copy the textbook CRC
+      pattern blindly without considering hash quality — under
+      adversarial inner flow-tuples the xor_fold output
+      collapses to a narrow port range and the underlay's ECMP
+      cannot spread the flow.
+
+  - id: swap_hash_to_crc32
+    applicable_when: |
+      ${outer_udp_src_port_mode} != fixed ∧
+      ${hash_algo} ∈ {xor_fold, crc16}
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `swap_hash_to_xor_fold`. CRC32
+      gives the strongest entropy of the three options and
+      maximises the `encap_outer_src_port_in_dynamic_range`
+      G1 test's distinct-value count.
+
+  - id: raise_workload_skew
+    applicable_when: |
+      ${workload_skew} ∈ {uniform, zipfian}
+    effect: |
+      ${workload_skew} ← next_skew(${workload_skew})
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the inner flow-tuple distribution skew by one step
+      (uniform → zipfian → adversarial). Combined with a weak
+      `${hash_algo}` this drives the
+      `encap_outer_src_port_in_dynamic_range` G1 test's
+      distinct-value count toward 1 — the implementation that ignores
+      hash quality fails.
+
+  - id: lower_workload_skew
+    applicable_when: |
+      ${workload_skew} ∈ {zipfian, adversarial}
+    effect: |
+      ${workload_skew} ← prev_skew(${workload_skew})
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: enable_outer_udp_checksum_compute
+    applicable_when: "${outer_udp_checksum_mode} == zero_on_tx"
+    effect: "${outer_udp_checksum_mode} ← computed_on_tx"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_udp_checksum_mode} == computed_on_tx"
+    kind: parameter
+    notes: |
+      Lift from the §5 SHOULD-be-zero default to the harder
+      MUST-correctly-cover variant. The implementation MUST compute UDP
+      checksum across (outer_ip + udp + vxlan + inner_packet) —
+      a multi-layer checksum extern invocation BMv2 supports
+      but most LLM-drafted P4 gets wrong on the first attempt
+      (forgetting the pseudo-header, wrong span).
+
+  - id: revert_outer_udp_checksum_to_zero
+    applicable_when: "${outer_udp_checksum_mode} == computed_on_tx"
+    effect: "${outer_udp_checksum_mode} ← zero_on_tx"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${outer_udp_checksum_mode} == zero_on_tx"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of
+      `enable_outer_udp_checksum_compute`. Returns to the §5
+      SHOULD-be-zero variant; the harder checksum span is gated
+      off.
+
+  - id: shrink_vni_mac_capacity_4x
+    applicable_when: |
+      ${vni_mac_remote_fib_capacity} ≠ unbounded ∧
+      ${vni_mac_remote_fib_capacity} > 64
+    effect: "${vni_mac_remote_fib_capacity} ← ${vni_mac_remote_fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${vni_mac_remote_fib_capacity} ≥ 16"
+    kind: parameter
+    notes: |
+      Tighten the MAC-FIB capacity axis. The implementation cannot rely
+      on a TCAM-of-everything strategy and must consider
+      aggregation. Pairs with realistic data-centre fan-out
+      regimes at D5.3.
+
+  - id: enlarge_vni_mac_capacity_2x
+    applicable_when: |
+      ${vni_mac_remote_fib_capacity} ≠ unbounded ∧
+      ${vni_mac_remote_fib_capacity} < 1048576
+    effect: "${vni_mac_remote_fib_capacity} ← ${vni_mac_remote_fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${vni_mac_remote_fib_capacity} ≤ 1048576"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_vni_mac_capacity_4x`.
+      Doubles (not quadruples) so the harden/ease asymmetry
+      gives difficulty recalibration a slow climb back
+      after an over-harden.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: |
+      'python_reference_impl' ∉ task.description
+    effect: |
+      Append the Python oracle source to task.description so
+      the SUT sees a host-side reference implementation in
+      addition to the behavioural spec — the heaviest
+      difficulty lever.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: |
+      'python_reference_impl' ∈ task.description
+    kind: rule
+    notes: |
+      Starter-library operator — laddering the
+      input form from behavioural-spec to host-side-reference
+      EASES the SUT's job (it has a Python implementation to
+      transliterate rather than design from scratch). Used
+      sparingly; should pair with a corresponding
+      `revert_input_form_to_behavioural` to keep the operator
+      pool symmetric.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: |
+      'python_reference_impl' ∈ task.description
+    effect: |
+      Strip the appended Python oracle source from
+      task.description, leaving only the behavioural spec.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: |
+      'python_reference_impl' ∉ task.description
+    kind: rule
+    notes: |
+      Paired harden counterpart of
+      `ladder_input_form_to_python_ref`. Restores the
+      behavioural-only spec — the SUT must design the encap/
+      decap from RFC 7348 alone.
+
+  - id: provide_outer_header_skeleton
+    applicable_when: |
+      'outer_header_skeleton' ∉ task.description
+    effect: |
+      Append the contents of
+      patterns/P-VXLANTunnel/outer_header_skeleton.p4 to
+      task.description under a clearly-marked
+      `outer_header_skeleton` section. The scaffold supplies the
+      outer-header MECHANICS the encap path keeps mis-building —
+      the four header type declarations (RFC-7348-correct field
+      widths), the `setValid()` sequence, and the deparser emit
+      ORDER — while leaving every behavioural decision (parser,
+      tables, ingress/decap control flow, the outer-header field
+      VALUES, and the entries file) to the SUT.
+    axis: compile-surface
+    direction: ease
+    feasibility_postcondition: |
+      'outer_header_skeleton' ∈ task.description
+    kind: rule
+    notes: |
+      Added mutation operator (human-authored) that attacks the
+      P-VXLANTunnel ANCHOR wall:
+      the baseline compiles + gets behaviour/decap/drop right but
+      deterministically mis-transcribes the outer Ether/IPv4/UDP/
+      VXLAN construction (header validity, struct layout, deparser
+      emit order), capping the compiling run at ~0.667 — a
+      field-fidelity / P4-transcription wall that the input-form
+      ladder (`ladder_input_form_to_python_ref`) provably does NOT
+      lift (the literal Python reference left the score unchanged;
+      see vxlan_vtep_disc_mut1). This op eases the *compile/
+      transcription surface* specifically — analogous to
+      `enable_ecmp_fixed_pair` (P-IPv4Routing) which softened the
+      ECMP compile cliff. It does NOT change rule/invariant
+      semantics, so the audited oracle is reused unchanged (no
+      re-audit). Pairs with `remove_outer_header_skeleton`.
+
+  - id: remove_outer_header_skeleton
+    applicable_when: |
+      'outer_header_skeleton' ∈ task.description
+    effect: |
+      Strip the appended outer_header_skeleton section from
+      task.description, restoring the scaffold-free spec.
+    axis: compile-surface
+    direction: harden
+    feasibility_postcondition: |
+      'outer_header_skeleton' ∉ task.description
+    kind: rule
+    notes: |
+      Paired harden counterpart of
+      `provide_outer_header_skeleton`. The SUT must construct the
+      outer-header P4 (struct layout, setValid, deparser order)
+      itself again.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4 (every entry below
+  is `[common-knowledge baseline]` rather than RFC-cited):
+
+    Anchor (D5.0_anchor_encap_decap, flag_strictness = lax,
+                 outer_udp_src_port_mode = fixed, outer_udp_checksum_mode
+                 = zero_on_tx, bum_handling = drop, mtu_enforcement
+                 = ignore):
+      - Parser: state_start → parse_ethernet → (etherType == 0x0800 ?
+        parse_ipv4 : accept) → (ipv4.protocol == 17 ? parse_udp :
+        accept) → (udp.dst == 4789 ? parse_vxlan : accept) →
+        parse_inner_ethernet → parse_inner_ipv4 → accept. The
+        outer-IPv4 / outer-UDP / VXLAN headers are members of the
+        `headers` struct and share field types with the inner stack;
+        the typical implementation declares
+        `header ethernet_t outer_ethernet; header ethernet_t inner_ethernet;`
+        and keys the parse graph by `isValid()`.
+      - Three control-plane tables: port_role_table (exact on
+        ingress_port), vni_mac_remote_fib_table (exact on (vni,
+        inner_ethernet.dst)), underlay_fib_table (exact on
+        remote_vtep_ip). vni_mac_local_fib_table (exact on (vni,
+        inner_ethernet.dst)) for the decap path.
+      - Encap action: setValid() the four outer headers, then
+        assign EVERY field explicitly (the `outer_header_field_
+        completeness` invariant pins this). Forgetting any one
+        assignment is the canonical silent bug — the
+        `vxlan_encap_all_outer_fields_set` G1 test catches it.
+      - Decap action: setInvalid() on outer_ethernet, outer_ipv4,
+        udp, vxlan in that order; the deparser then skips them.
+        The `outer_headers_truly_stripped_on_decap` G3 test
+        catches a missed setInvalid.
+      - MyComputeChecksum: update_checksum(outer_ipv4.isValid(),
+        {outer_ipv4.* fields}, outer_ipv4.header_checksum,
+        HashAlgorithm.csum16) for the encap path. Outer UDP
+        checksum is left at 0 at the anchor (§5 SHOULD).
+
+    D5.1 (full RFC 7348 validation): adds the strict-flag check
+    cascade to the decap path (vxlan.i_flag == 1, reserved bits
+    zero), the outer-source-port hash extern call
+    (hash(outer_udp.src, HashAlgorithm.crc16, 0, {inner_ethernet.src,
+    inner_ethernet.dst, inner_ipv4.src, inner_ipv4.dst, inner_l4.src,
+    inner_l4.dst}, 16384)), and the strict MTU drop on
+    standard_metadata.packet_length + ENCAP_OVERHEAD > outer_mtu.
+
+    D5.2 (BUM head-end replication): the encap action becomes a
+    loop — clone3() once per remote-VTEP target in
+    bum_replication_targets, with the cloned packet's metadata
+    carrying the per-replica remote_vtep_ip the post-clone
+    pipeline reads to pick outer_ipv4.dst and the underlay nexthop.
+
+    D5.3 (multi-tenant strict): the egress-side VNI-recheck
+    becomes a second-table apply that gates the access-port
+    forward on port_role(access_egress_port).access_vni ==
+    vxlan.vni; a mismatch drops.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Calling setValid() on the outer headers WITHOUT
+      individually assigning every field — the deparser emits
+      garbage for the unassigned fields. The #1 silent encap
+      bug per the common v1model cross-cutting taxonomy.
+      `vxlan_encap_all_outer_fields_set` catches it.
+
+    * Forgetting `update_checksum` for outer_ipv4 — BMv2 emits
+      the packet with an arbitrary stale checksum; real
+      receivers drop. The `checksum_recompute_on_outer_ipv4`
+      G3 case catches it.
+
+    * Emitting outer headers unconditionally in the deparser
+      regardless of `hdr.outer_*.isValid()` — leaks outer
+      headers to access ports on the decap path. The common v1model
+      conditional-deparser bug under its most-likely
+      manifestation here.
+
+    * Decrementing inner_ipv4.ttl on the encap path (or on the
+      decap path) — VXLAN is L2 overlay transport, not L3
+      forwarding. The `encap_path_inner_ttl_preservation` G3
+      case catches it.
+
+    * Keying the vni_mac_local_fib on inner_ethernet.dst alone,
+      forgetting the (vni, inner_dmac) composite key — breaches
+      VNI isolation for tenants with overlapping MAC addresses.
+      The `vni_crosswire_attempt_blocked` G3 case catches it
+      under strict isolation.
+
+    * Computing the outer UDP source port from inner header
+      fields that change between packets of the same flow
+      (e.g., inner_ipv4.identification) — splits a flow across
+      underlay ECMP paths and breaks inner TCP ordering. The
+      `encap_outer_src_port_in_dynamic_range` G1 test catches
+      the value-range part; per-flow-stickiness is implicit
+      in the test design.
+
+    * On the decap path, copying outer_ipv4.ttl into
+      inner_ipv4.ttl (or vice versa) — the two TTLs are
+      independent overlay/underlay quantities per RFC 7348 (the
+      protocol's whole point is that the inner frame is opaque
+      transport). The `inner_payload_persistence` invariant
+      and `encap_path_inner_ttl_preservation` G3 case together
+      pin both directions.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must
+       all pass validation.
+
+    2. For anchor instances of P-VXLANTunnel (D5.0, single VNI,
+       fixed outer src port, zero UDP checksum, drop on BUM), the
+       resulting task SHOULD be behaviourally equivalent to the
+       p4lang basic_tunnel exercise lifted to RFC 7348 framing.
+       Cross-check the public test set against the oracle for the
+       seed.
+
+    3. The pattern composes upstream of P-IPv4Routing on the
+       underlay: a P-VXLANTunnel instance whose encap-path egress
+       packets are then forwarded by a P-IPv4Routing instance is a
+       natural multi-pattern composition. Within the v1 corpus the
+       composition is implicit (the underlay_fib parameter encodes
+       the static nexthop directly); future work may chain a real
+       multi-pattern pipeline.

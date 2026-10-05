@@ -1,0 +1,202 @@
+task_name: arp_responder_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ARPResponder
+pattern_version: '1.0'
+
+seed:
+  faithfulness: D.table_proxy
+
+description: |
+  Implement a data-plane proxy-ARP responder on a single switch s1, per
+  RFC 826. ARP requests arrive on the uplink s1.p1. For a request whose target
+  IP the switch can resolve, the switch ORIGINATES an ARP reply and forwards it
+  toward the requester. Requesters are reached via an L2 MAC→port table.
+
+  ## Resolution table (target IP → resolved MAC)
+
+    | target IP    | resolved MAC        |
+    |--------------|---------------------|
+    | 10.0.0.100   | aa:bb:cc:00:00:01   |
+    | 10.0.0.200   | aa:bb:cc:00:00:02   |
+
+  ## L2 forwarding (requester MAC → egress port)
+
+    | requester MAC        | egress port |
+    |----------------------|-------------|
+    | 00:00:00:00:00:0b    | s1.p2       |
+    | 00:00:00:00:00:0c    | s1.p3       |
+
+  ## Required behaviour
+
+   - Only ARP requests (op 1) for a target IP in the resolution table are
+     answered. A non-ARP frame, an ARP reply (op 2), or a request for an
+     unknown target IP is dropped.
+   - For an answerable request the switch originates the corresponding ARP
+     reply that resolves the target — the standard RFC 826 reply, in which the
+     resolved MAC answers as the target's hardware address and the original
+     requester becomes the reply's destination — and sends it back to the
+     requester. The reply is framed with the resolved MAC as its Ethernet
+     source and the requester's MAC as its Ethernet destination, and egresses
+     the requester's port per the L2 forwarding table.
+   - If the requester's MAC is not in the L2 forwarding table the reply cannot
+     be delivered, so the request is dropped.
+
+  ## Topology
+
+  ARP requests arrive on s1.p1; requesters are reached via s1.p2 / s1.p3.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.0.1", mac: "00:00:00:00:00:0a", port: s1.p1}
+  h2: {ip: "10.0.0.11", mac: "00:00:00:00:00:0b", port: s1.p2}
+  h3: {ip: "10.0.0.12", mac: "00:00:00:00:00:0c", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: arp_reply_basic
+    visibility: public
+    description: |
+      Requester ...0b (IP 10.0.0.11) asks "who has 10.0.0.100".
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0b", psrc: "10.0.0.11", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.100"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        ARP.op:    {action: change_to, value: 2}
+        ARP.hwsrc: {action: change_to, value: "aa:bb:cc:00:00:01"}
+        ARP.psrc:  {action: change_to, value: "10.0.0.100"}
+        ARP.hwdst: {action: change_to, value: "00:00:00:00:00:0b"}
+        ARP.pdst:  {action: change_to, value: "10.0.0.11"}
+        Ether.src: {action: change_to, value: "aa:bb:cc:00:00:01"}
+        Ether.dst: {action: change_to, value: "00:00:00:00:00:0b"}
+
+  - name: arp_reply_distinct_requester
+    visibility: public
+    description: |
+      Requester ...0c (IP 10.0.0.12) asks "who has 10.0.0.200".
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0c", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0c", psrc: "10.0.0.12", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.200"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        ARP.op:    {action: change_to, value: 2}
+        ARP.hwsrc: {action: change_to, value: "aa:bb:cc:00:00:02"}
+        ARP.psrc:  {action: change_to, value: "10.0.0.200"}
+        ARP.pdst:  {action: change_to, value: "10.0.0.12"}
+        Ether.dst: {action: change_to, value: "00:00:00:00:00:0c"}
+
+  - name: arp_drop_unknown_target
+    visibility: public
+    description: |
+      A request for 10.0.0.250 (not in the resolution table).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0b", psrc: "10.0.0.11", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.250"}
+    expected:
+      behavior: drop
+
+  - name: arp_reply_target200_to_requester_b
+    visibility: hidden
+    description: |
+      Requester ...0b asks for 10.0.0.200 → reply (sender MAC
+      aa:bb:cc:00:00:02) out s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0b", psrc: "10.0.0.11", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.200"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        ARP.op:    {action: change_to, value: 2}
+        ARP.hwsrc: {action: change_to, value: "aa:bb:cc:00:00:02"}
+        ARP.psrc:  {action: change_to, value: "10.0.0.200"}
+
+  - name: arp_reply_target100_to_requester_c
+    visibility: hidden
+    description: |
+      Requester ...0c (IP 10.0.0.12) asks "who has 10.0.0.100" → reply (sender
+      MAC aa:bb:cc:00:00:01) framed for ...0c and forwarded out s1.p3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0c", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0c", psrc: "10.0.0.12", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.100"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        ARP.op:    {action: change_to, value: 2}
+        ARP.hwsrc: {action: change_to, value: "aa:bb:cc:00:00:01"}
+        ARP.psrc:  {action: change_to, value: "10.0.0.100"}
+        ARP.hwdst: {action: change_to, value: "00:00:00:00:00:0c"}
+        ARP.pdst:  {action: change_to, value: "10.0.0.12"}
+        Ether.src: {action: change_to, value: "aa:bb:cc:00:00:01"}
+        Ether.dst: {action: change_to, value: "00:00:00:00:00:0c"}
+
+# --- G2 ---
+
+  - name: arp_drop_unknown_requester
+    visibility: hidden
+    description: |
+      A request from an unknown requester MAC ...0f (not in the L2 table) → the
+      reply cannot be delivered → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0f", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {op: 1, hwsrc: "00:00:00:00:00:0f", psrc: "10.0.0.99", hwdst: "00:00:00:00:00:00", pdst: "10.0.0.100"}
+    expected:
+      behavior: drop
+
+# --- G3 ---
+
+  - name: arp_drop_reply_op
+    visibility: hidden
+    description: |
+      An ARP REPLY (op 2) arriving is not answered → drop (only requests are
+      handled).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:0a"}
+        - ARP:   {op: 2, hwsrc: "00:00:00:00:00:0b", psrc: "10.0.0.11", hwdst: "00:00:00:00:00:0a", pdst: "10.0.0.1"}
+    expected:
+      behavior: drop
+
+  - name: drop_non_arp
+    visibility: hidden
+    description: |
+      A non-ARP frame (IPv4) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:0a"}
+        - IP:    {src: "10.0.0.11", dst: "10.0.0.1", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop

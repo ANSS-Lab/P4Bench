@@ -1,0 +1,105 @@
+{
+  "oracle_hash": "91449b82912d0802337604b1a6e19c9069e5e14fd26aa50edfeb2aabfd59c01e",
+  "instance": "mobile_core_policer_anchor-default",
+  "ran_at": "2026-06-17T13:55:01.534219Z",
+  "canonical_examples": {
+    "passed": 6,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_gtpu_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "uplink_decap_nat_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "heavy_ue_policed",
+        "status": "pass"
+      },
+      {
+        "example_id": "inner_keyed_detection",
+        "status": "pass"
+      },
+      {
+        "example_id": "inner_ttl_one_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "inner_no_route_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "decap_precedes_detect": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "detect_precedes_nat": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "nat_binding_reuse": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "post_nat_routing": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "decap_precedes_detect",
+      "detect_precedes_nat",
+      "nat_binding_reuse",
+      "post_nat_routing",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Yang et al., Elastic Sketch, SIGCOMM 2018",
+      "3GPP TS 29.281",
+      "RFC3022",
+      "RFC1812"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

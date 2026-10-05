@@ -1,0 +1,791 @@
+task_name: dns_lb_disc
+task_type: full_program
+complexity: hard
+source: rfc
+pattern: P-DNSLoadBalancer
+pattern_version: '1.0'
+seed:
+  name_class_backend_entries:
+  - name_pattern: example.com
+    qtype: 1
+    action: route
+    egress_port: 2
+    backend_ip: none
+    backend_mac: 08:00:00:00:02:02
+    src_mac: 08:00:00:00:00:02
+  - name_pattern: example.com
+    qtype: 28
+    action: route
+    egress_port: 3
+    backend_ip: none
+    backend_mac: 08:00:00:00:03:03
+    src_mac: 08:00:00:00:00:03
+  - name_pattern: example.net
+    qtype: 1
+    action: rewrite
+    egress_port: 2
+    backend_ip: 10.1.0.20
+    backend_mac: 08:00:00:00:02:02
+    src_mac: 08:00:00:00:00:02
+  - name_pattern: example.org
+    qtype: 1
+    action: route
+    egress_port: 3
+    backend_ip: none
+    backend_mac: 08:00:00:00:03:03
+    src_mac: 08:00:00:00:00:03
+  max_label_count: 3
+  name_match_breadth: suffix_2label
+  qtype_match_enabled: true
+  action_breadth: route_rewrite
+  malformed_handling: strict_drop
+  default_action: forward_default
+  default_backend_port: 4
+  case_normalization: false
+  name_class_backend_capacity: unbounded
+  workload_skew: uniform
+  faithfulness: D5.2_rewrite_dnat
+  dns_udp_port: 53
+  local_vip: 10.0.0.53
+description: |
+  A switch s1 fronts an anycast DNS service (the virtual IP 10.0.0.53)
+  and steers client DNS *queries* across a pool of backend resolvers by
+  the queried name and record type, in the spirit of a DNS global server
+  load balancer (RFC 1035 message format). Clients reach s1 on port
+  s1.p1; three backend resolvers sit behind s1.p2, s1.p3, and s1.p4.
+
+  The switch inspects each ingress packet, decides whether it is a DNS
+  query it should handle, classifies the query by its domain name and
+  record type, and forwards (or drops) it accordingly. It is a stateless
+  function: every decision follows from the packet's headers and a
+  control-plane classification table you populate with the entries
+  below — no per-flow state is kept.
+
+  ## What a DNS query looks like on the wire
+
+  A query arrives as
+
+    Ethernet / IPv4 / UDP(destination port 53) / DNS-message
+
+  The DNS message begins with a 12-byte header. Its third and fourth
+  bytes are a flags field whose most-significant bit (the QR bit) is 0
+  for a query and 1 for a response. Bytes 5–6 of the header are QDCOUNT,
+  the number of questions; a query carries at least one. The first
+  question immediately follows the 12-byte header and consists of:
+
+    - QNAME — the queried domain name, encoded as a sequence of labels.
+      Each label is one length octet (the number of bytes in the label)
+      followed by that many bytes; the name ends with a zero length
+      octet (the root label). For example `api.example.com` encodes as
+      `0x03 'a' 'p' 'i' 0x07 'e' 'x' 'a' 'm' 'p' 'l' 'e' 0x03 'c' 'o'
+      'm' 0x00`. A label is at most 63 bytes (the length octet's two
+      most-significant bits are always 0 in a normal label).
+    - QTYPE — a two-byte record type (A = 1, AAAA = 28, MX = 15, …).
+    - QCLASS — a two-byte class (IN = 1).
+
+  ## Per-packet behaviour
+
+  Process every ingress packet by the first matching rule below.
+
+   1. **Not a DNS query → drop.** If the packet is not UDP to port 53,
+      or its DNS QR bit is 1 (a response, not a query), or it carries no
+      question (QDCOUNT = 0), drop it. This switch handles only DNS
+      queries; other traffic is out of scope.
+
+   2. **Malformed query → drop.** A DNS query whose QNAME cannot be read
+      as a well-formed label sequence MUST be dropped. Specifically,
+      drop the query if any of these holds while reading the QNAME:
+
+        a. a label's length octet has either of its two most-significant
+           bits set (i.e. the octet value is 0xC0 or larger) — such an
+           octet is not a normal label length and MUST NOT be followed
+           as one;
+        b. the name does not reach its terminating zero length octet
+           within the first 3 labels;
+        c. a label claims more bytes than the packet actually contains.
+
+   3. **Classify and act.** For a well-formed query, form a name key from
+      the LAST TWO labels of the QNAME (the registrable domain — e.g.
+      both `www.example.com` and `shop.cdn.example.com` have the key
+      `example.com`), pair it with the query's QTYPE, and look the
+      `(name key, QTYPE)` up in the classification table. On a match,
+      apply the entry's action:
+
+        - **route** — forward the query to the entry's backend port.
+          Rewrite the Ethernet source and destination MACs to the
+          entry's values and decrement the IPv4 TTL by one (this is an
+          L3 hop toward the backend). DO NOT change the IPv4 destination
+          address: it stays the anycast VIP 10.0.0.53 so the backend can
+          answer the client directly. Recompute the IPv4 header checksum.
+
+        - **rewrite** — forward to the entry's backend port, but also
+          rewrite the IPv4 destination address to the entry's backend IP
+          (a direct redirect to one specific resolver). Rewrite the MACs,
+          decrement the TTL, and recompute BOTH the IPv4 header checksum
+          and the UDP checksum (the UDP checksum covers the IPv4 address
+          that just changed).
+
+      In every forwarding case the DNS message itself — the header, the
+      QNAME, the QTYPE, and everything after — MUST be delivered to the
+      backend byte-for-byte identical to what arrived. Only the
+      Ethernet/IPv4/UDP envelope may change.
+
+   4. **No match → default.** A well-formed query whose `(name key,
+      QTYPE)` is not in the table is forwarded to the default backend
+      port s1.p4. Decrement the TTL, recompute the IPv4 header checksum,
+      and leave the IPv4 destination and the DNS message unchanged.
+
+  ## Classification table (install as control-plane entries)
+
+  | Name key (last two labels) | QTYPE   | Action  | Backend port | Backend IP   |
+  |----------------------------|---------|---------|--------------|--------------|
+  | example.com                | A (1)   | route   | s1.p2        | (VIP kept)   |
+  | example.com                | AAAA(28)| route   | s1.p3        | (VIP kept)   |
+  | example.net                | A (1)   | rewrite | s1.p2        | 10.1.0.20    |
+  | example.org                | A (1)   | route   | s1.p3        | (VIP kept)   |
+
+  For route/rewrite to s1.p2 use Ethernet src `08:00:00:00:00:02`, dst
+  `08:00:00:00:02:02`; to s1.p3 use src `08:00:00:00:00:03`, dst
+  `08:00:00:00:03:03`. Any well-formed query not matching a row goes to
+  the default backend s1.p4 with MACs unchanged.
+
+  Grounding: RFC 1035 (Domain Names — Implementation and Specification),
+  §3.1 / §4.1.1 / §4.1.2.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.1.0.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.1.0.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.1.0.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: route_example_com_a
+  visibility: public
+  description: |
+    A query for an A record under example.com is steered to backend A
+    (s1.p2): MACs rewritten, TTL decremented, IPv4 destination left as
+    the anycast VIP, IPv4 checksum recomputed, DNS payload unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33333
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: www.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+      DNSQuery.qtype:
+        action: unchanged
+- name: qtype_split_aaaa
+  visibility: public
+  description: |
+    The SAME name under example.com but an AAAA record steers to a
+    DIFFERENT backend (s1.p3) — the classifier must read QTYPE, not
+    just the name.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 44444
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: www.example.com
+        qtype: 28
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: rewrite_dnat_example_net
+  visibility: public
+  description: |
+    An A query under example.net uses the rewrite action: the IPv4
+    destination is DNATed to 10.1.0.20 and BOTH the IPv4 and UDP
+    checksums are recomputed (the UDP checksum covers the changed
+    destination). The DNS payload is unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 55555
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: mail.example.net
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.dst:
+        action: change_to
+        value: 10.1.0.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      UDP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: route_example_org_a
+  visibility: hidden
+  description: |
+    An A query under example.org steers to backend B (s1.p3), route
+    action, VIP preserved.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33401
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: api.example.org
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: qname_preserved_multilabel
+  visibility: hidden
+  description: |
+    A multi-label name a.example.com routes by its registrable suffix
+    (example.com) to backend A; the full QNAME must survive the
+    parse-then-deparse round-trip byte-for-byte.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33402
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: a.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+      DNSQuery.qtype:
+        action: unchanged
+- name: deep_subdomain_suffix_match
+  visibility: hidden
+  description: |
+    A subdomain sub.example.org (3 labels, within the bound) matches the
+    registrable suffix example.org and routes to backend B — suffix
+    matching ignores subdomain depth.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33403
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: sub.example.org
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      DNSQuery.qname:
+        action: unchanged
+- name: rewrite_dnat_example_net_hidden
+  visibility: hidden
+  description: |
+    A second example.net/A query (shop.example.net) exercises the rewrite
+    (DNAT) action on the HIDDEN path: the IPv4 destination is rewritten to the
+    backend 10.1.0.20, the egress-port source MAC is stamped, and the IPv4/UDP
+    checksums are recomputed. Pins the DNAT IP.dst transform and the src-MAC
+    rewrite against a program that forwards without rewriting them.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 44444
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: shop.example.net
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.dst:
+        action: change_to
+        value: 10.1.0.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      UDP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: name_at_parse_bound_3labels
+  visibility: public
+  description: |
+    A query whose name has exactly 3 labels (z.example.com) sits at the
+    parser depth bound and MUST still parse and route by its example.com
+    suffix to backend A.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33404
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: z.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      DNSQuery.qname:
+        action: unchanged
+- name: name_exceeds_parse_bound_drop
+  visibility: hidden
+  description: |
+    A query whose name has more labels than the 3-label bound
+    (a.b.c.d.e.f.g.example.com — 9 labels) does not terminate within
+    the bound and MUST be dropped under strict malformed handling.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33405
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: a.b.c.d.e.f.g.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: drop
+- name: default_unknown_name
+  visibility: hidden
+  description: |
+    A well-formed query for a name not in the table (example.io) is
+    steered to the default backend s1.p4, TTL decremented, VIP and DNS
+    payload unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33406
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: foo.example.io
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: default_unmatched_qtype
+  visibility: hidden
+  description: |
+    example.com is in the table for A and AAAA, but an MX query for it
+    matches no row (QTYPE participates in the key) and so goes to the
+    default backend s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33407
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: mail.example.com
+        qtype: 15
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      DNSQuery.qname:
+        action: unchanged
+- name: qr_response_dropped
+  visibility: public
+  description: |
+    A packet on UDP/53 whose QR bit is 1 is a DNS response, not a
+    query, and MUST NOT be steered as a query — drop it. Catches a
+    classifier that gates only on the UDP port and ignores QR.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33408
+        dport: 53
+    - DNSQuery:
+        qr: 1
+        qdcount: 1
+        qname: www.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: drop
+- name: malformed_compression_pointer_drop
+  visibility: hidden
+  description: |
+    A query whose QNAME contains a label-length octet with its high
+    bits set (0xC0 — a compression pointer, not a normal label length)
+    MUST be dropped under strict handling rather than followed as a
+    label length. Raw DNS bytes: header (QR=0, QDCOUNT=1) + label
+    'www' + pointer 0xC00C + QTYPE/QCLASS.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33409
+        dport: 53
+    - Raw:
+        load_hex: 12340000000100000000000003777777c00c00010001
+  expected:
+    behavior: drop
+- name: checksum_recompute_route_vip_preserved
+  visibility: hidden
+  description: |
+    Route path checksum / VIP discipline: the IPv4 checksum MUST be
+    valid after the TTL decrement, and the IPv4 destination MUST remain
+    the anycast VIP (a classifier that DNATs in route mode breaks the
+    anycast answer path).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 100
+        proto: 17
+    - UDP:
+        sport: 33410
+        dport: 53
+    - DNSQuery:
+        qr: 0
+        qdcount: 1
+        qname: shop.example.com
+        qtype: 1
+        qclass: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      DNSQuery.qname:
+        action: unchanged
+- name: non_dns_udp_port_dropped
+  visibility: hidden
+  description: |
+    A UDP packet to a non-DNS port (5353) is out of scope and MUST be
+    dropped — the switch handles only UDP/53 DNS queries.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33411
+        dport: 5353
+    - Raw:
+        load_hex: 12340000000100000000000003777777076578616d706c6503636f6d0000010001
+  expected:
+    behavior: drop
+- name: malformed_truncated_label_drop
+  visibility: hidden
+  description: |
+    A DNS query whose QNAME label-length octet claims more bytes than the
+    packet actually contains (length octet 0x07 followed by only 'www'
+    before the buffer ends) is truncated mid-label and MUST be dropped
+    under strict handling, without reading past the buffer end. This is
+    malformed rule 2c (the truncated-label case), distinct from the
+    compression-pointer (2a) and over-parse-bound (2b) drops already
+    covered. Raw DNS bytes: header (QR=0, QDCOUNT=1) + label-length 7 +
+    'www' (only 3 bytes present, no terminator/QTYPE).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.53
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 33412
+        dport: 53
+    - Raw:
+        load_hex: '12340000000100000000000007777777'
+  expected:
+    behavior: drop

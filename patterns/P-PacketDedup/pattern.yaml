@@ -1,0 +1,167 @@
+# P-PacketDedup — Data-plane duplicate / replay suppression
+#
+# TPL v1.0 task pattern. A stateful de-duplicator: maintain a
+# seen-set (exact at the canonical binding, a Bloom filter under capacity
+# pressure) keyed on a packet-identity tuple, forward the first occurrence, and
+# DROP subsequent replays within the window. Introduces the corpus's
+# seen-set / membership-state mechanism. Grounded in the dedup literature
+# (Bloom-filter packet dedup, e.g. in-network multicast / RDMA de-dup).
+
+pattern_id: P-PacketDedup
+version: "1.0"
+nf_categories:
+  descriptive:  [D8:deduplication]
+  prescriptive: [P3:flow-state]
+target_capability: scale_up
+summary: >
+  Stateful duplicate-packet suppression. The switch computes a packet-identity
+  key (source IP, destination IP, IP identification) and records seen keys in
+  data-plane state. The FIRST packet of a key is forwarded; any later packet
+  with the same key (a duplicate / replay) is DROPPED. The canonical instance
+  uses an exact seen-set; mutation shrinks it to a fixed-cell Bloom filter
+  (introducing false-positive drops) and to a sliding window.
+
+grounding:
+  papers:
+    - cite: bloom_dedup
+      role: scaling_approach
+      relevance: |
+        In-network and end-host packet de-duplication keep a compact membership
+        structure (a Bloom filter / counting sketch) keyed on a packet-identity
+        digest and drop matches. Motivates the exact→Bloom faithfulness ladder
+        and the ${dedup_capacity} register-cell axis.
+  rfcs:
+    - id: RFC791
+      sections: ["3.1"]
+      role: normative_behaviour
+      quote: >-
+        An identifying value assigned by the sender to aid in assembling the
+        fragments of a datagram.
+      quote_source: patterns/P-PacketDedup/grounding/RFC791.txt
+      relevance: |
+        Internet Protocol — the Identification field uniquely identifies a
+        datagram (with src/dst/proto) for reassembly; reused here as the
+        per-packet identity component of the dedup key.
+  tutorials: []
+
+entities:
+  packet:
+    notes: "Identity = (ipv4.src, ipv4.dst, ipv4.id)."
+  seen_set:                                 # the TPL `window`/state role
+    keyed_by_tuple: [src, dst, ip_id]
+    capacity: ${dedup_capacity}
+    eviction: ${eviction}
+    notes: |
+      Membership state of recently-seen packet keys. Exact map at the canonical
+      binding; a Bloom filter of ${dedup_capacity} cells under capacity pressure.
+
+parameters:
+  dedup_capacity:
+    type: int | unbounded
+    default: unbounded
+    notes: "Number of distinct keys the seen-set holds. unbounded = exact set."
+  eviction:
+    type: enum
+    values: [none, sliding_window, lru]
+    default: none
+  forward_port:
+    type: port
+    default: 2
+    notes: "Egress port for admitted (first-seen) packets."
+  faithfulness:
+    type: enum
+    values: [D8.0_exact_set, D8.1_bloom, D8.2_windowed]
+    default: D8.0_exact_set
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then: [drop]
+    notes: "Only IPv4 is de-duplicated; other ether-types are dropped."
+  - id: R1_duplicate_drop
+    when: "header_present(ipv4) ∧ key(packet) ∈ seen_set"
+    then: [drop]
+    notes: |
+      The key (src, dst, ipv4.id) has been seen → this is a duplicate/replay
+      → drop. The key does NOT include TTL or L4 ports, so a retransmit that
+      differs only in TTL is still a duplicate.
+  - id: R2_first_seen_forward
+    when: "header_present(ipv4) ∧ key(packet) ∉ seen_set"
+    then:
+      - "insert(seen_set, key(packet))"
+      - forward(${forward_port})
+    notes: |
+      First occurrence of a key → record it and forward out ${forward_port}.
+      The packet is forwarded unmodified (no header rewrite).
+
+invariants:
+  - id: first_seen_forwarded
+    clause: stability
+    target: forward_decision
+    while: "rule R2 fires"
+    notes: "Every key's first packet is forwarded exactly once."
+  - id: replay_suppressed
+    clause: stability
+    target: drop_decision
+    while: "rule R1 fires"
+    notes: "Every subsequent packet of a seen key is dropped."
+  - id: key_independence
+    clause: persistence
+    target: seen_set_membership
+    while: "always"
+    notes: "Distinct keys are independent — admitting one does not suppress another."
+
+test_scaffolding:
+  G1:
+    - id: first_packet_forward
+      generate: "A single packet (no prior) → forward out forward_port."
+    - id: duplicate_dropped
+      generate: "prior=[A]; resend A (same key, differing only in TTL) → drop."
+    - id: distinct_id_forward
+      generate: "prior=[A id=X]; send A' with id=Y≠X → forward (different key)."
+    - id: distinct_flow_forward
+      generate: "prior=[A]; send B with a different src → forward."
+  G2:
+    - id: triple_replay_dropped
+      generate: "prior=[A,A]; send A again → still dropped."
+    - id: bloom_capacity_overflow
+      requires: "${dedup_capacity} != unbounded"
+      generate: "Fill the seen-set beyond capacity; assert eviction/false-positive policy."
+  G3:
+    - id: drop_non_ipv4
+      generate: "ARP / non-IPv4 → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: shrink_to_bloom
+    axis: capacity
+    direction: harden
+    applicable_when: "${faithfulness} == D8.0_exact_set"
+    effect: "${faithfulness} ← D8.1_bloom ∧ ${dedup_capacity} ← 1024"
+    d_axis_delta: {D2: +1, test_rigor: +1}
+    notes: "Replace the exact set with a fixed Bloom filter — false positives now possible."
+  - id: shrink_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${dedup_capacity} != unbounded ∧ ${dedup_capacity} > 64"
+    effect: "${dedup_capacity} ← ${dedup_capacity} / 4"
+    d_axis_delta: {D2: +1}
+  - id: enable_sliding_window
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${eviction} == none"
+    effect: "${eviction} ← sliding_window ∧ ${faithfulness} ← D8.2_windowed"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+
+bridging_notes: |
+  Canonical implementation:
+    - A register (bit array) indexed by hash(src, dst, ipv4.id). On a packet:
+      read the cell; if set, drop (duplicate); else set it and forward.
+    - The exact set can be modelled as a register of seen-flags addressed by a
+      wide hash (collisions = the Bloom regime, deferred to mutation).
+    - The key MUST exclude TTL / L4 ports so a retransmit differing only in
+      TTL is still recognised as a duplicate.
+  Anti-patterns:
+    * Including TTL in the key (then a decremented retransmit looks new).
+    * Forwarding the duplicate (missing the read-before-write).
+    * Never setting the cell (every packet looks new → no dedup).

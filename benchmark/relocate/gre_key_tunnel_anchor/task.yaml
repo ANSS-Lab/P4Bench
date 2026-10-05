@@ -1,0 +1,211 @@
+task_name: gre_key_tunnel_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-GREKeyTunnel
+pattern_version: '1.0'
+
+seed:
+  local_vtep_ip: "10.200.0.1"
+  require_key: true
+  faithfulness: D13.0_decap_only
+
+description: |
+  Implement a GRE tunnel decapsulation endpoint on a single switch s1
+  (RFC 2784 / RFC 2890). The switch terminates GRE tunnels addressed to its
+  tunnel IP 10.200.0.1; tunnelled packets arrive as IPv4 (protocol 47, GRE)
+  carrying a GRE Key and an inner IPv4 packet. Matching packets are
+  decapsulated and the inner packet is delivered per the policy below.
+
+  ## Tunnels (GRE Key → egress)
+
+  The control plane installs these as table entries.
+
+    | GRE Key | egress port | next-hop MAC      | egress-port MAC   |
+    |---------|-------------|-------------------|-------------------|
+    | 0x1001  | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 0x1002  | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+   - A packet is processed only if it is IPv4, protocol 47 (GRE), its outer
+     destination is the tunnel IP 10.200.0.1, and its GRE Key matches a
+     configured tunnel. Any other packet — wrong outer destination, not GRE,
+     not IPv4, or an unknown Key — is dropped.
+   - A matching packet is decapsulated: the outer IPv4 and GRE headers are
+     removed, exposing the inner IPv4 packet, which is forwarded out the
+     tunnel's egress port with the Ethernet source set to the egress port's own
+     MAC and the destination set to the next-hop MAC.
+   - The inner IPv4 packet's source, destination, and TTL are not modified.
+
+  ## Topology
+
+  One switch s1. Tunnelled traffic arrives on s1.p1; decapsulated inner packets
+  egress s1.p2 / s1.p3.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.100.0.1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "10.2.2.2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "10.3.3.3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: decap_basic
+    visibility: public
+    description: |
+      A GRE packet (Key 0x1001) to 10.200.0.1 carrying an inner IPv4 packet.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x1001, proto: 0x0800}
+        - IP:    {src: "10.1.1.1", dst: "10.2.2.2", ttl: 50}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.dst:    {action: change_to, value: "10.2.2.2"}
+        IP.src:    {action: change_to, value: "10.1.1.1"}
+        IP.ttl:    {action: change_to, value: 50}
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: decap_distinct_key
+    visibility: public
+    description: |
+      A GRE packet with Key 0x1002.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x1002, proto: 0x0800}
+        - IP:    {src: "10.1.1.9", dst: "10.3.3.3", ttl: 40}
+        - UDP:   {sport: 1234, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.dst:    {action: change_to, value: "10.3.3.3"}
+        IP.ttl:    {action: change_to, value: 40}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+
+  - name: drop_unknown_key
+    visibility: public
+    description: |
+      A GRE packet whose Key 0x9999 is not a configured tunnel.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x9999, proto: 0x0800}
+        - IP:    {src: "10.1.1.1", dst: "10.2.2.2", ttl: 50}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: decap_preserves_inner
+    visibility: hidden
+    description: |
+      Inner destination 10.5.5.5 with TTL 33 survives decap unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x1001, proto: 0x0800}
+        - IP:    {src: "10.9.9.9", dst: "10.5.5.5", ttl: 33}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.dst: {action: change_to, value: "10.5.5.5"}
+        IP.src: {action: change_to, value: "10.9.9.9"}
+        IP.ttl: {action: change_to, value: 33}
+
+# --- G2 ---
+
+  - name: drop_wrong_vtep
+    visibility: hidden
+    description: |
+      A GRE packet whose outer destination is 10.200.0.9 (not the local
+      endpoint 10.200.0.1) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.9", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x1001, proto: 0x0800}
+        - IP:    {src: "10.1.1.1", dst: "10.2.2.2", ttl: 50}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: drop_non_gre_proto
+    visibility: hidden
+    description: |
+      A plain TCP packet to 10.200.0.1 (IP protocol 6, not GRE) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", ttl: 64}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: drop
+
+# --- G3 ---
+
+  - name: drop_non_ipv4
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.200.0.1", psrc: "10.100.0.1"}
+    expected:
+      behavior: drop
+
+  - name: decap_key1002_l2_rewrite_hidden
+    visibility: hidden
+    description: |
+      A GRE packet with Key 0x1002 decaps and forwards the inner packet to the
+      SECOND tunnel egress s1.p3 with BOTH the egress-port source MAC and the
+      next-hop destination MAC rewritten (the L2 next-hop resolution on decap).
+      Exercises the second forward port on the hidden path and pins the
+      Ether.src / Ether.dst rewrites a forward-without-rewrite program would skip.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.100.0.1", dst: "10.200.0.1", proto: 47, ttl: 64}
+        - GRE:   {key_present: 1, key: 0x1002, proto: 0x0800}
+        - IP:    {src: "10.7.7.7", dst: "10.3.3.3", ttl: 44}
+        - UDP:   {sport: 2000, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.dst:    {action: change_to, value: "10.3.3.3"}
+        IP.src:    {action: change_to, value: "10.7.7.7"}
+        IP.ttl:    {action: change_to, value: 44}
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}

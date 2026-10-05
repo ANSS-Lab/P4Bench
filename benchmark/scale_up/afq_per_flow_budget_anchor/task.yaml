@@ -1,0 +1,2764 @@
+task_name: afq_per_flow_budget_anchor
+task_type: full_program
+complexity: high
+source: paper
+paper_ref: Sharma et al., Approximating Fair Queueing on Reconfigurable Switches, NSDI 2018
+pattern: P-ApproxFairQueueing
+pattern_version: '1.0'
+seed:
+  window: 8
+  quantum: 256
+  fair_share_k: 4
+  sketch_rows: 2
+  sketch_width: 256
+  hash_polynomial: crc32
+  hash_independence: pairwise
+  flowkey_fields:
+  - hdr.ipv4.srcAddr
+  eligibility_protocol: tcp
+  byte_accounting: on_wire_length
+  faithfulness: D5.1_count_min
+  workload_skew: zipfian
+  access_port: 1
+  core_port: 2
+  core_mac: 08:00:00:00:02:01
+failure_modes:
+- long_sequence_stateful_drift
+- multi_checksum_selectivity
+- nested_conditional_with_early_return
+- byte_vs_packet_accounting
+- min_across_rows_count_min_sketch
+- off_by_one_drop_predicate
+- underflow_clamp
+description: |
+  An access switch s1 must enforce an approximate per-flow fair-bandwidth
+  admission policy on TCP traffic between subscribers and an upstream core
+  network.
+
+  ## Topology and roles
+
+    - s1 has three external connection points: an ACCESS connection
+      (s1.p1) facing subscribers, a CORE connection (s1.p2) facing the
+      upstream router whose Ethernet address is 08:00:00:00:02:01, and a
+      third connection (s1.p3) that carries no production traffic.
+    - Any frame arriving on a connection other than the ACCESS one must be
+      discarded.
+
+  ## Eligibility
+
+  A subscriber packet is eligible for admission only when ALL of the
+  following hold; the checks short-circuit in the order listed, and a
+  packet that fails an earlier check is never inspected against later
+  checks and never affects any internal state:
+
+    1. The packet arrived on the ACCESS connection.
+    2. The packet carries an IPv4 payload.
+    3. The IPv4 payload is TCP.
+
+  ## Per-flow byte accounting
+
+  The switch maintains an approximate per-flow byte estimate using two
+  distinct slot indices computed from the IPv4 source address:
+
+    - first index  = the final byte of the source address.
+    - second index = the second-to-last byte XOR the third-to-last byte
+                     of the source address.
+
+  For each flow, the switch's estimate of total bytes that flow has had
+  admitted is the MINIMUM of the byte counts stored at those two slot
+  positions. The switch must use this MIN value, not their sum and not
+  either single value.
+
+  The switch additionally keeps a single global "total bytes admitted"
+  counter incremented on every admission.
+
+  ## Round arithmetic
+
+  The switch derives two per-packet integer quantities (the byte sizes
+  below are the on-wire frame length, including Ethernet header):
+
+    - flow_round    = (per-flow byte estimate) divided by 256, integer.
+    - current_round = (global bytes admitted)  divided by 1024, integer.
+
+  It then computes
+
+    round_shift = max(0, flow_round - current_round)
+
+  — the clamp at zero is mandatory: a flow whose round trails the global
+  round never has a negative or wrap-around shift.
+
+  ## Admission decision
+
+    - If round_shift is 8 or greater, the packet must be discarded; per-flow
+      and global state MUST NOT change as a result of this discard.
+    - Otherwise, the packet is admitted. On admission and only on
+      admission, the per-flow byte estimate (both slots) and the global
+      counter must each be incremented by exactly the on-wire frame
+      length, and the packet observed at the CORE connection must
+      satisfy:
+        - Its IPv4 identification field equals round_shift.
+        - Its IPv4 hop count is reduced by exactly one and the datagram
+          remains a well-formed IPv4 packet that an unmodified
+          downstream receiver would accept.
+        - Its Ethernet destination address has been replaced by
+          08:00:00:00:02:01.
+        - All other fields of the packet are byte-identical to the
+          received packet.
+
+  ## Control plane
+
+  No control-plane configuration is supplied. The behaviour is fully
+  determined by the per-flow and global state the switch maintains
+  internally and by the constants given above.
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: sub
+    to: s1.p1
+  - from: s1.p2
+    to: core
+hosts:
+  sub:
+    ip: 10.0.1.254/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  core:
+    ip: 10.200.0.1/24
+    mac: 08:00:00:00:02:01
+    port: s1.p2
+test_cases:
+- name: first_packet_admit_round_shift_0
+  visibility: public
+  description: 'Fresh switch: a single TCP/IPv4 packet on the access port is admitted, the assigned round_shift is 0, written into IP.id; TTL decremented and Ethernet destination rewritten to the core MAC.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: single_jumbo_prior_round_shift_3
+  visibility: public
+  description: After one large prior packet from flow A, the next packet of flow A is admitted with a non-zero round_shift, encoded into IP.id.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: out_of_window_drop_after_three_jumbos
+  visibility: public
+  description: Three large prior packets from flow A push its assigned round more than WINDOW=8 ahead of the current round; the next packet of flow A is dropped.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5003
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5004
+        dport: 80
+  expected:
+    behavior: drop
+- name: sketch_min_row0_collision_does_not_leak
+  visibility: hidden
+  description: Flow A bursts; flow E shares the row-0 hash but not the row-1 hash, so the MIN-across-rows estimate for flow E is fresh and its first packet is admitted with round_shift=0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.5.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: sketch_min_full_collision_inherits_state
+  visibility: hidden
+  description: Flow A bursts with three jumbos; flow D collides on BOTH sketch rows, so its first packet inherits flow A's bytes and is dropped (out of window).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5003
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.5.4.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7000
+        dport: 80
+  expected:
+    behavior: drop
+- name: byte_accuracy_single_jumbo_gives_shift
+  visibility: hidden
+  description: One large prior packet (854 bytes) of flow A causes the next flow A packet to be assigned round_shift=3 — a packet-count implementation would assign round_shift=0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: byte_accuracy_four_minis_give_no_shift
+  visibility: hidden
+  description: Four minimum-size prior packets of flow A (216 bytes total) leave the next flow A packet at round_shift=0 — a packet-count implementation would assign a positive shift here.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5004
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5005
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: underflow_clamp_idle_flow_admits_at_zero
+  visibility: hidden
+  description: Flow A bursts heavily, then a previously-silent flow B sends a packet. Flow B's per-flow round is below the global current round, so the clamp prevents underflow and B is admitted with round_shift=0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5003
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: boundary_admit_round_shift_seven
+  visibility: hidden
+  description: State is engineered so that the test packet's round_shift equals WINDOW-1=7 — the last admissible value before the strict drop boundary.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5100
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5101
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5102
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5103
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5104
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5105
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5106
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5107
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5108
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5109
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5110
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5111
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5999
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 7
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: boundary_drop_strict_ge_window
+  visibility: hidden
+  description: State is engineered so that the test packet's round_shift equals WINDOW=8 exactly — must drop because the predicate is round_shift >= WINDOW, not round_shift > WINDOW.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5100
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5101
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5102
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5103
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5104
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5105
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5106
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5107
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5108
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5109
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5110
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5111
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5200
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5201
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5202
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5203
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5999
+        dport: 80
+  expected:
+    behavior: drop
+- name: eligibility_udp_probe_drops
+  visibility: hidden
+  description: A UDP packet on the access port is ineligible and dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: eligibility_arp_probe_drops
+  visibility: hidden
+  description: An ARP frame on the access port is ineligible (non-IPv4) and dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.1.254
+  expected:
+    behavior: drop
+- name: eligibility_wrong_port_drops
+  visibility: hidden
+  description: A TCP/IPv4 packet that arrives on a port other than the access port is dropped before any per-flow state is consulted.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: eligibility_priors_do_not_consume_bytes
+  visibility: hidden
+  description: A long sequence of UDP, ARP, and wrong-port packets MUST not consume any per-flow or global state. The flow-A test packet still sees round_shift=0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 5101
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.1.254
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5102
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 5103
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.3
+        pdst: 10.0.1.254
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5104
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 5105
+        dport: 53
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5106
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: cross_test_invariant_flow_a_baseline
+  visibility: hidden
+  description: 'Cross-test invariant: an isolated flow A baseline packet always sees round_shift=0, regardless of what other tests in the corpus do.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5050
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: long_sequence_drift_final_drop
+  visibility: hidden
+  description: After 100 interleaved priors mixing flow A, flow C, and ineligible UDP/ARP packets, flow A's accumulated byte count puts it deep out-of-window — the final test packet is dropped.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6500
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8000
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6501
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8001
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6502
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8002
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6503
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8003
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6504
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8004
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6505
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8005
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6506
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8006
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6007
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6507
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7007
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8007
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6008
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6508
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7008
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8008
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6009
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6509
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7009
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8009
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6010
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6510
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7010
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8010
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6011
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6511
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7011
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8011
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6012
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6512
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7012
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8012
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6013
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6513
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7013
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8013
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6014
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6514
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7014
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8014
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6015
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6515
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7015
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8015
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6016
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6516
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7016
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8016
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6017
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6517
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7017
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8017
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6018
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6518
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7018
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8018
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 6019
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:22
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.2
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        id: 48879
+    - UDP:
+        sport: 6519
+        dport: 53
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:33
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.3
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 7019
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.254
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 8019
+        dport: 80
+    - Raw:
+        load: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 9999
+        dport: 80
+  expected:
+    behavior: drop
+- name: ttl_decrement_admitted_packet
+  visibility: hidden
+  description: A fresh-switch admitted packet with TTL=10 egresses with TTL=9, Ethernet destination rewritten to the core MAC, and IP.id=0.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:11
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.7
+        dst: 8.8.8.8
+        ttl: 10
+        proto: 6
+        id: 48879
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

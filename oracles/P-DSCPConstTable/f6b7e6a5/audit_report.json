@@ -1,0 +1,115 @@
+{
+  "oracle_hash": "83efe269cd26b969c5bcfc6d8d3bc4fc8c3d45367edaeb59888e0da208c85235",
+  "instance": "dscp_const_table_anchor-default",
+  "ran_at": "2026-06-17T02:28:08.950694Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "ef_to_class2",
+        "status": "pass"
+      },
+      {
+        "example_id": "af11_to_class3",
+        "status": "pass"
+      },
+      {
+        "example_id": "be_to_class4",
+        "status": "pass"
+      },
+      {
+        "example_id": "ecn_bits_ignored_same_class",
+        "status": "pass"
+      },
+      {
+        "example_id": "unmapped_cs6_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "unmapped_under_deny_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "mapped_under_deny_still_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "remapped_config_follows_map",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_arp_to_default",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "const_map_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "cu_bits_ignored": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "default_class_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "class_routes_to_named_port": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ds_classify_header_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "const_map_correctness",
+      "cu_bits_ignored",
+      "default_class_correctness",
+      "class_routes_to_named_port",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2474",
+      "RFC2475"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

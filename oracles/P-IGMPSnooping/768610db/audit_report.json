@@ -1,0 +1,99 @@
+{
+  "oracle_hash": "6f57775074e3d33ea778aa07b0fcf19c134e0450d063a3d82d64223324eceb1c",
+  "instance": "igmp_snooping_anchor-default",
+  "ran_at": "2026-06-17T00:50:20.272872Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "unicast_out_of_scope_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "data_no_member_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "data_no_member_drop_distinct_group",
+        "status": "pass"
+      },
+      {
+        "example_id": "link_local_control_pruned_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "data_link_local_control_flood",
+        "status": "pass"
+      },
+      {
+        "example_id": "data_no_member_mrouter_only_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "data_to_member_set_only": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "prune_excludes_ingress": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "membership_monotone_under_no_control": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "leave_removes_then_drops": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_groups": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "data_to_member_set_only",
+      "prune_excludes_ingress",
+      "membership_monotone_under_no_control",
+      "leave_removes_then_drops",
+      "no_orphan_groups"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC 4541 \u00a72.1.1 / \u00a72.1.2",
+      "RFC 2236 \u00a72.1 / \u00a73"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

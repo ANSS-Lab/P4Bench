@@ -1,0 +1,368 @@
+task_name: natacl_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-NATACL
+pattern_version: '1.0'
+
+seed:
+  public_ip: "203.0.113.10"
+  internal_subnet: "192.168.1.0/24"
+  mode: static
+  static_mappings:
+    - {internal_ip: "192.168.1.5", internal_port: 5000, proto: 17, ext_port: 14000}
+    - {internal_ip: "192.168.1.5", internal_port: 6000, proto: 6,  ext_port: 15000}
+    - {internal_ip: "192.168.1.5", internal_port: 7000, proto: 17, ext_port: 16000}
+  rules:
+    - {priority: 100, action: deny, ipv4_src: "192.168.1.5/32", proto: 17, sport: 7000}
+  action_breadth: permit_deny
+  default_action: permit
+  acl_match_stage: internal_side
+  faithfulness: D5.0_static_nat_permit_acl
+
+topology:
+  switches:
+    - name: s1
+      ports:
+        internal: 1
+        external: 2
+  links:
+    - {from: h1, to: s1.internal}
+    - {from: s1.external, to: h2}
+
+description: |
+  A single switch s1 sits at the edge between a private network and the
+  public internet. It does TWO jobs on every packet, in order: it enforces
+  a stateless access-control policy (an ACL), and it performs IPv4 network
+  address-and-port translation (NAPT) that hides the internal hosts behind
+  one public address. The switch has two ports:
+
+    - s1.internal — faces the private subnet 192.168.1.0/24 (internal host
+      h1 = 192.168.1.5).
+    - s1.external — faces the public internet (external peer h2 = 8.8.8.8).
+
+  The switch's single public address is 203.0.113.10.
+
+  ## Control-plane configuration the switch is given
+
+  Static NAT mappings (each maps an internal endpoint to an external port
+  on the public address; both directions are pre-installed):
+
+    | internal           | protocol | external                |
+    |--------------------|----------|-------------------------|
+    | 192.168.1.5:5000   | UDP      | 203.0.113.10:14000      |
+    | 192.168.1.5:6000   | TCP      | 203.0.113.10:15000      |
+    | 192.168.1.5:7000   | UDP      | 203.0.113.10:16000      |
+
+  ACL policy — a list of priority-ordered rules; the highest-priority rule
+  whose match admits the packet decides the verdict. If no rule matches,
+  the default verdict is PERMIT. There is one rule:
+
+    - priority 100, action DENY, matching: source 192.168.1.5, protocol
+      UDP, source port 7000.
+
+  The ACL classifies on the INTERNAL-side addresses in both directions: for
+  a packet leaving the private network it sees the original internal source;
+  for a returning packet it sees the destination AFTER translation back to
+  the internal endpoint.
+
+  ## Required behaviour (first matching case wins)
+
+  1. **Non-IPv4** frames (e.g. ARP) are dropped.
+  2. **Non-TCP/UDP** IPv4 packets (e.g. ICMP) are dropped — translation
+     applies only to TCP and UDP.
+
+  ### Packets arriving on s1.internal (outbound)
+
+  3. **Policy first.** Evaluate the ACL on the packet's internal 5-tuple.
+     If the verdict is DENY, drop the packet immediately — before consulting
+     the NAT mappings. (A flow may have a NAT mapping yet still be denied;
+     the policy decision comes first.)
+  4. **Permitted + mapped:** if the verdict is permit and the internal
+     (source IP, source port, protocol) has a NAT mapping, translate the
+     source IP to 203.0.113.10 and the source port to the mapped external
+     port, decrement the IPv4 TTL by one, rewrite the Ethernet destination
+     to the external peer, recompute the checksums, and forward out
+     s1.external.
+  5. **Permitted but unmapped:** if the verdict is permit but there is no
+     NAT mapping for the flow, drop it (this static deployment allocates no
+     new mappings in the data plane).
+  6. A packet whose source address is not in 192.168.1.0/24 arriving on the
+     internal port is dropped.
+
+  ### Packets arriving on s1.external (inbound)
+
+  7. **Wrong destination:** a packet whose destination is not 203.0.113.10
+     is dropped.
+  8. **Unsolicited:** a packet to 203.0.113.10 whose (destination port,
+     protocol) matches no installed mapping is dropped (default-deny on the
+     public side).
+  9. **Return traffic:** otherwise translate the destination back to the
+     mapped internal IP and the destination port back to the mapped
+     internal port, then evaluate the ACL on the resulting internal 5-tuple.
+     If the verdict is DENY, drop. If permit, decrement the IPv4 TTL by one,
+     rewrite the Ethernet destination to the internal host, recompute the
+     checksums, and forward out s1.internal.
+
+  ## Side requirements
+
+  - The policy decision MUST precede the address translation on the outbound
+    path: a denied flow is dropped without ever drawing on the NAT mappings.
+  - The ACL verdict for a flow MUST be taken on the internal-side addresses
+    consistently in both directions.
+  - After any address/port rewrite the IPv4 header checksum and the
+    TCP/UDP checksum MUST be valid on egress.
+
+  Grounding: RFC 3022 (traditional NAT / NAPT) for the translation; RFC 3198
+  (policy terminology) and the P4Runtime ternary-priority semantics for the
+  ACL; the composed SNAT-plus-ACL cloud-gateway deployments described by
+  Sailfish (SIGCOMM '21) and Sirius (NSDI '24) for the policy-before-NAT
+  ordering.
+
+test_cases:
+
+# ─── G1: functional correctness ─────────────────────────────────────────
+
+  - name: outbound_udp_permit_snat
+    visibility: public
+    description: |
+      Outbound permitted UDP flow. h1 192.168.1.5:5000 → 8.8.8.8:53 is
+      ACL-permitted (default permit, no deny rule matches) and has the
+      mapping → 14000. Assert SNAT: IP.src ← 203.0.113.10, UDP.sport ←
+      14000, TTL−1, Ether.dst ← external peer, forward s1.external.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 17}
+        - UDP:   {sport: 5000, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.external
+      transformations:
+        IP.src:    {action: change_to, value: "203.0.113.10"}
+        IP.dst:    {action: unchanged}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        UDP.sport: {action: change_to, value: 14000}
+        UDP.dport: {action: unchanged}
+        Ether.dst: {action: change_to, value: "00:00:00:00:08:08"}
+
+  - name: inbound_udp_dnat_permit_return
+    visibility: public
+    description: |
+      Inbound permitted return. 8.8.8.8:53 → 203.0.113.10:14000 (UDP)
+      matches the mapping → DNAT to 192.168.1.5:5000. The de-NAT-ed internal
+      tuple is ACL-permitted (default). Assert IP.dst ← 192.168.1.5,
+      UDP.dport ← 5000, TTL−1, Ether.dst ← internal host, forward s1.internal.
+    input:
+      port: s1.external
+      layers:
+        - Ether: {src: "00:00:00:00:08:08", dst: "00:00:00:00:00:02"}
+        - IP:    {src: "8.8.8.8", dst: "203.0.113.10", ttl: 64, proto: 17}
+        - UDP:   {sport: 53, dport: 14000}
+    expected:
+      behavior: forward
+      output_port: s1.internal
+      transformations:
+        IP.dst:    {action: change_to, value: "192.168.1.5"}
+        IP.src:    {action: unchanged}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        UDP.dport: {action: change_to, value: 5000}
+        UDP.sport: {action: unchanged}
+        Ether.dst: {action: change_to, value: "00:00:00:00:01:05"}
+
+  - name: outbound_acl_deny_drops_mapped_flow
+    visibility: public
+    description: |
+      Composite: policy precedes translation. h1 192.168.1.5:7000 → 8.8.8.8
+      (UDP) HAS a NAT mapping (→ 16000), but the priority-100 deny rule
+      matches its internal 5-tuple. The packet MUST be dropped by the ACL
+      before the NAT lookup. Distinguishes the chained pipeline from a NAT
+      that forwards every mapped flow.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 17}
+        - UDP:   {sport: 7000, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: outbound_tcp_permit_snat
+    visibility: hidden
+    description: |
+      Outbound permitted TCP flow on a distinct mapping. h1
+      192.168.1.5:6000 → 8.8.8.8:80 (TCP) → SNAT to 15000. Confirms the
+      chain is L4-agnostic across TCP and UDP.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 6}
+        - TCP:   {sport: 6000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.external
+      transformations:
+        IP.src:    {action: change_to, value: "203.0.113.10"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        TCP.sport: {action: change_to, value: 15000}
+        TCP.dport: {action: unchanged}
+        Ether.dst: {action: change_to, value: "00:00:00:00:08:08"}
+
+  - name: inbound_tcp_dnat_permit_return
+    visibility: hidden
+    description: |
+      Inbound TCP return on the 15000 mapping → DNAT to 192.168.1.5:6000,
+      ACL-permitted, forward internal. TCP analogue of the UDP return.
+    input:
+      port: s1.external
+      layers:
+        - Ether: {src: "00:00:00:00:08:08", dst: "00:00:00:00:00:02"}
+        - IP:    {src: "8.8.8.8", dst: "203.0.113.10", ttl: 64, proto: 6}
+        - TCP:   {sport: 80, dport: 15000, flags: "SA"}
+    expected:
+      behavior: forward
+      output_port: s1.internal
+      transformations:
+        IP.dst:    {action: change_to, value: "192.168.1.5"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        TCP.dport: {action: change_to, value: 6000}
+        TCP.sport: {action: unchanged}
+        Ether.dst: {action: change_to, value: "00:00:00:00:01:05"}
+
+  - name: inbound_return_on_denied_outbound_flow_still_permitted
+    visibility: hidden
+    description: |
+      acl_match_stage_consistency: an inbound return on the 16000 mapping
+      DNATs to 192.168.1.5:7000. The deny rule keys on SOURCE 192.168.1.5 /
+      sport 7000 — on the de-NAT-ed inbound tuple the internal endpoint is
+      the DESTINATION (dst 192.168.1.5, dport 7000) and the source is the
+      external peer, so the deny rule does NOT match and the default permit
+      applies. Assert DNAT to 192.168.1.5:7000 and forward internal.
+    input:
+      port: s1.external
+      layers:
+        - Ether: {src: "00:00:00:00:08:08", dst: "00:00:00:00:00:02"}
+        - IP:    {src: "8.8.8.8", dst: "203.0.113.10", ttl: 64, proto: 17}
+        - UDP:   {sport: 53, dport: 16000}
+    expected:
+      behavior: forward
+      output_port: s1.internal
+      transformations:
+        IP.dst:    {action: change_to, value: "192.168.1.5"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        UDP.dport: {action: change_to, value: 7000}
+        Ether.dst: {action: change_to, value: "00:00:00:00:01:05"}
+
+# ─── G2: robustness / boundary ──────────────────────────────────────────
+
+  - name: outbound_permit_but_unmapped_drop
+    visibility: hidden
+    description: |
+      A permitted outbound flow (192.168.1.5:8000 UDP, no deny rule, default
+      permit) has NO installed NAT mapping. In this static deployment the
+      data plane allocates nothing, so the packet is dropped. Confirms an
+      ACL permit does not bypass the NAT lookup.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 17}
+        - UDP:   {sport: 8000, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: outbound_src_not_internal_subnet_drop
+    visibility: hidden
+    description: |
+      A packet on the internal port whose source address (10.0.0.9) is not
+      in 192.168.1.0/24 is dropped before any translation.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "10.0.0.9", dst: "8.8.8.8", ttl: 64, proto: 17}
+        - UDP:   {sport: 5000, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: inbound_wrong_dst_drop
+    visibility: hidden
+    description: |
+      An inbound packet whose destination (203.0.113.99) is not the public
+      address is dropped, regardless of port/protocol.
+    input:
+      port: s1.external
+      layers:
+        - Ether: {src: "00:00:00:00:08:08", dst: "00:00:00:00:00:02"}
+        - IP:    {src: "8.8.8.8", dst: "203.0.113.99", ttl: 64, proto: 6}
+        - TCP:   {sport: 80, dport: 14000, flags: "A"}
+    expected:
+      behavior: drop
+
+# ─── G3: security / bypass / bug-pattern ────────────────────────────────
+
+  - name: inbound_unsolicited_drop
+    visibility: hidden
+    description: |
+      Default-deny on the public side. An inbound packet to 203.0.113.10:9999
+      (UDP) matches no installed mapping → unsolicited → drop. The ACL is
+      never reached (there is no de-NAT-ed internal tuple to classify).
+    input:
+      port: s1.external
+      layers:
+        - Ether: {src: "00:00:00:00:08:08", dst: "00:00:00:00:00:02"}
+        - IP:    {src: "8.8.8.8", dst: "203.0.113.10", ttl: 64, proto: 17}
+        - UDP:   {sport: 1234, dport: 9999}
+    expected:
+      behavior: drop
+
+  - name: icmp_dropped
+    visibility: hidden
+    description: |
+      NAPT scope is TCP/UDP only. An ICMP echo from the internal host is
+      dropped (it has no L4 ports to translate).
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 1}
+        - ICMP:  {type: 8, code: 0}
+    expected:
+      behavior: drop
+
+  - name: non_ipv4_arp_dropped
+    visibility: hidden
+    description: |
+      Parser-edge / conditional-deparser check. An ARP frame is dropped
+      (non-IPv4). A program that emits a degenerate header on the drop path
+      breaks the parser/deparser boundary.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "ff:ff:ff:ff:ff:ff", type: 2054}
+        - ARP:   {op: 1}
+    expected:
+      behavior: drop
+
+  - name: snat_checksum_validity
+    visibility: hidden
+    description: |
+      Checksum-after-modification check (the most common silent NAT bug). The
+      outbound permitted flow 192.168.1.5:5000 UDP → 8.8.8.8 is SNAT-ed; the
+      egress IPv4 header checksum and the UDP checksum MUST be valid over the
+      rewritten (src, sport). Same forward as outbound_udp_permit_snat.
+    input:
+      port: s1.internal
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:00:01"}
+        - IP:    {src: "192.168.1.5", dst: "8.8.8.8", ttl: 64, proto: 17}
+        - UDP:   {sport: 5000, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.external
+      transformations:
+        IP.src:    {action: change_to, value: "203.0.113.10"}
+        UDP.sport: {action: change_to, value: 14000}
+        IP.ttl:    {action: decremented_by, delta: 1}

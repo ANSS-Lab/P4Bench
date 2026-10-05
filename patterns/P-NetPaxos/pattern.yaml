@@ -1,0 +1,544 @@
+# P-NetPaxos — Paxos ACCEPTOR relocated into the switch data plane
+#
+# TPL v1.0 task pattern. The data-plane-feasible role of
+# NetPaxos / P4xos: the switch acts as a Paxos ACCEPTOR, holding per-instance
+# (slot) consensus state in registers — the highest-promised round `rnd` and
+# the accepted pair `(vrnd, vvalue)` — and reacting to PHASE-1A (prepare) and
+# PHASE-2A (accept) messages by promising / accepting / dropping. Relocates a
+# coordinator-side consensus role into the data plane (D10×P10,
+# target_capability=relocate). Acceptor-only by design: proposer, learner and
+# leader roles plus liveness are cross-node coordination and are v2-deferred
+# (see bridging_notes).
+
+pattern_id: P-NetPaxos
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D10:distributed-systems-primitives]    # in-network consensus (acceptor role)
+  prescriptive: [P10:in-network-compute]                # consensus relocated into the pipeline; SwitchML-style relocate row
+target_capability: relocate                             # a host/coordinator-side consensus role received by the switch
+summary: >
+  Single-slot Paxos ACCEPTOR realised on switch registers: per consensus
+  instance the switch stores the highest round it has promised (`rnd`) and the
+  last accepted ballot/value pair (`vrnd`, `vvalue`). On a PHASE-1A (prepare,
+  round r): if r is strictly newer than the stored `rnd` the acceptor adopts r
+  and FORWARDS a PROMISE echoing its current (`vrnd`, `vvalue`) so the proposer
+  can pick the safe value; a stale prepare (r ≤ rnd) is DROPPED. On a PHASE-2A
+  (accept, round r, value v): if r is not older than the stored `rnd` the
+  acceptor records (`vrnd`=r, `vvalue`=v), bumps `rnd` to r, and FORWARDS the
+  ACCEPTED message to the learners; a stale accept (r < rnd) is DROPPED. All
+  state is per-slot register state and every decision is observable as
+  forward/drop + the echoed stored-round / accepted-value header fields. The
+  canonical instance is a single-slot acceptor; mutation lifts to multi-slot
+  register arrays, wider round/value widths, a strict-monotonicity guard, and
+  a tightened PHASE-2A predicate (strict `>` vs `≥`).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: dang_netpaxos_sosr15
+      title: "NetPaxos: Consensus at Network Speed (Dang et al., SOSR 2015)"
+      sections: ["3", "4"]
+      role: canonical_implementation
+      quote: "asks the acceptors to promise that in the given instance they will reject any requests (Phase 1 or 2) with round number less than c-rnd."
+      quote_source: "NetPaxos §3 Paxos background (verbatim; cached at patterns/P-NetPaxos/grounding/dang_netpaxos_sosr15.txt). Grounds acceptor PHASE-1A promise / round-rejection rules R1 (promise) and R2 (stale-prepare drop), and accept_predicate on PHASE-2A (R3/R4)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        The canonical "consensus in the data plane" design and the source of
+        the acceptor's observable contract:
+          - §3  Paxos roles mapped onto switches. The ACCEPTOR is the role
+                that is purely local per instance — it keeps the highest
+                promised round and the last accepted (round, value) and reacts
+                to PHASE-1A / PHASE-2A messages without coordinating with peers
+                — which is exactly why this pattern realises the acceptor and
+                defers proposer / leader / learner coordination to v2.
+          - §3  PHASE-1A (prepare) → PROMISE: an acceptor that has not promised
+                a higher round adopts r and returns its current accepted pair;
+                a prepare for a round it has already superseded is ignored.
+                Basis for R1 (promise) and R2 (stale-prepare drop).
+          - §3  PHASE-2A (accept) → ACCEPTED: an acceptor accepts a value for a
+                round no older than its promise and forwards the ACCEPTED to
+                the learners; an accept for an older round is ignored. Basis
+                for R3 (accept) and R4 (stale-accept drop).
+          - §4  NetPaxos observes that the acceptor's per-instance state fits
+                in switch registers and that the message-driven reaction needs
+                no timers in the data plane — basis for the no-time_tick,
+                register-state-only restriction this pattern enforces.
+
+  rfcs: []
+
+  tutorials: []
+
+
+  posts:
+    - cite: dang_p4xos_ton20
+      title: "P4xos: Consensus in a Box / Partitioned Paxos (Dang et al., IEEE/ACM ToN 2020)"
+      url: "https://doi.org/10.1109/TNET.2020.2992106"
+      role: scaling_approach
+      relevance: |
+        The scaling sibling of NetPaxos that ports the acceptor logic to P4 on
+        programmable targets. Two design points inform this pattern's mutation
+        surface rather than its canonical rules:
+          - Per-slot register arrays. P4xos keeps one (rnd, vrnd, vvalue) cell
+            per consensus instance/slot, indexed by the message's instance id.
+            Basis for the `n_slots` capacity axis and the multi-slot register
+            array (widen_slots / shrink_slots operators); the canonical
+            instance is single-slot to keep multi-slot determinism out of the
+            baseline (see bridging_notes gradability note).
+          - Round / value bit-widths. P4xos parameterises the ballot and value
+            field widths; basis for the `round_width` / `value_width`
+            faithfulness ladder (D5.x) and its tighten/relax operator pair.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      A Paxos message carried in a custom UDP-payload "paxos" header:
+      msg_type (PHASE-1A | PHASE-2A | PROMISE | ACCEPTED), inst (slot id),
+      rnd (proposer's ballot), vrnd (echoed accepted round), vvalue (value).
+      All decisions derive from these fields plus the per-slot register state.
+
+  bucket:                                  # the per-slot acceptor register set
+    keyed_by_tuple: [hdr.paxos.inst]
+    attrs:
+      rnd:    int                          # highest round this acceptor has PROMISED, width ${round_width}
+      vrnd:   int                          # round at which vvalue was accepted, width ${round_width}
+      vvalue: int                          # last accepted value, width ${value_width}
+    capacity: ${n_slots}
+    notes: |
+      One acceptor cell per consensus instance/slot (P4xos register array).
+      In v1model: three register<>(${n_slots}) arrays indexed by hdr.paxos.inst
+      (single cell at index 0 when ${n_slots}==1). Initialised so an as-yet
+      untouched slot has rnd=vrnd=${round_zero} and vvalue=${value_none}.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  n_slots:
+    type: int
+    range: "[1, 65536]"
+    default: 1
+    notes: |
+      Number of consensus instances (register-array depth). Canonical instance
+      is single-slot (1); widen_slots / shrink_slots move the capacity axis.
+
+  round_width:
+    type: int
+    range: "[8, 32]"
+    default: 16
+    notes: "Bit-width of rnd / vrnd. Part of the D5.x faithfulness ladder."
+
+  value_width:
+    type: int
+    range: "[8, 256]"
+    default: 32
+    notes: "Bit-width of vvalue. Part of the D5.x faithfulness ladder."
+
+  round_zero:
+    type: int
+    range: "[0, 0]"
+    default: 0
+    notes: |
+      The sentinel 'no round promised yet' value an untouched slot reports
+      (rnd=vrnd=round_zero). A first prepare with rnd > round_zero promises.
+
+  value_none:
+    type: int
+    default: 0
+    notes: "The sentinel 'no value accepted yet' a fresh slot echoes as vvalue."
+
+  accept_predicate:
+    type: enum
+    values: [ge, gt]
+    default: ge
+    notes: |
+      PHASE-2A acceptance test against the stored rnd.
+        ge → accept when r ≥ rnd  (textbook Paxos; canonical instance).
+        gt → accept when r > rnd  (strict variant; tighten_accept_predicate).
+      Moves the feature-breadth axis (which message-handling rule the SUT must
+      get exactly right), not state fidelity.
+
+  enforce_round_monotonic:
+    type: bool
+    default: false
+    notes: |
+      Strictness guard for the round_monotonic invariant. When true, the
+      stored rnd MUST be non-decreasing across the message trace for a slot
+      (advisory → enforced). enable_round_monotonicity / disable_* move it.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_single_slot, D5.1_multi_slot, D5.2_wide_fields]
+    default: D5.0_single_slot
+    notes: |
+      Pattern-specific faithfulness ladder:
+        D5.0_single_slot → one slot, default widths (canonical).
+        D5.1_multi_slot  → register array indexed by inst.
+        D5.2_wide_fields → widened round/value fields.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_paxos_drop
+    when: "¬header_present(paxos)"
+    then:
+      - drop
+    notes: |
+      The pattern is the Paxos acceptor role only. Any frame without the paxos
+      header (e.g. plain IP/UDP, ARP) is out of scope and MUST NOT be forwarded.
+
+  - id: R1_phase1a_promise
+    when: |
+      header_present(paxos) ∧ match(hdr.paxos.msg_type, PHASE_1A)
+        ∧ value(bucket.rnd, "<", hdr.paxos.rnd)
+    given:
+      bucket: by_key(hdr.paxos.inst)       # single cell when ${n_slots}==1
+    then:
+      - set(bucket.rnd, hdr.paxos.rnd)
+      - set(hdr.paxos.msg_type, PROMISE)
+      - rewrite(hdr.paxos.vrnd, bucket.vrnd)
+      - rewrite(hdr.paxos.vvalue, bucket.vvalue)
+      - forward(promise_egress)
+    notes: |
+      NetPaxos §3 — a prepare with a round strictly newer than the highest
+      promised round is honoured: the acceptor adopts the new round and returns
+      a PROMISE echoing the round/value it has already accepted (round_zero /
+      value_none if none yet), so the proposer can choose the safe value. The
+      stored (vrnd, vvalue) are NOT modified by a prepare. The echoed fields
+      are the observable: a SUT that promises but fails to echo the prior
+      accepted pair is wrong even though it forwards.
+
+  - id: R2_phase1a_stale_drop
+    when: |
+      header_present(paxos) ∧ match(hdr.paxos.msg_type, PHASE_1A)
+        ∧ value(bucket.rnd, ">=", hdr.paxos.rnd)
+    given:
+      bucket: by_key(hdr.paxos.inst)
+    then:
+      - drop
+    notes: |
+      A prepare whose round is not newer than what the acceptor already
+      promised is stale and MUST be ignored (dropped). Pins the strict-`<`
+      promise boundary against an off-by-one ≤/< confusion.
+
+  - id: R3_phase2a_accept
+    when: |
+      header_present(paxos) ∧ match(hdr.paxos.msg_type, PHASE_2A)
+        ∧ accept_ok(bucket.rnd, hdr.paxos.rnd, ${accept_predicate})
+    given:
+      bucket: by_key(hdr.paxos.inst)
+    then:
+      - set(bucket.rnd, hdr.paxos.rnd)
+      - set(bucket.vrnd, hdr.paxos.rnd)
+      - set(bucket.vvalue, hdr.paxos.vvalue)
+      - set(hdr.paxos.msg_type, ACCEPTED)
+      - rewrite(hdr.paxos.vrnd, hdr.paxos.rnd)
+      - forward(learner_egress)
+    notes: |
+      NetPaxos §3 — an accept for a round the acceptor has not superseded is
+      accepted: store (vrnd=r, vvalue=v), bump rnd to r, and FORWARD an ACCEPTED
+      to the learners. accept_ok(stored, r, pred) is `r ≥ stored` when
+      ${accept_predicate}==ge (textbook) and `r > stored` when ==gt (strict).
+      The acceptance test is against the PROMISED round; both R3 and R4 read the
+      same stored rnd so their guards partition the input.
+
+  - id: R4_phase2a_stale_drop
+    when: |
+      header_present(paxos) ∧ match(hdr.paxos.msg_type, PHASE_2A)
+        ∧ ¬accept_ok(bucket.rnd, hdr.paxos.rnd, ${accept_predicate})
+    given:
+      bucket: by_key(hdr.paxos.inst)
+    then:
+      - drop
+    notes: |
+      An accept for a round older than (or, under gt, not strictly newer than)
+      the promised round is stale and MUST be dropped — the acceptor has
+      promised a later proposer not to accept it. The complement of R3's guard.
+
+  - id: R5_reply_message_drop
+    when: |
+      header_present(paxos)
+        ∧ (match(hdr.paxos.msg_type, PROMISE) ∨ match(hdr.paxos.msg_type, ACCEPTED))
+    then:
+      - drop
+    notes: |
+      PROMISE / ACCEPTED are acceptor *outputs*; an acceptor that receives one
+      as input (loopback / misdirected) has no role for it and drops. Keeps the
+      message-type space total and guards against a SUT that re-processes its
+      own replies.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: promise_round_safety
+    clause: stability
+    target: bucket.rnd
+    while: "rule R1 fires ∨ rule R3 fires"
+    notes: |
+      After honouring a prepare (R1) or accept (R3) for round r, the stored
+      rnd equals r and is the largest round the acceptor has ever promised. A
+      later prepare/accept with a round ≤ rnd (or < rnd under gt) must NOT move
+      it — this is the core Paxos safety the promise/accept boundary encodes.
+
+  - id: accepted_pair_persistence
+    clause: persistence
+    target: "(bucket.vrnd, bucket.vvalue)"
+    while: "rule R1 fires ∨ rule R2 fires"
+    free_under: [R3_phase2a_accept]
+    notes: |
+      A prepare NEVER changes the accepted pair (R1 echoes it, R2 drops). The
+      accepted (vrnd, vvalue) changes ONLY when an accept is honoured (R3), the
+      single free operation. A SUT that overwrites vvalue on a prepare violates
+      Paxos safety.
+
+  - id: round_monotonic
+    clause: stability
+    target: bucket.rnd
+    while: "any rule fires for a given hdr.paxos.inst"
+    enforced_when: "${enforce_round_monotonic}"
+    notes: |
+      The promised round for a slot is non-decreasing across the trace: no
+      honoured message ever lowers rnd. Advisory by default; enable_round_
+      monotonicity makes it an enforced check (strictness axis).
+
+  - id: no_orphan_slots
+    clause: no_orphan
+    target: bucket
+    notes: |
+      Acceptor state is bounded: at most ${n_slots} cells are live, indexed by
+      hdr.paxos.inst; an inst outside [0, ${n_slots}) maps to no orphaned cell
+      (see drop_inst_out_of_range). No unbounded per-message allocation.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: promise_fresh_slot
+      generate: |
+        Send PHASE-1A inst=0 rnd=5 to an untouched slot (rnd=round_zero).
+        Assert: FORWARDED on promise_egress; msg_type==PROMISE; echoed
+        vrnd==round_zero, vvalue==value_none; stored rnd becomes 5.
+    - id: accept_after_promise
+      generate: |
+        After promise_fresh_slot, send PHASE-2A inst=0 rnd=5 vvalue=42.
+        Assert: FORWARDED on learner_egress; msg_type==ACCEPTED; stored
+        (vrnd,vvalue)==(5,42); stored rnd==5; echoed vrnd==5.
+    - id: promise_echoes_prior_accept
+      generate: |
+        After accept_after_promise, send PHASE-1A inst=0 rnd=8. Assert:
+        PROMISE forwarded echoing vrnd==5, vvalue==42 (the previously accepted
+        pair, NOT round_zero/value_none); stored rnd becomes 8; (vrnd,vvalue)
+        unchanged at (5,42).
+    - id: accept_at_equal_round_ge
+      requires: "${accept_predicate} == ge"
+      generate: |
+        Slot with rnd=5; send PHASE-2A rnd=5 vvalue=7. Under ge, r==rnd is
+        accepted: ACCEPTED forwarded; (vrnd,vvalue)==(5,7). Pins the ≥ boundary.
+
+  G2:
+    - id: drop_stale_prepare
+      generate: |
+        Slot with rnd=8 (promised); send PHASE-1A rnd=8 then rnd=3. Assert
+        BOTH dropped (r not strictly > rnd); stored rnd unchanged at 8;
+        (vrnd,vvalue) unchanged.
+    - id: drop_stale_accept
+      generate: |
+        Slot with rnd=8; send PHASE-2A rnd=3 vvalue=99. Assert DROP; stored
+        (vrnd,vvalue) unchanged; rnd unchanged at 8 (acceptor promised a later
+        proposer not to accept this).
+    - id: accept_at_equal_round_gt_drops
+      requires: "${accept_predicate} == gt"
+      generate: |
+        Slot with rnd=5; send PHASE-2A rnd=5 vvalue=7. Under gt, r==rnd is NOT
+        strictly newer ⇒ DROP; (vrnd,vvalue) unchanged. Boundary complement of
+        accept_at_equal_round_ge.
+    - id: drop_inst_out_of_range
+      requires: "${n_slots} > 1"
+      generate: |
+        Send PHASE-2A inst=${n_slots} (one past the last valid slot). Assert
+        DROP (no orphaned cell); no in-range slot's state changes.
+    - id: multi_slot_independence
+      requires: "${n_slots} > 1"
+      generate: |
+        Promise+accept on inst=0, then PHASE-1A on inst=1. Assert inst=1
+        echoes its OWN (round_zero,value_none), not inst=0's accepted pair —
+        slots are independent register cells.
+
+  G3:
+    - id: drop_non_paxos
+      generate: |
+        Send a plain IPv4/UDP frame with no paxos header (and an ARP frame);
+        assert DROP (R0). Probes the conditional-deparser bug: the paxos header
+        must be emitted only when valid, never on the dropped non-paxos frame.
+    - id: drop_reply_message_loopback
+      generate: |
+        Send an ACCEPTED (and a PROMISE) message INTO the acceptor; assert DROP
+        (R5) — these are outputs, not inputs; no state change.
+    - id: prepare_does_not_corrupt_value
+      generate: |
+        Slot holding accepted (vrnd=5,vvalue=42); send a winning PHASE-1A
+        rnd=9; assert the PROMISE echoes (5,42) and the stored (vrnd,vvalue)
+        is STILL (5,42) afterwards — a prepare must never write the value
+        register (accepted_pair_persistence). Adversarial against value clobber.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: widen_slots
+    axis: capacity
+    direction: harden
+    applicable_when: "${n_slots} == 1"
+    effect: |
+      ${n_slots} ← 16 ∧ ${faithfulness} ← D5.1_multi_slot.
+      Lifts the single cell to a register array indexed by hdr.paxos.inst;
+      activates drop_inst_out_of_range and multi_slot_independence G2 cases.
+    feasibility_postcondition: "${n_slots} ≥ 2 ∧ ${n_slots} ≤ 65536"
+    notes: |
+      Multi-slot acceptor (P4xos register array). The SUT must index three
+      register arrays by inst and bound the index — the per-slot determinism
+      the canonical instance deliberately avoided.
+
+  - id: shrink_slots
+    axis: capacity
+    direction: ease
+    applicable_when: "${n_slots} > 1"
+    effect: "${n_slots} ← 1 ∧ ${faithfulness} ← D5.0_single_slot"
+    feasibility_postcondition: "${n_slots} == 1"
+    notes: |
+      Ease counterpart of widen_slots: collapse to a single slot, removing the
+      array-indexing burden and the out-of-range / independence G2 cases.
+
+  - id: tighten_accept_predicate
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${accept_predicate} == ge"
+    effect: "${accept_predicate} ← gt"
+    feasibility_postcondition: "${accept_predicate} == gt"
+    notes: |
+      Switch PHASE-2A acceptance from r ≥ rnd to the strict r > rnd variant.
+      Swaps which boundary the SUT must get exactly right (activates
+      accept_at_equal_round_gt_drops, deactivates accept_at_equal_round_ge);
+      feature-breadth, not state fidelity.
+
+  - id: relax_accept_predicate
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${accept_predicate} == gt"
+    effect: "${accept_predicate} ← ge"
+    feasibility_postcondition: "${accept_predicate} == ge"
+    notes: "Ease counterpart of tighten_accept_predicate: revert to textbook ≥."
+
+  - id: enable_round_monotonicity
+    axis: strictness
+    direction: harden
+    applicable_when: "${enforce_round_monotonic} == false"
+    effect: "${enforce_round_monotonic} ← true"
+    feasibility_postcondition: "${enforce_round_monotonic} == true"
+    notes: |
+      Promote round_monotonic from advisory to enforced: the trace-level check
+      now fails any SUT that ever lowers a slot's promised round. Strictness
+      axis (invariant guard), no rule-semantics change.
+
+  - id: disable_round_monotonicity
+    axis: strictness
+    direction: ease
+    applicable_when: "${enforce_round_monotonic} == true"
+    effect: "${enforce_round_monotonic} ← false"
+    feasibility_postcondition: "${enforce_round_monotonic} == false"
+    notes: "Ease counterpart of enable_round_monotonicity."
+
+  - id: widen_fields
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${round_width} <= 16 ∧ ${value_width} <= 32"
+    effect: |
+      ${round_width} ← 32 ∧ ${value_width} ← 256 ∧
+      ${faithfulness} ← D5.2_wide_fields
+    feasibility_postcondition: "${round_width} ≤ 32 ∧ ${value_width} ≤ 256"
+    notes: |
+      Widen the ballot/value fields (P4xos parameterises these). Stresses
+      wide-field register handling and comparison correctness — the
+      exact-state-fidelity faithfulness axis, distinct from feature-breadth.
+
+  - id: narrow_fields
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${round_width} >= 32 ∨ ${value_width} >= 256"
+    effect: |
+      ${round_width} ← 16 ∧ ${value_width} ← 32 ∧
+      ${faithfulness} ← D5.0_single_slot
+    feasibility_postcondition: "${round_width} ≥ 8 ∧ ${value_width} ≥ 8"
+    notes: "Ease counterpart of widen_fields: revert to default widths."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations to v1model P4:
+
+    Canonical (n_slots: 1, accept_predicate: ge):
+      - Parser: ethernet → ipv4 → udp → (dstPort == PAXOS_PORT) → parse_paxos.
+        The paxos header carries msg_type, inst, rnd, vrnd, vvalue.
+      - State: three register arrays — reg_rnd, reg_vrnd, reg_vvalue, each
+        register<bit<W>>(${n_slots}); index = hdr.paxos.inst (constant 0 when
+        single-slot). Read the cell at ingress, branch on msg_type, write back.
+      - PHASE-1A: if (hdr.paxos.rnd > rnd) { rnd = hdr.paxos.rnd;
+        hdr.paxos.msg_type = PROMISE; hdr.paxos.vrnd = vrnd_reg;
+        hdr.paxos.vvalue = vvalue_reg; forward(promise_egress); } else drop.
+      - PHASE-2A: if (accept_ok) { rnd = vrnd = hdr.paxos.rnd;
+        vvalue = hdr.paxos.vvalue; hdr.paxos.msg_type = ACCEPTED;
+        hdr.paxos.vrnd = hdr.paxos.rnd; forward(learner_egress); } else drop.
+      - Deparser: emit paxos only when hdr.paxos.isValid(); on a dropped
+        non-paxos frame the paxos header is invalid and MUST NOT be emitted
+        (the conditional-deparser bug class).
+
+  Anti-pattern implementations to reject:
+    * Writing the value register (vvalue) on a PHASE-1A prepare — a prepare
+      only promises; it never accepts (accepted_pair_persistence).
+    * Using ≤ where the spec wants < on the prepare boundary (and vice-versa
+      on the accept boundary under gt) — the off-by-one round bugs R2/R4 pin.
+    * Reading standard_metadata after a drop / unconditional paxos emit on the
+      non-paxos path.
+    * Indexing the register arrays with an unbounded hdr.paxos.inst when
+      n_slots>1 (out-of-bounds register access) — bound to [0, n_slots).
+
+  GRADABILITY / SCOPE (v2-deferred — the higher-order deferred class):
+    This pattern realises ONLY the Paxos ACCEPTOR, and only its single-slot
+    register reaction, because that is the subset expressible in the v1.0 TPL
+    vocabulary and deterministically gradable under BMv2 --use-files:
+      - PROPOSER / LEADER roles need leader election, ballot generation, and
+        retransmission across nodes — cross-node coordination with no v1.0
+        primitive, and the harness injects no time_tick (no failure-detection
+        timeout, no periodic re-proposal). Deferred to v2.
+      - LEARNER quorum counting (a value is "chosen" once a majority of
+        acceptors accept it) requires aggregating ACCEPTED messages across
+        DISTINCT acceptor nodes — multi-node aggregation the single-switch
+        harness cannot stage. The acceptor here merely FORWARDS its ACCEPTED to
+        the learner egress; it does not count quorums. Deferred to v2.
+      - LIVENESS / progress (eventual chosen value under a stable leader) is a
+        temporal multi-node property, not a per-packet decision; not gradable
+        without timers and multiple nodes. Deferred to v2.
+    What remains — promise/accept/drop on per-slot rnd/(vrnd,vvalue) registers,
+    observable as forward vs drop plus the echoed stored-round / accepted-value
+    header fields — is fully deterministic and single-node, hence gradable.
+    Multi-slot (widen_slots) stays gradable because each slot is an independent
+    register cell keyed by hdr.paxos.inst with no cross-slot interaction.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance (schema, bindings, oracle
+  audit) and hand-run the public tests through the oracle for the seed. Author a
+  custom_headers.py defining the `paxos` Scapy layer (msg_type, inst, rnd,
+  vrnd, vvalue) so the verifier can build and read it.

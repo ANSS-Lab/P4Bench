@@ -1,0 +1,601 @@
+task_name: ptp_tc_disc_mut1
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-PTPTransparentClock
+pattern_version: '1.0'
+
+seed:
+  faithfulness: D5.1_udp_checksum
+  step_mode: one_step
+  delay_mechanism: p2p
+  correction_field_faithfulness: full64_scaled_ns
+  transport: udp_ipv4
+  domain_handling: multi_domain_filtered
+  active_domains: [0]
+  corrected_message_types: all_event
+  correlation_capacity: unbounded
+  link_delays:
+    - ingress_port: 1
+      mean_link_delay: 100000000
+    - ingress_port: 2
+      mean_link_delay: 10000000
+  link_delay_capacity: 64
+
+scoring:
+  public_weight: 0.2   # public-overfitting cannot exceed 0.2
+  hidden_weight: 0.8
+
+description: |
+  A switch s1 sits on the path between a time master and a time slave and
+  acts as a Precision Time Protocol (PTP, IEEE 1588) *peer-to-peer
+  transparent clock*. For each PTP event message that transits the switch it
+  folds the switch's own delay contribution into a correction value the
+  message carries, so a downstream clock can subtract it. A peer-to-peer
+  transparent clock corrects for two things together: the *residence time*
+  (how long the message spent inside the switch) AND the *mean link delay*
+  of the link the message arrived on. Concept attribution: IEEE 1588
+  transparent clock; the end-to-end vs peer-to-peer mechanism and
+  clock-domain vocabulary follow RFC 8173 (the PTPv2 MIB).
+
+  PTP runs over UDP/IPv4 (IEEE 1588 Annex D): PTP **event** messages arrive
+  as Ethernet / IPv4 / UDP with UDP destination port 319, and PTP **general**
+  messages with UDP destination port 320. All other traffic is non-PTP.
+
+  ## What a PTP message looks like on the wire
+
+  After the UDP header sits a 34-byte PTP common header:
+
+    - byte 0: a 4-bit transportSpecific/majorSdoId field, then a 4-bit
+      **messageType** (the low nibble of the byte).
+    - byte 1: a 4-bit minorVersionPTP, then a 4-bit versionPTP.
+    - bytes 2-3: messageLength (16 bits).
+    - byte 4: **domainNumber**.
+    - byte 5: minorSdoId / reserved.
+    - bytes 6-7: flagField (16 bits).
+    - bytes 8-15: **correctionField** — a 64-bit value in units of
+      2^-16 nanoseconds (the integer nanosecond count is the value shifted
+      left by 16 bits).
+    - bytes 16-19: a 32-bit messageTypeSpecific / **reserved** field.
+    - bytes 20-29: sourcePortIdentity = an 8-byte clockIdentity followed by
+      a 2-byte portNumber.
+    - bytes 30-31: sequenceId (16 bits).
+    - byte 32: controlField.
+    - byte 33: logMessageInterval.
+
+  The messageType nibble identifies the message:
+
+    - **Event messages** (timing that the correction affects):
+      Sync 0x0, Delay_Req 0x1, Pdelay_Req 0x2, Pdelay_Resp 0x3.
+    - **General messages** (never corrected by a transparent clock):
+      Follow_Up 0x8, Delay_Resp 0x9, Pdelay_Resp_Follow_Up 0xA,
+      Announce 0xB, Signaling 0xC, Management 0xD.
+
+  ## Topology, forwarding, and per-link configuration
+
+  Two hosts attach to s1:
+
+    - h1 (the master side) attaches at s1.p1; IPv4 10.0.1.1,
+      MAC 08:00:00:00:01:01.
+    - h2 (the slave side) attaches at s1.p2; IPv4 10.0.2.2,
+      MAC 08:00:00:00:02:02.
+
+  s1 forwards every frame — PTP or not — toward the host that owns the
+  destination IPv4 address: a packet for 10.0.1.1 leaves s1.p1, a packet
+  for 10.0.2.2 leaves s1.p2, and in each case the Ethernet destination is
+  rewritten to that host's MAC. You provide the forwarding table and its
+  entries. As a transparent clock the switch does NOT decrement the IPv4
+  TTL and does NOT otherwise alter forwarded headers beyond the PTP
+  correction described below.
+
+  The control plane configures a **mean link delay**, in nanoseconds, for
+  each ingress link. You provide this per-ingress-port table and its
+  entries with the following values:
+
+    - the link arriving on s1.p1 has mean link delay **100000000 ns**;
+    - the link arriving on s1.p2 has mean link delay **10000000 ns**.
+
+  ## Per-packet behaviour
+
+  For every frame s1 receives:
+
+   1. **Non-PTP passthrough.** If the frame is not a PTP message (not an
+      IPv4/UDP packet with UDP destination port 319 or 320), forward it
+      normally with no PTP processing.
+
+   2. **General messages pass through uncorrected.** A PTP message whose
+      messageType is one of Follow_Up 0x8, Delay_Resp 0x9,
+      Pdelay_Resp_Follow_Up 0xA, Announce 0xB, Signaling 0xC, or
+      Management 0xD MUST be forwarded with its correctionField and every
+      other PTP field byte-identical to the input.
+
+   3. **Domain filter.** Only PTP event messages whose **domainNumber is 0**
+      are corrected. A PTP event message with any other domainNumber MUST be
+      forwarded unmodified — its correctionField and reserved field
+      untouched, exactly like a general message.
+
+   4. **Event messages in domain 0 are corrected.** For every PTP event
+      message (Sync 0x0, Delay_Req 0x1, Pdelay_Req 0x2, Pdelay_Resp 0x3)
+      whose domainNumber is 0:
+
+        a. Measure the **residence time**: the elapsed time between the
+           moment the message entered the switch and the moment it leaves
+           the switch.
+
+        b. Take the **mean link delay** configured for the message's ingress
+           link (from the per-port table above).
+
+        c. Sum the residence time and the mean link delay, convert that sum
+           to the correctionField's units (2^-16 ns), and **ADD** it to the
+           message's existing correctionField. The correction MUST be
+           *added* to whatever value the field already holds — it MUST NOT
+           overwrite the field. Use the full 64-bit field with carry; do not
+           truncate to 32 bits and do not drop the 2^-16-ns scale.
+
+        d. Clear the 32-bit messageTypeSpecific / reserved field
+           (bytes 16-19) to zero on the corrected message.
+
+        e. Because the correctionField (and the reserved field) live inside
+           the UDP payload, recompute the UDP checksum so the forwarded
+           packet carries a correct checksum.
+
+        f. Forward the corrected message normally (per the forwarding rule).
+
+   5. **Transparency.** Non-PTP frames, PTP general messages, and event
+      messages outside domain 0 leave the switch with their PTP-relevant
+      content unchanged. A correction never replaces the existing
+      correctionField — it accumulates onto it.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - from: h1
+      to: s1.p1
+    - from: s1.p2
+      to: h2
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+
+custom_headers:
+  - file: custom_headers.py
+    class: PTP
+    description: "IEEE 1588 PTP common header (34 bytes) over UDP/IPv4, ports 319/320"
+
+# Correction-arithmetic note for the expected blocks (peer-to-peer):
+#   correctionField_out = correctionField_in + ((residence_ns + mean_link_delay_ns) << 16)
+#   Event messages preload correctionField = 2^48 (281474976710656). The mean
+#   link delay is a control-plane CONSTANT (port1 = 100000000 ns, port2 =
+#   10000000 ns), so it dominates the small non-deterministic residence and the
+#   output is bracketed tightly by change_to_range:
+#     port-1 ingress (residence <= 10 ms ceiling): [288028576710656, 288683936710656]
+#     port-2 ingress (residence <= 10 ms ceiling): [282130336710656, 282785696710656]
+#     port-1 ingress with zero incoming field    : [6553600000000,   7208960000000]
+#   The two per-port ranges do not overlap, so a single-global-delay
+#   implementation fails one of the two ports; an e2e (no link delay)
+#   implementation falls far below either floor.
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: sync_residence_correction_additive_p1
+    visibility: public
+    description: |
+      A PTP Sync (messageType 0x0, domainNumber 0) over UDP/IPv4 (dst port
+      319) transits from the master (h1) toward the slave (h2). It arrives
+      with a large nonzero correctionField and nonzero reserved. The switch
+      MUST add (residence + the s1.p1 mean link delay 100000000 ns) to the
+      correctionField — not substitute for it — and clear the reserved
+      field. The dominant, constant link-delay term makes the corrected
+      value land in a tight, predictable range.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            flagField: 0x0200
+            correctionField: 0x0001000000000000
+            reserved: 0xDEADBEEF
+            sequenceId: 100
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: non_ptp_passthrough_unmodified
+    visibility: public
+    description: |
+      A plain non-PTP packet (IPv4/TCP from h1 to h2) MUST be forwarded
+      toward h2 (s1.p2) with the Ethernet destination rewritten to h2's MAC
+      and the IPv4 TTL unchanged. No PTP processing applies.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 6}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl: {action: unchanged}
+
+  - name: reserved_cleared_after_correction
+    visibility: public
+    description: |
+      A domain-0 Sync with a nonzero reserved field MUST have its 32-bit
+      reserved field cleared to zero after correction, and the link-delay
+      correction applied. A switch that forwards the event message untouched
+      fails both checks.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x12345678
+            sequenceId: 101
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.reserved: {action: change_to, value: 0}
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+
+  - name: sync_from_h2_per_port_link_delay
+    visibility: hidden
+    description: |
+      A domain-0 Sync arriving on s1.p2 (from h2 toward h1) MUST be corrected
+      with the s1.p2 mean link delay (10000000 ns), NOT the s1.p1 delay. The
+      corrected value lands in the port-2 range, which does not overlap the
+      port-1 range — so an implementation that uses a single global link
+      delay (or the wrong port's value) fails here. Tests the per-port
+      link-delay lookup.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000DD
+            sequenceId: 102
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        PTP.correctionField: {action: change_to_range, min: 282130336710656, max: 282785696710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: announce_correction_field_untouched
+    visibility: hidden
+    description: |
+      A PTP Announce (messageType 0xB) on the general port (320) with a
+      nonzero correctionField MUST pass through byte-identical.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 320}
+        - PTP:
+            messageType: 0xB
+            versionPTP: 2
+            messageLength: 64
+            domainNumber: 0
+            correctionField: 0x0000000000000ABC
+            reserved: 0x00000000
+            sequenceId: 7
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: signaling_message_untouched
+    visibility: hidden
+    description: |
+      A PTP Signaling message (messageType 0xC) on the general port (320)
+      MUST pass through with its correctionField unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 320}
+        - PTP:
+            messageType: 0xC
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0000000000005555
+            sequenceId: 8
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+
+  - name: delay_req_event_corrected
+    visibility: hidden
+    description: |
+      A domain-0 Delay_Req (messageType 0x1) on s1.p1 MUST have
+      (residence + s1.p1 link delay) added to its correctionField under the
+      all-event correction policy. A switch that corrects only Sync fails.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x1
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000AA
+            sequenceId: 200
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: pdelay_req_event_corrected
+    visibility: hidden
+    description: |
+      A domain-0 Pdelay_Req (messageType 0x2) on s1.p1 MUST have the
+      peer-to-peer correction added under the all-event policy.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x2
+            versionPTP: 2
+            messageLength: 54
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000BB
+            sequenceId: 201
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: pdelay_resp_event_corrected
+    visibility: hidden
+    description: |
+      A domain-0 Pdelay_Resp (messageType 0x3) on s1.p1 MUST have the
+      peer-to-peer correction added under the all-event policy.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x3
+            versionPTP: 2
+            messageLength: 54
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000CC
+            sequenceId: 202
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+# --- G2: resource robustness / boundary ---
+
+  - name: non_ptp_udp_other_port_passthrough
+    visibility: hidden
+    description: |
+      A UDP packet on a non-PTP destination port (1234) MUST be treated as
+      non-PTP and forwarded normally. Catches a switch that corrects any UDP
+      packet.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 1234}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl: {action: unchanged}
+
+  - name: sync_zero_incoming_correctionfield_boundary
+    visibility: hidden
+    description: |
+      Boundary case: a domain-0 Sync on s1.p1 with correctionField = 0. The
+      (residence + s1.p1 link delay) correction is added onto zero; the
+      output lands in the zero-incoming port-1 range, and the reserved field
+      is cleared.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0000000000000000
+            reserved: 0x99887766
+            sequenceId: 300
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: change_to_range, min: 6553600000000, max: 7208960000000}
+        PTP.reserved: {action: change_to, value: 0}
+
+# --- G3: regression for v1model bug patterns + the new domain/p2p surfaces ---
+
+  - name: udp_checksum_recomputed_after_correction
+    visibility: hidden
+    description: |
+      Regression for the #1 silent-failure bug family (checksum after
+      modification). A domain-0 Sync over UDP/IPv4 (dst port 319) arrives with
+      a valid UDP checksum; the switch rewrites the correctionField and clears
+      the reserved field, both inside the UDP payload, so the UDP checksum MUST
+      be recomputed. The check recomputes the UDP checksum over the EMITTED
+      output packet and asserts it equals the emitted checksum field — a switch
+      that rewrites the payload but leaves the stale checksum (peers would drop
+      the packet) fails. This is residence-independent: it tests
+      self-consistency of the output, not a predicted magnitude.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x0F0F0F0F
+            sequenceId: 500
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        UDP.chksum: {action: checksum_valid}
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: sync_other_domain_passthrough
+    visibility: hidden
+    description: |
+      A Sync (messageType 0x0) with domainNumber = 5 (NOT in the corrected
+      set {0}) MUST pass through UNMODIFIED — correctionField unchanged and
+      reserved NOT cleared — exactly like a general message. Catches a switch
+      that corrects every event message regardless of domainNumber.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 5
+            correctionField: 0x0001000000000000
+            reserved: 0x44556677
+            sequenceId: 301
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: deparser_structure_corrected_sync
+    visibility: hidden
+    description: |
+      Regression for the conditional-deparser surface: a corrected domain-0
+      Sync must emerge with full Ethernet/IPv4/UDP/PTP structure intact — UDP
+      destination port still 319, correctionField present and corrected,
+      reserved cleared.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x0BADF00D
+            sequenceId: 400
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        UDP.dport: {action: unchanged}
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: deparser_structure_passthrough_announce
+    visibility: hidden
+    description: |
+      Companion to the corrected-Sync regression: a pass-through Announce
+      must emerge with full structure intact, UDP destination port still 320,
+      and correctionField byte-identical.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 320}
+        - PTP:
+            messageType: 0xB
+            versionPTP: 2
+            messageLength: 64
+            domainNumber: 0
+            correctionField: 0x0000000000001234
+            reserved: 0x00000000
+            sequenceId: 401
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        UDP.dport: {action: unchanged}
+        PTP.correctionField: {action: unchanged}

@@ -1,0 +1,120 @@
+{
+  "oracle_hash": "035027e84bc21834a78a2b142b3c4295f23d17554650f92db2b4831753f83e2d",
+  "instance": "retransmit_detect_anchor-default",
+  "ran_at": "2026-06-16T20:44:39.559757Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_tcp_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "pure_ack_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "first_segment_init",
+        "status": "pass"
+      },
+      {
+        "example_id": "in_order_advance",
+        "status": "pass"
+      },
+      {
+        "example_id": "retransmit_detected",
+        "status": "pass"
+      },
+      {
+        "example_id": "retransmit_does_not_rewind_mark",
+        "status": "pass"
+      },
+      {
+        "example_id": "distinct_flow_independence",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_observable_surface_mark_only_retransmit",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_observable_surface_mark_and_count_retransmit",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_flow_capacity_bounded_hashed_retransmit",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_seq_faithfulness_bare_seq_retransmit",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_count_strictness_true_retransmit",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "highwater_monotone": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "retransmit_flag_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "data_path_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "retransmit_count_exact": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mirror_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "highwater_monotone",
+      "retransmit_flag_correctness",
+      "data_path_preserved",
+      "retransmit_count_exact",
+      "mirror_no_orphan"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "lossradar_conext16",
+      "dapper_sosr17",
+      "RFC9293"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

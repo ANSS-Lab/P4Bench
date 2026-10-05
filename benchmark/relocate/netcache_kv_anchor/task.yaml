@@ -1,0 +1,361 @@
+task_name: netcache_kv_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-NetCacheKV
+pattern_version: '1.0'
+
+seed:
+  client_ports: [1]
+  backend_ports: [2]
+  backend_port: 2
+  cache_entries:
+    - {key: 100, value: 1000}
+    - {key: 200, value: 2000}
+    - {key: 300, value: 3000}
+  cache_op_breadth: get_put_delete
+  coherence_policy: invalidate_on_write
+
+description: |
+  A switch s1 sits in front of a backend key-value (KV) storage server and
+  acts as an in-network read cache for a small set of hot keys, in the style
+  of NetCache (Jin et al., SOSP 2017). Port s1.p1 faces the clients that
+  issue KV requests; port s1.p2 faces the backend storage server. The goal
+  is to serve reads of cached keys directly from the switch — without
+  bothering the backend — while never returning a value that the store has
+  since changed.
+
+  ## KV request format
+
+  Clients send KV requests in a small application header carried over UDP
+  with destination port 8888. The header has three fields:
+
+    - `op`    — 1 byte: 0 = GET, 1 = PUT, 2 = DELETE, 3 = GET_RESPONSE
+    - `key`   — an 8-byte (64-bit) key
+    - `value` — a 4-byte (32-bit) value
+
+  A GET reads a key; a PUT writes a key (its new value is in the `value`
+  field); a DELETE removes a key. GET_RESPONSE is the op the switch uses
+  when it answers a read itself.
+
+  ## Cached contents (provided by the control plane)
+
+  The control plane has decided that the following keys are hot and should
+  be cached, and has provided their current values:
+
+    - key 100 → value 1000
+    - key 200 → value 2000
+    - key 300 → value 3000
+
+  Every cached key starts out valid (the cache holds a value the switch is
+  allowed to serve). Keys that are not in this list are not cached.
+
+  ## Per-packet behaviour (requests arrive on the client port s1.p1)
+
+   1. **GET of a cached, still-valid key** — the switch MUST answer the
+      request itself: it forms a response (op = GET_RESPONSE) carrying the
+      cached value and sends it back toward the requesting client, and it
+      MUST NOT forward the request on to the backend server. The read is
+      served entirely by the switch. (Observable effect: nothing is sent to
+      the backend port s1.p2.)
+
+   2. **GET of a key that is not cached, or whose cached copy has been
+      invalidated** — the switch MUST forward the request to the backend
+      server on s1.p2 (the backend owns the authoritative value).
+
+   3. **PUT or DELETE of a cached key** — the value in the store is about to
+      change, so the switch MUST invalidate that key's cached copy: after
+      this write, a subsequent GET of the same key MUST be treated as a miss
+      (forwarded to the backend) until the key is cached again. The write
+      itself MUST also be forwarded to the backend server on s1.p2.
+
+   4. **PUT or DELETE of a key that is not cached** — the switch MUST forward
+      the write to the backend on s1.p2 and MUST NOT disturb any other key's
+      cached copy.
+
+   5. **Any packet that is not a KV request** (for example ordinary UDP
+      traffic not destined to port 8888) — this is not a cache request and
+      MUST be forwarded normally toward the backend on s1.p2; it MUST NOT be
+      dropped or modified.
+
+  ## Requirements
+
+    - The cache must distinguish keys: a request for one key must never be
+      answered with, or invalidate, a different key's cached value.
+    - Invalidation MUST persist: once a write has invalidated a key, every
+      later GET of that key is a miss until the key is re-cached. The switch
+      must not keep serving the old value.
+    - A request for a key the switch has never cached MUST be a miss
+      (forwarded to the backend) — the switch must never fabricate a value
+      for an unknown key.
+
+  Grounding: NetCache (Jin et al., SOSP 2017); DistCache (Liu et al.,
+  FAST 2019).
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: get_hit_cached_key
+    visibility: public
+    description: |
+      A GET for cached key 100 arrives on the client port s1.p1. The switch
+      MUST answer it itself (originate a GET_RESPONSE back toward the client)
+      and MUST NOT forward the request to the backend on s1.p2. Observable
+      effect: no packet reaches the backend port.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5000, dport: 8888}
+        - NetCache: {op: 0, key: 100, value: 0}
+    expected:
+      behavior: drop
+
+  - name: get_miss_uncached_key
+    visibility: public
+    description: |
+      A GET for key 999, which is not cached, arrives on s1.p1. The switch
+      MUST forward it to the backend storage server on s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5001, dport: 8888}
+        - NetCache: {op: 0, key: 999, value: 0}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: get_hit_second_cached_key
+    visibility: public
+    description: |
+      A GET for cached key 200 is also served in-switch (no backend forward),
+      proving the cache lookup is parameterised by the key rather than
+      hard-coded to one entry.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5002, dport: 8888}
+        - NetCache: {op: 0, key: 200, value: 0}
+    expected:
+      behavior: drop
+
+  - name: put_invalidates_then_get_misses
+    visibility: hidden
+    description: |
+      Write-invalidation coherence. A PUT for cached key 100 (carrying a new
+      value) is sent first; it invalidates the cached copy and is forwarded
+      to the backend. The following GET for key 100 MUST now be a miss —
+      forwarded to the backend on s1.p2 — NOT answered from the stale cached
+      value.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+          - UDP:   {sport: 5003, dport: 8888}
+          - NetCache: {op: 1, key: 100, value: 4242}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5004, dport: 8888}
+        - NetCache: {op: 0, key: 100, value: 0}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: delete_invalidates_then_get_misses
+    visibility: hidden
+    description: |
+      A DELETE for cached key 200 invalidates its cached copy; the subsequent
+      GET for key 200 MUST miss and be forwarded to the backend on s1.p2.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+          - UDP:   {sport: 5005, dport: 8888}
+          - NetCache: {op: 2, key: 200, value: 0}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5006, dport: 8888}
+        - NetCache: {op: 0, key: 200, value: 0}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: unrelated_write_leaves_other_key_cached
+    visibility: hidden
+    description: |
+      Cross-key independence. A PUT for cached key 300 is sent first; it
+      invalidates key 300 only. The following GET for key 100 MUST still HIT
+      (answered in-switch, no backend forward) — the write to 300 must not
+      disturb key 100's cached copy.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+          - UDP:   {sport: 5007, dport: 8888}
+          - NetCache: {op: 1, key: 300, value: 7777}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5008, dport: 8888}
+        - NetCache: {op: 0, key: 100, value: 0}
+    expected:
+      behavior: drop
+
+# --- G2: robustness / boundary ---
+
+  - name: put_to_cached_key_forwarded_to_backend
+    visibility: hidden
+    description: |
+      A PUT for cached key 100 MUST be forwarded to the backend storage
+      server on s1.p2 (the backend is the source of truth); the invalidation
+      is a side effect, the write itself still goes through.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5009, dport: 8888}
+        - NetCache: {op: 1, key: 100, value: 5555}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: write_to_uncached_key_forwards
+    visibility: hidden
+    description: |
+      A PUT for key 999, which is not cached, MUST be forwarded to the
+      backend on s1.p2 and must not affect any cached key.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5010, dport: 8888}
+        - NetCache: {op: 1, key: 999, value: 1234}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: write_to_uncached_key_leaves_cache_intact
+    visibility: hidden
+    description: |
+      No-cross-key contamination on the write side. A PUT for uncached key
+      888 is sent first; the following GET for cached key 300 MUST still HIT
+      (no backend forward) — a write to an uncached key must not invalidate
+      any cached entry.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+          - UDP:   {sport: 5011, dport: 8888}
+          - NetCache: {op: 1, key: 888, value: 9999}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5012, dport: 8888}
+        - NetCache: {op: 0, key: 300, value: 0}
+    expected:
+      behavior: drop
+
+# --- G3: security / structural bug checks ---
+
+  - name: cold_start_uncached_key_miss
+    visibility: hidden
+    description: |
+      Cold-start check. A GET for key 777, which has never been cached, MUST
+      be a miss — forwarded to the backend on s1.p2. The switch must never
+      fabricate a hit for a key it does not hold (e.g. by reading an
+      unpopulated value register as if it were a cached value).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5013, dport: 8888}
+        - NetCache: {op: 0, key: 777, value: 0}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+  - name: delete_uncached_then_cached_still_hits
+    visibility: hidden
+    description: |
+      A DELETE for uncached key 555 is forwarded to the backend and changes
+      no cache state; the following GET for cached key 300 still HITS
+      (in-switch, no backend forward). Confirms DELETE handling does not
+      over-invalidate.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+          - UDP:   {sport: 5014, dport: 8888}
+          - NetCache: {op: 2, key: 555, value: 0}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5015, dport: 8888}
+        - NetCache: {op: 0, key: 300, value: 0}
+    expected:
+      behavior: drop
+
+  - name: non_kv_packet_passthrough
+    visibility: hidden
+    description: |
+      A non-KV UDP packet (destination port 53, not the KV port 8888) arrives
+      on the client port. It is not a cache request and MUST simply be
+      forwarded to the backend on s1.p2 — the cache logic must not mangle or
+      drop ordinary traffic, and the deparser must not append a stray KV
+      response header.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5016, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p2

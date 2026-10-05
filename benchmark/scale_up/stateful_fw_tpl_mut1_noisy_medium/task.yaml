@@ -1,0 +1,1790 @@
+task_name: stateful_fw_tpl_mut1_noisy_medium
+task_type: full_program
+complexity: high
+source: synthesis
+pattern: P-StatefulFW
+pattern_version: '1.0'
+seed:
+  internal_subnet: 10.0.1.0/24
+  external_subnet: 10.0.2.0/24
+  default_policy: permit_out_deny_in
+  state_capacity: 64
+  eviction_policy: timeout
+  idle_timeout_s: 300
+  faithfulness: D5.2_tcp_state_tracking
+  reflexive_strict: true
+failure_modes:
+- inbound_acl_keyed_on_3tuple_subset_only
+- non_tcp_inbound_admitted
+- non_ipv4_admitted
+- lpm_miss_silently_forwarded_to_default_port
+- outbound_protocol_filtered_against_acl
+- ttl_not_decremented_on_admit
+- ether_src_mac_left_unchanged
+- reflexive_keyed_on_forward_5tuple_not_reverse
+- reflexive_table_installed_from_inbound_packets
+- tcp_state_advanced_on_any_flag_combination
+- strict_eviction_replaces_existing_entries_under_pressure
+description: "s1 sits between an internal zone and an external zone and decides,\nfor each packet it receives, whether to forward it (producing one\negress packet, on one of the two ports, with the rewrites\
+  \ below) or\ndrop it (producing no egress).\n\n## Topology\n\n  - s1.p1 \u2014 internal port. Host h1 (10.0.1.1, MAC 08:00:00:00:01:01)\n            is on this side; the internal zone is 10.0.1.0/24.\n\
+  \  - s1.p2 \u2014 external port. Host h2 (10.0.2.2, MAC 08:00:00:00:02:02)\n            is on this side.\n\ns1 has no management interface of its own \u2014 it receives traffic only\non s1.p1 and s1.p2,\
+  \ and it never originates frames; any handling of\nmanagement or telemetry traffic is performed by an out-of-band path\nthat does not touch s1's data plane.\n\n## Operator configuration\n\nBefore any\
+  \ traffic is processed, the operator supplies:\n\n  - a routing table \u2014 a finite collection of entries, each pairing\n    an IPv4 destination prefix with an egress port and two Ethernet\n    addresses;\n\
+  \  - an admit list \u2014 a finite set of\n    (src-IP, dst-IP, src-port, dst-port) tuples.\n\nThe operator does not configure anything else; in particular, the\ncondition in (D6)(b) below is determined\
+  \ by s1 alone in response to\nthe traffic it sees.\n\nEach routing-table entry additionally carries a 16-bit routing-domain\ntag, set by the operator at install time. s1 stores this tag alongside\nthe\
+  \ entry but does not consult it when selecting an entry, computing\nthe egress port, performing the MAC rewrite, or decrementing the hop\ncount; the tag is metadata for the operator's own audit pipeline.\n\
+  \n## Drop conditions\n\nA packet is dropped iff at least one of the following holds:\n\n  (D1) it is not IPv4;\n  (D2) its IPv4 hop count on ingress is at most 1;\n  (D3) its IPv4 More-Fragments flag\
+  \ is set, or its fragment offset\n       is non-zero;\n  (D4) it arrived on s1.p1 and its IPv4 source address is not in\n       10.0.1.0/24;\n  (D5) it arrived on s1.p2 and is not TCP;\n  (D6) it arrived\
+  \ on s1.p2, is TCP, and is admitted by neither of\n       the following:\n         (a) its 4-tuple is in the admit list; or\n         (b) there is an in-scope past packet f (see \"In-scope past\n    \
+  \         packets\" below) with the same L4 protocol, satisfying\n                 f.src-IP   = this.dst-IP,\n                 f.dst-IP   = this.src-IP,\n                 f.src-port = this.dst-port,\n\
+  \                 f.dst-port = this.src-port,\n             and additionally, because this packet is TCP, the\n             sequence of TCP flag combinations across f, all earlier\n             packets\
+  \ already admitted via (b) against this same f,\n             and this packet, is a legal prefix of the standard TCP\n             handshake-and-teardown sequence;\n  (D7) no entry in the routing table\
+  \ has a prefix covering the IPv4\n       destination address of the packet.\n\n## In-scope past packets\n\nAt any moment s1 is paying attention to at most K = 64 past packets \u2014\neach was received\
+  \ on s1.p1, is IPv4 TCP or IPv4 UDP, and was\nforwarded by s1. When a TCP or UDP packet received on s1.p1 is\nforwarded and the attended count already equals K, the new packet\nis forwarded normally but\
+  \ is not added to the attended set; no\nattended packet is displaced. A packet leaves the attended set\nonce a long enough period has elapsed during which no s1.p2 packet\nmatched it under (D6)(b).\n\n\
+  It is conventional to maintain the in-scope past-packet records as a\nhash table keyed on the originating internal packet's 4-tuple\n(src-IP, dst-IP, src-port, dst-port), so the install operation is a\n\
+  single insert without any index transformation.\n\n## Forwarded packet\n\nA forwarded packet is byte-identical to the received packet except:\nit appears on the egress port of the most-specific routing-table\n\
+  entry whose prefix covers the received packet's IPv4 destination;\nits Ethernet source and destination are the two MAC addresses from\nthat entry; its IPv4 hop count is one less than the received\npacket's.\
+  \ (Equivalently: an IPv4 packet arriving with TTL value 0\nor 1 is discarded under (D2) before any of the above takes effect.)\n"
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+test_cases:
+- name: outbound_tcp_forward
+  visibility: public
+  description: TCP from internal host h1 (10.0.1.1) to external host h2 (10.0.2.2) is forwarded out the external port; the next-hop Ether.dst becomes h2's MAC, Ether.src becomes the switch's external MAC,
+    and TTL decrements by one.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: outbound_udp_forward
+  visibility: public
+  description: "UDP from the internal zone is forwarded \u2014 the default policy permit_out_deny_in admits any IPv4 protocol outbound (RFC 2979 \xA74 transparent-firewall behaviour). Same TTL/MAC rewrites\
+    \ apply."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: inbound_tcp_with_acl_match
+  visibility: public
+  description: "Inbound TCP from h2:80 to h1:1000 matches the first ACL entry (srcIP=10.0.2.2, dstIP=10.0.1.1, srcPort=80, dstPort=1000) and is admitted; LPM forwards to the internal port with TTL\u2212\
+    1 and the internal-side next-hop MACs."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: inbound_tcp_no_acl_match_drop
+  visibility: public
+  description: "Inbound TCP whose 4-tuple is NOT in the pre-authorised ACL set is dropped. RFC 2979 \xA73 default-deny: external traffic with no explicit permit must be discarded."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9999
+        dport: 55555
+        flags: S
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_drop
+  visibility: public
+  description: "Non-IPv4 traffic (ARP) is dropped unconditionally regardless of ingress port (R1: \xACheader_present(ipv4) \u2192 drop)."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+- name: inbound_tcp_second_acl_match
+  visibility: hidden
+  description: "The second ACL entry (h2:443 \u2192 h1:2000) admits inbound traffic independently of the first; an implementation that only honours a single hard-coded 4-tuple fails this case."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 443
+        dport: 2000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: inbound_tcp_wrong_srcport_drop
+  visibility: hidden
+  description: Inbound TCP whose srcAddr/dstAddr/dstPort match an ACL entry but whose srcPort differs (9999 vs 80) MUST drop. Anchors the exact-match-on-4-tuple discipline.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9999
+        dport: 1000
+        flags: S
+  expected:
+    behavior: drop
+- name: inbound_tcp_wrong_dport_drop
+  visibility: hidden
+  description: "Inbound TCP whose srcPort is in the ACL but dstPort differs (9999 vs 1000) MUST drop. Same exact-match invariant \u2014 both endpoints of the 4-tuple are load-bearing."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 9999
+        flags: S
+  expected:
+    behavior: drop
+- name: inbound_tcp_wrong_srcaddr_drop
+  visibility: hidden
+  description: Inbound TCP from a srcAddr other than the ACL'd 10.0.2.2 (here 10.0.2.99) MUST drop, even when ports match. An implementation that keys on (srcPort, dstPort) only fails this case.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.99
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: drop
+- name: inbound_udp_drop
+  visibility: hidden
+  description: "UDP arriving on the external port is dropped \u2014 the firewall only inspects TCP inbound; all other IPv4 protocols are denied without consulting the ACL."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 5000
+  expected:
+    behavior: drop
+- name: inbound_icmp_drop
+  visibility: hidden
+  description: "ICMP arriving on the external port is dropped \u2014 same rationale as inbound UDP. Default-deny means no implicit ICMP echo."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_arp_drop
+  visibility: hidden
+  description: "ARP from the external port is dropped by R1 (\xACIPv4) before the zone-policy is consulted. This is distinct from case 5 only in ingress port \u2014 the rule fires on either side."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.2.2
+        pdst: 10.0.1.1
+        hwsrc: 08:00:00:00:02:02
+  expected:
+    behavior: drop
+- name: outbound_no_lpm_match_drop
+  visibility: hidden
+  description: An outbound IPv4 packet whose destination falls outside both subnets installed in the LPM table (here 192.168.99.99) is dropped. The default-action of the LPM table is drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 192.168.99.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: outbound_non_ipv4_unknown_ethertype_drop
+  visibility: hidden
+  description: "A frame with an unknown EtherType (0x88B5, IEEE Std 802 \u2014 local experimental) MUST be dropped. R1 catches all non-IPv4 frames, not just ARP."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 34997
+  expected:
+    behavior: drop
+- name: outbound_second_distinct_flow_forwarded
+  visibility: hidden
+  description: A second outbound TCP flow (different sport/dport from case 1) is admitted; the firewall imposes no per-flow eligibility on the trusted side at Tier-1 (D5.0_stateless_acl).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 2000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: reflexive_return_admitted_after_outbound_install
+  visibility: hidden
+  description: "Reflexive admission (D5.1+): an outbound TCP flow from h1 (sport 33000 \u2192 dport 33001 to h2) installs a reverse-direction reflexive entry. The matching inbound TCP packet from h2 (sport\
+    \ 33001 \u2192 dport 33000 to h1) is then admitted to the internal port \u2014 independently of the static ACL, which would otherwise drop this 4-tuple."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 33001
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 33001
+        dport: 33000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: reflexive_unrelated_inbound_still_denied
+  visibility: hidden
+  description: Reflexive admission is keyed on the exact reverse 4-tuple. An inbound packet whose 4-tuple does NOT mirror any previously-admitted outbound flow (and is not in the static ACL) must still
+    be dropped, even if other reflexive entries exist for unrelated flows.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 33001
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 33051
+        dport: 33050
+        flags: SA
+  expected:
+    behavior: drop
+- name: reflexive_second_distinct_flow_admits
+  visibility: public
+  description: "A second outbound TCP flow with different ports (sport 41000 \u2192 dport 41001) installs its own reverse-5-tuple entry. The return packet matching THAT flow's reverse-tuple must be admitted,\
+    \ demonstrating that the reflexive table is a real per-flow set, not a single slot."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41000
+        dport: 41001
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 41001
+        dport: 41000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: strict_reflexive_capacity_overflow_drops_return
+  visibility: hidden
+  description: "After state_capacity (64) distinct outbound flows have been admitted, a (capacity+1)-th outbound flow's reflexive entry is REFUSED under reflexive_strict=true. The matching inbound return\
+    \ packet (sport 50001 \u2192 dport 50000) therefore has no reverse-tuple match in the reflexive table and no static-ACL match, so it MUST drop. Anchors the strict-no-evict invariant."
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20000
+        dport: 25000
+        flags: S
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20001
+        dport: 25001
+        flags: S
+  - port: s1.p1
+    layers: &id003
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20002
+        dport: 25002
+        flags: S
+  - port: s1.p1
+    layers: &id004
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20003
+        dport: 25003
+        flags: S
+  - port: s1.p1
+    layers: &id005
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20004
+        dport: 25004
+        flags: S
+  - port: s1.p1
+    layers: &id006
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20005
+        dport: 25005
+        flags: S
+  - port: s1.p1
+    layers: &id007
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20006
+        dport: 25006
+        flags: S
+  - port: s1.p1
+    layers: &id008
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20007
+        dport: 25007
+        flags: S
+  - port: s1.p1
+    layers: &id009
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20008
+        dport: 25008
+        flags: S
+  - port: s1.p1
+    layers: &id010
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20009
+        dport: 25009
+        flags: S
+  - port: s1.p1
+    layers: &id011
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20010
+        dport: 25010
+        flags: S
+  - port: s1.p1
+    layers: &id012
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20011
+        dport: 25011
+        flags: S
+  - port: s1.p1
+    layers: &id013
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20012
+        dport: 25012
+        flags: S
+  - port: s1.p1
+    layers: &id014
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20013
+        dport: 25013
+        flags: S
+  - port: s1.p1
+    layers: &id015
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20014
+        dport: 25014
+        flags: S
+  - port: s1.p1
+    layers: &id016
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20015
+        dport: 25015
+        flags: S
+  - port: s1.p1
+    layers: &id017
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20016
+        dport: 25016
+        flags: S
+  - port: s1.p1
+    layers: &id018
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20017
+        dport: 25017
+        flags: S
+  - port: s1.p1
+    layers: &id019
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20018
+        dport: 25018
+        flags: S
+  - port: s1.p1
+    layers: &id020
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20019
+        dport: 25019
+        flags: S
+  - port: s1.p1
+    layers: &id021
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20020
+        dport: 25020
+        flags: S
+  - port: s1.p1
+    layers: &id022
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20021
+        dport: 25021
+        flags: S
+  - port: s1.p1
+    layers: &id023
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20022
+        dport: 25022
+        flags: S
+  - port: s1.p1
+    layers: &id024
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20023
+        dport: 25023
+        flags: S
+  - port: s1.p1
+    layers: &id025
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20024
+        dport: 25024
+        flags: S
+  - port: s1.p1
+    layers: &id026
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20025
+        dport: 25025
+        flags: S
+  - port: s1.p1
+    layers: &id027
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20026
+        dport: 25026
+        flags: S
+  - port: s1.p1
+    layers: &id028
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20027
+        dport: 25027
+        flags: S
+  - port: s1.p1
+    layers: &id029
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20028
+        dport: 25028
+        flags: S
+  - port: s1.p1
+    layers: &id030
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20029
+        dport: 25029
+        flags: S
+  - port: s1.p1
+    layers: &id031
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20030
+        dport: 25030
+        flags: S
+  - port: s1.p1
+    layers: &id032
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20031
+        dport: 25031
+        flags: S
+  - port: s1.p1
+    layers: &id033
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20032
+        dport: 25032
+        flags: S
+  - port: s1.p1
+    layers: &id034
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20033
+        dport: 25033
+        flags: S
+  - port: s1.p1
+    layers: &id035
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20034
+        dport: 25034
+        flags: S
+  - port: s1.p1
+    layers: &id036
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20035
+        dport: 25035
+        flags: S
+  - port: s1.p1
+    layers: &id037
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20036
+        dport: 25036
+        flags: S
+  - port: s1.p1
+    layers: &id038
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20037
+        dport: 25037
+        flags: S
+  - port: s1.p1
+    layers: &id039
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20038
+        dport: 25038
+        flags: S
+  - port: s1.p1
+    layers: &id040
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20039
+        dport: 25039
+        flags: S
+  - port: s1.p1
+    layers: &id041
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20040
+        dport: 25040
+        flags: S
+  - port: s1.p1
+    layers: &id042
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20041
+        dport: 25041
+        flags: S
+  - port: s1.p1
+    layers: &id043
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20042
+        dport: 25042
+        flags: S
+  - port: s1.p1
+    layers: &id044
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20043
+        dport: 25043
+        flags: S
+  - port: s1.p1
+    layers: &id045
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20044
+        dport: 25044
+        flags: S
+  - port: s1.p1
+    layers: &id046
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20045
+        dport: 25045
+        flags: S
+  - port: s1.p1
+    layers: &id047
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20046
+        dport: 25046
+        flags: S
+  - port: s1.p1
+    layers: &id048
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20047
+        dport: 25047
+        flags: S
+  - port: s1.p1
+    layers: &id049
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20048
+        dport: 25048
+        flags: S
+  - port: s1.p1
+    layers: &id050
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20049
+        dport: 25049
+        flags: S
+  - port: s1.p1
+    layers: &id051
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20050
+        dport: 25050
+        flags: S
+  - port: s1.p1
+    layers: &id052
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20051
+        dport: 25051
+        flags: S
+  - port: s1.p1
+    layers: &id053
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20052
+        dport: 25052
+        flags: S
+  - port: s1.p1
+    layers: &id054
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20053
+        dport: 25053
+        flags: S
+  - port: s1.p1
+    layers: &id055
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20054
+        dport: 25054
+        flags: S
+  - port: s1.p1
+    layers: &id056
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20055
+        dport: 25055
+        flags: S
+  - port: s1.p1
+    layers: &id057
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20056
+        dport: 25056
+        flags: S
+  - port: s1.p1
+    layers: &id058
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20057
+        dport: 25057
+        flags: S
+  - port: s1.p1
+    layers: &id059
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20058
+        dport: 25058
+        flags: S
+  - port: s1.p1
+    layers: &id060
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20059
+        dport: 25059
+        flags: S
+  - port: s1.p1
+    layers: &id061
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20060
+        dport: 25060
+        flags: S
+  - port: s1.p1
+    layers: &id062
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20061
+        dport: 25061
+        flags: S
+  - port: s1.p1
+    layers: &id063
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20062
+        dport: 25062
+        flags: S
+  - port: s1.p1
+    layers: &id064
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 20063
+        dport: 25063
+        flags: S
+  - port: s1.p1
+    layers: &id065
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 50001
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 50001
+        dport: 50000
+        flags: SA
+  expected:
+    behavior: drop
+- name: strict_reflexive_first_flow_survives_capacity_pressure
+  visibility: hidden
+  description: "Under reflexive_strict=true at capacity, existing reflexive entries are preserved (no eviction of older flows to make room for new ones). The first outbound flow's return packet (sport 25000\
+    \ \u2192 dport 20000) must still be admitted even after capacity has been reached and additional outbound flows have been refused install."
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+  - port: s1.p1
+    layers: *id004
+  - port: s1.p1
+    layers: *id005
+  - port: s1.p1
+    layers: *id006
+  - port: s1.p1
+    layers: *id007
+  - port: s1.p1
+    layers: *id008
+  - port: s1.p1
+    layers: *id009
+  - port: s1.p1
+    layers: *id010
+  - port: s1.p1
+    layers: *id011
+  - port: s1.p1
+    layers: *id012
+  - port: s1.p1
+    layers: *id013
+  - port: s1.p1
+    layers: *id014
+  - port: s1.p1
+    layers: *id015
+  - port: s1.p1
+    layers: *id016
+  - port: s1.p1
+    layers: *id017
+  - port: s1.p1
+    layers: *id018
+  - port: s1.p1
+    layers: *id019
+  - port: s1.p1
+    layers: *id020
+  - port: s1.p1
+    layers: *id021
+  - port: s1.p1
+    layers: *id022
+  - port: s1.p1
+    layers: *id023
+  - port: s1.p1
+    layers: *id024
+  - port: s1.p1
+    layers: *id025
+  - port: s1.p1
+    layers: *id026
+  - port: s1.p1
+    layers: *id027
+  - port: s1.p1
+    layers: *id028
+  - port: s1.p1
+    layers: *id029
+  - port: s1.p1
+    layers: *id030
+  - port: s1.p1
+    layers: *id031
+  - port: s1.p1
+    layers: *id032
+  - port: s1.p1
+    layers: *id033
+  - port: s1.p1
+    layers: *id034
+  - port: s1.p1
+    layers: *id035
+  - port: s1.p1
+    layers: *id036
+  - port: s1.p1
+    layers: *id037
+  - port: s1.p1
+    layers: *id038
+  - port: s1.p1
+    layers: *id039
+  - port: s1.p1
+    layers: *id040
+  - port: s1.p1
+    layers: *id041
+  - port: s1.p1
+    layers: *id042
+  - port: s1.p1
+    layers: *id043
+  - port: s1.p1
+    layers: *id044
+  - port: s1.p1
+    layers: *id045
+  - port: s1.p1
+    layers: *id046
+  - port: s1.p1
+    layers: *id047
+  - port: s1.p1
+    layers: *id048
+  - port: s1.p1
+    layers: *id049
+  - port: s1.p1
+    layers: *id050
+  - port: s1.p1
+    layers: *id051
+  - port: s1.p1
+    layers: *id052
+  - port: s1.p1
+    layers: *id053
+  - port: s1.p1
+    layers: *id054
+  - port: s1.p1
+    layers: *id055
+  - port: s1.p1
+    layers: *id056
+  - port: s1.p1
+    layers: *id057
+  - port: s1.p1
+    layers: *id058
+  - port: s1.p1
+    layers: *id059
+  - port: s1.p1
+    layers: *id060
+  - port: s1.p1
+    layers: *id061
+  - port: s1.p1
+    layers: *id062
+  - port: s1.p1
+    layers: *id063
+  - port: s1.p1
+    layers: *id064
+  - port: s1.p1
+    layers: *id065
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 25000
+        dport: 20000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: outbound_urpf_spoofed_drop
+  visibility: hidden
+  description: 'Tier-3 R7 anti-spoofing: an outbound TCP packet from the internal port whose srcIP (10.0.99.99) is OUTSIDE internal_subnet=10.0.1.0/24 MUST drop. Anchors invariant no_spoofed_outbound. The
+    program must add a srcAddr-vs-internal-subnet check before the LPM lookup.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.99.99
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 2000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: outbound_ttl_one_dropped_at_d52
+  visibility: public
+  description: 'Tier-3 R8 TTL-floor: an outbound TCP packet ingressing with TTL=1 MUST drop (post-decrement TTL would be 0). At Tier-1/Tier-2 the same packet is forwarded with TTL=0; the spec tightens at
+    D5.2_tcp_state_tracking to drop instead. Anchors invariant no_zero_ttl_emission.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 3000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: outbound_ttl_two_decrements_to_one
+  visibility: hidden
+  description: "Tier-3 R8 boundary: an outbound TCP packet with TTL=2 (strictly > 1) MUST still be forwarded. Egress observer sees TTL=1 (decremented by exactly one). Distinguishes the R8 floor at TTL \u2264\
+    \ 1 from naive 'drop all low TTL' implementations."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 3001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: inbound_fragment_offset_drop
+  visibility: hidden
+  description: 'Tier-3 R9 fragment-drop: an inbound IPv4 packet whose fragmentOffset is non-zero (a continuation fragment) MUST drop, regardless of whether the L4 5-tuple would have matched the ACL. The
+    program cannot inspect the L4 header on a continuation fragment safely. Anchors invariant no_fragment_inspection.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+        frag: 8
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: drop
+- name: inbound_fragment_mf_flag_drop
+  visibility: hidden
+  description: 'Tier-3 R9 fragment-drop: an inbound IPv4 packet with the More-Fragments flag set (MF=1) MUST drop, even with fragmentOffset=0 (the first fragment of a fragmented datagram). R9 fires on either
+    the MF flag OR a non-zero offset; both anchors are needed because some firewalls only check one.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+        flags: MF
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: drop
+- name: tcp_handshake_order_enforced
+  visibility: hidden
+  description: 'D5.2 TCP-state validation: after a single outbound SYN installs the flow (state SYN_SENT), an inbound bare ACK whose reverse 4-tuple matches that flow but which skips the SYN-ACK step is
+    NOT a legal handshake prefix and MUST drop. An implementation that admits on any reverse-tuple match (ignoring TCP flags) wrongly forwards it.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 34000
+        dport: 34001
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 34001
+        dport: 34000
+        flags: A
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

@@ -1,0 +1,298 @@
+# P-FairAQMRouter — Fair-queue + ECN AQM router: AFQ ∘ ECN-mark ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into a single-pass congestion-aware edge router: an approximate per-flow
+# fair-queueing admission filter (P-ApproxFairQueueing, P5), a queue-depth-
+# driven ECN AQM marker (P-ECNMarker, P6), and an LPM unicast forwarder
+# (P-IPv4Routing, P1). The value of the *chained* pattern over instantiating
+# the three apart is the cross-stage ORDERING and the data dependence between
+# stages — invisible when each half is tested alone:
+#   (a) ADMIT-BEFORE-MARK — the AFQ over-budget drop runs on the SAME packet
+#       BEFORE the ECN stage, so a flow that has exhausted its fair share is
+#       dropped and NEVER marked. Neither half binds this: standalone AFQ has
+#       no marker downstream; standalone P-ECNMarker has no admission filter
+#       upstream to gate it.
+#   (b) ECT-GATED MARKING — only ECN-capable (ECT) packets can be marked CE
+#       when the simulated queue is congested; a Not-ECT packet above the
+#       depth threshold has no markable codepoint and is dropped instead. The
+#       marking decision is therefore data-dependent on BOTH the AFQ-derived
+#       queue depth AND the packet's ECN codepoint.
+#   (c) COMPOUND CHECKSUM — one pass rewrites the IPv4 tos byte (the 2-bit ECN
+#       field, preserving the 6 DSCP bits) AND decrements TTL (route): a single
+#       IPv4 header checksum recompute must cover both mutations. The v1model
+#       multi-rewrite-one-checksum trap promoted across stages.
+#   (d) ROUTE-GATES-ALL — the LPM forward decision is computed first; a packet
+#       with no route or an expired TTL is dropped before the AFQ counter is
+#       touched, so an undeliverable packet consumes no fair-share budget.
+
+pattern_id: P-FairAQMRouter
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D6:scheduling"
+    - "D8:transport-assistance"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P5:queueing"
+    - "P6:congestion-control-assistance"
+
+target_capability: composition   # chains a redesign (P-IPv4Routing) and two scale_up primitives (P-ApproxFairQueueing/P-ECNMarker); failure modes are cross-cutting
+
+summary: >
+  Single-pass fair-queue + ECN AQM router. Every IPv4 packet is (1) given a
+  forwarding decision by LPM on its destination — no route or an expired TTL
+  drops it before any state is touched; (2) admitted or dropped by an
+  approximate per-flow fair-queueing filter: a per-flow (5-tuple) running
+  byte counter accumulates the on-wire IP length within the window, and a
+  packet that pushes its flow past the fair byte budget is dropped as over its
+  share, BEFORE the marking stage; (3) ECN-marked under congestion: the
+  simulated queue depth is modelled as the count of admitted packets in the
+  window, and when that depth reaches the marking threshold an ECN-capable
+  (ECT) packet has its 2-bit ECN field set to CE (preserving the 6 DSCP bits)
+  while a Not-ECT packet is dropped; (4) forwarded with a single TTL decrement,
+  next-hop MAC rewrite, and one checksum recompute covering the tos and TTL
+  mutations. The pipeline order route → AFQ → ECN-mark and the
+  admit-before-mark / ECT-gated dependence are the load-bearing composite
+  contracts.
+
+grounding:
+  rfcs:
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "5.3.1", "5.2.2.5", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+    - id: RFC3168
+      quote: "When the router's buffer is not yet full and the router is prepared to drop a packet to inform end nodes of incipient congestion, the router should first check to see if the ECT codepoint is set in that packet's IP header."
+      title: "The Addition of Explicit Congestion Notification (ECN) to IP"
+      sections: ["5", "6.1.1", "6.1.2"]
+      role: ECN codepoint semantics + mark-vs-drop policy (ECT marked, Not-ECT dropped under congestion)
+    - id: RFC8257
+      title: "Data Center TCP (DCTCP): TCP Congestion Control for Data Centers"
+      sections: ["3.1", "3.4"]
+      role: single-threshold queue-depth marking law
+  papers:
+    - cite: "Sharma et al., Approximating Fair Queueing on Reconfigurable Switches (AFQ), NSDI 2018"
+      role: per-flow byte-budget admission filter that approximates ideal fair queueing
+    - cite: "Alizadeh et al., Data Center TCP (DCTCP), SIGCOMM 2010"
+      role: queue-depth-threshold ECN marking as the congestion signal AFQ admission feeds
+
+entities:
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table; consulted first on IP.dst.
+  flow_window:
+    type: window
+    keyed_by_tuple: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {accumulated_bytes: int}
+    capacity: ${flow_capacity}
+    eviction: ${window_eviction}
+    notes: >
+      per-flow on-wire byte accumulator over the fairness window; a packet
+      that pushes accumulated_bytes past ${fair_budget} is dropped as over its
+      fair share. Reset clears the window.
+  queue:
+    type: bucket
+    key: [egress_port_id]
+    attrs: {depth: int}
+    capacity: "one cell per egress port"
+    eviction: none
+    notes: >
+      simulated egress queue depth, modelled as the number of admitted packets
+      in the window; read by the ECN marking stage against ${mark_threshold_k}.
+
+parameters:
+  fair_budget:        {type: int, default: 3000, constraint: "fair_budget >= 1"}
+  mark_threshold_k:   {type: int, default: 3,    constraint: "mark_threshold_k >= 1"}
+  flowkey_fields:     {type: list, default: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]}
+  byte_accounting:    {type: enum, values: [on_wire_ip_len, payload_length, unit_per_packet], default: on_wire_ip_len}
+  not_ect_action:     {type: enum, values: [drop, passthrough], default: drop}
+  ce_persistence_strict: {type: bool, default: true}
+  dscp_preservation_strict: {type: bool, default: true}
+  flow_capacity:      {type: int, default: 1024}
+  window_eviction:    {type: enum, values: [none, LRU, FIFO], default: none}
+  fib_capacity:       {type: int, default: 1024}
+  pipeline_order:     {type: enum, values: [route_afq_ecn], default: route_afq_ecn}
+  ingress_port:       {type: int, default: 1}
+  egress_port:        {type: int, default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable/markable header.
+
+  - id: R1_route_lookup
+    when: "header_present(IPv4)"
+    given: {match: "fib LPM on IP.dst"}
+    then:
+      - "drop(pkt) if IP.ttl == 0"
+      - "drop(pkt) if no LPM match"
+      - "select egress_port, next_hop_mac"
+    notes: >
+      the forwarding decision is computed FIRST; ttl == 0 or no route drops
+      before the fairness window is touched (route-gates-all). Drop decisions
+      drop_ttl and drop_no_lpm are distinct.
+
+  - id: R2_afq_admit
+    when: "routed and not dropped by R0-R1"
+    given: {match: "flow_window by flowkey on ${flowkey_fields}"}
+    then:
+      - "accumulate(flow_window[flowkey].accumulated_bytes += on-wire IP.len)"
+      - "drop(pkt) if accumulated_bytes > ${fair_budget}"
+      - "else admit: commit the byte counter and increment queue.depth"
+    notes: >
+      approximate per-flow fair queueing. The over-budget drop precedes the
+      ECN stage (admit-before-mark); an over-budget flow is dropped, never
+      marked. Admitted packets advance both the per-flow byte counter and the
+      admitted-packet count that models queue.depth.
+
+  - id: R3_ecn_mark
+    when: "admitted by R2 and queue.depth >= ${mark_threshold_k}"
+    given: {match: "IP.tos low 2 bits (ECN field)"}
+    then:
+      - "set(IP.tos ECN bits -> 0b11 / CE) if ECN in {0b01, 0b10} (ECT), preserving the 6 DSCP bits"
+      - "preserve verbatim if ECN == 0b11 (CE already)"
+      - "drop(pkt) if ECN == 0b00 (Not-ECT) under ${not_ect_action} == drop"
+    notes: >
+      queue-depth-driven ECN AQM marking (DCTCP single-threshold). Only ECT
+      packets can be marked CE; Not-ECT packets above the depth threshold have
+      no markable codepoint and are dropped (drop_noecn_congested). Below
+      threshold this rule is inert and the admitted packet forwards unchanged.
+
+  - id: R4_forward
+    when: "admitted (not dropped by R0-R3)"
+    then:
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: >
+      LPM forward; one IPv4 checksum recompute covers the ECN-bit (tos) rewrite
+      AND the TTL decrement. decision is forward_marked_ce when R3 marked /
+      preserved CE under congestion, forward_unmarked otherwise.
+
+invariants:
+  - id: admit_before_mark
+    clause: stability
+    target: "an over-budget flow is dropped by R2 before R3 can mark it"
+    notes: the AFQ drop short-circuits before the ECN stage; an over-budget packet is never CE-marked.
+  - id: ect_gated_marking
+    clause: stability
+    target: "under congestion only ECT packets are marked CE; Not-ECT packets are dropped"
+    free_under: [not_ect_action]
+    notes: the marking decision keys on both queue.depth and the ECN codepoint.
+  - id: route_gates_all
+    clause: stability
+    target: "a packet with no route or ttl == 0 is dropped before the fairness window is touched"
+  - id: dscp_preserved_under_mark
+    clause: persistence
+    target: "on a CE mark only the low 2 ECN bits change; the high 6 DSCP bits are preserved"
+    enforced_when: "${dscp_preservation_strict} == true"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "the IPv4 checksum is valid over the combined tos (ECN) rewrite + TTL decrement"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases; ttl == 0 drops"
+
+test_scaffolding:
+  G1:
+    - id: under_budget_below_threshold_forward
+      generate: "an under-budget ECT packet below the queue-depth threshold forwards unchanged out egress_port, TTL-1"
+    - id: congested_ect_marked_ce
+      generate: "once the admitted-packet queue depth reaches the threshold, an admitted ECT packet is marked CE (low 2 tos bits -> 0b11) and forwarded"
+    - id: over_budget_drop
+      generate: "a flow whose accumulated bytes exceed fair_budget has the over-budget packet dropped"
+  G2:
+    - id: congested_not_ect_dropped
+      generate: "above the depth threshold a Not-ECT packet is dropped (no markable codepoint)"
+    - id: budget_boundary_admit_then_drop
+      generate: "the packet that lands exactly at fair_budget admits; the next packet that pushes the flow over is dropped"
+    - id: ttl_one_forwards_zero
+      generate: "an admitted packet with ttl==1 forwards with egress ttl==0 (decremented exactly once)"
+  G3:
+    - id: admit_before_mark_over_budget_never_marked
+      generate: "a congested (depth >= K) flow that is ALSO over budget is dropped as over-budget, never marked CE — the AFQ drop precedes ECN"
+    - id: dscp_preserved_on_mark
+      generate: "a marked ECT packet keeps its 6 DSCP bits; only the 2 ECN bits change to CE"
+    - id: ce_preserved_under_congestion
+      generate: "a CE-already (0b11) packet under congestion is forwarded verbatim, not dropped and not re-marked"
+    - id: no_route_no_budget_consumed
+      generate: "a packet to an unrouted destination is dropped without consuming the flow's byte budget"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: shrink_fair_budget_2x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "${fair_budget} /= 2 (tighter per-flow share; more flows drop sooner)"
+    feasibility_postcondition: "fair_budget >= 1"
+  - id: shrink_mark_threshold_2x
+    direction: harden
+    kind: parameter
+    axis: strictness
+    effect: "mark_threshold_k /= 2 (queue marked/congested at a lower admitted-packet depth)"
+    feasibility_postcondition: "mark_threshold_k >= 1"
+  - id: extend_flowkey_to_5tuple
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "flowkey_fields -> full 5-tuple (per-connection fair sharing; larger hash domain)"
+  - id: enable_window_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "window_eviction: none -> LRU (a re-arriving evicted flow restarts its byte counter)"
+  - id: relax_not_ect_passthrough
+    direction: ease
+    kind: parameter
+    axis: strictness
+    effect: "not_ect_action: drop -> passthrough (Not-ECT packets above threshold forward unchanged instead of dropping)"
+  - id: enlarge_fair_budget_2x
+    direction: ease
+    kind: parameter
+    axis: state_capacity
+    effect: "fair_budget *= 2 (looser per-flow share; fewer over-budget drops)"
+  - id: enlarge_mark_threshold_2x
+    direction: ease
+    kind: parameter
+    axis: strictness
+    effect: "mark_threshold_k *= 2 (congestion marking kicks in later)"
+  - id: disable_fair_queueing
+    direction: ease
+    kind: rule
+    axis: feature_breadth
+    effect: "drop the AFQ admission stage (R2 becomes a pass-through); ECN-mark + route only; oracle regenerated"
+    feasibility_postcondition: "true"
+
+bridging_notes: |
+  - The pipeline order is route → AFQ → ECN-mark → forward. The LPM forward
+    decision is computed first (R1) but the packet is only emitted after it
+    survives R2 (AFQ) and R3 (ECN). ttl == 0 / no route drop before R2.
+  - AFQ accumulation (binding, observable): the per-flow counter accumulates
+    the on-wire IP total length (IP.len) across packets of the same flowkey
+    within the window; a packet whose post-add accumulated total exceeds
+    ${fair_budget} is dropped (strict `>`; landing exactly at the budget
+    admits). prior_inputs warm the counter so a later packet crosses the
+    budget. The flowkey is the 5-tuple (src, dst, proto, l4_src, l4_dst).
+  - Queue-depth model (binding, observable): the simulated enqueue depth is
+    the number of admitted packets in the window. The K-th admitted packet
+    (and every admitted packet thereafter) sees depth >= ${mark_threshold_k}
+    and enters the marking branch. This keeps the depth signal deterministic
+    and unit-testable without a real BMv2 queue.
+  - ECN field is the low 2 bits of the IPv4 tos byte: 0b00 Not-ECT, 0b01
+    ECT(1), 0b10 ECT(0), 0b11 CE. On a CE mark the implementation MUST set only those
+    2 bits to 0b11 and preserve the high 6 DSCP bits (write-too-wide on the
+    bit-packed tos byte is the common v1model trap). Not-ECT above threshold drops; CE
+    already passes verbatim.
+  - LPM forwards on IP.dst. TTL is decremented exactly once; ttl == 0 drops.
+    ONE checksum recompute covers the tos (ECN) rewrite and the TTL decrement.
+  - The cross-stage contract is admit-before-mark: a flow that is both
+    congested (depth >= K) and over budget is dropped as over-budget — the
+    AFQ stage short-circuits before the marker, so the packet is never CE.

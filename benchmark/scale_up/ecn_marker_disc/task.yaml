@@ -1,0 +1,447 @@
+task_name: ecn_marker_disc
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ECNMarker
+pattern_version: '1.0'
+
+seed:
+  access_port: 1
+  core_port:   2
+  marking_threshold_k:        64
+  marking_mode:               single_threshold
+  not_ect_action:             drop
+  ce_persistence_strict:      true
+  dscp_preservation_strict:   true
+  checksum_recompute:         required
+  queue_depth_signal:         synthetic_qdepth
+  non_ipv4_action:            drop
+  eligibility_protocol:       any_l4
+  workload_skew:              uniform
+
+description: |
+  A switch s1 sits between two hosts and acts as an Active Queue
+  Management (AQM) block that performs Explicit Congestion Notification
+  (ECN) marking on IPv4 traffic per RFC 3168 and RFC 8257 (DCTCP). On
+  every IPv4 packet the switch sees on its tenant-facing port, it
+  observes a queue-depth signal carried by the test harness and decides
+  whether to (a) pass the packet through unchanged, (b) rewrite the
+  packet's ECN field from ECT(0) or ECT(1) to CE ("Congestion
+  Experienced") and forward the packet, or (c) drop the packet outright.
+
+  ## The ECN field
+
+  The 8-bit IPv4 ToS / DiffServ byte is split into two sub-fields per
+  RFC 3168 §5 / §19:
+
+    - The high 6 bits are the Differentiated Services Code Point (DSCP).
+      DSCP is the traffic-class label set by an upstream classifier.
+    - The low 2 bits are the ECN field. Its four codepoints are:
+        00 = Not-ECT  (the endpoints do not support ECN)
+        01 = ECT(1)
+        10 = ECT(0)
+        11 = CE        (Congestion Experienced)
+      Both ECT(0) and ECT(1) indicate the endpoints DO support ECN; they
+      are equivalent for marking purposes. CE indicates a router on the
+      path has observed congestion and has signalled it without dropping.
+
+  ## What the switch MUST do
+
+  Let K denote the marking threshold (a configuration parameter; in this
+  deployment K = 64). Let DEPTH denote the queue-depth signal observed
+  for the packet at processing time. The test harness puts the synthetic
+  DEPTH value in the packet's IPv4 identification (`hdr.ipv4.id`) field
+  before sending each packet to the switch; the switch reads that field
+  to make its decision. (In a production deployment DEPTH would come
+  from the egress queue's `enq_qdepth` / `deq_qdepth` metadata; the
+  identification-field carrier is a unit-testable substitute for that
+  signal — single packets cannot build real queue depth in isolation.)
+
+  Numbered MUST / MUST-NOT statements:
+
+   1. **Eligibility short-circuit.**
+
+      a. Frames arriving on any port other than the tenant-facing port
+         (s1.p1) MUST be dropped before any ECN inspection.
+
+      b. Non-IPv4 frames (ARP, IPv6, MPLS, raw Ethernet) MUST be
+         dropped — ECN is an IPv4 / IPv6 feature, and this task is
+         scoped to IPv4 only; non-IP traffic has no ECN field to act on.
+
+   2. **Below threshold — passthrough.**
+
+      a. If DEPTH < K, the packet MUST be forwarded to s1.p2 unchanged.
+         The 8-bit ToS/DiffServ byte, including both the DSCP sub-field
+         and the ECN sub-field, MUST be preserved verbatim. The IPv4
+         header checksum MUST remain unchanged (because no header field
+         is modified).
+
+   3. **Above threshold — ECT becomes CE.**
+
+      a. If DEPTH ≥ K and the packet's ECN field is ECT(0) (`10`) or
+         ECT(1) (`01`), the switch MUST rewrite the ECN field to CE
+         (`11`) and forward the packet to s1.p2.
+
+      b. ONLY the 2-bit ECN sub-field of the ToS/DiffServ byte may
+         change. The 6-bit DSCP sub-field (the high 6 bits) MUST be
+         preserved exactly. An implementation that rewrites the full 8-bit ToS
+         byte clobbers DSCP and violates RFC 3168 §19 (DSCP / ECN
+         independence).
+
+      c. The IPv4 header checksum MUST be recomputed after the ECN-bit
+         rewrite, since the ToS/DiffServ byte is covered by the
+         checksum and its value has changed (RFC 791 §3.1, inherited).
+
+      d. Both ECT codepoints (`10` and `01`) behave identically — both
+         MUST be coerced to CE (`11`). They are equivalent for marking
+         purposes per RFC 3168 §6.1.1.
+
+   4. **Above threshold — CE is preserved (no unmark).**
+
+      a. If DEPTH ≥ K and the packet's ECN field is CE (`11`) on
+         ingress, the switch MUST forward the packet to s1.p2 with the
+         ECN field STILL set to CE. RFC 3168 §6.1.5 is explicit: "once
+         the CE codepoint is set in a packet, the router MUST NOT
+         change the codepoint back to ECT or Not-ECT." CE is irreversible
+         at a single hop.
+
+      b. Since no header field is modified, the IPv4 checksum MUST
+         remain unchanged.
+
+   5. **Above threshold — Not-ECT drops.**
+
+      a. If DEPTH ≥ K and the packet's ECN field is Not-ECT (`00`),
+         the switch MUST drop the packet. RFC 3168 §6.1.2 is binding
+         on this: "the router MUST NOT mark a packet as CE if the ECN
+         field is `00` (Not-ECT)" — Not-ECT packets indicate the
+         endpoints do not understand ECN, so marking them would be
+         silently lost; the only safe congestion signal for them is
+         drop.
+
+   6. **Below threshold — Not-ECT is forwarded too.**
+
+      a. If DEPTH < K and the packet's ECN field is Not-ECT (`00`), the
+         packet MUST be forwarded to s1.p2 unchanged — Not-ECT-on-
+         congestion is a drop, but Not-ECT-without-congestion is a
+         legitimate non-ECN packet that the router should forward.
+
+  ## Threshold semantics
+
+  The threshold check is strict: DEPTH = K (exactly) counts as "above
+  threshold" and triggers the rules in §§3-5; DEPTH = K - 1 counts as
+  "below threshold" and triggers §§2 and 6.
+
+  ## Topology
+
+  Two hosts on a single switch s1:
+    - h1 attaches at s1.p1. h1's IPv4 address is 10.0.1.1; h1's MAC is
+      08:00:00:00:01:01.
+    - h2 attaches at s1.p2. h2's IPv4 address is 10.0.2.2; h2's MAC is
+      08:00:00:00:02:02.
+
+  Every test sends a packet from h1 to h2 with a specific synthetic
+  DEPTH value carried in the IPv4 identification field.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: below_threshold_ect_passthrough
+    visibility: public
+    description: |
+      Below-threshold ECT passthrough. DEPTH = 50 (< K = 64); ECN =
+      ECT(0). The switch MUST forward the packet to s1.p2 with the
+      ToS byte unchanged (ECN still ECT(0)).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 50}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+        IP.id:  {action: unchanged}
+
+  - name: above_threshold_ect_marked
+    visibility: public
+    description: |
+      Above-threshold ECT mark. DEPTH = 100 (≥ K); ECN = ECT(0)
+      (tos = 0b00000010 = 2). The switch MUST forward the packet to
+      s1.p2 with the ECN bits rewritten to CE (tos = 0b00000011 = 3),
+      the IPv4 checksum recomputed, and DSCP unchanged (DSCP was 0
+      here; preservation is trivial but the action is on the bit
+      pattern).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 100}
+        - TCP:   {sport: 5001, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: above_threshold_ect_one_also_marked
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.1 codepoint equivalence. ECT(0) and ECT(1) are
+      equivalent for marking — both MUST be coerced to CE on congestion.
+      DEPTH = 100; ECN = ECT(1) (tos = 0b00000001 = 1). Expected output
+      ToS = 0b00000011 = 3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 1, id: 100}
+        - TCP:   {sport: 5002, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: ce_persists_above_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE persistence above threshold. DEPTH = 100;
+      ECN = CE already on ingress (tos = 0b00000011 = 3). The switch
+      MUST forward unchanged — CE is irreversible. Any modification to
+      the ECN bits, including a "remark to CE" that overwrites with the
+      same value, would invalidate the checksum unnecessarily, so the
+      program MUST take the no-op branch.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 100}
+        - TCP:   {sport: 5003, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: ce_persists_below_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE persistence below threshold. DEPTH = 10;
+      ECN = CE on ingress. Forward unchanged on the below-threshold path.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 10}
+        - TCP:   {sport: 5004, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+# --- G2: robustness / boundary ---
+
+  - name: boundary_at_exactly_threshold_ect_marked
+    visibility: public
+    description: |
+      Boundary case at DEPTH = K = 64 exactly. ECN = ECT(0). The
+      threshold check is STRICT (`≥`, not `>`), so DEPTH = K MUST
+      trigger marking. An implementation that uses `>` instead of `≥` will
+      passthrough here and fail.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 64}
+        - TCP:   {sport: 5005, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: boundary_at_threshold_minus_one_passthrough
+    visibility: hidden
+    description: |
+      Boundary case at DEPTH = K - 1 = 63 exactly. ECN = ECT(0).
+      Below threshold — passthrough. Pairs with the above to enclose
+      the K = 64 boundary on both sides. A `>` bug fails this in the
+      reverse direction (passthrough is correct here regardless).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 63}
+        - TCP:   {sport: 5006, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: dscp_high_value_preserved_under_mark
+    visibility: hidden
+    description: |
+      DSCP preservation at non-zero DSCP. The input ToS byte is
+      0b10100010 = 162 (DSCP = 0b101000 = 40 = CS5; ECN = ECT(0)).
+      DEPTH = 80 (≥ K). Expected output ToS = 0b10100011 = 163 —
+      DSCP unchanged (0b101000), ECN rewritten to CE (0b11). Only the
+      low 2 ECN bits may change; rewriting the whole ToS byte would
+      clobber the DSCP sub-field and fail (RFC 3168 §19).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 162, id: 80}
+        - TCP:   {sport: 5007, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 163}
+
+# --- G3: security / bypass ---
+
+  - name: not_ect_above_threshold_drop_not_silent_mark
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.2 MUST: Not-ECT on congestion MUST be dropped,
+      NOT marked. DEPTH = 100 (≥ K); ECN = Not-ECT (tos = 0). A
+      program that implements "any packet above K → mark with CE"
+      silently coerces Not-ECT to CE and violates the spec — the
+      endpoints would not understand the CE signal anyway, so this
+      bug is silently lost on the wire.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 100}
+        - TCP:   {sport: 5008, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: dscp_preservation_under_mark
+    visibility: hidden
+    description: |
+      RFC 3168 §19 DSCP / ECN independence — security-grade check.
+      Input ToS = 0b00101000_10 written byte-wise as 0b00101010 = 42
+      (DSCP = 0b001010 = 10 = AF11; ECN = ECT(0)). DEPTH = 80 (≥ K).
+      Expected output ToS = 0b00101011 = 43 — DSCP unchanged, ECN
+      now CE. A marker that rewrites the whole ToS byte rather than
+      only the 2-bit ECN sub-field overwrites the AF11 DSCP marking
+      and fails (RFC 3168 §19 mandates DSCP/ECN independence).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 42, id: 80}
+        - TCP:   {sport: 5009, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 43}
+
+  - name: ce_no_silent_unmark_below_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE-no-unmark — security-grade check. DEPTH = 0
+      (deep below threshold); ECN = CE on ingress (tos = 3). An implementation
+      that implements "below threshold → write ECN bits to ECT(0)"
+      (a "renormalise" misreading) silently unmarks CE, hiding
+      upstream-detected congestion from the receiver. Expected:
+      ToS preserved at 3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 0}
+        - TCP:   {sport: 5010, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: not_ect_below_threshold_passthrough
+    visibility: hidden
+    description: |
+      Below-threshold Not-ECT is forwarded, NOT dropped. Not-ECT-
+      on-congestion is a drop (per case 5); Not-ECT-without-
+      congestion is a legitimate non-ECN packet that the router
+      forwards unmolested. DEPTH = 10; ECN = Not-ECT. Catches a
+      common over-broad reading of the §6.1.2 MUST that drops ALL
+      Not-ECT packets regardless of congestion state.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 10}
+        - TCP:   {sport: 5011, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+# --- G0: eligibility short-circuit (pre-ECN drops) ---
+
+  - name: wrong_port_drop
+    visibility: hidden
+    description: |
+      Eligibility short-circuit — wrong ingress port (case 1a). A
+      frame arrives on s1.p2 instead of the tenant-facing port s1.p1.
+      It MUST be dropped before any ECN inspection, regardless of its
+      ECN field or the carried DEPTH value (here an otherwise-markable
+      ECT(0) packet at DEPTH = 100 ≥ K). Catches an implementation that applies
+      the marking pipeline on every port instead of guarding on the
+      tenant-facing port.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, tos: 2, id: 100}
+        - TCP:   {sport: 5012, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: non_ipv4_frame_drop
+    visibility: hidden
+    description: |
+      Eligibility short-circuit — non-IPv4 frame (case 1b). An ARP
+      frame arrives on the tenant-facing port s1.p1. It carries no ECN
+      field, so the switch MUST drop it before any ECN inspection.
+      Catches an implementation that assumes every frame is IPv4 and reads the
+      ToS byte out of a non-IPv4 payload.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.2"}
+    expected:
+      behavior: drop

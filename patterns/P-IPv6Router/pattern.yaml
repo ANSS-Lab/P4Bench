@@ -1,0 +1,466 @@
+# P-IPv6Router — IPv6 Unicast Forwarding (128-bit LPM + Hop-Limit)
+#
+# TPL v1.0 task pattern. The IPv6 sibling of P-IPv4Routing:
+# same destination-based match-action forwarder, but on 128-bit addresses with
+# the IPv6 fixed-header semantics — Hop Limit (not TTL), NO header checksum,
+# Next Header chaining, and link-local / multicast scope filtering (RFC 8200,
+# RFC 4291). Closes the basic-layer IPv6-datapath gap (no IPv6 forwarder
+# existed in the corpus). Instances are produced by binding the parameters below.
+
+pattern_id: P-IPv6Router
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                            # destination-based unicast forwarding
+  prescriptive: [P1:forwarding]                         # match-action + LPM table; ECMP composable
+target_capability: scale_up                             # widens the forwarder's address/table axis from 32→128 bit
+summary: >
+  Destination-based IPv6 unicast forwarding: 128-bit longest-prefix-match FIB
+  lookup, Hop-Limit decrement with zero-drop, Ethernet rewrite on every hop,
+  and IPv6 address preservation across the forwarder. Unlike IPv4 there is NO
+  header checksum to recompute (RFC 8200 §3) and the drop boundary is "Hop
+  Limit decremented to zero" rather than the IPv4 TTL≤1 convention. The
+  canonical instance is a single-next-hop static FIB; mutation lifts to ECMP
+  groups with per-flow hash consistency (RFC 2992), scoped-address filtering
+  (link-local fe80::/10, multicast ff00::/8), and scaled FIB with overlapping
+  prefixes.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC8200
+      sections: ["3", "4", "4.1"]
+      role: canonical_spec
+      quote: >-
+        Hop Limit: 8-bit unsigned integer. Decremented by 1 by each node that
+        forwards the packet. When forwarding, the packet is discarded if Hop
+        Limit was zero when received or is decremented to zero.
+      quote_source: patterns/P-IPv6Router/grounding/RFC8200.txt
+      relevance: |
+        Internet Protocol, Version 6 (IPv6) Specification — the canonical
+        clauses every rule realises:
+          - §3   Header format: the IPv6 fixed header has NO checksum field
+                 (deliberately removed vs IPv4), so a forwarder MUST NOT
+                 attempt a header-checksum recompute — basis for the absence
+                 of any checksum invariant and the `no_v6_header_checksum`
+                 anti-pattern note.
+          - §3   Hop Limit: "Decremented by 1 by each node that forwards the
+                 packet. The packet is discarded if Hop Limit is decremented
+                 to zero." — basis for R1 (hop-limit-exhausted drop, gate
+                 hlim>1) and the hoplimit_quantum_one invariant. A transit
+                 node cannot forward a packet arriving with Hop Limit 1
+                 (it would decrement to 0), distinguishing IPv6 from the
+                 IPv4 "ttl==1 forwards to 0" tutorial convention.
+          - §4   Extension headers: Next Header chaining (Hop-by-Hop,
+                 Routing, …). The basic forwarder parses the fixed header and
+                 forwards on the destination regardless of upper-layer
+                 protocol — basis for R2 being Next-Header-agnostic.
+    - id: RFC4291
+      sections: ["2.4", "2.5.2", "2.5.6", "2.7"]
+      role: normative_behaviour
+      relevance: |
+        IP Version 6 Addressing Architecture — the address scopes the scope
+        filter enforces:
+          - §2.4 / §2.5.6  Link-Local unicast fe80::/10 has link-only scope;
+                 a router MUST NOT forward a packet whose destination is
+                 link-local off the arrival link — basis for R4 (gated).
+          - §2.7  Multicast ff00::/8: unicast forwarding does not apply to
+                 multicast destinations; a unicast forwarder drops them
+                 — basis for R5 (gated).
+          - §2.5.2  The unspecified address :: MUST NOT be used as a
+                 destination — basis for the drop_unspecified_dst G3 case.
+    - id: RFC2992
+      sections: ["1", "2.2"]
+      role: normative_behaviour
+      relevance: |
+        Analysis of an Equal-Cost Multi-Path Algorithm — the per-flow
+        stickiness MUST ("the same next-hop will be chosen for a given flow")
+        the ecmp_flow_consistency invariant enforces once ${multipath_mode}
+        lifts off `none`. The IPv6 flow key is (src, dst, next-header,
+        L4 src/dst) per RFC 2992 §2.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The p4lang "basic" exercise topology (3 hosts, 1 switch, one LPM
+        table on the destination address) carries over unchanged to IPv6 —
+        the LPM key widens to 128 bits and the TTL action becomes a Hop-Limit
+        decrement with no checksum block.
+
+  papers: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Decisions derive from hdr.ipv6 fields,
+      std.ingress_port, and the control-plane-installed FIB.
+
+  flow:
+    key:
+      - hdr.ipv6.src
+      - hdr.ipv6.dst
+      - hdr.ipv6.nextHdr
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Flow tuple used only by ECMP hashing to pin a flow onto one next-hop
+      (RFC 2992 §2.2). Not materialised as data-plane state.
+
+  route:                                  # the TPL `bucket` role
+    keyed_by_lpm: hdr.ipv6.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int               # 0..128
+    capacity: ${fib_capacity}
+    notes: |
+      A FIB entry. The LPM table is keyed on the 128-bit destination; the
+      matched entry yields a nexthop_group_id. First-match is LONGEST-prefix.
+
+  nexthop_group:                          # also a `bucket` (class)
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops: "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac: "list[address]"           # per-egress source MAC for the L2 rewrite
+    notes: |
+      Singletons (|nexthops|==1) handle non-ECMP routes; >1 enables ECMP
+      under ${multipath_mode}.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv6_cidr, prefix_len ∈ [0,128],
+      nexthop_group_id:int; no two entries share both prefix AND prefix_len.
+    notes: "Control-plane FIB. A default route is ::/0."
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights are positive ints"
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Max route entries. shrink_fib_capacity_4x exercises this axis."
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_5tuple]
+    default: none
+    notes: |
+      none             → singleton next-hops only (canonical instance).
+      ecmp_hash_5tuple → hash over (src, dst, nextHdr, l4 ports); RFC 2992.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32]
+    default: crc16
+    enforced_when: "${multipath_mode} != none"
+
+  filter_link_local:
+    type: bool
+    default: true
+    notes: |
+      RFC 4291 §2.5.6. When true, R4 drops packets whose destination is in
+      fe80::/10 (link-local scope MUST NOT be routed off-link).
+
+  filter_multicast:
+    type: bool
+    default: true
+    notes: |
+      RFC 4291 §2.7. When true, R5 drops packets whose destination is in
+      ff00::/8 (a unicast forwarder does not forward multicast).
+
+  default_action:
+    type: enum
+    values: [drop]
+    default: drop
+    notes: "Behaviour on LPM miss. v1.0: drop (no ICMPv6 origination)."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_static_fib, D5.1_ecmp, D5.2_scale]
+    default: D5.0_static_fib
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_ipv6_drop
+    when: "¬header_present(ipv6)"
+    then:
+      - drop
+    notes: |
+      The pattern is IPv6 unicast forwarding only. IPv4, ARP, and any other
+      ether-type are out of scope and MUST NOT be forwarded.
+
+  - id: R1_hoplimit_exhausted
+    when: |
+      header_present(ipv6) ∧ hdr.ipv6.hopLimit ≤ 1
+    then:
+      - drop
+    notes: |
+      RFC 8200 §3 — "discarded if Hop Limit is decremented to zero." A transit
+      router cannot forward a packet whose Hop Limit would reach 0, so a
+      packet arriving with hopLimit ∈ {0,1} is dropped. (Contrast IPv4's
+      tutorial ttl==1→forward convention; IPv6 differs and the
+      drop_hoplimit_one G2 case pins it.)
+
+  - id: R4_link_local_dst
+    when: |
+      header_present(ipv6) ∧ in_prefix(hdr.ipv6.dst, fe80::/10)
+    enforced_when: "${filter_link_local}"
+    then:
+      - drop
+    notes: "RFC 4291 §2.5.6 — link-local destinations are not routed off-link."
+
+  - id: R5_multicast_dst
+    when: |
+      header_present(ipv6) ∧ in_prefix(hdr.ipv6.dst, ff00::/8)
+    enforced_when: "${filter_multicast}"
+    then:
+      - drop
+    notes: "RFC 4291 §2.7 — a unicast forwarder drops multicast destinations."
+
+  - id: R2_lpm_hit_forward
+    when: |
+      header_present(ipv6) ∧ hdr.ipv6.hopLimit > 1
+        ∧ exists(route, lpm(hdr.ipv6.dst, ${routes}))
+        ∧ ¬(in_prefix(hdr.ipv6.dst, fe80::/10) ∧ ${filter_link_local})
+        ∧ ¬(in_prefix(hdr.ipv6.dst, ff00::/8) ∧ ${filter_multicast})
+    given:
+      route:         by_lpm(hdr.ipv6.dst, ${routes})
+      nexthop_group: by_key(route.nexthop_group_id)
+      flow:          deduce_from_packet   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv6.hopLimit, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      The canonical forwarding step. Hop Limit is decremented by EXACTLY one;
+      IPv6 src/dst are preserved; the egress Ethernet src is the EGRESS port's
+      MAC and dst is the next-hop MAC. There is NO IPv6 header checksum —
+      adding/recomputing one is an implementation bug. When multipath_mode==none the
+      group is a singleton and i=0.
+
+  - id: R3_no_route
+    when: |
+      header_present(ipv6) ∧ hdr.ipv6.hopLimit > 1
+        ∧ ¬exists(route, lpm(hdr.ipv6.dst, ${routes}))
+    then:
+      - "${default_action}"
+    notes: "RFC: no matching route ⇒ drop (no ::/0 default present)."
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: "Hop-Limit decrement on every forward (R2) bounds the path."
+
+  - id: hoplimit_quantum_one
+    clause: stability
+    target: hdr.ipv6.hopLimit_decrement
+    while: "rule R2 fires"
+    notes: |
+      RFC 8200 §3 — Hop Limit decremented by EXACTLY one per forward.
+      Double-decrement (ingress + egress) is the classic implementation bug;
+      drop_hoplimit_one + fwd_hoplimit_two pin it.
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "exists(route, lpm(hdr.ipv6.dst, ${routes}))"
+    notes: |
+      The chosen next-hop belongs to the LONGEST matching prefix. Using a
+      ternary table without prefix priorities selects the wrong route when
+      prefixes overlap.
+
+  - id: ip6_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv6.src, hdr.ipv6.dst)"
+    while: "rule R2 fires"
+    free_under: []
+    notes: "RFC 8200 — addresses MUST NOT change during unicast forwarding."
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ rule R2 fires"
+    notes: |
+      Egress Ether src MUST be the egress port's own MAC; Ether dst MUST be
+      the next-hop's MAC. Anti-pattern: src ← old ingress dst.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "rule R2 fires ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — every packet of one flow lands on the same next-hop.
+      Hashing on a per-packet-varying field splits the flow.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_lpm_hit_single_prefix
+      generate: |
+        Send an IPv6 packet to a destination covered by exactly one prefix.
+        Assert: output_port == matched egress; Ether.src ← port_mac;
+        Ether.dst ← next_hop_mac; hopLimit decremented by 1; src/dst
+        unchanged.
+    - id: fwd_lpm_distinct_prefixes
+      generate: |
+        Install ≥2 prefixes to different ports; send to each; assert each
+        lands on its prefix's egress with the L2 rewrite.
+    - id: fwd_longest_prefix_priority
+      generate: |
+        Overlapping prefixes (e.g. 2001:db8::/32 → A and 2001:db8:2::/48 →
+        B). Send into the /48; assert it forwards to B, not A.
+    - id: fwd_nextheader_independence
+      generate: |
+        Send IPv6+TCP and IPv6+UDP to one prefix; assert both forward on the
+        same egress (forwarding is Next-Header-agnostic).
+    - id: fwd_hoplimit_two
+      generate: |
+        Send hopLimit==2 to a matching prefix; assert FORWARDED with egress
+        hopLimit==1.
+    - id: fwd_ecmp_flow_consistency
+      requires: "${multipath_mode} != none"
+      generate: |
+        K≥2 nexthop group; send 10 packets of one 5-tuple; assert all exit
+        the same egress (RFC 2992 §2.2).
+
+  G2:
+    - id: drop_hoplimit_one
+      generate: |
+        Send hopLimit==1 to a matching prefix; assert DROP (a transit router
+        cannot forward; it would decrement to 0). RFC 8200 §3.
+    - id: drop_hoplimit_zero
+      generate: |
+        Send hopLimit==0; assert drop.
+    - id: drop_no_route
+      generate: |
+        Send to a destination matching no prefix (no ::/0 default); assert
+        drop.
+    - id: fwd_host_route_128
+      generate: |
+        Install a /128 host route; send to it (forward) and to an adjacent
+        address not otherwise covered (drop).
+
+  G3:
+    - id: drop_non_ipv6
+      generate: |
+        Send an IPv4 / ARP / raw frame; assert drop (R0).
+    - id: drop_link_local_dst
+      requires: "${filter_link_local}"
+      generate: |
+        Send to fe80::1; assert drop (RFC 4291 §2.5.6).
+    - id: drop_multicast_dst
+      requires: "${filter_multicast}"
+      generate: |
+        Send to ff02::1; assert drop (RFC 4291 §2.7).
+    - id: drop_unspecified_dst
+      generate: |
+        Send to :: (unspecified); assert drop (no route / RFC 4291 §2.5.2).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: enable_ecmp_5tuple
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 2) ∧
+      ${faithfulness} ← D5.1_ecmp
+    d_axis_delta: {D5: +1, D3: +1, test_rigor: +1}
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Lift to ECMP. Activates ecmp_flow_consistency. Bridge: hash(5-tuple)
+      selects a member index; the IPv6 5-tuple hash must include only
+      flow-stable fields.
+
+  - id: inflate_fib_with_overlapping_prefixes
+    axis: workload
+    direction: harden
+    applicable_when: "true"
+    effect: |
+      Generate ${routes} so ≥30% of prefixes overlap (a /32 plus several
+      /48s and /64s within it). Add a G2 longest-prefix-stress test.
+    d_axis_delta: {D2: +1, test_rigor: +1}
+    notes: "Stresses lpm_longest_match_correctness on 128-bit keys."
+
+  - id: shrink_fib_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${fib_capacity} ≥ 16"
+
+  - id: disable_scope_filters
+    axis: strictness
+    direction: ease
+    applicable_when: "${filter_link_local} ∨ ${filter_multicast}"
+    effect: "${filter_link_local} ← false ∧ ${filter_multicast} ← false"
+    d_axis_delta: {D7: -1}
+    notes: |
+      Ease operator: drop the scope-filter rules R4/R5, leaving a pure
+      LPM+Hop-Limit forwarder. Removes the drop_link_local / drop_multicast
+      G3 cases.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations in v1model P4:
+
+    Canonical (multipath_mode: none):
+      - Parser: select(etherType) — 0x86DD → parse_ipv6, else accept with
+        ipv6 invalid (R0 drops via the pre-LPM gate).
+      - One LPM table on hdr.ipv6.dstAddr (128-bit) → action ipv6_forward(
+        port, port_mac, next_hop_mac): egress_spec=port; Ether.src=port_mac;
+        Ether.dst=next_hop_mac; hdr.ipv6.hopLimit = hdr.ipv6.hopLimit - 1.
+      - Pre-LPM gate: if (hdr.ipv6.isValid() && hdr.ipv6.hopLimit > 1).
+      - There is NO checksum block — IPv6 has no header checksum. A
+        MyComputeChecksum that touches a non-existent ipv6 checksum is wrong.
+      - Scope filters: drop fe80::/10 and ff00::/8 before/independent of LPM.
+
+  Anti-pattern implementations to reject:
+    * Adding an IPv6 header checksum recompute — IPv6 has none (RFC 8200 §3).
+    * Using ttl>0 / forward-at-1 IPv4 convention — IPv6 drops hopLimit≤1.
+    * Decrementing hopLimit twice (ingress + egress).
+    * Ether.src ← ingress Ether.dst instead of the egress port MAC.
+    * Ternary instead of LPM on the 128-bit destination.
+
+post_instantiation_hooks: |
+  For each instance, the public tests run through the oracle for the seed
+  must yield the expected outputs.

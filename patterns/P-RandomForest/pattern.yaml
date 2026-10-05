@@ -1,0 +1,1271 @@
+# P-RandomForest — in-switch random-forest (decision-tree ENSEMBLE) inference
+#
+# TPL v1.0 task pattern. The THIRD occupant of the
+# (D3:ml-inference × P11:ml-inference) cell of the NF design-space
+# map — the ML-inference row of the `relocate` frontier — alongside, and
+# structurally derived from, P-DecisionTreeInfer (a single tree) and
+# orthogonal to P-BinaryNeuralNet (an XNOR-popcount BNN). P-RandomForest is
+# the ENSEMBLE scale-up of P-DecisionTreeInfer: it REUSES the single-tree
+# IIsy/Planter encode-based feature-table → decision-table conventions
+# (per-feature range/ternary split codes, code-tuple → leaf-class table,
+# most-common-label default, exact ≤/< boundary tie-break) verbatim and
+# builds the NEW mechanism on top — K parallel trees over the SAME feature
+# vector, each emitting a per-tree class VOTE, followed by a
+# VOTE-AGGREGATION / ARGMAX stage that resolves the final class by majority.
+# That per-class vote accumulation (`inc` on per-class counters) + argmax is
+# the distinguishing mechanism this pattern adds and P-DecisionTreeInfer
+# lacks. The headline capacity / feature-breadth knobs are the number of
+# trees `${n_trees}` and the per-tree depth `${tree_depth}` (and the
+# tie-breaking strictness of the argmax).
+#
+# target_capability = relocate: random-forest inference has historically
+# lived on hosts / collectors / control-plane analytics; the data plane is
+# now able to *receive* an already-trained forest and classify at line rate.
+# The relocate failure mode shows up in its ENSEMBLE ML form: there is
+# no fixed-function ASIC precedent for "run K decision trees and vote", so
+# the SUT must REDESIGN a host-side `for tree in forest: votes[tree(x)] += 1;
+# argmax(votes)` loop into K loop-free encode-based trees PLUS a
+# stage-bounded vote-accumulate-and-argmax encoding, with no prior data-plane
+# design to copy. Where the single-tree pattern stresses one encode-based
+# tree, this pattern stresses the ENSEMBLE: K trees + the aggregation layer.
+#
+# Extracted from Planter (Zheng et al.,
+# "Planter: Rapid Prototyping of In-Network Machine Learning Inference") as
+# the canonical implementation of mapping a trained random forest onto
+# match-action, with pForest / IIsy (Xiong & Zilberman, "Do Switches Dream
+# of Machine Learning? Toward In-Network Classification", HotNets 2019) for
+# the per-feature feature-table / decision-table encoding and the forest
+# voting layer, plus the Cluster-F / K1 / NF-4a ML-inference lineage of
+# the NF literature survey.
+
+pattern_id: P-RandomForest
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D3:ml-inference]                             # D3 family "ML inference" — random forests / decision-tree ensembles run in-pipeline
+  prescriptive: [P11:ml-inference]                            # P11 "ML inference" — model inference in match-action pipeline; `relocate` row in the NF-category table
+
+target_capability: relocate                                   # trained-forest inference relocated from host / collector analytics down into the switch pipeline
+
+summary: >
+  An in-switch random-forest (decision-tree ENSEMBLE) classifier. For each
+  classifiable packet the switch reads a fixed set of `${feature_count}`
+  header-derived feature fields, quantises each to `${feature_bit_width}`
+  bits, and evaluates a pre-trained random forest of `${n_trees}` trees
+  installed by the control plane. Each tree is a single
+  P-DecisionTreeInfer-style encode-based tree (IIsy / Planter): per-feature
+  range/ternary FEATURE TABLES slice that feature into the tree's split
+  intervals (a per-feature code), and a per-tree exact-match DECISION TABLE
+  maps the composed code tuple to that tree's leaf class — its default
+  action storing the tree's most-common label so an unmatched tuple falls to
+  the tree default. Each tree thus emits ONE per-tree class VOTE. The
+  distinguishing ENSEMBLE mechanism, absent at the single tree, is the
+  VOTE-AGGREGATION stage: the per-tree votes are ACCUMULATED into per-class
+  vote counters (`inc` per class) and the final class is the ARGMAX
+  (plurality majority) over those counters. Ties are resolved per
+  `${tie_break}` (lowest-class-index / weighted). The winning class drives
+  forwarding through a control-plane class-action map: `forward` (steer to
+  the class's egress port), `drop` (the anomaly / malicious class), or
+  `mark` (stamp the class id into the IPv4 DSCP/diffserv field, recomputing
+  the IPv4 checksum). A packet missing a required feature header is handled
+  per `${unclassified_action}`. The pattern is STATELESS — the vote counters
+  are per-packet scratch, reset for every packet; every verdict is a PURE
+  function of the current packet's features and the control-plane-installed
+  forest (the headline `inference_determinism` invariant). Its difficulty
+  lives in the ensemble redesign: K encode-based trees must each reproduce
+  their split-boundary tie-break exactly (`boundary_classification_fidelity`),
+  the per-class vote accumulation + argmax must reproduce the forest's
+  documented tie-break exactly (`vote_aggregation_fidelity` — the ensemble's
+  silent misclassification), the whole evaluation must terminate in a fixed
+  number of stages regardless of K or depth, the payload must round-trip
+  unmodified, and the IPv4 checksum must be recomputed after a DSCP mark.
+  Faithfulness anchors at D5.0 (a small forest of 3 shallow trees, two
+  features, forward-only, exact coarse quantisation, lowest-index
+  tie-break, uniform workload) and ladders through D5.1 (more / deeper
+  trees, more features, +drop class, strict boundary fidelity), D5.2
+  (a larger forest + weighted voting + mark action), and D5.3 (full feature
+  set, a large deep forest, tight model capacity, adversarial on-boundary /
+  vote-tie feature workload).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: planter_zheng_innetwork_ml
+      title: "Planter: Rapid Prototyping of In-Network Machine Learning Inference"
+      where: "Zheng et al. (ACM SIGCOMM CCR / Planter framework)"
+      role: canonical_implementation
+      relevance: |
+        The textbook framework for mapping a trained tree-based model —
+        decision tree AND random forest — onto a match-action pipeline, and
+        the spine of every rule and invariant here. The clauses below bind
+        directly on the pattern's ENSEMBLE structure:
+
+          - Encode-based per-tree mapping (the single-tree base, reused from
+            P-DecisionTreeInfer). Planter adopts ternary matches in all
+            feature tables and uses a decision (code) table whose default
+            action stores the most common label; one feature table per
+            feature plus one decision table per tree. This IS the per-tree
+            encode-based evaluation each of the `${n_trees}` trees performs,
+            and the `${default_class}` / per-tree-default mechanism — the
+            base this pattern REUSES rather than re-derives.
+
+          - Random forest as an ensemble of such trees. Planter maps a
+            random forest by replicating the per-tree (feature tables +
+            decision table) structure across the K trees of the forest, each
+            tree producing its own leaf decision over the SAME input feature
+            vector. This grounds the `${n_trees}` headline knob and the
+            per-tree-vote production — the structural difference from a single
+            tree.
+
+          - Vote aggregation / final-decision table. Planter combines the
+            per-tree decisions into the forest's final prediction by
+            accumulating votes per class and taking the majority (a final
+            decision / voting stage after the per-tree tables). This is the
+            DISTINGUISHING mechanism this pattern adds over
+            P-DecisionTreeInfer: the per-class vote counters (`inc`) and the
+            argmax/majority resolution (`vote_aggregation_fidelity`), and it
+            bounds the evaluation to a fixed number of logical stages
+            regardless of K or tree depth (`no_loop`).
+
+          - Control plane compiles the model. Planter's offline step turns a
+            trained scikit-learn forest into the feature-table ranges + the
+            decision-table leaf rows + the voting-table / class-action rows;
+            the data-plane program is model-agnostic. This is the
+            `${model_artifact}` → table-entries compile the seed performs.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model realisation — emitting each per-feature code
+        into a metadata field, concatenating the code tuple as the per-tree
+        decision-table key, REPLICATING the (feature tables + decision table)
+        per tree, accumulating per-class vote counters in metadata across the
+        K trees, applying the argmax / weighted argmax with a deterministic
+        tie-break, the `class_action` table mapping the winning class to
+        mark_to_drop / egress_spec / a DSCP write, and the update_checksum
+        after a DSCP mark — is widely known P4-on-v1model practice rather
+        than Planter-cited, and is flagged `[common-knowledge baseline]` in
+        `bridging_notes:`.
+
+    - cite: iisy_xiong_zilberman_hotnets19
+      title: "Do Switches Dream of Machine Learning? Toward In-Network Classification (IIsy)"
+      where: "HotNets 2019 (Xiong & Zilberman)"
+      role: domain_concepts
+      relevance: |
+        The earlier in-network classification design IIsy / pForest builds
+        on — the source of the per-feature feature-table encoding and the
+        forest-voting framing this pattern reproduces. The clauses that bind:
+
+          - Feature space sliced by feature tables. IIsy slices each feature
+            dimension into intervals via (ternary) matches that emit an
+            "area code", composing the per-feature codes into a key the model
+            table resolves to a label — the per-feature encode-based step
+            each tree of the forest reuses (the
+            `boundary_classification_fidelity` ≤-vs-< tie-break is the
+            load-bearing per-tree invariant).
+
+          - Ensemble voting. IIsy / pForest frame the random forest as the
+            ensemble whose per-tree predictions are combined into the final
+            class by voting — the conceptual basis for this pattern's
+            vote-accumulate-and-argmax stage and the
+            `vote_aggregation_fidelity` invariant. pForest additionally
+            motivates running the trained forest at line rate, the `relocate`
+            framing.
+
+          - Stage bound. Both designs emphasise that the encode-based
+            evaluation runs in a fixed number of logical pipeline stages
+            regardless of tree depth (no per-node tree walk) — grounding the
+            `no_loop` fixed-stage invariant, which the K-tree + voting
+            structure must preserve.
+
+  rfcs: []                                                    # ML inference is a research / engineering NF with no IETF data-plane normative source.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet or cross-packet state. Every classification
+      derives from the current packet's `${feature_count}` header-derived
+      feature fields, the ingress port, and the control-plane-installed
+      forest + class-action tables. The pattern is STATELESS — no `flow` /
+      `window` rows are maintained ACROSS packets. The per-class vote
+      counters used by the aggregation stage are PER-PACKET scratch (reset to
+      zero for every packet), not cross-packet state, which is what keeps the
+      oracle a pure `classify(features) -> class` function. Per-packet
+      header-feature inference is the IIsy / Planter model; flow-level /
+      sliding-window feature accumulation (pForest / BoS) is stateful and out
+      of scope (it composes with the P3 flow-tracking patterns).
+
+  forest_model:                                               # TPL `bucket` — aggregate state across a class of packets (the trained forest compiled to entries)
+    type: bucket
+    keyed_by_tuple: [tree_id, feature_code_tuple]             # which tree's decision table + the composed per-feature codes for THAT tree; resolves to a per-tree leaf class
+    attrs:
+      leaf_class:    int                                      # the per-tree class this tree's code tuple votes for
+      tree_id:       int                                      # which ensemble member (0 .. ${n_trees}-1) produced this code
+      tree_weight:   int                                      # vote weight of this tree (1 for unweighted majority; >1 for weighted voting)
+    capacity: ${model_capacity}
+    populated_from: ${model_artifact}                         # the trained forest: per-tree per-feature split boundaries + per-tree leaf-class maps the seed compiles to entries
+    notes: |
+      The trained forest compiled to match-action entries via the IIsy /
+      Planter encode-based scheme, REPLICATED per tree: per-feature
+      range/ternary split rows (feature tables) plus the code-tuple →
+      per-tree-leaf-class rows (decision table) for EACH of the `${n_trees}`
+      trees. Control-plane installed. Each tree's decision-table default
+      action is that tree's most-common label (`${default_class}`) for an
+      unmatched code tuple. The data-plane program is model-agnostic — it
+      implements the K-tree encoding + voting, not the specific forest.
+
+  class_action_map:                                           # TPL `bucket` — per-class steering decision
+    type: bucket
+    keyed_by_tuple: [winning_class]
+    attrs:
+      verdict:      "enum {forward, drop, mark}"              # which rule (R3/R1/R2) the argmax-resolved class fires
+      egress_port:  port                                      # class egress port (forward + mark)
+      mark_value:   "int | none"                              # DSCP/diffserv value stamped (mark only)
+    capacity: ${num_classes}
+    populated_from: ${class_action_entries}                   # class → action rows the seed installs
+    notes: |
+      The (argmax-)winning-class → forwarding-action table. Control-plane
+      installed (an operator policy: which classes forward where, which drop
+      as the anomaly/malicious class, which get stamped). Separates the model
+      (forest_model) from the policy (class_action_map) so the same forest
+      can drive different actions across instances.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  model_artifact:
+    type: list[tree_spec]
+    constraint: |
+      a list of EXACTLY ${n_trees} trees; each tree_spec is a set of decision
+      nodes {feature_index ∈ [0, ${feature_count}), threshold:int, tie_break ∈
+      {le, lt}}, leaf nodes {leaf_class:int ∈ [0, ${num_classes})}, and an
+      integer tree_weight ≥ 1 (1 for unweighted majority); every feature_index
+      used is < ${feature_count}; every threshold fits in ${feature_bit_width}
+      bits; each tree's depth ≤ ${tree_depth}. The compiled
+      (feature_code_tuple → leaf_class) rows per tree are unique. A per-tree
+      most-common-label default is declared for that tree's decision-table
+      default action.
+    notes: |
+      The trained forest the seed binds — the data the instantiation step
+      compiles into the per-tree per-feature split (feature) tables and the
+      per-tree code-tuple → leaf-class (decision) table rows. Bound by the
+      seed; carries no own operator (it is data, not a difficulty knob — the
+      knobs are n_trees / tree_depth / feature_count / quantisation / tie
+      strictness, each with its own operator). The parametric-source
+      contract holds: the oracle reads the splits, leaf maps, and tree
+      weights from runtime state, never bakes them as source constants — so
+      forest rebinding reuses the same audited oracle.
+
+  class_action_entries:
+    type: list[class_action_entry]
+    constraint: |
+      one entry per class index that can win the vote; each has
+      class_index:int ∈ [0, ${num_classes}); verdict ∈ {forward, drop, mark};
+      egress_port:int ∈ [1, 511] (required for forward/mark); mark_value:int ∈
+      [0, 63] (required iff verdict == mark, the 6-bit DSCP field, else none).
+      verdict ∈ {drop} entries appear only when ${action_breadth} ∈
+      {forward_drop, forward_drop_mark}; verdict ∈ {mark} entries only when
+      ${action_breadth} == forward_drop_mark.
+    notes: |
+      The rows that populate `class_action_map`. Bound by the seed; the
+      harness installs the corresponding class-action table at task start.
+
+  num_classes:
+    type: int
+    range: "[2, 64]"
+    default: 2
+    notes: |
+      Number of distinct leaf classes the forest can emit (the model's label
+      space, and the width of the per-class vote-counter array). Anchor
+      instances are binary (benign / anomaly). Coupled into the
+      model_artifact and class_action_entries; not a standalone difficulty
+      knob (the difficulty is forest / tree / feature structure).
+
+  n_trees:
+    type: int
+    range: "[1, 32]"
+    default: 3
+    notes: |
+      THE headline ensemble knob — the number of trees in the forest. `1` is
+      a degenerate single tree (P-DecisionTreeInfer); `> 1` is a true random
+      forest and is the anchor (default 3). Each added tree is one more
+      replicated (feature tables + decision table) group AND one more vote to
+      accumulate, so it WIDENS both the per-tree encode surface and the
+      vote-aggregation arithmetic. `grow_forest` hardens, `shrink_forest`
+      eases (feature-breadth axis — more of the ensemble surface to
+      implement). Capped at 32 to stay within the v1model stage budget.
+
+  tree_depth:
+    type: int
+    range: "[1, 12]"
+    default: 3
+    notes: |
+      Maximum depth of EACH tree — the number of split comparisons on a
+      root-to-leaf path, and hence the number of distinct intervals each
+      feature table may carry and the width of each tree's composed code
+      tuple. Deeper trees mean more feature-table rows and a larger per-tree
+      decision table to encode without overlap/gap, raising the off-by-one /
+      mis-encode risk across ALL ${n_trees} trees. `deepen_tree_depth`
+      hardens, `shallow_tree_depth` eases (capacity axis — the resource is
+      per-tree encoding breadth / decision-table rows; distinct resource from
+      n_trees, which moves ensemble breadth).
+
+  feature_count:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: |
+      Number of header-derived input features — i.e. the number of feature
+      tables PER TREE in the encode-based mapping. More features means more
+      feature tables to slice correctly and a wider composed code tuple per
+      tree, so `add_feature` hardens (feature-breadth axis). The seed's
+      `${feature_set}` must list exactly this many fields. The feature vector
+      is SHARED across all trees of the forest.
+
+  feature_set:
+    type: list[header_field_ref]
+    constraint: |
+      length == ${feature_count}; each entry references a parseable header
+      field usable as a classification feature (e.g. ipv4.totalLen,
+      ipv4.protocol, ipv4.ttl, ipv4.diffserv, tcp.srcPort, tcp.dstPort,
+      tcp.flags, udp.dstPort). Every referenced header is in the parser's
+      reachable set.
+    notes: |
+      Which header fields the classifier reads as features (shared by every
+      tree). Bound by the seed. The instantiation step renders each into the
+      corresponding quantised feature value the per-tree feature tables key
+      on.
+
+  feature_bit_width:
+    type: int
+    values: [4, 8, 12, 16]
+    default: 8
+    notes: |
+      Bits each feature is quantised to before the feature-table lookups.
+      Narrower widths bin more raw values together, so more packets land on a
+      bin boundary and the SUT must reproduce the model's exact binning /
+      rounding across all trees — a faithfulness surface.
+      `coarsen_feature_quantisation` (narrow) hardens;
+      `refine_feature_quantisation` (widen) eases.
+
+  vote_aggregation:
+    type: enum
+    values: [majority, weighted_majority, sum_threshold]
+    default: majority
+    notes: |
+      How per-tree votes combine into the final class. `majority` is the
+      plurality argmax over unit votes; `weighted_majority` accumulates each
+      tree's `tree_weight` into its voted class then argmaxes; `sum_threshold`
+      sums per-class scores against a cutoff. Coupled into the faithfulness
+      ladder rather than carrying its own operator pair (it refines the
+      aggregation the ensemble already has).
+
+  tie_break:
+    type: enum
+    values: [lowest_index, highest_weight, reject]
+    default: lowest_index
+    notes: |
+      How the argmax resolves a TIE in the per-class vote counters (e.g. two
+      classes each receiving the same number of votes in an even forest).
+      `lowest_index` picks the lowest class index (the deterministic default);
+      `highest_weight` prefers the class whose tied votes carry the larger
+      summed tree_weight; `reject` routes a tie to `${default_class}`. THE
+      ensemble tie-break strictness knob: `tighten_tie_break` hardens (demand
+      the exact documented tie resolution), `loosen_tie_break` eases (a
+      lenient lowest-index default the SUT is most likely to guess) — a
+      strictness axis distinct from the per-tree boundary tie-break. The
+      `vote_tie_resolution` test pins it.
+
+  default_class:
+    type: "int | most_common"
+    default: most_common
+    notes: |
+      The class an unmatched per-tree code tuple votes for (the IIsy/Planter
+      decision-table default action, the tree's most-common training label),
+      and the class a `reject` vote-tie resolves to. `most_common` mirrors the
+      trained model; coupled into the faithfulness ladder rather than carrying
+      its own operator pair. The `default_class_fallback` test pins that a
+      per-tree table miss resolves deterministically rather than faulting.
+
+  action_breadth:
+    type: enum
+    values: [forward_only, forward_drop, forward_drop_mark]
+    default: forward_only
+    notes: |
+      Which class verdicts the seed's table exercises. `forward_only` is the
+      anchor minimum (every class steers to a port — R3). `forward_drop` adds
+      the anomaly/malicious drop class (R1). `forward_drop_mark` adds the
+      DSCP-stamp action (R2) and its IPv4-checksum surface. Broader action
+      sets add reachable rules and bug surfaces, so `broaden_class_action`
+      hardens (feature-breadth axis).
+
+  unclassified_action:
+    type: enum
+    values: [drop, forward_default]
+    default: forward_default
+    notes: |
+      How a packet that lacks a required feature header (cannot be
+      classified) is handled: `forward_default` steers it to
+      `${default_egress_port}` (a passthrough), `drop` is closed-world
+      default-deny. Coupled into the faithfulness ladder, not a standalone
+      operator pair.
+
+  default_egress_port:
+    type: int
+    range: "[1, 511]"
+    enforced_when: "${unclassified_action} == forward_default"
+    notes: |
+      Egress port an unclassifiable packet is forwarded to under
+      `${unclassified_action} == forward_default`. Bound by the seed.
+
+  model_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of compiled model rows (per-tree feature-table +
+      decision-table entries + voting/class rows summed over the forest) the
+      data plane supports. `shrink_model_capacity_4x` tightens it from the
+      anchor's `unbounded`, forcing the SUT toward a compact encoding (e.g.
+      ternary feature tables that fold many raw values per row, shared across
+      trees) rather than a row-per-leaf table per tree (capacity axis —
+      distinct resource from `tree_depth` and `n_trees`, which move encoding
+      breadth; all capacity, so each carries its own harden/ease pair).
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of feature values in the G1 traffic tests. `uniform` is
+      the anchor default. `zipfian` concentrates on a few hot classes.
+      `adversarial` packs feature values that sit EXACTLY on per-tree split
+      thresholds and at the `${feature_bit_width}` quantisation-bin edges,
+      AND crafts vectors that produce an EVEN per-class vote split (the
+      ensemble tie) — where a mis-encoded boundary OR a mis-resolved argmax
+      tie mis-classifies. `raise_workload_skew` hardens (workload axis).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_small_forest, D5.1_deep_forest_drop, D5.2_weighted_forest_mark, D5.3_adversarial_forest]
+    default: D5.0_anchor_small_forest
+    notes: |
+      The faithfulness ladder for this pattern. D5.0 is a small forest (3
+      shallow trees, 2 features, forward-only, coarse-but-exact quantisation,
+      lowest-index tie-break, uniform workload, explicit default class). D5.1
+      grows / deepens the trees, adds features, adds the drop class, and
+      demands strict boundary fidelity. D5.2 enlarges the forest, switches to
+      weighted voting, and adds the mark action. D5.3 takes the full feature
+      set, a large deep forest, tight model capacity, and the adversarial
+      on-boundary / vote-tie feature workload. `tighten_faithfulness` walks
+      the ladder up; `loosen_faithfulness` walks it down (feature-breadth
+      ladder).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+#
+# Shorthands used in the `when` clauses below:
+#   has_features  := header_present(ipv4) ∧ ∀ f ∈ ${feature_set}: header_present(f.header)
+#                    (every feature field's enclosing header parsed successfully)
+#   features      := quantise(read(${feature_set}), ${feature_bit_width})
+#   tree_vote(t)  := infer_tree(features, forest_model, t, ${default_class})
+#                    -- the per-tree encode-based evaluation: per-feature
+#                       range-table codes composed by tree t's decision table
+#                       to a leaf class; resolves to ${default_class} when the
+#                       composed code tuple is absent from tree t's table.
+#   votes         := for t in [0, ${n_trees}): inc(vote_counter[tree_vote(t)],
+#                       tree_weight(t))         -- per-class vote accumulation
+#   winning_class := argmax(votes, ${vote_aggregation}, ${tie_break})
+#                    -- the ensemble's final class (plurality / weighted /
+#                       sum-threshold), ties resolved per ${tie_break}.
+#   verdict       := class_action_map[winning_class].verdict
+
+rules:
+
+  - id: R0_unclassifiable
+    when: |
+      ¬has_features
+    then:
+      - "forward(${default_egress_port}) if ${unclassified_action} == forward_default else drop"
+    notes: |
+      A packet that does not carry the required feature headers (e.g. a
+      non-IPv4 frame, or a non-TCP packet when a TCP feature is configured)
+      cannot be classified. It is handled per `${unclassified_action}` — a
+      deterministic passthrough or drop — and the NF MUST NOT read the absent
+      feature fields (that would be an unspecified-value read per P4-16
+      §8.25). `read_invalid_feature_guard` and the `feature_read_safety`
+      invariant pin this.
+
+  - id: R1_class_drop
+    when: |
+      has_features ∧ verdict == drop
+    given:
+      forest_model:     by_key(tree_id, feature_code_tuple) for each tree
+      class_action_map: by_key(winning_class)
+    then:
+      - "inc(vote_counter[tree_vote(t)], tree_weight(t))   ∀ t ∈ [0, ${n_trees})"   # per-class vote accumulation across all trees
+      - drop
+    notes: |
+      The argmax-winning class is the anomaly / malicious class (the drop
+      verdict). The per-class votes are still accumulated to RESOLVE that
+      verdict; the packet is then dropped before any forwarding. Only
+      reachable when `${action_breadth} ∈ {forward_drop, forward_drop_mark}`
+      (the seed installs no drop-verdict classes otherwise). The D7-flavoured
+      security use of in-network inference (drop traffic the forest flags).
+      `class_drop` exercises it.
+
+  - id: R2_class_mark
+    when: |
+      has_features ∧ verdict == mark
+    given:
+      forest_model:     by_key(tree_id, feature_code_tuple) for each tree
+      class_action_map: by_key(winning_class)
+    then:
+      - "inc(vote_counter[tree_vote(t)], tree_weight(t))   ∀ t ∈ [0, ${n_trees})"   # per-class vote accumulation across all trees
+      - "set(ipv4.diffserv, class_action_map.mark_value)"     # stamp the winning class id into DSCP/diffserv
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - forward(class_action_map.egress_port)
+    notes: |
+      The argmax-winning class is stamped into the IPv4 DSCP/diffserv byte for
+      a downstream consumer (a class-aware queue / collector), then the packet
+      is forwarded. Because the IPv4 header changed, the IPv4 header checksum
+      MUST be recomputed — the #1 silent failure (`checksum_after_mark`,
+      `envelope_checksum_validity`). The PAYLOAD is untouched
+      (`payload_persistence`). Only reachable when `${action_breadth} ==
+      forward_drop_mark`.
+
+  - id: R3_class_forward
+    when: |
+      has_features ∧ verdict == forward
+    given:
+      forest_model:     by_key(tree_id, feature_code_tuple) for each tree
+      class_action_map: by_key(winning_class)
+    then:
+      - "inc(vote_counter[tree_vote(t)], tree_weight(t))   ∀ t ∈ [0, ${n_trees})"   # per-class vote accumulation across all trees
+      - forward(class_action_map.egress_port)
+    notes: |
+      The anchor action: the forest's argmax-winning class steers the
+      packet to its class egress port (e.g. a per-class queue / next hop). No
+      header is rewritten — the inference NF is a pure classifier-steerer
+      here, so the whole packet (headers + payload) round-trips byte-for-byte
+      (`payload_persistence`). This is the default verdict for every class at
+      the `forward_only` anchor. The `inc` over the K per-tree votes followed
+      by the argmax is the ENSEMBLE mechanism distinguishing this rule from
+      P-DecisionTreeInfer's single-tree forward (which has no vote
+      accumulation). Implementation anti-patterns: keying the decision on a
+      per-packet-varying field instead of the configured features
+      (`inference_determinism`); mis-encoding a per-tree split boundary so an
+      on-threshold feature value votes wrong (`boundary_classification_fidelity`);
+      mis-counting the votes or mis-resolving the argmax tie
+      (`vote_aggregation_fidelity`).
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The ensemble evaluation is a FIXED
+      number of logical stages regardless of K or tree depth — one lookup per
+      feature table, one decision-table lookup per tree, one vote-accumulation
+      stage, and one argmax — and every rule is a single-pass forward or drop.
+      There is NO recirculation. An implementation that tries to iterate the trees or
+      walk each tree node-by-node via recirculation (the naive host-side
+      `for tree in forest` transliteration) violates the bound; the unrolled,
+      encode-based K-tree + voting form does not.
+
+  - id: vote_aggregation_fidelity
+    clause: stability
+    target: "(per_class_vote_counters, winning_class)"
+    while: "has_features"
+    notes: |
+      THE ensemble-redesign invariant — the mechanism P-DecisionTreeInfer
+      does NOT have. The final class equals the argmax over the per-class
+      vote counters, where each of the ${n_trees} trees contributes exactly
+      ONE vote (of weight tree_weight under weighted_majority) to its own
+      leaf class, the counters are PER-PACKET (reset for every packet), and
+      the argmax tie is resolved per `${tie_break}`. An implementation that
+      double-counts a tree, drops a tree's vote, sizes the vote counter too
+      narrow to hold ${n_trees}, or resolves an even-forest tie
+      non-deterministically silently mis-classifies — and often only on the
+      vote-tie boundary, so the bug hides until a tie input. Pins the Planter
+      voting-table / final-decision stage. `vote_tie_resolution` and the
+      adversarial workload enumerate it.
+
+  - id: boundary_classification_fidelity
+    clause: stability
+    target: leaf_class
+    while: "has_features ∧ ∃ tree, ∃ f ∈ ${feature_set}: read(f) is on a split threshold of that tree in forest_model"
+    notes: |
+      The PER-TREE headline invariant, reused from P-DecisionTreeInfer. A
+      feature value sitting EXACTLY on a trained split threshold of ANY tree
+      is classified by that tree per the model's documented tie-break (`le`:
+      x ≤ t low; `lt`: x < t low) — and the data-plane range/ternary
+      feature-table encoding must reproduce that tie-break exactly for every
+      tree. An off-by-one in the interval bounds silently mis-votes the
+      boundary packet in one tree, which can flip the ensemble argmax. The #1
+      silent per-tree misclassification. `feature_boundary_value` and the
+      adversarial workload enumerate it.
+
+  - id: inference_determinism
+    clause: stability
+    target: "(winning_class, forward_decision)"
+    while: "has_features"
+    notes: |
+      Stable classification: two packets with identical quantised feature
+      values always produce the same per-tree votes, the same per-class
+      counters, the same argmax winning class, and the same forwarding
+      action. The forest is a PURE function of the configured features — no
+      per-packet register state that persists across packets, no dependence
+      on a per-packet-varying field (transaction id, source port when not a
+      feature, arrival order). Implementation anti-pattern: folding a non-feature
+      field into a tree's code tuple, FAILING TO RESET the per-packet vote
+      counters between packets, or a non-deterministic argmax tie-break —
+      each splits one logical feature vector across classes.
+      `inference_determinism_repeat` witnesses it.
+
+  - id: payload_persistence
+    clause: persistence
+    target: "(packet_headers_except_diffserv, payload)"
+    while: "(R2 ∨ R3 ∨ R0-forward) fires"
+    free_under: ["ipv4.diffserv under R2 (the class mark)"]
+    notes: |
+      On every forwarded (non-dropped) packet the headers and payload are
+      delivered byte-for-byte identical to what arrived, EXCEPT the IPv4
+      DSCP/diffserv byte under the R2 mark action. The inference NF
+      classifies-and-steers (and optionally stamps one byte) — it does not
+      rewrite or truncate the packet. Pins the conditional-deparser surface:
+      an implementation that drops, reorders, or fixed-width-pads a parsed header
+      corrupts the steered packet even though forwarding "works".
+      `conditional_deparser_roundtrip` enumerates it.
+
+  - id: envelope_checksum_validity
+    clause: stability
+    target: ipv4.header_checksum
+    while: "R2 fires ∧ egress(packet)"
+    notes: |
+      Every marked packet carries a valid IPv4 header checksum on egress,
+      recomputed after the DSCP/diffserv write. Omitting `update_checksum`
+      after a header-field edit is the #1 silent failure in the v1model
+      bug taxonomy (cross-cutting): BMv2 emits a stale checksum the downstream
+      NIC / kernel silently drops. `checksum_after_mark` catches it.
+
+  - id: feature_read_safety
+    clause: stability
+    target: forward_decision
+    while: "¬has_features"
+    notes: |
+      A packet missing a required feature header produces a DETERMINISTIC
+      decision (`unclassified_action`) and NEVER reads a feature field from
+      an absent / invalid header (an unspecified-value read per P4-16 §8.25 /
+      the bug-taxonomy "read from invalid header"). Pins that the classifier
+      degrades gracefully rather than classifying on garbage bytes.
+      `read_invalid_feature_guard` witnesses it.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: rf_classify_golden
+      generate: |
+        Install a forest of ${n_trees} trees whose per-tree splits make a
+        specific feature vector receive a clear majority vote for a known
+        class C with class_action verdict=forward, egress_port=P. Send a
+        packet whose feature fields produce that vector. Assert it is
+        forwarded on P, with all headers and payload byte-for-byte unchanged.
+        (Anchor — the golden ensemble inference path, G1-P1-T1.)
+
+    - id: rf_majority_overrides_minority
+      generate: |
+        Install a forest where the trees DISAGREE on a crafted feature vector
+        (e.g. with n_trees=3, two trees vote class A and one votes class B) →
+        A and B map to different egress ports. Send that packet. Assert the
+        aggregated verdict is the `${vote_aggregation}` winner (majority → A's
+        port), NOT the minority tree's. Forces the SUT to accumulate per-tree
+        votes and apply the argmax rather than reading one tree. (THE
+        distinguishing ensemble branch vs the single tree; Planter voting
+        stage.)
+
+    - id: rf_two_classes
+      generate: |
+        Install a forest + class_action_map that map two distinct feature
+        vectors to two different majority classes → two different egress
+        ports. Send one packet for each. Assert each is steered to its class's
+        port. Confirms the forest actually evaluates the configured features
+        and votes rather than steering on a constant. (G1-P1-T1 per-class
+        coverage.)
+
+    - id: rf_default_class_fallback
+      generate: |
+        Send a packet whose feature vector corresponds to NO installed
+        decision-table code tuple in one or more trees. Assert those trees
+        vote their `${default_class}` (most-common-label default), the
+        ensemble argmax proceeds deterministically, and the packet takes the
+        winning class's action — never a per-tree table-miss fault or a
+        forward on uninitialised metadata. (Pins the IIsy/Planter
+        default-action mechanism; G1 state/branch coverage.)
+
+    - id: rf_mark_class
+      requires: "${action_breadth} == forward_drop_mark"
+      generate: |
+        Send a packet whose ensemble argmax is a mark-verdict class with
+        mark_value=V. Assert the egress packet has ipv4.diffserv=V, a valid
+        recomputed IPv4 header checksum, the same egress port, and the payload
+        byte-for-byte preserved. (R2 path; G1-P1-T3/T5 transformation
+        assertions.)
+
+  G2:
+    - id: feature_boundary_value
+      generate: |
+        Send packets whose feature value is EXACTLY a trained split threshold
+        t (and t±1) for at least one tree. Assert each is classified per that
+        tree's documented tie-break (le: ≤t low; lt: <t low) and the ensemble
+        argmax matches the oracle — the on-threshold packet must NOT flip to
+        an off-by-one neighbour. (Pins `boundary_classification_fidelity`; the
+        per-tree silent misclassification.)
+
+    - id: vote_tie_resolution
+      generate: |
+        With an even-vote-capable forest, craft a feature vector that
+        produces a TIE in the per-class vote counters (e.g. n_trees=4 → 2
+        votes class A, 2 votes class B). Assert the winner is resolved per
+        `${tie_break}` (lowest_index → A; highest_weight → the larger summed
+        tree_weight; reject → ${default_class}) EXACTLY as the oracle.
+        (Pins `vote_aggregation_fidelity` — the ensemble tie-break; the
+        ensemble's silent misclassification.)
+
+    - id: feature_at_bit_width_max
+      generate: |
+        Send a packet whose feature value is the maximum representable at
+        `${feature_bit_width}` (all-ones). Assert it quantises and is voted on
+        by every tree without wrap/overflow into a wrong bin. (Boundary;
+        feature-quantisation edge.)
+
+    - id: unclassifiable_missing_header
+      generate: |
+        Send a packet missing a required feature header (e.g. a non-IPv4
+        frame, or a UDP packet when a TCP-port feature is configured). Assert
+        it takes `${unclassified_action}` (drop, or forward to
+        `${default_egress_port}`) deterministically, with no read of the
+        absent feature fields and no tree evaluation. (G2 malformed/edge
+        input; pins `feature_read_safety`.)
+
+  G3:
+    - id: inference_determinism_repeat
+      generate: |
+        Send the SAME feature vector in N (≥3) packets, optionally varying a
+        NON-feature field (IP id, payload bytes). Assert every packet gets the
+        identical winning class and egress port — no flap. Catches an implementation
+        that folds a per-packet-varying field into a tree's code tuple, FAILS
+        TO RESET the per-packet vote counters between packets (votes leak
+        across packets), or uses a non-deterministic argmax tie-break. (Pins
+        `inference_determinism`; G3 stability probe — the ensemble-specific
+        counter-reset trap is unique to this pattern.)
+
+    - id: read_invalid_feature_guard
+      generate: |
+        Send (a) a non-IPv4 frame and (b) an IPv4 packet whose configured
+        feature lives in an absent upper-layer header (e.g. tcp.dstPort
+        feature but the packet is ICMP). Assert the NF does NOT classify on or
+        forward based on unspecified feature bytes — it takes
+        `${unclassified_action}`. (P4-16 §8.25 unspecified-value read; bug
+        taxonomy "read from invalid header".)
+
+    - id: conditional_deparser_roundtrip
+      generate: |
+        Send a forward-classified packet with a distinctive payload. Assert
+        the egress byte layout is exactly the input headers (DSCP unchanged
+        under forward; only DSCP changed under mark) followed by the payload
+        byte-for-byte — no header dropped, duplicated, reordered, or
+        fixed-width-padded. Catches the common v1model conditional-deparser bug
+        (emitting parsed headers unconditionally / out of order — the dominant
+        silent failure).
+
+    - id: checksum_after_mark
+      requires: "${action_breadth} == forward_drop_mark"
+      generate: |
+        Same setup as `rf_mark_class`. After R2 writes ipv4.diffserv,
+        recompute the IPv4 header checksum over the 20-byte header from the
+        egress bytes and assert it matches. Catches the implementation that edits DSCP
+        but forgets the checksum recompute — the #1 silent failure in the
+        v1model bug taxonomy (cross-cutting).
+
+    - id: class_drop
+      requires: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+      generate: |
+        Install a drop-verdict (anomaly) class. Send a packet whose ensemble
+        argmax is it; assert drop. Then send a packet whose argmax is a
+        forward class; assert it still forwards (the drop is class-scoped, not
+        a blanket deny). (In-network-inference security use, R1; G3
+        default-deny.)
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Nine harden operators paired with nine ease counterparts; every operator
+# declares `direction` so difficulty recalibration can pick
+# from the matching pool depending on whether r > r* + δ (harden) or
+# r < r* − δ (ease). Every harden has an ease counterpart on the SAME axis.
+
+mutation_operators:
+
+  - id: grow_forest
+    applicable_when: "${n_trees} < 32"
+    effect: "${n_trees} ← min(${n_trees} * 2, 32)   (replicate the per-tree feature+decision tables for the new trees; widen the per-class vote counters to hold the larger count)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${n_trees} ≤ 32 ∧ ${n_trees} ≥ 1 ∧ len(${model_artifact}) == ${n_trees}"
+    kind: parameter
+    notes: |
+      THE headline ensemble lever — grow the forest. Each added tree is one
+      more replicated (feature tables + decision table) group AND one more
+      vote to accumulate before the argmax, so it widens both the per-tree
+      encode surface and the vote-aggregation arithmetic. This is the SCALE-UP
+      of the single-tree mechanism into the ensemble — the structural
+      difference from P-DecisionTreeInfer. feature-breadth axis (more of the
+      ensemble surface to implement). Capped at 32 to stay within the v1model
+      stage budget.
+
+  - id: shrink_forest
+    applicable_when: "${n_trees} > 1"
+    effect: "${n_trees} ← max(${n_trees} / 2, 1)   (drop trees; narrow the per-class vote counters)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${n_trees} ≥ 1 ∧ ${n_trees} ≤ 32 ∧ len(${model_artifact}) == ${n_trees}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `grow_forest`. Halves (not quarters) the
+      tree count so the harden/ease asymmetry gives difficulty recalibration
+      a slower climb back after an over-grow. Dropping to 1 degenerates
+      to a single tree (P-DecisionTreeInfer's mechanism) and trivialises the
+      `rf_majority_overrides_minority` / `vote_tie_resolution` tests.
+
+  - id: deepen_tree_depth
+    applicable_when: "${tree_depth} < 12"
+    effect: "${tree_depth} ← min(${tree_depth} * 2, 12)"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${tree_depth} ≤ 12 ∧ ${tree_depth} ≥ 1"
+    kind: parameter
+    notes: |
+      Deepen each tree — more split comparisons per path, more feature-table
+      intervals and a wider composed code tuple to encode without overlap or
+      gap, across ALL ${n_trees} trees. The per-tree encoding breadth is a
+      structural resource, so this moves the `capacity` axis (the specific
+      resource is per-tree decision-table / interval breadth — distinct from
+      n_trees, which moves ensemble breadth). Raises the off-by-one and
+      mis-encode risk; activates more `feature_boundary_value` boundaries.
+
+  - id: shallow_tree_depth
+    applicable_when: "${tree_depth} > 1"
+    effect: "${tree_depth} ← max(${tree_depth} / 2, 1)"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${tree_depth} ≥ 1 ∧ ${tree_depth} ≤ 12"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `deepen_tree_depth`. Halves (not quarters)
+      the depth so the harden/ease asymmetry gives difficulty recalibration
+      a slower climb back after an over-deepen.
+
+  - id: add_feature
+    applicable_when: "${feature_count} < 8"
+    effect: "${feature_count} ← ${feature_count} + 1   (and extend ${feature_set} by one parseable field; add the per-feature table to every tree)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${feature_count} ≤ 8 ∧ len(${feature_set}) == ${feature_count}"
+    kind: parameter
+    notes: |
+      Add an input feature — one more feature table PER TREE to slice
+      correctly and a wider per-tree code tuple to compose. feature-breadth
+      axis (more of the model's input surface must be implemented across the
+      forest).
+
+  - id: drop_feature
+    applicable_when: "${feature_count} > 1"
+    effect: "${feature_count} ← ${feature_count} - 1   (and drop the last field from ${feature_set})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${feature_count} ≥ 1 ∧ len(${feature_set}) == ${feature_count}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `add_feature`.
+
+  - id: coarsen_feature_quantisation
+    applicable_when: "${feature_bit_width} > 4"
+    effect: "${feature_bit_width} ← prev_width(${feature_bit_width})"     # 16 → 12 → 8 → 4
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${feature_bit_width} ∈ {4, 8, 12}"
+    kind: parameter
+    notes: |
+      Narrow the feature quantisation. Coarser bins put MORE raw values on a
+      bin boundary, so the SUT must reproduce the model's exact binning /
+      rounding to classify those packets correctly in every tree — a fidelity
+      (not breadth) surface. faithfulness axis (exact↔approximate computation
+      of the quantised feature).
+
+  - id: refine_feature_quantisation
+    applicable_when: "${feature_bit_width} < 16"
+    effect: "${feature_bit_width} ← next_width(${feature_bit_width})"     # 4 → 8 → 12 → 16
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${feature_bit_width} ∈ {8, 12, 16}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `coarsen_feature_quantisation`. Finer bins
+      put fewer values on a boundary, easing the binning-fidelity demand.
+
+  - id: tighten_tie_break
+    applicable_when: "${tie_break} == lowest_index"
+    effect: "${tie_break} ← next_tie_break(${tie_break})   (lowest_index → highest_weight → reject; couple ${vote_aggregation} ← weighted_majority when highest_weight)"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${tie_break} ∈ {highest_weight, reject} ∧ (${tie_break} ≠ highest_weight ∨ ${vote_aggregation} == weighted_majority)"
+    kind: parameter
+    notes: |
+      Tighten the ENSEMBLE argmax tie-break strictness. `lowest_index` is the
+      lenient default the SUT is most likely to guess; `highest_weight`
+      demands the SUT track summed tree_weight to break ties (and so switches
+      voting to weighted_majority); `reject` demands a tie route to
+      ${default_class}. A strictness axis (how exactly the documented tie
+      resolution must be reproduced) DISTINCT from the per-tree boundary
+      tie-break (faithfulness) — this is the ensemble-specific knob. Activates
+      / hardens `vote_tie_resolution`.
+
+  - id: loosen_tie_break
+    applicable_when: "${tie_break} ∈ {highest_weight, reject}"
+    effect: "${tie_break} ← prev_tie_break(${tie_break})   (reject → highest_weight → lowest_index)"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${tie_break} ∈ {lowest_index, highest_weight}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_tie_break`. Steps back toward the
+      lenient lowest-index default the SUT guesses by reflex, easing the
+      ensemble tie-break demand.
+
+  - id: broaden_class_action
+    applicable_when: "${action_breadth} ∈ {forward_only, forward_drop}"
+    effect: "${action_breadth} ← next_action_breadth(${action_breadth})"  # forward_only → forward_drop → forward_drop_mark
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+    kind: parameter
+    notes: |
+      Add reachable class verdicts: forward_drop activates R1 (the
+      anomaly-drop class and `class_drop`), forward_drop_mark activates R2
+      (the DSCP-mark action and its checksum surface via `checksum_after_mark`).
+      feature-breadth axis.
+
+  - id: narrow_class_action
+    applicable_when: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+    effect: "${action_breadth} ← prev_action_breadth(${action_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${action_breadth} ∈ {forward_only, forward_drop}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_class_action`. Removes the
+      most-recently-added verdict and skips its `requires:`-guarded tests.
+
+  - id: shrink_model_capacity_4x
+    applicable_when: "${model_capacity} ≠ unbounded ∧ ${model_capacity} > 64"
+    effect: "${model_capacity} ← ${model_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${model_capacity} ≥ 16"
+    kind: parameter
+    notes: |
+      Tighten the compiled-model table budget over the whole forest. The SUT
+      cannot rely on a row-per-leaf table per tree and must adopt a compact
+      ternary encoding that folds many raw values per feature-table row,
+      shared across trees. capacity axis. (Distinct resource from
+      `deepen_tree_depth` and `grow_forest`, which move encoding / ensemble
+      breadth — all capacity-flavoured but on disjoint resources, so each
+      carries its own pair.)
+
+  - id: enlarge_model_capacity_2x
+    applicable_when: "${model_capacity} ≠ unbounded ∧ ${model_capacity} < 1048576"
+    effect: "${model_capacity} ← ${model_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${model_capacity} ≤ 1048576"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_model_capacity_4x`. Doubles (not
+      quadruples) for a slow climb back after an over-shrink.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"              # uniform → zipfian → adversarial
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the feature-value distribution skew. `adversarial` packs values
+      sitting exactly on per-tree split thresholds and quantisation-bin edges
+      AND crafts vectors that produce an EVEN per-class vote split (the
+      ensemble tie), where a mis-encoded boundary OR a mis-resolved argmax tie
+      mis-classifies — combined with coarse quantisation and a strict
+      tie-break this drives the classifier toward both boundary and
+      vote-tie errors. workload axis.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_small_forest, D5.1_deep_forest_drop, D5.2_weighted_forest_mark}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_deep_forest_drop then
+          ${n_trees} ← 5 ∧ ${tree_depth} ← 6 ∧ ${feature_count} ← 4 ∧
+          ${action_breadth} ← forward_drop ∧ ${workload_skew} ← zipfian ) ∧
+      ( if ${faithfulness}_post == D5.2_weighted_forest_mark then
+          ${n_trees} ← 8 ∧ ${vote_aggregation} ← weighted_majority ∧
+          ${tie_break} ← highest_weight ∧ ${action_breadth} ← forward_drop_mark ) ∧
+      ( if ${faithfulness}_post == D5.3_adversarial_forest then
+          ${n_trees} ← 16 ∧ ${feature_count} ← 6 ∧
+          ${feature_bit_width} ← 4 ∧ ${workload_skew} ← adversarial )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_small_forest ∧
+      ( ${faithfulness} ≠ D5.1_deep_forest_drop
+        ∨ ∃ entry ∈ ${class_action_entries}: entry.verdict == drop ) ∧
+      ( ${faithfulness} ≠ D5.2_weighted_forest_mark
+        ∨ ( ${vote_aggregation} == weighted_majority ∧
+            ∃ entry ∈ ${class_action_entries}: entry.verdict == mark ) )
+    kind: parameter
+    notes: |
+      Lift the faithfulness ladder one rung. D5.0 → D5.1 grows / deepens the
+      forest, adds features, adds the drop class. D5.1 → D5.2 enlarges the
+      forest, switches to weighted voting + highest-weight tie-break, adds the
+      mark action. D5.2 → D5.3 takes the full feature set, a large forest,
+      coarse quantisation, and the adversarial on-boundary / vote-tie
+      workload. Couples several knobs per step, so its
+      `feasibility_postcondition` requires the drop/mark rows and weighted
+      voting to exist before the rungs that need them.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_deep_forest_drop, D5.2_weighted_forest_mark, D5.3_adversarial_forest}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_small_forest then
+          ${n_trees} ← 3 ∧ ${tree_depth} ← 3 ∧ ${feature_count} ← 2 ∧
+          ${feature_bit_width} ← 8 ∧ ${vote_aggregation} ← majority ∧
+          ${tie_break} ← lowest_index ∧ ${action_breadth} ← forward_only ∧
+          ${workload_skew} ← uniform ) ∧
+      ( if ${faithfulness}_post == D5.1_deep_forest_drop then
+          ${n_trees} ← 5 ∧ ${vote_aggregation} ← majority ∧
+          ${tie_break} ← lowest_index ∧ ${action_breadth} ← forward_drop ∧
+          ${feature_bit_width} ← 8 ∧ ${workload_skew} ← zipfian ) ∧
+      ( if ${faithfulness}_post == D5.2_weighted_forest_mark then
+          ${feature_count} ← 4 ∧ ${feature_bit_width} ← 8 ∧
+          ${workload_skew} ← uniform )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_adversarial_forest
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the ladder
+      back one rung and reverts the entailed parameter bindings.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source (the encode-based per-tree classify +
+      vote-accumulate-and-argmax reference) to task.description so the SUT
+      sees a host-side reference implementation in addition to the
+      behavioural spec — the heaviest difficulty lever.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      Starter-library operator — laddering the input form from
+      behavioural spec to host-side reference EASES the SUT's job (it has a
+      Python `for tree in forest: votes[tree(x)] += 1; argmax(votes)` to
+      transliterate rather than redesign the encode-based K-tree + voting
+      mapping from scratch). For a `relocate` ML task this is the sharpest
+      probe of the relocate frontier: if the SUT still fails the compile gate WITH the
+      algorithm supplied, the bottleneck is the P4 ensemble encoding, not the
+      model. Used sparingly; pairs with the harden revert below.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`. The SUT
+      must redesign the encode-based K-tree + vote-aggregation mapping from
+      the behavioural spec alone.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  ENSEMBLE STRUCTURE (the distinguishing mechanism vs P-DecisionTreeInfer,
+  the headline relocate constraint):
+    P-DecisionTreeInfer is the SINGLE-TREE base; P-RandomForest REUSES that
+    base per tree and ADDS the vote-aggregation layer. The per-tree machinery
+    below is inherited verbatim from P-DecisionTreeInfer's bridging notes; the
+    NEW machinery is the K-tree replication + the vote-accumulate-and-argmax
+    stage. Every entry below is `[common-knowledge baseline]` rather than
+    Planter/IIsy-cited.
+
+  Common implementations from this pattern to v1model P4:
+
+    Anchor (D5.0_anchor_small_forest, n_trees=3, feature_count=2,
+                 tree_depth=3, feature_bit_width=8, vote_aggregation=majority,
+                 tie_break=lowest_index, action_breadth=forward_only,
+                 unclassified_action=forward_default):
+      - Parser: ethernet → (etherType==0x0800 ? ipv4 : accept) →
+        (ipv4.protocol selects tcp/udp if a transport feature is used).
+        Feature fields are read straight from the parsed headers; no
+        variable-length parse. The feature vector is SHARED across trees.
+      - Per-tree encode-based mapping (IIsy/Planter EB), REPLICATED for each
+        of the ${n_trees} trees: one ternary/range FEATURE TABLE per feature
+        keyed on the (optionally quantised) feature field, whose action writes
+        a small per-feature `code` into a per-tree metadata field; then one
+        exact per-tree DECISION TABLE keyed on the concatenated code tuple,
+        whose action sets THAT tree's voted class id; its `default_action`
+        writes the tree's most-common-label `${default_class}` (so a
+        code-tuple miss does NOT fault). Unroll the (small) tree set — do NOT
+        iterate trees via recirculation.
+      - Vote aggregation (THE NEW STAGE): maintain a per-class vote-counter
+        array in metadata (NOT a register — per-packet scratch, implicitly
+        zeroed each packet). For each tree, `votes[tree_vote] += tree_weight`
+        (weight 1 under majority). Then compute the argmax over the counters —
+        a small unrolled compare chain (or a decision table keyed on the
+        counter tuple for tiny class spaces) — resolving ties per
+        `${tie_break}` (lowest_index: pick the lowest class index among the
+        maxima; highest_weight: prefer the larger summed tree_weight; reject:
+        route to ${default_class}). The winner is `winning_class`.
+      - Class-action: a table keyed on `winning_class` → {mark_to_drop (drop),
+        egress_spec=port (forward), set diffserv + update_checksum +
+        egress_spec (mark)}.
+      - The whole evaluation is a fixed handful of logical stages regardless
+        of K or tree depth — the IIsy/Planter fixed-stage property. Do NOT
+        walk trees node-by-node or loop over trees via recirculation (breaks
+        `no_loop`).
+      - Deparser: emit ethernet, ipv4 (and transport), then payload — all
+        headers re-emitted in order, only ipv4.diffserv possibly changed
+        (mark). The packet round-trips otherwise byte-for-byte.
+
+    D5.1 (deep_forest_drop): more / deeper trees (more feature-table
+    intervals + a wider per-tree code tuple), more features, and a
+    drop-verdict (anomaly) class wired to mark_to_drop.
+
+    D5.2 (weighted_forest_mark): a larger forest with per-tree weights;
+    accumulate `tree_weight` (not unit votes) per class; weighted argmax with
+    highest-weight tie-break. Add the mark action with update_checksum.
+
+    D5.3 (adversarial_forest): full feature set, a large deep forest, coarse
+    (4-bit) quantisation, tight model_capacity (a compact ternary encoding
+    shared across trees), and the adversarial on-boundary / even-vote-tie
+    workload that stresses the per-tree split-boundary tie-break and the
+    ensemble vote-tie resolution together.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Reading ONE tree (or a single decision table) instead of accumulating
+      all ${n_trees} votes and taking the argmax — collapses the forest to a
+      tree. `rf_majority_overrides_minority` catches it. (The single-tree
+      pattern's correct behaviour is this pattern's BUG.)
+
+    * Mis-counting / mis-sizing the votes — a vote counter too narrow to hold
+      ${n_trees}, double-counting a tree, dropping a tree's vote, or a
+      non-deterministic / wrong argmax tie-break. `vote_tie_resolution` +
+      `vote_aggregation_fidelity` catch it.
+
+    * Failing to RESET the per-class vote counters between packets (using a
+      register that accumulates across packets instead of per-packet
+      metadata) — votes leak across packets, breaking determinism.
+      `inference_determinism_repeat` catches it. (Ensemble-specific trap not
+      present in the single-tree pattern.)
+
+    * Mis-encoding a per-tree split boundary — encoding x ≤ t as x < t (or
+      overlapping / gapped feature-table intervals) — so an on-threshold
+      feature value votes for the wrong leaf in one tree. The #1 silent
+      per-tree misclassification; `feature_boundary_value` +
+      `boundary_classification_fidelity` catch it.
+
+    * Omitting a per-tree decision-table `default_action` — a code tuple with
+      no installed row table-misses and the per-tree vote metadata is read
+      uninitialised. The most-common-label default
+      (`rf_default_class_fallback`) must be installed per tree.
+
+    * Walking the trees node-by-node or looping over trees via
+      recirculation/resubmit instead of the unrolled encode-based K-tree
+      mapping — breaks the `no_loop` fixed-stage bound and typically does not
+      fit the pipeline.
+
+    * Folding a non-feature, per-packet-varying field (IP id, a non-feature
+      port) into a tree's code tuple — splits one logical feature vector
+      across classes. `inference_determinism_repeat` catches it.
+
+    * Forgetting `update_checksum` for ipv4 after the DSCP/diffserv mark —
+      BMv2 emits a stale checksum the downstream silently drops.
+      `checksum_after_mark` + `envelope_checksum_validity` catch it.
+
+    * Reading a feature field from an absent header (e.g. tcp.dstPort on an
+      ICMP packet) without a `header_present` guard — an unspecified-value
+      read. `read_invalid_feature_guard` + `feature_read_safety` catch it.
+
+    * Re-emitting a fixed-length / truncated packet instead of the parsed
+      headers + payload — corrupts the steered packet even though forwarding
+      "works". `conditional_deparser_roundtrip` + `payload_persistence` catch
+      it.
+
+  v2-deferred (out of scope for this pattern, noted for reviewers):
+    * Flow-level / sliding-window feature extraction (pForest's per-flow
+      feature accumulation, BoS's RNN window flattening) is STATEFUL and
+      composes transitively with the P3 flow-tracking patterns rather than
+      being re-encoded here — this pattern is per-packet header-feature
+      ensemble inference (the IIsy/Planter model).
+    * Gradient-boosted trees (additive regression output) and sequential /
+      RNN models (BoS) are separate patterns; this one is the
+      classification random-forest line (NF-4a / K1).
+    * Floating-point feature arithmetic and floating-point vote weights are
+      out of scope (v1model is integer); features are integer header fields
+      quantised to `${feature_bit_width}` bits and tree_weight is an integer.
+    * Forests beyond 32 trees / per-tree depth beyond 12, whose unrolled
+      per-tree tables + vote arithmetic blow the v1model stage budget — capped
+      by the ${n_trees}/${tree_depth} ranges; growing to the cap is the
+      `grow_forest` / `deepen_tree_depth` difficulty lever, not a supported
+      steady state beyond the caps.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance (schema, bindings, oracle
+  audit) and hand-run the public tests through the oracle for the seed. Audit must
+  include canonical examples exercising the operator knobs at their
+  feasibility_postcondition extremes — n_trees at the cap with an even-vote
+  tie, a per-tree feature value exactly on a split threshold, and a
+  vote-counter at the maximum ${n_trees} — so a constant-baked forest /
+  vote-arithmetic oracle is rejected.

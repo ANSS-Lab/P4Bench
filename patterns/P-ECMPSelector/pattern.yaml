@@ -1,0 +1,457 @@
+# P-ECMPSelector — Equal-cost multipath next-hop selection (action_selector)
+#
+# TPL v1.0 task pattern. RFC 2992 equal-cost multipath: LPM the
+# destination to a GROUP of N equal-cost next-hops, then select one member by a
+# hash over the flow 5-tuple — the v1model `action_selector`
+# (dynamic_action_selection) extern with a `tuple{...}` selector key. All
+# packets of a flow pick the SAME member (consistency); distinct flows spread
+# across the group (distribution).
+#
+# Differentiation: vs P-IPv4Routing (D5/P1, hand-rolled hash+register ECMP),
+# this pattern is the vehicle for the `action_selector` + `tuple<>` language-
+# feature coverage gap: group-based multipath via
+# the action_selector extern, not a register-array hash. Keep both.
+# Instances are produced by binding the parameters below.
+
+pattern_id: P-ECMPSelector
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                            # ECMP is named under D5 (SRv6, ECMP, fast reroute)
+  prescriptive: [P1:forwarding]                         # "match-action + table lookup; L2/L3 forwarding, ECMP, multicast"
+target_capability: redesign                             # P1 row column — programmability redesigns fixed-function ECMP next-hop selection
+summary: >
+  An RFC 2992 equal-cost multipath (ECMP) next-hop selector. Longest-prefix-
+  match the IPv4 destination to a GROUP of N equal-cost next-hop ports, then
+  select ONE member by a hash over the flow 5-tuple (src/dst addr, protocol,
+  L4 src/dst port) and forward to it — the v1model `action_selector`
+  (dynamic_action_selection) extern, whose selector key is a `tuple{...}` of the
+  5-tuple fields. Every packet of a flow selects the SAME member (RFC 2992
+  consistency, so TCP does not reorder); distinct flows spread across the group
+  (distribution). A destination with no route, or a non-IPv4 frame, takes the
+  default action (drop, or a default port). Anchor instances route one prefix
+  to a 3-member group; the parameter-rebinding surface lifts the group size, the number
+  of routed prefixes, the hash key breadth, and whether the next-hop action also
+  rewrites the L2 header / decrements TTL — so one audited oracle covers a bare
+  3-way selector through a multi-prefix routing+rewrite ECMP.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                            # ECMP is mature engineering — no single research-publication slot.
+
+  rfcs:
+    - id: RFC2992
+      sections: ["2", "3"]
+      role: normative_behaviour
+      grounds: ecmp_selection
+      quote: >-
+        Given N next-hops the packet header fields which describe the flow are
+        run through a hash function. A final modulo-N is applied to the output
+        of the hash.
+      quote_source: patterns/P-ECMPSelector/grounding/RFC2992.txt
+      relevance: |
+        The normative ECMP selection mechanism: hash the flow key (the
+        5-tuple) and apply modulo-N to pick one of N equal-cost
+        next-hops. This is exactly the v1model `action_selector`
+        (dynamic_action_selection) — a table whose action is selected
+        from a group of members by a hash over a declared selector key,
+        which the SUT supplies as a `tuple{...}` of the 5-tuple fields.
+    - id: RFC2992
+      sections: ["2"]
+      role: normative_behaviour
+      grounds: ecmp_consistency
+      quote: >-
+        As long as the region boundaries remain unchanged the same next-hop
+        will be chosen for a given flow.
+      quote_source: patterns/P-ECMPSelector/grounding/RFC2992.txt
+      relevance: |
+        The consistency property: every packet of one flow selects the
+        SAME next-hop (so a TCP stream is not reordered). Grounds the
+        ecmp_consistency invariant — the hash must use only stable
+        5-tuple fields, never a volatile field (TTL, IP id).
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The next-hop is a pure function of the
+      destination (route lookup) and the 5-tuple (member selection).
+
+  flow:
+    keyed_by_tuple: [src_ip, dst_ip, protocol, l4_src, l4_dst]
+    notes: |
+      The selection granularity. The selector hash is computed over this
+      5-tuple; every packet of one flow MUST select the same member.
+
+  bucket:                                  # plays the TPL `bucket` role — an ECMP group
+    keyed_by_tuple: [route_id]
+    attrs:
+      prefix:   "dst_net/prefix_len"
+      members:  "list[egress_port]"        # the N equal-cost next-hops
+    capacity: ${group_size}
+    notes: |
+      An equal-cost group: a routed prefix and its list of N next-hop
+      ports. The action_selector picks one member per flow by hash mod N.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  routes:
+    type: list[ecmp_route]
+    constraint: |
+      every entry has a dst_net/prefix_len and a non-empty members list of
+      distinct egress ports; |members| == ${group_size} for the anchor
+      (groups may differ in size under mutation).
+    notes: |
+      The routed prefixes and their equal-cost next-hop groups. Anchor:
+      one route 10.0.2.0/24 → [2,3,4].
+
+  group_size:
+    type: int
+    range: "[2, 16]"
+    default: 3
+    notes: |
+      Number of equal-cost next-hops per group. More members = more
+      selector buckets and a harder distribution to get uniform.
+
+  hash_key:
+    type: enum
+    values: [five_tuple, three_tuple, dst_only]
+    default: five_tuple
+    notes: |
+      The selector key breadth. five_tuple (src/dst/proto/sport/dport) is
+      the canonical RFC 2992 key. three_tuple drops the L4 ports;
+      dst_only collapses per-flow spreading (all flows to one dst share a
+      member) — a faithfulness-of-distribution lever.
+
+  routing_rewrite:
+    type: enum
+    values: [select_only, select_rewrite]
+    default: select_only
+    notes: |
+      select_only: the next-hop action just sets the egress port.
+      select_rewrite: it also decrements IPv4 TTL and rewrites the
+      Ethernet dst MAC to the next-hop's — a full L3 forwarding hop.
+
+  default_action:
+    type: enum
+    values: [drop, forward_default_class]
+    default: drop
+    notes: |
+      Behaviour for a destination with no route, or a non-IPv4 frame.
+      drop (canonical router miss) or forward to ${default_port}.
+
+  default_port:
+    type: int
+    range: "[1, 511]"
+    default: 5
+    notes: |
+      Egress port for the default action when forward_default_class.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+
+rules:
+
+  - id: R0_no_route_default
+    when: "¬header_present(ipv4) ∨ ¬exists(bucket, lpm_match(routes, hdr.ipv4.dst))"
+    then:
+      - drop                                                       # when ${default_action} == drop; else forward(${default_port})
+    notes: |
+      A non-IPv4 frame, or an IPv4 destination matching no route, takes
+      ${default_action} — drop (canonical) or forward to ${default_port}.
+
+  - id: R1_ecmp_select_forward
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, lpm_match(routes, hdr.ipv4.dst))
+    given:
+      bucket: by_longest_prefix(routes, hdr.ipv4.dst)
+    then:
+      - forward(bucket.members[hash(flow.5tuple) mod |bucket.members|])
+    notes: |
+      The destination matches an ECMP group → hash the 5-tuple, take it
+      modulo the member count, and forward to the selected member port.
+      Every packet of a flow selects the SAME member (ecmp_consistency).
+      Under ${routing_rewrite}==select_rewrite the action also decrements
+      TTL and rewrites the dst MAC.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: ecmp_consistency
+    clause: stability
+    target: selected_member
+    while: "R1 fires"
+    notes: |
+      RFC 2992: every packet of one flow MUST select the same next-hop.
+      The hash MUST use only the stable 5-tuple; a SUT that folds a
+      volatile field (TTL, IP id) into the key splits the flow across
+      members. Witnessed by a same-flow burst landing wholly on one port.
+
+  - id: member_in_group
+    clause: stability
+    target: egress_port
+    while: "R1 fires"
+    notes: |
+      The selected next-hop MUST be a member of the matched group — never
+      an off-group port. Catches a modulo / index-arithmetic bug.
+
+  - id: ecmp_distribution
+    clause: fairness
+    target: member_usage
+    while: "many distinct flows traverse R1"
+    notes: |
+      Distinct flows SHOULD spread across the group (RFC 2992: a uniform
+      hash yields uniform distribution). A SUT that selects a constant
+      index (ignoring the hash) sends every flow to one member. Decided
+      behaviourally over a multi-flow burst (≥2 distinct members used).
+      This is a fairness/distribution clause (EX·probe), not a per-packet
+      field relation.
+
+  - id: default_action_correctness
+    clause: stability
+    target: decision
+    while: "R0 fires"
+    notes: |
+      A no-route / non-IPv4 packet MUST take ${default_action}.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Single-pass: a selected packet is not recirculated through the
+      selector.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: ecmp_flow_consistency
+      generate: |
+        Send a same-flow BURST (≥4 packets, identical 5-tuple) to a routed
+        prefix. Assert behavior ecmp_consistent: every packet lands on ONE
+        member port of the group (output_ports = the group members,
+        min_count = burst size). Tests ecmp_consistency.
+
+    - id: ecmp_flow_distribution
+      generate: |
+        Send many DISTINCT flows (vary L4 src port) to the routed prefix.
+        Assert behavior ecmp_distributes: the flows use ≥2 distinct member
+        ports (output_ports = members, min_distinct_ports = 2). Tests
+        ecmp_distribution — catches a constant-index selector.
+
+    - id: route_miss_default
+      generate: |
+        Send a packet to a destination outside every route. Assert
+        ${default_action} (drop, or forward to ${default_port}). Tests
+        default_action_correctness.
+
+  G2:
+    - id: non_ipv4_default
+      generate: |
+        Send a non-IPv4 frame (ARP). Assert ${default_action}; the selector
+        must not run on a frame with no IPv4 destination.
+
+    - id: l4less_flow_consistency
+      generate: |
+        Send a same-flow burst with NO L4 ports (ICMP). Assert
+        ecmp_consistent — the selector handles a 5-tuple with zero ports
+        deterministically and keeps the flow together.
+
+  G3:
+    - id: volatile_field_no_split
+      generate: |
+        Send a same-flow burst whose packets differ ONLY in TTL (and IP
+        id). Assert ecmp_consistent — the flow MUST NOT split. Catches a
+        SUT that hashes TTL / id (a volatile-field hash bug, a common v1model hash
+        misuse). This is the strongest discriminator for ecmp_consistency.
+
+    - id: off_group_port_guard
+      generate: |
+        Over a multi-flow burst, assert NO packet egresses a port outside
+        the group's member set (member_in_group). Catches a modulo/index
+        off-by-one that addresses a non-member port.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: grow_group_size
+    applicable_when: "${group_size} < 16"
+    effect: "${group_size} ← min(${group_size} * 2, 16) ∧ extend each route's members accordingly"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${group_size} ≤ 16 ∧ every route has |members| == ${group_size}"
+    notes: |
+      More equal-cost next-hops per group — more selector buckets, harder
+      uniform distribution. Pairs with shrink_group_size.
+
+  - id: shrink_group_size
+    applicable_when: "${group_size} > 2"
+    effect: "${group_size} ← max(${group_size} / 2, 2) ∧ trim each route's members accordingly"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${group_size} ≥ 2"
+    notes: |
+      Fewer next-hops per group. Pairs with grow_group_size.
+
+  - id: narrow_hash_key
+    applicable_when: "${hash_key} ≠ dst_only"
+    effect: "${hash_key} ← next of {five_tuple → three_tuple → dst_only}"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Narrow the selector key (drop L4 ports, then to dst-only) — coarser
+      flow granularity, worse distribution; the SUT must hash exactly the
+      specified fields. Pairs with widen_hash_key.
+
+  - id: widen_hash_key
+    applicable_when: "${hash_key} ≠ five_tuple"
+    effect: "${hash_key} ← previous of {five_tuple ← three_tuple ← dst_only}"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Widen the selector key back toward the full 5-tuple. Pairs with
+      narrow_hash_key.
+
+  - id: add_ecmp_route
+    applicable_when: "|${routes}| < 32"
+    effect: "add a routed prefix with its own ${group_size}-member group to ${routes}"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "|${routes}| ≤ 32 ∧ prefixes remain LPM-disambiguable"
+    notes: |
+      Add routed prefixes / groups — more LPM + selector work. Pairs with
+      remove_ecmp_route.
+
+  - id: remove_ecmp_route
+    applicable_when: "|${routes}| > 1"
+    effect: "remove a routed prefix from ${routes}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "|${routes}| ≥ 1"
+    notes: |
+      Fewer routed prefixes. Pairs with add_ecmp_route.
+
+  - id: enable_routing_rewrite
+    applicable_when: "${routing_rewrite} == select_only"
+    effect: "${routing_rewrite} ← select_rewrite"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      The next-hop action also decrements TTL and rewrites the dst MAC — a
+      full L3 forwarding hop, not a bare port select. Pairs with
+      disable_routing_rewrite.
+
+  - id: disable_routing_rewrite
+    applicable_when: "${routing_rewrite} == select_rewrite"
+    effect: "${routing_rewrite} ← select_only"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Revert to bare next-hop port selection. Pairs with
+      enable_routing_rewrite.
+
+  - id: flip_default_to_forward
+    applicable_when: "${default_action} == drop"
+    effect: "${default_action} ← forward_default_class"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Forward route-misses to ${default_port} instead of dropping. Pairs
+      with flip_default_to_drop. (Drop is the stricter router default, so
+      flipping to forward is the EASE direction.)
+
+  - id: flip_default_to_drop
+    applicable_when: "${default_action} == forward_default_class"
+    effect: "${default_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Drop route-misses (canonical router behaviour; the implementation must
+      declare the default). Pairs with flip_default_to_forward.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common v1model P4 implementations:
+
+    Anchor (one route 10.0.2.0/24 → [2,3,4], five_tuple, select_only,
+            default drop):
+      - An action_selector over the next-hop action:
+          action_selector(HashAlgorithm.crc16, 32w64, 32w16) ecmp_sel;
+          action set_nh(bit<9> port){ standard_metadata.egress_spec = port; }
+          table ipv4_ecmp {
+            key = {
+              hdr.ipv4.dstAddr : lpm;
+              // selector key — the 5-tuple tuple{...}:
+              hdr.ipv4.srcAddr  : selector;
+              hdr.ipv4.dstAddr  : selector;
+              hdr.ipv4.protocol : selector;
+              meta.l4_src       : selector;
+              meta.l4_dst       : selector;
+            }
+            actions = { set_nh; }
+            implementation = ecmp_sel;
+          }
+      - Control plane (the harness installs from the SUT entries file):
+          "action_profiles": [{
+            "name": "<selector name>",
+            "members": [{"id":1,"action_name":"...set_nh","action_params":{"port":2}}, ...],
+            "groups":  [{"id":1,"members":[1,2,3]}]
+          }],
+          "entries": [{"table":"...ipv4_ecmp",
+                       "match":{"hdr.ipv4.dstAddr":["10.0.2.0",24]}, "group":1}]
+        → act_prof_create_member / create_group / add_member_to_group +
+          table_indirect_add_with_group (range/ternary keys carry a priority).
+        HARNESS DEPENDENCY: action-profile install support was added to
+        evaluation/switch_runner.py for this pattern.
+    +select_rewrite: the action also does hdr.ipv4.ttl = ttl-1 and
+      hdr.ethernet.dstAddr = <next-hop mac>; recompute is not needed for
+      Ethernet, but TTL change leaves the IPv4 checksum to MyComputeChecksum.
+
+  Anti-pattern implementations to reject:
+    * Hashing a volatile field (TTL, IP identification) into the selector key —
+      the flow splits across members. volatile_field_no_split catches it.
+    * A constant member index (not actually hashing) — no distribution.
+      ecmp_flow_distribution catches it.
+    * Hand-rolling the selection with a register array + hash instead of the
+      action_selector — defeats the pattern (it is the P-IPv4Routing implementation).
+      The sanitised spec describes group-based multipath; a clean solution uses
+      the action_selector. (Behaviourally graded, so this is a review note.)
+    * Omitting the default on a route miss — black-hole. default_action_
+      correctness catches it.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+    1. The instance must pass schema validation and the oracle audit.
+    2. The oracle reads routes / default_action / default_port from
+       state["config"]; group_size / hash_key / routing_rewrite are variant-
+       selectors exercised by regeneration. A canonical_examples entry must
+       straddle the route config (remapped members) and default_action
+       (route-miss drop vs forward).
+    3. Runtime grading uses ecmp_consistent / ecmp_distributes (behavioural,
+       hash-agnostic) — NOT a specific member, since BMv2's selector hash is
+       internal. Cross-check the public consistency + distribution tests.
+    4. P-ECMPSelector shares the D5/P1 space with P-IPv4Routing; when a
+       mutation removes the group dimension (single next-hop), prefer P-IPv4Routing.

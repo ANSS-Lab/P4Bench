@@ -1,0 +1,1563 @@
+# P-AQMFairQueue — Edge: Approximate Fair-Queue Admission ∘ Queue-Depth ECN Marking (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-ApproxFairQueueing (per-flow byte-budget
+# admission filter, Sharma et al. AFQ NSDI '18) with P-ECNMarker (queue-depth-
+# driven IPv4 ECN marking, RFC 3168 / RFC 8257) into a single ingress AQM
+# block — the canonical "fair queue with congestion marking" a datacenter
+# top-of-rack runs: an arriving packet is first subjected to the per-flow
+# fairness filter, and only packets the filter ADMITS are then subjected to
+# the depth-driven ECN-marking decision.
+#
+# The value of this *chained* pattern (versus instantiating P-ApproxFairQueueing
+# and P-ECNMarker independently) is the STAGE-ORDERING contract between a
+# stateful admission stage and a stateless-per-packet marking stage — a
+# contract that is invisible when the components are tested in isolation:
+#   (a) the fairness filter executes BEFORE the marker, so an out-of-window
+#       (unfair) packet is dropped by AFQ and is NEVER ECN-marked — it never
+#       reaches the depth check, never has its ECN bits inspected;
+#   (b) the fairness byte-accounting reflects ADMISSION, not DELIVERY: a
+#       packet AFQ admits but the marker then tail-drops (Not-ECT above
+#       threshold) STILL consumes its sketch bytes (account_on_admit), so the
+#       drop order between the two stages is observable through a follow-up
+#       same-flow packet's round_shift;
+#   (c) the admit-and-mark path mutates the IPv4 header in THREE places in one
+#       pass — IPv4.identification (← round_shift, AFQ), IPv4.ttl (--, AFQ),
+#       and IPv4.ecn (← CE, marker) — so the IPv4 header checksum MUST be
+#       recomputed exactly once over ALL THREE changes (sharper than the
+#       two-field P-RouterACL mark-then-route checksum surface).
+#   (d) the D5.2 co-design rung COUPLES the two signals: a flow's effective
+#       marking threshold drops by its round_shift, so over-share flows are
+#       marked earlier — the genuine AQM+FQ co-design neither standalone
+#       pattern reaches.
+# See `bridging_notes:` for the v1model failure modes this composition exposes
+# that neither standalone pattern reaches.
+#
+# Instances are produced by binding the parameters below. The cross-axis
+# `composition` target_capability tag is used because this NF
+# chains two scale_up primitives (P-ApproxFairQueueing scales the fixed-queue
+# fair scheduler; P-ECNMarker scales the fixed-function RED block) into a
+# single composed NF whose structural failure modes are stage-ordering
+# interactions, not the per-stage failures of either constituent.
+
+pattern_id: P-AQMFairQueue
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D6:scheduling, D8:transport-assistance]   # fair-queue scheduling ∘ congestion signalling
+  prescriptive: [P5:queueing, P6:congestion-control-assistance]  # rank-based admission ∘ ECN marking
+target_capability: composition                          # chained composition of two scale_up primitives; failure modes are stage-ordering, cross-cutting
+summary: >
+  Ingress active-queue-management block composing a per-flow approximate
+  fair-queueing admission filter with a queue-depth-driven IPv4 ECN marker in
+  a single pipeline pass. An ingress packet is first classified by the AFQ
+  fairness filter: it derives round_shift = max(0, flow_round - current_round)
+  from a count-min byte sketch and a global counter, and DROPS the packet when
+  round_shift ≥ window (out of the flow's fair share). Packets within the
+  window are ADMITTED — their bytes are accounted into the sketch, round_shift
+  is stamped into IPv4.identification, TTL is decremented, and the next-hop
+  MAC is written — and only then subjected to the ECN-marking decision keyed
+  on the observed egress-queue depth: above the marking threshold K, an ECT
+  codepoint is rewritten to CE, a Not-ECT codepoint is tail-dropped (RFC 3168
+  §6.1.2), and a CE codepoint is preserved (§6.1.5); below K the packet is
+  forwarded unchanged. The composition's load-bearing contract is stage
+  ordering: fairness admission strictly precedes marking, byte-accounting
+  reflects admission not delivery, and the admit-and-mark path recomputes the
+  IPv4 checksum exactly once over the THREE header fields it touches.
+  Faithfulness ladder: D5.0 exact-per-flow FQ + DCTCP single-threshold ECN →
+  D5.1 count-min sketch FQ + RED proportional ECN → D5.2 round-coupled marking
+  (the over-share flow is marked earlier). The parameter-rebinding mutation surface lifts the
+  fairness window / sketch geometry / hash family / byte accounting and the
+  marking threshold / marking law / RFC-3168 strictness knobs / accounting
+  ordering independently, so the same composed oracle covers everything from a
+  2-row sketch with a step ECN marker to an adversarial-collision sketch under
+  round-coupled RED marking.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: afq_nsdi18
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-ApproxFairQueueing. Sharma et al.'s AFQ paper is the
+        primary algorithm source for the fairness-admission half. §3.2 defines
+        the ingress filter this composition's R3 / R5..R7 reuse verbatim:
+        flow_round = bytes_per_flow / QUANTUM, current_round = global_bytes /
+        (QUANTUM * K), round_shift = max(0, flow_round - current_round), drop
+        if round_shift ≥ WINDOW, else admit + stamp the rank. §3.4 (sketch of
+        counters, Count-Min row hash + MIN aggregation) grounds the `flow_sketch`
+        entity layout; §3.5 Theorem 1 bounds the admitted-flow round gap at
+        WINDOW − 1, the source of the `fair_round_gap_bounded` invariant. The
+        composition layers the ECN marker ON TOP of this admission filter
+        without changing the AFQ ingress contract.
+
+    - cite: calendarq_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-ApproxFairQueueing. PCQ (Sharma et al.) extends AFQ's
+        rotating-strata dequeue to a general calendar queue while keeping the
+        same ingress admission filter. Cited because PCQ's dequeue side is
+        exactly the consumer of the IPv4.identification rank this composition
+        stamps — the strata are the egress-side implementation surface, out of
+        scope for the ingress AQM block this pattern models.
+
+    - cite: sppifo_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-ApproxFairQueueing. SP-PIFO is the sibling line of
+        attack on the same scale_up scheduling gap (approximating PIFO with
+        strict-priority queues). Cited as the comparison point for the
+        fairness-half faithfulness sub-ladder (exact-per-flow recovers ideal FQ
+        at O(|flows|) state; count-min recovers Sharma AFQ at O(rows × width)).
+
+    - cite: sketchlib_nsdi22
+      role: domain_concepts
+      relevance: |
+        Inherited from P-ApproxFairQueueing. SketchLib §3 enumerates the four
+        PISA resource bottlenecks (hash calls / memory accesses / pipeline
+        stages / per-row hash independence) that bound any sketch-based NF —
+        the source of the `sketch_rows` / `sketch_width` ranges and the
+        `hash_polynomial` / `hash_independence` axes carried into this
+        composition's fairness half.
+
+  rfcs:
+    - id: RFC3168
+      title: "The Addition of Explicit Congestion Notification (ECN) to IP"
+      sections: ["5", "6.1.1", "6.1.2", "6.1.5", "19"]
+      role: normative_behaviour
+      grounding_cache: grounding/RFC3168.txt                  # verbatim RFC 3168 text fetched from https://www.rfc-editor.org/rfc/rfc3168.txt
+      grounds: R5_admit_and_mark                              # §5 ECT-marking clause; also grounds ce_persistence_no_unmark via §12 CE-reset MUST NOT
+      quote: |                                                # RFC 3168 §5 — grounds R5 (at incipient congestion, mark an ECT packet's CE codepoint instead of dropping)
+        see if the ECT codepoint is set in that packet's IP header.  If so,
+        then instead of dropping the packet, the router MAY instead set the
+        CE codepoint in the IP header.
+      relevance: |
+        Inherited from P-ECNMarker. The base ECN spec; binds the marking-half
+        rules R4..R7 and the persistence invariants:
+          - §6.1.1 codepoint semantics (00=Not-ECT, 01/10=ECT, 11=CE) — the
+            marker partitions admitted packets exactly along this enum.
+          - §6.1.2 marking-vs-drop — "the router MUST NOT mark a packet as CE
+            if the ECN field is 00 (Not-ECT)" (R4 tail-drops Not-ECT above K);
+            "if the ECT codepoint is set … the router MAY instead set the CE
+            codepoint, and forward" (R5 marks ECT→CE).
+          - §6.1.5 CE persistence — "once the CE codepoint is set … routers
+            MUST NOT change the codepoint back" (R6 preserves CE verbatim).
+          - §19 DSCP-and-ECN independence — only the low 2 bits of the diffserv
+            byte may change on mark (`dscp_preserved_under_mark`).
+
+    - id: RFC8257
+      sections: ["3.1", "3.4"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-ECNMarker. DCTCP's IETF codification: §3.1 single-
+        threshold step marking (the `single_threshold` marking law R4/R5
+        express) and §3.4's K recommendation (65 packets at 10 Gbps) grounding
+        the `marking_threshold_k` default.
+
+    - id: RFC8087
+      sections: ["3", "5"]
+      role: domain_concepts
+      relevance: |
+        Inherited from P-ECNMarker. Operational ECN guidance: §3 (mark-instead-
+        of-drop reduces FCT / tail latency — the deployed-AQM benefit this
+        composition realises on the fair-queued flows) and §5 (deployment
+        hazards — header-mangling, DSCP-blanking, checksum-not-recomputed —
+        motivating the strictness knobs and their paired operators).
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The canonical p4lang/tutorials single-switch topology supplying the
+        ingress→egress packet-flow convention, the TTL-decrement + Ethernet-
+        rewrite forwarding skeleton the admit path reuses, and the
+        single-LPM-style table layout the control plane installs entries into.
+
+
+  posts: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Per-packet. Eligibility checks (R0-R2), the fairness round_shift
+      derivation (R3, R4..R7), the depth-threshold marking decision (R4-R7),
+      and all field rewrites operate on this entity. The packet's observed
+      congestion signal is read from `queue.depth`; its fairness rank is
+      derived from `flow_sketch`; its ECN field is read/written via
+      hdr.ipv4.ecn (the 2 low bits of the diffserv byte), its rank stamped into
+      hdr.ipv4.identification.
+
+  flow_sketch:                              # AFQ count-min sketch + 1-cell global counter (bucket role)
+    key:
+      - sketch_row_index                    # 0 .. ${sketch_rows} - 1
+      - sketch_column_index                 # 0 .. ${sketch_width} - 1, = h_r(flowkey) mod W
+    attrs:
+      bytes_count: int                      # cumulative admitted on-wire bytes for any flow mapping to (row, column)
+      global_bytes: int                     # single-cell aggregate; reserved (row=GLOBAL, column=0) slot
+    capacity: "${sketch_rows} × ${sketch_width} cells + 1 global cell"
+    notes: |
+      Reused verbatim from P-ApproxFairQueueing. Two accumulators co-live: the
+      count-min sketch (R × W cells addressed by per-row hash of
+      ${flowkey_fields}, read with the min-across-rows aggregator) and the
+      single-cell global "total bytes admitted" counter. Updates happen ONLY on
+      the AFQ admit decision (R4..R7), and ONLY per the `account_policy`
+      ordering contract — out-of-window (R3) and ineligible (R0-R2) packets
+      leave both cell sets untouched (`state_unchanged_on_reject`).
+
+  queue:                                    # per-egress-port queue-depth signal (bucket role, read-only)
+    key:
+      - egress_port_id
+    attrs:
+      depth: int                            # current queue depth at processing time
+    capacity: "one cell per egress port; populated by the v1model architecture's enq_qdepth/deq_qdepth metadata at processing time, selected by ${queue_depth_signal}"
+    notes: |
+      Reused verbatim from P-ECNMarker. The egress queue modelled as a per-port
+      bucket with one read-only `depth` attribute, read by R4..R7's
+      count_exceeds(queue.depth, ...) predicate. The depth is driven by the
+      architecture (BMv2 enqueueing populates standard_metadata.enq_qdepth /
+      deq_qdepth), not by any rule here; `${queue_depth_signal}` selects which
+      field is wired in. The oracle audit's canonical examples supply depth
+      directly in state[config][queue_depth] so single-packet tests can
+      reproduce above-/below-threshold behaviour deterministically.
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    notes: |
+      The flow tuple used by the sketch hash to index `flow_sketch`. Its
+      breadth is set by ${flowkey_fields} — per-source-IP by default (the AFQ
+      paper's evaluation), extensible to the full 5-tuple. Not materialised as
+      data-plane state; the hash is recomputed per packet.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+# Two parameter families — fairness (AFQ) and marking (ECN) — plus the
+# composition-derived knobs. Disambiguated by name; the only collisions across
+# the constituents (eligibility_protocol, non_ipv4_action, workload_skew,
+# faithfulness, access_port, core_port) are merged into single shared params.
+
+parameters:
+
+  # ── Fairness-admission stage (from P-ApproxFairQueueing) ─────────────────
+
+  window:
+    type: int
+    range: "[2, 64]"
+    default: 8
+    notes: |
+      Strict drop boundary for the fairness filter. A packet's round_shift must
+      be strictly less than ${window} to be admitted; round_shift == ${window}
+      is already a drop (R3's `≥` predicate). Smaller values are stricter
+      per-flow rate limits.
+
+  quantum:
+    type: int
+    range: "[64, 4096]"
+    default: 256
+    notes: |
+      Bytes per per-flow round. flow_round = sketch_estimate / ${quantum}
+      (integer division). AFQ §3.2 picks 256 (the L2-MTU / 6 quotient for
+      1500-byte frames).
+
+  fair_share_k:
+    type: int
+    range: "[1, 64]"
+    default: 4
+    notes: |
+      Fair-share denominator. current_round = global_bytes /
+      (${quantum} * ${fair_share_k}). Larger K advances current_round more
+      slowly. Default 4, matching the AFQ paper's 24-queue evaluation.
+
+  sketch_rows:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: |
+      Count-min depth R. Each row is one independent hash; the min aggregator
+      bounds Count-Min's one-sided error. R=1 removes min protection (the
+      `shrink_sketch_rows_to_1` harden). SketchLib §3 caps R at 8.
+
+  sketch_width:
+    type: int
+    range: "[16, 65536]"
+    default: 256
+    notes: |
+      Columns per row W. Drives the false-positive tail (1/W)^R. Power-of-two
+      so the hash can be truncated by mod-2^k.
+
+  hash_polynomial:
+    type: enum
+    values: [crc16, crc32, crc32c, custom_lfsr]
+    default: crc32
+    notes: |
+      Per-row hash family. `custom_lfsr` is the harden direction (forces a
+      bespoke per-row polynomial rather than a stock CRC variant).
+
+  hash_independence:
+    type: enum
+    values: [pairwise, four_wise]
+    default: pairwise
+    notes: |
+      Hash-family independence axis (SketchLib §3). Count-Min's expected-error
+      bound holds under pairwise; `four_wise` is required when adversarial
+      collisions are the threat model (${workload_skew} == adversarial_collision).
+
+  flowkey_fields:
+    type: list[header_field]
+    constraint: "non-empty; every field is parseable on a v1model PISA pipeline"
+    default: [hdr.ipv4.srcAddr]
+    notes: |
+      Flowkey breadth for the fairness sketch. Default per-source-IP fair
+      sharing (the AFQ evaluation). Extending to the 5-tuple makes it a
+      per-connection filter (larger hash domain, L4 ports parsed first).
+
+  byte_accounting:
+    type: enum
+    values: [on_wire_length, payload_length, unit_per_packet]
+    default: on_wire_length
+    notes: |
+      Accounting source driving the sketch / global increments on admit.
+      `on_wire_length` (default, AFQ §3.2 contract) increments by the full
+      Ethernet frame length. `payload_length` and `unit_per_packet` are
+      faithfulness regressions that break the byte-accuracy invariant.
+
+  # ── Marking stage (from P-ECNMarker) ─────────────────────────────────────
+
+  marking_threshold_k:
+    type: int
+    range: "[1, 1024]"
+    default: 64
+    notes: |
+      DCTCP single-threshold K (in queue-depth units). An ADMITTED packet is
+      marked / tail-dropped / preserved when queue.depth ≥
+      ${marking_threshold_k} and forwarded unchanged otherwise. RFC 8257 §3.4
+      recommends 65 for 10 Gbps; the default 64 sits there. The boundary is
+      strict (`≥`); the off-by-one trap is probed by the boundary G2 scaffolds.
+      Distinct from the fairness ${window}: K is the congestion signal, window
+      is the fairness budget.
+
+  marking_mode:
+    type: enum
+    values: [single_threshold, red_proportional, tail_drop_passthrough]
+    default: single_threshold
+    notes: |
+      Marking law on the admitted packet. `single_threshold` is the DCTCP step
+      function (R4-R7 express it directly). `red_proportional` is RFC 2309 RED:
+      linear-ramp marking probability between ${min_threshold} and
+      ${marking_threshold_k} with ceiling ${marking_probability_max}.
+      `tail_drop_passthrough` disables marking — admitted packets at depth ≥ K
+      are tail-dropped regardless of ECN field (a non-ECN AQM block).
+
+  min_threshold:
+    type: int
+    range: "[1, 1023]"
+    default: 32
+    notes: |
+      RED low watermark; used only when ${marking_mode} == red_proportional.
+      Below it, no marking; between it and ${marking_threshold_k}, mark with
+      probability proportional to (depth - min_threshold) /
+      (marking_threshold_k - min_threshold) * ${marking_probability_max}.
+      Constraint: ${min_threshold} ≤ ${marking_threshold_k}. Also the floor the
+      round-coupled effective threshold (D5.2) is clamped to.
+
+  marking_probability_max:
+    type: float
+    range: "[0.0, 1.0]"
+    default: 1.0
+    notes: |
+      RED max marking probability; used only under red_proportional. The
+      default 1.0 collapses RED into a step function at ${marking_threshold_k},
+      so a single_threshold ↔ red_proportional transition does not change the
+      binary verdict on the unit tests. Probed by the D5.1 scaffolding.
+
+  not_ect_action:
+    type: enum
+    values: [drop, passthrough]
+    default: drop
+    notes: |
+      RFC 3168 §6.1.2 strictness knob for ADMITTED packets above K. `drop` (the
+      RFC default) enforces "MUST drop Not-ECT on congestion" (R4 fires).
+      `passthrough` is the relaxed (unsafe) mode: Not-ECT admitted packets above
+      K are forwarded unchanged. The only knob where the harden direction is the
+      RFC-compliant one and ease relaxes the spec.
+
+  ce_persistence_strict:
+    type: bool
+    default: true
+    notes: |
+      RFC 3168 §6.1.5 strictness gate. When true, R6 / R7 preserve CE verbatim
+      regardless of depth. When false, the implementation may "renormalise" CE to ECT —
+      a known incorrect pattern the ease direction probes.
+
+  dscp_preservation_strict:
+    type: bool
+    default: true
+    notes: |
+      Whether the implementation MUST preserve the 6-bit DSCP (high 6 bits of the
+      diffserv byte) on the mark transformation. RFC 3168 §19 mandates DSCP/ECN
+      independence; strict-true is the default. Sharpened by the composition:
+      neither the ECN write (R5) nor the AFQ id-stamp may touch DSCP.
+
+  checksum_recompute:
+    type: enum
+    values: [required, omitted]
+    default: required
+    notes: |
+      Whether the implementation must recompute the IPv4 header checksum after the
+      header rewrites. `required` (RFC-compliant default) is what the
+      `single_checksum_over_three_fields` G3 scaffold and the
+      `ipv4_checksum_validity_after_admit` invariant assert. `omitted` decouples
+      ECN/AFQ rewrites from the checksum surface to isolate other failure modes.
+
+  queue_depth_signal:
+    type: enum
+    values: [enq_qdepth, deq_qdepth, synthetic_qdepth]
+    default: synthetic_qdepth
+    notes: |
+      Which architecture-supplied value `queue.depth` is wired to. `enq_qdepth`
+      / `deq_qdepth` are the BMv2/v1model egress queue depths; `synthetic_qdepth`
+      is a control-plane-installed table mapping ingress key → synthetic depth,
+      for single-packet unit-testability (default). Production seeds pick
+      enq_qdepth.
+
+  # ── Shared eligibility / topology ────────────────────────────────────────
+
+  eligibility_protocol:
+    type: enum
+    values: [tcp, udp, any_l4]
+    default: tcp
+    notes: |
+      L4 short-circuit shared by both stages. `tcp` (default) drops non-TCP
+      packets at R2 before any sketch read or depth check. `any_l4` admits all
+      L4 traffic into the fairness filter (R2 vacuous). DCTCP deployments often
+      run TCP-only.
+
+  non_ipv4_action:
+    type: enum
+    values: [drop, passthrough]
+    default: drop
+    notes: |
+      What happens to non-IPv4 frames (ARP, IPv6, MPLS) at R1 — they have no
+      fairness flowkey and no ECN field. `drop` (default) discards them;
+      `passthrough` forwards them unchanged (transparent-AQM behaviour).
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision, bursty_above_threshold, adversarial_not_ect]
+    default: zipfian
+    notes: |
+      Assumed traffic distribution (union of the two constituents' axes).
+      `uniform` / `zipfian` exercise the fairness filter benignly;
+      `adversarial_collision` crafts flowkeys maximising sketch-row collisions
+      (probes the fairness half); `bursty_above_threshold` skews depth so most
+      ADMITTED packets see queue.depth ≥ K (probes the marking half);
+      `adversarial_not_ect` mixes mostly Not-ECT packets that AFQ admits but the
+      marker tail-drops (probes the stage-ordering accounting contract at scale).
+
+  access_port:
+    type: int
+    range: "[1, 511]"
+    default: 1
+    notes: Topology binding — the ingress port at which the AQM block applies.
+
+  core_port:
+    type: int
+    range: "[1, 511]"
+    default: 2
+    notes: Topology binding — the egress port admitted/marked packets are forwarded to; also the port `queue.depth` tracks.
+
+  core_mac:
+    type: string
+    constraint: "valid IEEE 802 colon-separated unicast MAC (e.g., 08:00:00:00:02:01)"
+    default: "08:00:00:00:02:01"
+    notes: Topology binding — the next-hop MAC written into Ether.dst on every admitted forward.
+
+  # ── Composition (derived / co-design) ────────────────────────────────────
+
+  account_policy:
+    type: enum
+    values: [account_on_admit, account_on_deliver]
+    default: account_on_admit
+    notes: |
+      The composition's byte-accounting ORDERING contract. `account_on_admit`
+      (default) counts a packet's bytes into the sketch the moment AFQ admits
+      it (round_shift < window), BEFORE the marking stage runs — so a packet
+      AFQ admits but the marker then tail-drops (Not-ECT above K, R4) STILL
+      consumes its bytes. `account_on_deliver` counts bytes only for packets the
+      marker actually forwards — so an R4 marker-drop does NOT consume bytes.
+      The two policies are behaviourally distinguishable only through a follow-up
+      same-flow packet's round_shift, which is exactly the stage-ordering probe
+      `account_reflects_admission_not_delivery`.
+
+  marking_coupling:
+    type: enum
+    values: [decoupled, round_coupled]
+    default: decoupled
+    notes: |
+      Whether the marking threshold is COUPLED to the fairness rank (the AQM+FQ
+      co-design). `decoupled` (default, D5.0/D5.1): the marking decision uses
+      ${marking_threshold_k} for every flow, independent of round_shift.
+      `round_coupled` (D5.2): the effective threshold for a packet is
+      max(${min_threshold}, ${marking_threshold_k} - ${coupling_gain} *
+      round_shift) — over-share flows (high round_shift) cross the marking
+      threshold at a lower depth and are marked / dropped earlier. The genuine
+      composition co-design neither standalone pattern reaches.
+
+  coupling_gain:
+    type: int
+    range: "[1, 64]"
+    default: 8
+    notes: |
+      Depth units the effective marking threshold drops per unit of round_shift
+      under ${marking_coupling} == round_coupled (vacuous when decoupled). Larger
+      gain marks over-share flows more aggressively. The effective threshold is
+      clamped at ${min_threshold} so a maximally-over-share flow is not marked
+      below the RED low watermark.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_fq_then_step_ecn         # anchor — exact-or-min FQ admission + DCTCP single-threshold ECN, decoupled
+      - D5.1_sketch_fq_red_ecn        # + count-min sketch collisions and RED proportional marking
+      - D5.2_round_coupled_marking    # + the co-design: effective marking threshold drops by round_shift
+    default: D5.0_fq_then_step_ecn
+    notes: |
+      Composition faithfulness ladder. DERIVED from
+      (marking_mode, marking_coupling, sketch geometry); the lift/revert
+      operators advance it as a side-effect of their sub-knob rebinds rather
+      than a standalone move. D5.0 is the clean two-stage pipeline (fair admit →
+      step-mark or drop); D5.1 adds sketch collisions + probabilistic marking;
+      D5.2 adds the round-coupled marking co-design.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The packet flows FAIRNESS-stage →
+# MARKING-stage: AFQ derives round_shift and either drops out-of-window (R3) or
+# admits; an admitted packet is accounted (per ${account_policy}) and then the
+# depth-driven ECN verdict (R4 drop / R5 mark / R6 preserve / R7 passthrough)
+# is applied. Eligibility guards (R0-R2) are hoisted above both stages because
+# every guarded packet drops regardless of fairness or congestion.
+
+rules:
+
+  - id: R0_wrong_port_drop
+    when: "¬ingress(${access_port})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      First eligibility short-circuit. Frames on any port other than
+      ${access_port} are discarded BEFORE any sketch read or depth check. MUST
+      NOT update any flow_sketch cell (`state_unchanged_on_reject`). Lifted from
+      P-ApproxFairQueueing R0.
+
+  - id: R1_non_ipv4_action
+    when: "ingress(${access_port}) ∧ ¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop                              # default per ${non_ipv4_action} == drop; passthrough forwards on ${core_port} unchanged
+    notes: |
+      Second eligibility short-circuit. ARP / IPv6 / MPLS have neither a
+      fairness flowkey nor an ECN field. Default ${non_ipv4_action} == drop
+      fires here; under ${non_ipv4_action} == passthrough the implementation forwards
+      the frame unchanged on ${core_port}. No sketch update either way. Fuses
+      P-ApproxFairQueueing R1 with P-ECNMarker R1.
+
+  - id: R2_non_eligible_l4_drop
+    when: "ingress(${access_port}) ∧ header_present(ipv4) ∧ ¬header_present(${eligibility_protocol})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Third eligibility short-circuit. Under default ${eligibility_protocol} ==
+      tcp, IPv4/UDP and IPv4/ICMP drop before the fairness filter. Under
+      any_l4 this rule is vacuous. No sketch update. Lifted from
+      P-ApproxFairQueueing R2.
+
+  - id: R3_fairness_out_of_window_drop
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      count_exceeds(round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1)
+    given:
+      packet: deduce_from_packet
+      flow_sketch: by_hash(flowkey, ${sketch_rows})
+      flow: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      FAIRNESS DROP — the AFQ ingress filter. round_shift(flow_sketch, flowkey,
+      quantum, K) = max(0, aggregate(flow_sketch, min, flowkey) / ${quantum} −
+      flow_sketch.global_bytes / (${quantum} * ${fair_share_k})). The predicate
+      count_exceeds(..., ${window} - 1) is round_shift ≥ ${window} (strict `≥`).
+      This is the composition's master stage-ordering boundary: a packet dropped
+      here is OUT of its flow's fair share and is NEVER passed to the marking
+      stage — its ECN field is never inspected, queue.depth is never read. No
+      state mutation (`state_unchanged_on_reject`). Lifted from
+      P-ApproxFairQueueing R3.
+
+  - id: R4_admit_then_not_ect_drop
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1) ∧
+      count_exceeds(queue.depth, effective_threshold(${marking_threshold_k}, ${marking_coupling}, ${coupling_gain}, ${min_threshold}, round_shift) - 1) ∧
+      match(hdr.ipv4.ecn, 0b00)
+    given:
+      packet: deduce_from_packet
+      flow_sketch: by_hash(flowkey, ${sketch_rows})
+      queue: by_key(${core_port})
+      flow: deduce_from_packet
+    then:
+      - "inc(flow_sketch[h_r(flowkey)] for r in 0..${sketch_rows}-1, by ${byte_accounting})   IF ${account_policy} == account_on_admit"
+      - "inc(flow_sketch.global_bytes, by ${byte_accounting})                                  IF ${account_policy} == account_on_admit"
+      - drop
+    notes: |
+      ADMIT-THEN-TAIL-DROP. The packet is WITHIN its fair share (so AFQ admits
+      it and, under ${account_policy} == account_on_admit, counts its bytes),
+      but it is Not-ECT (0b00) and the effective marking threshold is exceeded,
+      so RFC 3168 §6.1.2 forbids marking and the marker tail-drops it. This is
+      the composition's signature interaction: a packet ACCOUNTED by the
+      fairness stage but DROPPED by the marking stage. Under ${account_policy}
+      == account_on_deliver the inc actions are skipped (bytes counted only on
+      delivery). Under ${not_ect_action} == passthrough this rule is disabled
+      and the Not-ECT packet falls to R7 (forward unchanged). `effective_threshold`
+      collapses to ${marking_threshold_k} when ${marking_coupling} == decoupled.
+      Fuses P-ApproxFairQueueing R4 (admit/account) with P-ECNMarker R3 (Not-ECT
+      drop).
+
+  - id: R5_admit_and_mark
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1) ∧
+      count_exceeds(queue.depth, effective_threshold(${marking_threshold_k}, ${marking_coupling}, ${coupling_gain}, ${min_threshold}, round_shift) - 1) ∧
+      (match(hdr.ipv4.ecn, 0b01) ∨ match(hdr.ipv4.ecn, 0b10))
+    given:
+      packet: deduce_from_packet
+      flow_sketch: by_hash(flowkey, ${sketch_rows})
+      queue: by_key(${core_port})
+      flow: deduce_from_packet
+    then:
+      - "inc(flow_sketch[h_r(flowkey)] for r in 0..${sketch_rows}-1, by ${byte_accounting})"
+      - "inc(flow_sketch.global_bytes, by ${byte_accounting})"
+      - "set(hdr.ipv4.identification, round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}))"
+      - "set(hdr.ipv4.ecn, 0b11)"
+      - "dec(hdr.ipv4.ttl, 1)"
+      - "set(hdr.ethernet.dstAddr, ${core_mac})"
+      - "forward(${core_port})"
+    notes: |
+      ADMIT-AND-MARK. The packet is within its fair share AND congested AND
+      ECN-capable (01 or 10), so AFQ admits + accounts it and the marker rewrites
+      ECN → CE (0b11). Both ECT codepoints map to CE (RFC 3168 §6.1.1). The
+      IPv4 header is mutated in THREE places this pass — identification (←
+      round_shift, derived against the BEFORE-write sketch state), ecn (← CE),
+      and ttl (--) — and the implementation MUST recompute the IPv4 checksum exactly
+      once over ALL THREE (`ipv4_checksum_validity_after_admit`). DSCP (the high
+      6 diffserv bits) MUST be preserved (`dscp_preserved_under_mark`). Under
+      ${marking_mode} == red_proportional the predicate gains a probabilistic
+      term from ${min_threshold} / ${marking_probability_max}. Fuses
+      P-ApproxFairQueueing R4 (admit/account/stamp/ttl/ether) with P-ECNMarker
+      R4 (ECT→CE mark).
+
+  - id: R6_admit_ce_preserve
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1) ∧
+      count_exceeds(queue.depth, effective_threshold(${marking_threshold_k}, ${marking_coupling}, ${coupling_gain}, ${min_threshold}, round_shift) - 1) ∧
+      match(hdr.ipv4.ecn, 0b11)
+    given:
+      packet: deduce_from_packet
+      flow_sketch: by_hash(flowkey, ${sketch_rows})
+      queue: by_key(${core_port})
+      flow: deduce_from_packet
+    then:
+      - "inc(flow_sketch[h_r(flowkey)] for r in 0..${sketch_rows}-1, by ${byte_accounting})"
+      - "inc(flow_sketch.global_bytes, by ${byte_accounting})"
+      - "set(hdr.ipv4.identification, round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}))"
+      - "dec(hdr.ipv4.ttl, 1)"
+      - "set(hdr.ethernet.dstAddr, ${core_mac})"
+      - "forward(${core_port})"
+    notes: |
+      ADMIT-AND-PRESERVE-CE. Within fair share AND congested but the packet is
+      ALREADY CE (0b11): RFC 3168 §6.1.5 forbids changing it. AFQ admits +
+      accounts + stamps + decrements TTL + rewrites Ether.dst, but the ECN field
+      is left untouched (`ce_persistence_no_unmark`). The IPv4 header changes in
+      TWO places (identification, ttl) — the checksum recompute covers both; no
+      ECN write occurs. Fuses P-ApproxFairQueueing R4 with P-ECNMarker R5.
+
+  - id: R7_admit_below_threshold_passthrough
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1) ∧
+      ¬count_exceeds(queue.depth, effective_threshold(${marking_threshold_k}, ${marking_coupling}, ${coupling_gain}, ${min_threshold}, round_shift) - 1)
+    given:
+      packet: deduce_from_packet
+      flow_sketch: by_hash(flowkey, ${sketch_rows})
+      queue: by_key(${core_port})
+      flow: deduce_from_packet
+    then:
+      - "inc(flow_sketch[h_r(flowkey)] for r in 0..${sketch_rows}-1, by ${byte_accounting})"
+      - "inc(flow_sketch.global_bytes, by ${byte_accounting})"
+      - "set(hdr.ipv4.identification, round_shift(flow_sketch, flowkey, ${quantum}, ${fair_share_k}))"
+      - "dec(hdr.ipv4.ttl, 1)"
+      - "set(hdr.ethernet.dstAddr, ${core_mac})"
+      - "forward(${core_port})"
+    notes: |
+      ADMIT-AND-FORWARD (not congested). Within fair share AND the effective
+      marking threshold is NOT exceeded: AFQ admits + accounts + stamps +
+      decrements TTL + rewrites Ether.dst, and the ECN field is forwarded
+      UNCHANGED whatever its value (CE stays CE — §6.1.5; Not-ECT stays Not-ECT
+      — not silently coerced to ECT). The highest-frequency rule on a benign
+      workload, so a checksum/DSCP bug here is caught most often. Fuses
+      P-ApproxFairQueueing R4 with P-ECNMarker R6.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  # ── Composition-specific (the stage-ordering contract) ──────────────────
+
+  - id: admission_precedes_marking
+    clause: stability
+    target: forward_decision
+    while: "R3 fires (fairness out-of-window drop)"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      The composition's MASTER invariant. A packet the fairness filter drops
+      (round_shift ≥ window) MUST be dropped WITHOUT any marking-stage action —
+      queue.depth is never read, hdr.ipv4.ecn is never inspected or rewritten,
+      and no forward occurs. Catches the dominant composition bug: wiring the
+      ECN marker BEFORE the fairness filter (so a congested-but-unfair packet is
+      marked-and-forwarded instead of fairness-dropped), or treating the
+      fairness verdict as advisory. The composed analogue of P-RouterACL's
+      `acl_precedes_routing`. Anchored by `fairness_drop_not_marked`.
+
+  - id: account_reflects_admission_not_delivery
+    clause: persistence
+    binds: [flow_sketch]
+    statement: |
+      Under ${account_policy} == account_on_admit: every packet AFQ admits
+      (round_shift < window) increments the sketch row cells (one per row) and
+      the global cell by ${byte_accounting}, REGARDLESS of the subsequent
+      marking verdict — including the Not-ECT tail-drop path (R4). Under
+      ${account_policy} == account_on_deliver: only packets the marker forwards
+      (R5/R6/R7) increment the cells; the R4 marker-drop does NOT. The two
+      policies are distinguishable only through a follow-up same-flow packet's
+      round_shift. Catches an implementation that conditions the AFQ byte-update on the
+      ECN verdict when the policy says otherwise — the composition's subtle
+      drop-order probe.
+    enforced_when: "true"
+
+  - id: ipv4_checksum_validity_after_admit
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ (R5 ∨ R6 ∨ R7) fires"
+    enforced_when: "${checksum_recompute} == required"
+    notes: |
+      On every admitted-and-forwarded path the IPv4 header changes — TWO fields
+      on R6/R7 (identification, ttl) and THREE on R5 (identification, ttl, ecn).
+      The egress checksum MUST be valid over ALL the changes with a SINGLE
+      recompute. This is the #1 silent-failure v1model bug "checksum after
+      modification" pattern in its sharpest composed form: the admit-and-mark
+      path (R5) touches three header fields written by TWO different logical
+      stages (AFQ id/ttl + marker ecn); an implementation that recomputes after the AFQ
+      writes but before the ECN write (or in two clobbering MyComputeChecksum
+      updates) emits a stale checksum BMv2 forwards but real peers reject. The
+      single most valuable invariant this composition adds over its constituents.
+      Sharper than P-RouterACL's two-field `mark_then_route_single_checksum`.
+
+  # ── Marking-stage invariants (from P-ECNMarker) ─────────────────────────
+
+  - id: ce_persistence_no_unmark
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every ADMITTED packet whose ingress hdr.ipv4.ecn == 0b11 (CE) and
+      whose firing rule is R6 or R7: the egress hdr.ipv4.ecn MUST equal 0b11. CE
+      is irreversible at a single hop (RFC 3168 §6.1.5); no rule may transition
+      CE to another codepoint. An implementation that recomputes the ECN field
+      unconditionally (e.g. always writes 0b10 on forward) silently unmarks CE.
+    enforced_when: "${ce_persistence_strict} == true"
+
+  - id: not_ect_never_marked
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every ADMITTED packet whose ingress hdr.ipv4.ecn == 0b00 (Not-ECT):
+      the packet is either tail-dropped (R4, under ${not_ect_action} == drop) or
+      forwarded with egress hdr.ipv4.ecn == 0b00 (R7 below threshold; R4 disabled
+      under passthrough). No rule may transition Not-ECT to CE — RFC 3168 §6.1.2
+      "MUST NOT mark Not-ECT as CE".
+    enforced_when: "true"
+
+  - id: dscp_preserved_under_mark
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every admitted packet (R5/R6/R7): the egress diffserv byte's high 6
+      bits (DSCP) MUST equal the ingress high 6 bits. Only the low 2 bits (ECN)
+      may change, and only on R5. RFC 3168 §19 mandates DSCP/ECN independence; an
+      implementation that writes the full 8-bit diffserv field on the ECN mark, or that
+      reaches into diffserv when stamping IPv4.identification, clobbers DSCP.
+    enforced_when: "${dscp_preservation_strict} == true"
+
+  - id: stable_marking_decision
+    clause: stability
+    target: forward_decision
+    while: "R4..R7 fires"
+    enforced_when: "${marking_mode} ≠ red_proportional"
+    notes: |
+      For two ADMITTED packets with identical hdr.ipv4.ecn ingress value,
+      identical observed queue.depth, and identical round_shift, the firing rule
+      (drop / mark / preserve / passthrough) MUST be the same under
+      single_threshold or tail_drop_passthrough. The marking verdict is a
+      deterministic function of (depth, ecn, round_shift, parameters). Relaxed
+      under red_proportional (probabilistic with ${marking_probability_max}
+      ceiling).
+
+  # ── Fairness-stage invariants (from P-ApproxFairQueueing) ───────────────
+
+  - id: state_unchanged_on_reject
+    clause: persistence
+    binds: [flow_sketch]
+    statement: |
+      For every packet whose firing rule is R0, R1, R2, or R3 (wrong-port,
+      non-IPv4, non-L4, or fairness out-of-window), NO flow_sketch cell — neither
+      any (row, column) sketch slot nor the global cell — changes. This makes
+      eligibility short-circuits and fairness drops cost-free in state terms; an
+      "inc-first then check window" implementation violates it. Note this is the
+      FAIRNESS reject; the marking-stage Not-ECT drop (R4) is governed instead by
+      `account_reflects_admission_not_delivery`. Lifted from
+      P-ApproxFairQueueing.
+    enforced_when: "true"
+
+  - id: counter_persistence_within_lifetime
+    clause: persistence
+    binds: [flow_sketch]
+    statement: |
+      The sketch cells and the global cell are monotonically non-decreasing
+      across admitting firings — there is no eviction or decay rule in v1.0 of
+      this composition. Lifted from P-ApproxFairQueueing.
+    enforced_when: "true"
+
+  - id: fair_round_gap_bounded
+    clause: fairness
+    binds: [flow_sketch, packet]
+    statement: |
+      For every admitted-and-FORWARDED packet (R5/R6/R7): the stamped
+      hdr.ipv4.identification value (= round_shift at admit time) lies in
+      [0, ${window} - 1]. AFQ Theorem 1 (§3.5) made testable — every admitted
+      flow's per-flow round trails the current round by at most ${window} - 1
+      quanta. Captures both the underflow clamp (lower bound 0) and the strict
+      drop boundary (upper bound ${window} - 1). The R4 marker-drop has no
+      observable stamp. Lifted from P-ApproxFairQueueing.
+    enforced_when: "true"
+
+  - id: byte_accuracy_under_default_accounting
+    clause: stability
+    binds: [flow_sketch, packet]
+    statement: |
+      Under ${byte_accounting} == on_wire_length: each accounting firing
+      increments the sketch row cells and the global cell by exactly
+      standard_metadata.packet_length (the bytes-on-the-wire Ethernet-frame
+      length). Packet-count (unit_per_packet) and L4-payload (payload_length)
+      accounting violate this and break the AFQ fairness theorem on
+      heterogeneous packet sizes. Lifted from P-ApproxFairQueueing.
+    enforced_when: "${byte_accounting} == on_wire_length"
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "(R5 ∨ R6 ∨ R7) fires (any admitted-and-forwarded path)"
+    enforced_when: "true"
+    notes: |
+      TTL decremented by EXACTLY one on every forwarded path, never twice
+      (e.g. once in an inherited AFQ admit action and once in a marking action).
+      The R4 tail-drop and R0-R3 drops do not forward, so TTL is irrelevant there.
+
+  - id: no_pipeline_loop
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every packet traverses the pipeline exactly once — no recirculation, no
+      resubmit. round_shift is computed in a single pass over the sketch rows +
+      one global read; the depth read and ECN rewrite happen in the same
+      ingress→egress pass; the checksum recompute is a single arithmetic over
+      the rewritten header. Lifted from both constituents.
+    enforced_when: "true"
+
+# ─── Test scaffolding (oracle-audit canonical examples) ─────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The composition's
+# distinctive entries are the STAGE-ORDERING probes (fairness_drop_not_marked,
+# account_reflects_admission_not_delivery, single_checksum_over_three_fields)
+# that neither standalone pattern can express.
+
+test_scaffolding:
+
+  G1:
+    - id: admit_below_threshold_passthrough
+      generate: |
+        Fresh switch. One eligible packet on ${access_port}, ECN = 0b10 (ECT(0)),
+        synthetic depth = ${marking_threshold_k} - 1 (below boundary). Assert:
+        admitted via R7, forwarded on ${core_port} with ECN = 0b10 UNCHANGED,
+        IPv4.identification = 0 (round_shift on a cold flow), TTL decremented by
+        1, Ether.dst = ${core_mac}, DSCP unchanged, IPv4 checksum valid. The
+        composed golden path: fair-admit → not-congested forward. Probes R7 +
+        G1-P1-T5.
+
+    - id: admit_above_threshold_marked
+      generate: |
+        Fresh switch. One eligible ECT(0) packet, synthetic depth =
+        ${marking_threshold_k} (at boundary). Assert: admitted AND marked via R5
+        — forwarded with ECN = 0b11 (CE), IPv4.identification = 0, TTL
+        decremented by 1, Ether.dst rewritten, DSCP unchanged, IPv4 checksum
+        VALID over the id+ecn+ttl rewrite (single recompute). Probes R5 + the
+        `ipv4_checksum_validity_after_admit` invariant.
+
+    - id: fairness_drop_not_marked
+      generate: |
+        Prior_inputs: burst the same flowkey so its round_shift climbs to ≥
+        ${window}. Probe: one more eligible packet of that flowkey at synthetic
+        depth ≥ ${marking_threshold_k} (so a marking-before-fairness implementation would
+        MARK and FORWARD it). Assert: DROPPED (R3), no egress packet. The
+        composition's master stage-ordering probe — anchors
+        `admission_precedes_marking`. A marker-first implementation fails by forwarding
+        a CE-marked copy.
+
+    - id: ce_preserved_on_admitted_congested
+      generate: |
+        Fresh switch. One eligible CE packet (ECN = 0b11), synthetic depth =
+        ${marking_threshold_k}. Assert: admitted AND forwarded via R6 with ECN =
+        0b11 UNCHANGED, IPv4.identification = 0, TTL decremented, checksum valid.
+        Probes R6 + `ce_persistence_no_unmark`.
+
+    - id: account_reflects_admission_not_delivery
+      requires: "${account_policy} == account_on_admit ∧ ${not_ect_action} == drop"
+      generate: |
+        Prior_inputs: one large eligible Not-ECT (0b00) packet (~800 B, so on-wire
+        length crosses ${quantum}) for flowkey f_A at synthetic depth ≥
+        ${marking_threshold_k} — AFQ admits it but the marker tail-drops it (R4).
+        Probe: a second eligible ECT packet for the SAME flowkey f_A at depth <
+        ${marking_threshold_k}. Assert: admitted via R7 with IPv4.identification
+        > 0 — proving the tail-dropped first packet's bytes WERE accounted
+        (account_on_admit). An implementation that only accounts on delivery gives
+        IPv4.identification = 0 here. The composition's signature accounting-order
+        probe; anchors `account_reflects_admission_not_delivery`.
+
+  G2:
+    - id: boundary_fairness_admit_at_window_minus_one
+      generate: |
+        Stage prior_inputs so the probe's round_shift = ${window} - 1 exactly.
+        Probe at depth < ${marking_threshold_k}. Assert: admitted (R7) with
+        IPv4.identification = ${window} - 1. Probes the admit side of the
+        fairness `≥` boundary + `fair_round_gap_bounded` upper bound.
+
+    - id: boundary_fairness_drop_at_window
+      generate: |
+        Stage prior_inputs one quantum further so the probe's round_shift =
+        ${window} exactly. Assert: DROPPED (R3) and the dropped probe consumes NO
+        sketch bytes (`state_unchanged_on_reject`). An off-by-one `>` implementation
+        admits incorrectly.
+
+    - id: boundary_marking_at_threshold_marked
+      generate: |
+        Admit an ECT packet (round_shift < window) at synthetic depth =
+        ${marking_threshold_k} exactly. Assert: marked (R5, ECN → CE). The paired
+        depth = ${marking_threshold_k} - 1 probe must passthrough (R7). Probes the
+        strict marking `≥` boundary; a `>` implementation under-marks.
+
+    - id: ttl_one_admitted_egresses_ttl_zero
+      generate: |
+        Eligible ECT probe with TTL = 1, round_shift < window, depth <
+        ${marking_threshold_k}. Assert: admitted via R7 with TTL = 0 on egress
+        and the IPv4 checksum recomputed over the new TTL and the round_shift
+        stamp. No TTL-expiry rule in this composition. Probes G2-P1-T2 +
+        checksum-after-multi-field-rewrite.
+
+  G3:
+    - id: single_checksum_over_three_fields
+      requires: "${checksum_recompute} == required"
+      generate: |
+        Admit an ECT packet (round_shift < window) at depth ≥
+        ${marking_threshold_k} so R5 fires (mark). Send a packet with a known
+        non-canonical IPv4 payload. Assert: the egress IPv4 checksum equals the
+        RFC 791 ones-complement checksum of the egress header with
+        identification = round_shift, ecn = 0b11, ttl decremented, and ALL OTHER
+        fields unchanged. The #1 silent-failure v1model bug probe in its sharpest
+        composed form (THREE fields, TWO stages); anchors
+        `ipv4_checksum_validity_after_admit`. An implementation with two clobbering
+        checksum updates fails.
+
+    - id: not_ect_admitted_then_dropped_not_silently_marked
+      requires: "${not_ect_action} == drop"
+      generate: |
+        Admit a Not-ECT (0b00) packet (round_shift < window) at depth ≥
+        ${marking_threshold_k}. Assert: DROPPED (R4), NOT silently coerced to CE
+        and forwarded. Probes `not_ect_never_marked` + RFC 3168 §6.1.2 MUST on
+        the ADMITTED path (distinct from the fairness drop R3). An implementation
+        implementing "any admitted packet above K → mark CE" fails.
+
+    - id: dscp_preserved_under_mark_after_admit
+      requires: "${dscp_preservation_strict} == true"
+      generate: |
+        Admit an ECT(0) packet at depth ≥ ${marking_threshold_k} with diffserv =
+        0b101000_10 (DSCP = AF11, ECN = ECT(0)). Assert: egress diffserv =
+        0b101000_11 (DSCP unchanged; ECN now CE) AND IPv4.identification stamped
+        WITHOUT touching diffserv. An implementation that writes the full 8-bit diffserv on
+        the mark, or that overlaps the id-stamp into the diffserv byte, fails.
+        Probes the common v1model bug "write-too-wide on bit-packed field" +
+        `dscp_preserved_under_mark`.
+
+    - id: eligibility_priors_do_not_consume_bytes
+      generate: |
+        Prior_inputs: a mixed sequence — UDP packets, ARP frames, wrong-port
+        packets, IPv6 frames — all sharing probe target f_A's flowkey. Probe: one
+        eligible packet for f_A. Assert: admitted with IPv4.identification = 0,
+        exactly as if no priors had been sent — the ineligible priors consumed no
+        sketch bytes. Probes fail-closed eligibility (R0-R2) +
+        `state_unchanged_on_reject`.
+
+    - id: conditional_deparser_mixed_verdicts
+      generate: |
+        Probes the common v1model bug "conditional deparser". Send four eligible packets of the
+        same flowkey back-to-back, engineered (via prior_inputs + depth) to take
+        each branch: (a) round_shift ≥ window → R3 fairness-drop; (b) admitted,
+        depth ≥ K, Not-ECT → R4 marker-drop; (c) admitted, depth ≥ K, ECT → R5
+        mark+forward; (d) admitted, depth < K → R7 passthrough. Assert each
+        output is bit-exact-correct (drops = no egress; mark = id+ecn+ttl change
+        with checksum; passthrough = id+ttl change with checksum, ECN unchanged).
+        An implementation whose drop branches corrupt deparser state for the forward
+        branches fails.
+
+    - id: sketch_min_full_collision_inherits_state
+      requires: "${faithfulness} != D5.0_fq_then_step_ecn ∧ ${sketch_rows} >= 2"
+      generate: |
+        Prior_inputs: burst flowkey f_A so both sketch rows climb past the
+        fairness boundary. Probe: an eligible packet for flowkey f_D crafted to
+        collide with f_A on EVERY sketch row (full-collision adversarial). Assert:
+        f_D's first packet is DROPPED (R3) — the min-across-rows estimator
+        inherits f_A's bytes, not f_D's fresh zero. Probes the Count-Min
+        one-sided-error guarantee on the fairness half.
+
+  coverage_floor:
+    G1: 4
+    G2: 2
+    G3: 3
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease so difficulty recalibration by
+# parameter rebinding can move in either direction. Operators move exactly one axis (single-axis
+# displacement); the composite `faithfulness` is DERIVED and bumped as a
+# side-effect of the marking-law / coupling / sketch operators.
+
+mutation_operators:
+
+  # ── Fairness window strictness ───────────────────────────────────────────
+  - id: shrink_window_2x
+    applicable_when: "${window} >= 4"
+    effect: "${window} ← ${window} / 2"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${window} >= 2"
+    notes: "Tighten the fairness budget; more packets fairness-drop at R3. Pairs with enlarge_window_2x."
+
+  - id: enlarge_window_2x
+    applicable_when: "${window} <= 32"
+    effect: "${window} ← ${window} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${window} <= 64"
+    notes: "Loosen the fairness budget. Pairs with shrink_window_2x."
+
+  # ── Marking threshold strictness ─────────────────────────────────────────
+  - id: shrink_marking_threshold_2x
+    applicable_when: "${marking_threshold_k} >= 4"
+    effect: "${marking_threshold_k} ← ${marking_threshold_k} / 2"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${marking_threshold_k} >= 2 ∧ ${marking_threshold_k} >= ${min_threshold}"
+    notes: "Halve the congestion threshold; more admitted packets cross the marking boundary (R4/R5). Pairs with enlarge_marking_threshold_2x."
+
+  - id: enlarge_marking_threshold_2x
+    applicable_when: "${marking_threshold_k} <= 512"
+    effect: "${marking_threshold_k} ← ${marking_threshold_k} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${marking_threshold_k} <= 1024"
+    notes: "Raise the congestion threshold. Pairs with shrink_marking_threshold_2x."
+
+  # ── Sketch capacity (min-protection budget) ──────────────────────────────
+  - id: shrink_sketch_rows_to_1
+    applicable_when: "${sketch_rows} >= 2 ∧ ${faithfulness} != D5.0_fq_then_step_ecn"
+    effect: "${sketch_rows} ← 1"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${sketch_rows} >= 1"
+    notes: |
+      Single-row sketch — no min protection. Any adversarial-collision workload
+      inflates the estimate; `sketch_min_full_collision_inherits_state` goes
+      vacuous. Pairs with enlarge_sketch_rows.
+
+  - id: enlarge_sketch_rows
+    applicable_when: "${sketch_rows} < 4"
+    effect: "${sketch_rows} ← ${sketch_rows} + 1"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${sketch_rows} <= 8"
+    notes: "Add a sketch row (more min protection). Pairs with shrink_sketch_rows_to_1."
+
+  - id: shrink_sketch_width_4x
+    applicable_when: "${sketch_width} >= 64"
+    effect: "${sketch_width} ← ${sketch_width} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${sketch_width} >= 16"
+    notes: "Narrow the sketch (more collisions). Pairs with enlarge_sketch_width_2x."
+
+  - id: enlarge_sketch_width_2x
+    applicable_when: "${sketch_width} <= 32768"
+    effect: "${sketch_width} ← ${sketch_width} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${sketch_width} <= 65536"
+    notes: "Widen the sketch. Pairs with shrink_sketch_width_4x."
+
+  # ── RFC-3168 strictness: Not-ECT-on-congestion action ────────────────────
+  - id: enable_strict_not_ect_drop
+    applicable_when: "${not_ect_action} == passthrough"
+    effect: "${not_ect_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Enforce RFC 3168 §6.1.2 MUST-drop on Not-ECT for admitted congested
+      packets (R4). The only axis where harden is the RFC-correct direction.
+      Pairs with relax_not_ect_passthrough.
+
+  - id: relax_not_ect_passthrough
+    applicable_when: "${not_ect_action} == drop"
+    effect: "${not_ect_action} ← passthrough"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax to forward admitted Not-ECT packets above K (R4 disabled → R7). Pairs with enable_strict_not_ect_drop."
+
+  # ── RFC-3168 strictness: DSCP preservation ───────────────────────────────
+  - id: enable_strict_dscp_preservation
+    applicable_when: "${dscp_preservation_strict} == false"
+    effect: "${dscp_preservation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Activate `dscp_preserved_under_mark`; force-probe the write-too-wide / id-stamp-into-diffserv bugs. Pairs with disable_dscp_preservation."
+
+  - id: disable_dscp_preservation
+    applicable_when: "${dscp_preservation_strict} == true"
+    effect: "${dscp_preservation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax the DSCP-preservation test. Pairs with enable_strict_dscp_preservation."
+
+  # ── Checksum strictness ──────────────────────────────────────────────────
+  - id: require_checksum_recompute
+    applicable_when: "${checksum_recompute} == omitted"
+    effect: "${checksum_recompute} ← required"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Activate `ipv4_checksum_validity_after_admit` + the three-field G3 probe. Pairs with omit_checksum_recompute."
+
+  - id: omit_checksum_recompute
+    applicable_when: "${checksum_recompute} == required"
+    effect: "${checksum_recompute} ← omitted"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Decouple the rewrites from the checksum surface. Pairs with require_checksum_recompute."
+
+  # ── Accounting-order axis (the composition's drop-order contract) ─────────
+  - id: account_on_admit_strict
+    applicable_when: "${account_policy} == account_on_deliver"
+    effect: "${account_policy} ← account_on_admit"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Count fairness bytes the moment AFQ admits, before the marking stage — so a
+      marker-tail-dropped (R4) packet still consumes bytes. Makes
+      `account_reflects_admission_not_delivery` load-bearing on the admit branch.
+      Pairs with account_on_deliver_relax.
+
+  - id: account_on_deliver_relax
+    applicable_when: "${account_policy} == account_on_admit"
+    effect: "${account_policy} ← account_on_deliver"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Count bytes only on delivered packets (R5/R6/R7), not the R4 marker-drop. Pairs with account_on_admit_strict."
+
+  # ── Byte-accuracy axis ───────────────────────────────────────────────────
+  - id: enable_byte_accurate_accounting
+    applicable_when: "${byte_accounting} != on_wire_length"
+    effect: "${byte_accounting} ← on_wire_length"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Switch accounting to on-wire frame length (read standard_metadata.packet_length). Pairs with disable_byte_accurate_accounting."
+
+  - id: disable_byte_accurate_accounting
+    applicable_when: "${byte_accounting} == on_wire_length"
+    effect: "${byte_accounting} ← unit_per_packet"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Regress to packet-count accounting (simpler, breaks the AFQ fairness theorem). Pairs with enable_byte_accurate_accounting."
+
+  # ── Hash-family axis ─────────────────────────────────────────────────────
+  - id: switch_hash_polynomial_to_custom_lfsr
+    applicable_when: "${hash_polynomial} ∈ {crc16, crc32, crc32c}"
+    effect: "${hash_polynomial} ← custom_lfsr"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Force a bespoke per-row polynomial. Pairs with revert_hash_polynomial_to_crc32."
+
+  - id: revert_hash_polynomial_to_crc32
+    applicable_when: "${hash_polynomial} != crc32"
+    effect: "${hash_polynomial} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to stock crc32. Pairs with switch_hash_polynomial_to_custom_lfsr."
+
+  - id: tighten_hash_independence
+    applicable_when: "${hash_independence} == pairwise ∧ ${faithfulness} != D5.0_fq_then_step_ecn"
+    effect: "${hash_independence} ← four_wise"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Require four-wise independence (adversarial-collision threat model). Pairs with relax_hash_independence."
+
+  - id: relax_hash_independence
+    applicable_when: "${hash_independence} == four_wise"
+    effect: "${hash_independence} ← pairwise"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax to pairwise independence. Pairs with tighten_hash_independence."
+
+  # ── Eligibility-breadth axis ─────────────────────────────────────────────
+  - id: restrict_eligibility_to_tcp
+    applicable_when: "${eligibility_protocol} ∈ {udp, any_l4}"
+    effect: "${eligibility_protocol} ← tcp"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Tighten the eligibility short-circuit to TCP (adds an isValid(hdr.tcp) guard surface). Pairs with broaden_eligibility_to_any_l4."
+
+  - id: broaden_eligibility_to_any_l4
+    applicable_when: "${eligibility_protocol} ∈ {tcp, udp}"
+    effect: "${eligibility_protocol} ← any_l4"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Broaden eligibility to any L4. Pairs with restrict_eligibility_to_tcp."
+
+  # ── Flowkey-breadth axis ─────────────────────────────────────────────────
+  - id: extend_flowkey_to_5tuple
+    applicable_when: "len(${flowkey_fields}) == 1 ∧ ${eligibility_protocol} ∈ {tcp, udp}"
+    effect: |
+      ${flowkey_fields} ← [hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                           hdr.ipv4.protocol, hdr.${eligibility_protocol}.sport,
+                           hdr.${eligibility_protocol}.dport]
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${eligibility_protocol} ∈ {tcp, udp}"
+    notes: "Lift the fairness flowkey from per-source-IP to per-connection (parse L4 ports before sketch indexing). Pairs with shrink_flowkey_to_src_only."
+
+  - id: shrink_flowkey_to_src_only
+    applicable_when: "len(${flowkey_fields}) > 1"
+    effect: "${flowkey_fields} ← [hdr.ipv4.srcAddr]"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Narrow the flowkey to per-source-IP. Pairs with extend_flowkey_to_5tuple."
+
+  # ── Workload axis ────────────────────────────────────────────────────────
+  - id: raise_workload_to_adversarial_not_ect
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian, adversarial_collision, bursty_above_threshold}"
+    effect: "${workload_skew} ← adversarial_not_ect"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${not_ect_action} == drop"
+    notes: |
+      Skew traffic to mostly Not-ECT packets AFQ admits but the marker tail-drops
+      — maximises the account-on-admit / R4 interaction at scale. Pairs with
+      lower_workload_skew.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {adversarial_collision, bursty_above_threshold, adversarial_not_ect}"
+    effect: "${workload_skew} ← zipfian"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Return to a benign zipfian workload. Pairs with raise_workload_to_adversarial_not_ect."
+
+  # ── Faithfulness ladder: D5.0 ↔ D5.1 ↔ D5.2 (composition co-design) ──────
+  - id: lift_to_sketch_fq_red_ecn
+    applicable_when: "${faithfulness} == D5.0_fq_then_step_ecn ∧ ${min_threshold} < ${marking_threshold_k}"
+    effect: |
+      ${faithfulness}   ← D5.1_sketch_fq_red_ecn
+      ${marking_mode}   ← red_proportional
+      ${sketch_rows}    ← max(${sketch_rows}, 2)
+      ${sketch_width}   ← max(${sketch_width}, 256)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${sketch_rows} >= 1 ∧ ${sketch_width} >= 16 ∧ ${min_threshold} < ${marking_threshold_k} ∧ ${marking_probability_max} > 0.0"
+    notes: |
+      Add BOTH sketch collisions (count-min fairness) and probabilistic RED
+      marking. The implementation must use a hash-indexed per-row register layout with
+      the min aggregator AND a per-packet random-draw marking decision; the
+      `stable_marking_decision` invariant relaxes. Pairs with
+      revert_to_fq_then_step_ecn.
+
+  - id: revert_to_fq_then_step_ecn
+    applicable_when: "${faithfulness} == D5.1_sketch_fq_red_ecn"
+    effect: |
+      ${faithfulness}   ← D5.0_fq_then_step_ecn
+      ${marking_mode}   ← single_threshold
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Step back to exact/min FQ + DCTCP single-threshold marking. Pairs with lift_to_sketch_fq_red_ecn."
+
+  - id: lift_to_round_coupled_marking
+    applicable_when: "${faithfulness} == D5.1_sketch_fq_red_ecn ∧ ${marking_coupling} == decoupled"
+    effect: |
+      ${faithfulness}     ← D5.2_round_coupled_marking
+      ${marking_coupling} ← round_coupled
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "${coupling_gain} >= 1 ∧ ${min_threshold} >= 1 ∧ ${min_threshold} <= ${marking_threshold_k}"
+    notes: |
+      The composition's CO-DESIGN rung. The effective marking threshold for a
+      packet becomes max(${min_threshold}, ${marking_threshold_k} -
+      ${coupling_gain} * round_shift), so over-share flows (high round_shift)
+      are marked / tail-dropped at a lower depth. The marking verdict now depends
+      on BOTH the congestion signal AND the fairness rank — a coupling neither
+      standalone pattern can express. Requires oracle regeneration (R4-R7
+      predicates resolve `effective_threshold` against round_shift). Pairs with
+      revert_to_decoupled_marking.
+
+  - id: revert_to_decoupled_marking
+    applicable_when: "${faithfulness} == D5.2_round_coupled_marking"
+    effect: |
+      ${faithfulness}     ← D5.1_sketch_fq_red_ecn
+      ${marking_coupling} ← decoupled
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Decouple marking from the fairness rank (effective threshold ← ${marking_threshold_k}). Pairs with lift_to_round_coupled_marking."
+
+  # ── CE-persistence strictness ────────────────────────────────────────────
+  - id: enable_ce_persistence_strict
+    applicable_when: "${ce_persistence_strict} == false"
+    effect: "${ce_persistence_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Activate `ce_persistence_no_unmark` on the admitted CE path (R6/R7). Pairs with disable_ce_persistence_strict."
+
+  - id: disable_ce_persistence_strict
+    applicable_when: "${ce_persistence_strict} == true"
+    effect: "${ce_persistence_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax the CE-persistence test. Pairs with enable_ce_persistence_strict."
+
+  # ── Non-IPv4 action axis ─────────────────────────────────────────────────
+  - id: tighten_non_ipv4_drop
+    applicable_when: "${non_ipv4_action} == passthrough"
+    effect: "${non_ipv4_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Drop non-IPv4 frames at R1 (parser-eligibility surface). Pairs with relax_non_ipv4_passthrough."
+
+  - id: relax_non_ipv4_passthrough
+    applicable_when: "${non_ipv4_action} == drop"
+    effect: "${non_ipv4_action} ← passthrough"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Forward non-IPv4 frames unchanged on ${core_port}. Pairs with tighten_non_ipv4_drop."
+
+  # ── Depth-signal axis ────────────────────────────────────────────────────
+  - id: move_depth_signal_to_enq_qdepth
+    applicable_when: "${queue_depth_signal} == synthetic_qdepth"
+    effect: "${queue_depth_signal} ← enq_qdepth"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Wire the marking threshold to the real BMv2 egress enq_qdepth instead of a
+      control-plane synthetic-depth table — the production-realistic but
+      hardest-to-unit-test signal (the marking decision must move to / read from
+      egress metadata). Pairs with move_depth_signal_to_synthetic.
+
+  - id: move_depth_signal_to_synthetic
+    applicable_when: "${queue_depth_signal} ∈ {enq_qdepth, deq_qdepth}"
+    effect: "${queue_depth_signal} ← synthetic_qdepth"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Use the control-plane synthetic-depth table (deterministic single-packet tests). Pairs with move_depth_signal_to_enq_qdepth."
+
+# ─── Implementation notes (advisory only — author-side, not LLM-visible) ───
+bridging_notes: |
+  Canonical BMv2 / v1model implementation sketch (D5.0 default seed: exact-or-min FQ,
+  single_threshold ECN, decoupled, account_on_admit, synthetic depth):
+
+    header ipv4_t {
+      bit<4>  version; bit<4> ihl;
+      bit<6>  dscp;            # split the diffserv byte 6+2 so ecn is bit-accessible
+      bit<2>  ecn;
+      bit<16> totalLen; bit<16> identification;
+      ...
+      bit<16> hdrChecksum;
+      ...
+    }
+
+    control MyIngress(...) {
+      apply {
+        if (std.ingress_port != ${access_port}) { mark_to_drop(std); return; }   // R0
+        if (!hdr.ipv4.isValid()) {                                               // R1
+          if (${non_ipv4_action}==drop) { mark_to_drop(std); return; }
+          else { std.egress_spec = ${core_port}; return; }
+        }
+        if (${eligibility_protocol}==tcp && hdr.ipv4.protocol != 6) {            // R2
+          mark_to_drop(std); return;
+        }
+        // ── FAIRNESS stage (P-ApproxFairQueueing) ──
+        // per-row hash over ${flowkey_fields}; b_r = sketch_row_r.read(h_r);
+        // est = min(b_0..b_{R-1}); total = global_bytes.read(0);
+        // current = total >> log2(${quantum} * ${fair_share_k});
+        // flow_round = est >> log2(${quantum});
+        // round_shift = (flow_round > current) ? (flow_round - current) : 0;
+        if (round_shift >= ${window}) { mark_to_drop(std); return; }             // R3 — NEVER reaches marking
+        // admit: account FIRST (account_on_admit) so an R4 drop still counts
+        if (${account_policy}==account_on_admit) {
+          sketch_row_r.write(h_r, b_r + std.packet_length);   // for each row
+          global_bytes.write(0, total + std.packet_length);
+        }
+        // ── MARKING stage (P-ECNMarker), keyed on queue.depth ──
+        // K_eff = (${marking_coupling}==round_coupled)
+        //           ? max(${min_threshold}, ${marking_threshold_k} - ${coupling_gain}*round_shift)
+        //           : ${marking_threshold_k};
+        if (meta.qdepth >= K_eff) {                                              // congested
+          if (hdr.ipv4.ecn == 2w0b00) {                                          // R4 Not-ECT
+            // (account_on_deliver: undo / skip the inc above)
+            mark_to_drop(std); return;
+          }
+          if (hdr.ipv4.ecn == 2w0b01 || hdr.ipv4.ecn == 2w0b10) {                // R5 mark
+            hdr.ipv4.ecn = 2w0b11;
+          }
+          // else CE already → leave it (R6)
+        }
+        // common admit-forward tail (R5/R6/R7):
+        hdr.ipv4.identification = (bit<16>) round_shift;
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+        hdr.ethernet.dstAddr = ${core_mac};
+        std.egress_spec = ${core_port};
+      }
+    }
+
+    control MyComputeChecksum(...) {
+      apply {
+        update_checksum(hdr.ipv4.isValid(),
+          { hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.dscp, hdr.ipv4.ecn,
+            hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags,
+            hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol,
+            hdr.ipv4.srcAddr, hdr.ipv4.dstAddr },
+          hdr.ipv4.hdrChecksum, HashAlgorithm.csum16);
+      }
+    }
+    # ONE update_checksum covering identification + ecn + ttl is the
+    # composition's load-bearing requirement (single recompute over three fields).
+
+  [common-knowledge baseline] v1model bug-catalogue anchors this
+  composition exposes that NEITHER standalone reaches:
+
+    (a) STAGE ORDERING — marking-before-fairness: an implementation that evaluates the
+        depth/ECN decision before the round_shift drop forwards a CE-marked copy
+        of an unfair packet that should have been dropped. Caught by
+        `fairness_drop_not_marked` / `admission_precedes_marking`.
+
+    (b) ACCOUNTING ORDER — the R4 admit-then-tail-drop path. account_on_admit
+        means a Not-ECT packet AFQ admits but the marker drops STILL consumes
+        bytes; an implementation that gates the AFQ inc on the final forward verdict
+        gets the follow-up round_shift wrong. Caught by
+        `account_reflects_admission_not_delivery`.
+
+    (c) THREE-FIELD CHECKSUM — the admit-and-mark path (R5) writes id + ecn + ttl
+        from two logical stages; a single update_checksum must cover all three.
+        Two separate / mis-ordered checksum updates clobber each other. Caught by
+        `single_checksum_over_three_fields`. Sharper than P-RouterACL's
+        two-field mark-then-route checksum.
+
+    (d) BIT-PACKED WRITE-TOO-WIDE — the ECN mark (low 2 diffserv bits) must not
+        clobber DSCP, and the AFQ identification stamp must not bleed into the
+        diffserv byte. Caught by `dscp_preserved_under_mark_after_admit`.
+
+    (e) CONDITIONAL DEPARSER across four verdict branches (fairness-drop /
+        marker-drop / mark-forward / passthrough-forward). Caught by
+        `conditional_deparser_mixed_verdicts`.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - The stage ORDER (fairness admission BEFORE depth-marking) is the modelled
+      contract; real AQM+FQ silicon makes both decisions at enqueue and the
+      ordering between them is an implementation choice. This pattern fixes the
+      order (fairness first) so the composition has a single ground truth; the
+      `account_policy` parameter exposes the one degree of freedom that is
+      genuinely observable (whether a marker-dropped admitted packet consumed
+      its fair-share bytes).
+    - The round-coupled effective-threshold law (D5.2) — K_eff =
+      max(min_threshold, K - gain*round_shift) — is a synthesised co-design
+      lifting AFQ's per-flow rank into the ECN marking decision. It is NOT from a
+      single cited source; it is the natural fusion of AFQ's round_shift fairness
+      signal with DCTCP's depth-threshold marking, and exists to give the
+      composition a genuine D5.2 rung that neither constituent's faithfulness
+      ladder reaches. Flagged for human verdict at audit.
+    - round_shift is stamped into IPv4.identification (inherited from the
+      P-ApproxFairQueueing implementation convention) to make the fairness rank observable
+      to the verifier without adding a wire header.
+
+  v2 deferral notes:
+    - Epoch rotation / sketch decay (evict at a time_tick) is out of scope (no
+      no_orphan invariant); sketch cells grow within a process lifetime.
+    - True per-priority queueing (a distinct queue.depth per DSCP class, à la
+      P-ECNMarker's priority_queue_count axis) is deferred — this composition
+      uses one shared egress-queue depth signal.
+    - Egress-control marking (reading deq_qdepth and applying the mark in the
+      egress pipeline) is reachable via ${queue_depth_signal} == deq_qdepth but
+      is not the v1.0 default; most v1model implementations put both stages in ingress
+      for testability.

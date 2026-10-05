@@ -1,0 +1,1439 @@
+# P-HTTPHeaderRoute — shallow-L7 HTTP/1.1 request steering and filtering
+#
+# TPL v1.0 task pattern. The HTTP sibling of
+# P-DNSLoadBalancer: both fill the P12:shallow-L7-protocols `relocate`
+# row of the NF design-space map (one of the five
+# *publication-record gap* prescriptive rows — shallow L7 has "no
+# descriptive counterpart in the surveyed corpus"), so the descriptive
+# tags are mechanism-assigned. Where P-DNSLoadBalancer parses a UDP/53
+# DNS query's length-prefixed label sequence, this pattern parses a
+# cleartext TCP HTTP/1.1 request-line and the Host header within a
+# BOUNDED byte prefix and steers / filters on (method, host,
+# path-prefix). Method-based + Host-based + path-prefix steering = a
+# routing-family behaviour (D5); the denylist / default-deny block
+# action = a security-family behaviour (D7) — the same multi-tag
+# mechanism-assignment precedent P-DNSLoadBalancer [D5,D7] set, and that
+# P-BFDLiveness (P16→D5) / P-PTPTransparentClock (P14→D4) set for the
+# other publication-record-gap rows.
+#
+# target_capability = relocate: L7 HTTP request routing / filtering has
+# historically lived on host-side reverse proxies, API gateways, and L7
+# load balancers (nginx, Envoy, HAProxy, F5 LTM); the programmable data
+# plane is now able to *receive* the header-only subset of the function.
+# The relocate frontier's structural failure mode shows up here
+# as the SUT having to redesign a host-side string-matching algorithm —
+# tokenise a variable-length, CRLF-delimited text request — onto a
+# loop-free, BOUNDED-depth match-action parser with no prior data-plane
+# design to copy. This is the SECOND-cleanest probe of the L7-parse
+# failure class in the corpus (after P-DNSLoadBalancer): unlike DNS's
+# length-prefixed labels, HTTP is a free-form *text* protocol with no
+# length prefixes, so the bounded parse is even more brittle — full HTTP
+# parsing is genuinely INFEASIBLE on v1model and is deliberately
+# constrained here to a fixed-offset method classifier + a capped
+# Host/path scan within a bounded prefix (see bridging_notes:
+# feasibility). Full HTTP/1.1 parsing (chunked transfer, request
+# pipelining, header folding, arbitrary header order) is v2-deferred.
+#
+# Extracted from RFC 9112 (HTTP/1.1
+# message format — the request-line + Host-header grammar, canonical)
+# and RFC 9110 (HTTP Semantics — method tokens + the Host header MUST).
+# Instances need an HTTP `custom_headers.py` (Scapy ships no native
+# HTTP-request layer that the verifier can build from a layer spec).
+
+pattern_id: P-HTTPHeaderRoute
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing, D7:security]                     # mechanism-assigned: P12 is a publication-record-gap row with no native descriptive family. Method/Host/path steering = routing (D5); denylist / default-deny block = security (D7). Multi-tag straddle, same precedent as P-DNSLoadBalancer [D5,D7] and P-StatefulFW [D1,D7].
+  prescriptive: [P12:shallow-L7-protocols]                    # parse upper-layer (HTTP/1.1) headers; proxy-style steering — `relocate` row in Table 1
+
+target_capability: relocate                                   # L7 HTTP routing / filtering relocated from host reverse-proxies / API gateways down into the switch pipeline
+
+summary: >
+  A shallow-L7 HTTP/1.1 request router / filter. On a TCP HTTP request
+  (a payload whose first bytes are a recognised method token followed by
+  a space and an origin-form request-target, RFC 9112 §3) the switch
+  parses, within a BOUNDED byte prefix `${parse_window_bytes}`, three
+  classification fields: the request method (GET / POST / PUT / DELETE /
+  … — a fixed set of leading tokens, RFC 9110 §9), the request-target's
+  leading path prefix (the bytes between the method's trailing space and
+  the first `/`-delimited path boundary or `?`/SP, up to a cap), and the
+  value of the Host header (the first `Host:` field-line within the
+  bounded prefix, RFC 9110 §7.2 / RFC 9112 §3.2 — folded to lowercase
+  per the host being case-insensitive), and matches the derived
+  (method, host, path-prefix) key against a control-plane
+  `http_route_policy` table under the configured match breadth
+  (method-only, +host, or +path-prefix). The matched entry carries one
+  of three actions: *route* (L3-forward the request to the selected
+  backend — MAC rewrite, TTL decrement, IPv4-checksum recompute, the
+  service-VIP destination preserved so backends behind an anycast/NAT
+  tier answer correctly), *rewrite* (DNAT the destination to a specific
+  backend IP with IPv4 + TCP checksum recompute), or *block* (drop the
+  request — a denylist / WAF-style deny, the D7:security half). A request
+  whose method is not in the recognised set, whose request-line or Host
+  header does not appear within `${parse_window_bytes}`, or that is not a
+  parseable HTTP/1.1 request at all is handled per
+  `${malformed_handling}` (strict drop vs steer to the default backend).
+  Unclassified-but-well-formed requests fall to `${default_action}`. The
+  pattern is STATELESS — every decision derives from the bounded-prefix
+  header bytes and the control-plane table — which is what differentiates
+  it from the stateful-flow `relocate`/`scale_up` patterns; its
+  difficulty lives entirely in the data-dependent bounded text parse and
+  the parse-then-deparse round-trip of the request payload. The headline
+  invariant pins the common v1model silent-failure surfaces this NF concentrates:
+  the HTTP request payload is delivered byte-for-byte unmodified (the
+  switch edits only the L2/L3/L4 envelope), the IPv4/TCP checksums are
+  recomputed after every envelope edit, and the bounded prefix scan never
+  reads past `${parse_window_bytes}`. Faithfulness anchors at D5.0
+  (route-only, method-only match, lax malformed handling, case-sensitive
+  fixed-offset method compare) and ladders through D5.1 (full RFC 9110
+  validation: strict malformed drop, +host match, case-insensitive host
+  fold, Host-header MUST enforcement), D5.2 (add the rewrite/DNAT action
+  with TCP checksum), and D5.3 (add denylist blocking + path-prefix match
+  under an adversarial bounded-prefix-edge workload).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # HTTP data-plane processing is engineering-mature but has little coverage in the SIGCOMM/NSDI/CoNEXT literature. Its lineage is the host-side reverse-proxy / API-gateway design (nginx, Envoy, HAProxy) pulled *down* into the switch; no paper is cited because none was directly read.
+
+  rfcs:
+    - cite: rfc9112
+      title: "HTTP/1.1"
+      sections: ["§2.1 message format", "§3 request line", "§3.2 request target (origin-form)", "§5 field syntax (field-line, Host)"]
+      role: normative_behaviour
+      quote: "A request-line begins with a method token, followed by a single space (SP), the request-target, and another single space (SP), and ends with the protocol version."
+      quote_source: "RFC 9112 §3 Request Line (verbatim; cached at patterns/P-HTTPHeaderRoute/grounding/rfc9112.txt). Grounds the bounded request-line parse (method token at offset 0, SP-delimited request-target) the shallow-L7 router classifies on (R3 route)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        The canonical wire-format source for the HTTP/1.1 request this
+        pattern parses, and the spine of every parse boundary. The
+        clauses below were retrieved and bind directly on the bounded
+        data-plane parse and decision:
+
+          - §2.1 message format — an HTTP/1.1 message is "a sequence of
+            octets" structured as a start-line, a sequence of field-lines
+            each ending in CRLF, an empty CRLF line, and an optional body.
+            There are NO length prefixes; the request-line and each
+            field-line are delimited only by CRLF (`\r\n`). A bounded
+            match-action parser therefore commits to scanning a fixed
+            byte window for the CRLF delimiters rather than walking a
+            length-prefixed structure — this is the `${parse_window_bytes}`
+            bound and the `request_line_within_window` /
+            `host_within_window` well-formedness boundary.
+
+          - §3 request line — "request-line = method SP request-target SP
+            HTTP-version CRLF". The method is a leading token, the
+            request-target follows a single space, and the line ends in
+            CRLF. The pattern keys the method at the fixed leading offset
+            and the path-prefix on the bytes immediately after the
+            method's trailing space — the `method_at_offset_zero` and
+            `path_prefix_extracted` G1 tests pin these.
+
+          - §3.2 request target (origin-form) — for a direct request to
+            an origin server the target is "origin-form = absolute-path
+            [ "?" query ]", i.e. a path that begins with `/`. The
+            path-prefix key is the leading absolute-path segment; a
+            request-target that is asterisk-form (`*`) or authority-form
+            (CONNECT) has no absolute-path and is treated as
+            non-path-classifiable. The `path_prefix_match` G1 test and the
+            `asterisk_form_default` G2 test pin this.
+
+          - §5 field syntax — "field-line = field-name ":" OWS
+            field-value OWS". The Host field-line carries the target host
+            authority. The pattern scans for the first `Host:` field-name
+            (case-insensitive field name) within `${parse_window_bytes}`
+            and reads its field-value up to the terminating CRLF or a cap.
+            The `host_header_match` G1 test and
+            `host_header_absent_malformed` G3 test pin the Host scan.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model bridging — the fixed-offset method
+        classifier (an exact/ternary match on the first N payload bytes,
+        or a small unrolled `select` over the recognised method tokens),
+        the bounded prefix scan for the `Host:` field-line and the path
+        boundary (an unrolled chain of single-byte-extract parser states
+        capped at `${parse_window_bytes}`, OR a fixed-width payload-prefix
+        header walked by a parser that gives up at the bound), the hash /
+        truncation that folds the host bytes into a fixed-width table key,
+        and the `update_checksum` calls on the IPv4 and (rewrite-mode) TCP
+        headers — is widely-known P4-on-v1model practice rather than
+        RFC-cited, and is flagged `[common-knowledge baseline]` in
+        `bridging_notes:`. The genuine feasibility constraint (HTTP is
+        variable-length text; v1model cannot parse arbitrary headers) is
+        documented in `bridging_notes:` feasibility, not RFC-cited.
+
+  rfcs_secondary:
+    - cite: rfc9110
+      title: "HTTP Semantics"
+      sections: ["§7.2 Host and :authority", "§9 methods (method tokens, safe/idempotent)", "§9.3 method definitions"]
+      role: normative_behaviour
+      relevance: |
+        The semantic source for the method set and the Host header MUST
+        that the classification key and the malformed-handling boundary
+        enforce. Retrieved clauses:
+
+          - §9 methods — the method token set (GET, HEAD, POST, PUT,
+            DELETE, CONNECT, OPTIONS, TRACE, PATCH) and the "method token
+            is case-sensitive" rule. The pattern's `${method_set}`
+            parameter is the recognised leading-token set; a request whose
+            leading token is not in the set is non-HTTP-classifiable and
+            falls to `${malformed_handling}`. The
+            `method_discrimination` G1 test (steer GET vs POST for the
+            same host to different backends) and `unknown_method_default`
+            G2 test pin this.
+
+          - §7.2 Host — "A client MUST send a Host header field-line in
+            all HTTP/1.1 request messages." A well-formed HTTP/1.1 request
+            therefore carries exactly one Host; its absence is a protocol
+            violation. When `${host_match_enabled}` the missing-Host case
+            is malformed (handled per `${malformed_handling}`); the
+            `host_header_absent_malformed` G3 test pins this MUST.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Every steering decision derives from
+      the parsed-within-bound request fields (method, host, path-prefix),
+      the ingress port, and the control-plane-installed `http_route_policy`
+      table. The pattern is STATELESS — no `flow` / `connection` /
+      `session` rows are maintained, and (per the harness constraint, see
+      bridging_notes feasibility) each graded request is carried in a
+      SINGLE TCP segment so the bounded parse sees the whole request-line +
+      Host within one packet (cross-segment reassembly is v2-deferred).
+      The request direction only is in scope: the switch steers
+      client→backend requests; the response return path composes
+      transitively with P-NAT44 (rewrite mode). This is what keeps the
+      oracle cost bounded while still exercising the shallow-L7 parse
+      surface.
+
+  http_route_policy:                                          # TPL `bucket` — aggregate state across a class of requests (per-(method,host,path) steering decision)
+    type: bucket
+    keyed_by_tuple: [method, host_key, path_prefix_key]       # host_key participates only when ${host_match_enabled}; path_prefix_key only when ${path_match_enabled}; method always
+    attrs:
+      action:       "enum {route, rewrite, block}"            # which rule (R3/R4/R2) the matched class fires
+      egress_port:  port                                      # backend egress port (route + rewrite)
+      backend_ip:   "address | none"                          # DNAT target (rewrite only)
+      backend_mac:  address                                   # next-hop / backend MAC (L2 rewrite on route + rewrite)
+      src_mac:      address                                   # this switch's egress-port MAC
+    capacity: ${route_policy_capacity}
+    populated_from: ${http_route_policy_entries}              # rows the seed installs
+    notes: |
+      The (method, host-class, path-prefix) → steering-decision table that
+      drives the whole pattern. Control-plane installed (an L7-LB
+      controller, a WAF denylist feed for the `block` rows, or a static
+      map). `host_key` is the bounded fixed-width key the classifier
+      derives from the parsed Host value under `${host_match_breadth}` and
+      `${case_normalization}`; `path_prefix_key` is the leading path
+      segment under `${path_match_breadth}`. At D5.0 the table is a handful
+      of method → route rows; D5.3 ladders to (method, host, path) keys,
+      block rows, and realistic fan-out.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  http_route_policy_entries:
+    type: list[http_route_entry]
+    constraint: |
+      every entry has method (a recognised method token ∈ ${method_set});
+      host (a dotted authority, e.g. "api.example.com", present iff
+      ${host_match_enabled}); path_prefix (a leading absolute-path
+      segment, e.g. "/v1", present iff ${path_match_enabled}); action ∈
+      {route, rewrite, block}; egress_port:int ∈ [1, 511] (required for
+      route/rewrite); backend_ip:address (required iff action == rewrite,
+      else none); backend_mac:address and src_mac:address (required for
+      route/rewrite). The (method, host_key, path_prefix_key) derived from
+      each entry under the configured breadths is unique across the list.
+      action ∈ {rewrite} entries appear only when ${action_breadth} ∈
+      {route_rewrite, all}; action ∈ {block} entries only when
+      ${action_breadth} ∈ {route_block, all}.
+    notes: |
+      The rows that populate the `http_route_policy` bucket. Bound by the
+      seed; the harness installs the corresponding classification table at
+      task start. The instantiation step renders each entry into the
+      bounded fixed-width key the chosen breadths produce.
+
+  parse_window_bytes:
+    type: int
+    range: "[16, 256]"
+    default: 64
+    notes: |
+      The bounded byte prefix of the TCP payload the data plane scans for
+      the request-line (method + path) and the first Host field-line. HTTP
+      has NO length prefixes (RFC 9112 §2.1), so a match-action parser
+      cannot parse an arbitrary-length request; it commits to a fixed scan
+      window. A request whose request-line or (under
+      ${host_match_enabled}) whose Host header does not appear within this
+      many bytes is handled per ${malformed_handling}. Wider windows force
+      the SUT to unroll more single-byte scan states correctly (more
+      off-by-one and bound-overrun risk), so `widen_parse_window` hardens
+      (capacity axis — the scan-depth resource).
+
+  method_set:
+    type: list[method_token]
+    constraint: |
+      non-empty subset of {GET, HEAD, POST, PUT, DELETE, CONNECT, OPTIONS,
+      TRACE, PATCH} (RFC 9110 §9); tokens are case-sensitive (RFC 9110
+      §9). A leading token not in this set is non-HTTP-classifiable.
+    default: [GET, POST]
+    notes: |
+      The recognised method tokens the fixed-offset classifier matches at
+      the request's leading bytes. Anchor instances use a small set
+      ({GET, POST}); `broaden_method_set` adds tokens (more leading-token
+      branches to discriminate, longer max method-token width to scan
+      before the first SP), feature-breadth axis.
+
+  host_match_enabled:
+    type: bool
+    default: false
+    notes: |
+      Whether the classification key includes the parsed Host value (RFC
+      9110 §7.2 / RFC 9112 §5) so the same method can steer api.example.com
+      and cdn.example.com to different backends — the virtual-host /
+      name-based L7 routing case. `true` forces the SUT to scan past the
+      request-line to the first Host field-line within the window and fold
+      it into the key, and (RFC 9110 §7.2 MUST) treat an absent Host as
+      malformed. Activates `host_header_match` and
+      `host_header_absent_malformed`. feature-breadth axis.
+
+  host_match_breadth:
+    type: enum
+    values: [exact_host, registrable_suffix]
+    default: exact_host
+    enforced_when: "${host_match_enabled}"
+    notes: |
+      How the parsed Host value is keyed. `exact_host` keys on the full
+      authority (e.g. api.example.com). `registrable_suffix` keys on the
+      registrable two-label suffix (e.g. example.com) so all sub-hosts
+      share a backend — requires correctly finding the suffix boundary in
+      the scanned host bytes. `broaden_host_match` widens exact→suffix
+      (feature-breadth axis).
+
+  path_match_enabled:
+    type: bool
+    default: false
+    notes: |
+      Whether the classification key includes the request-target's leading
+      path prefix (RFC 9112 §3.2 origin-form absolute-path) so
+      e.g. POST /v1/... and POST /v2/... steer to different API backends.
+      `true` forces the SUT to parse the bytes after the method's trailing
+      SP up to the path boundary and fold the prefix into the key.
+      Activates `path_prefix_match`. feature-breadth axis.
+
+  path_match_breadth:
+    type: enum
+    values: [first_segment, two_segments]
+    default: first_segment
+    enforced_when: "${path_match_enabled}"
+    notes: |
+      How much of the absolute-path the prefix key covers. `first_segment`
+      keys on the leading `/seg` (e.g. /v1). `two_segments` keys on the
+      first two segments (e.g. /v1/users) — requires scanning a second
+      `/` boundary within the window. `broaden_path_match` widens
+      first→two (feature-breadth axis).
+
+  action_breadth:
+    type: enum
+    values: [route_only, route_block, route_rewrite, all]
+    default: route_only
+    notes: |
+      Which of the three steering actions (R2 block / R3 route / R4
+      rewrite) the seed's table exercises. `route_only` is the anchor-band
+      minimum (R3 only). `route_block` adds the denylist / WAF-style drop
+      (R2). `route_rewrite` adds the DNAT action (R4) and its TCP-checksum
+      surface. `all` enables every action. Broader action sets add
+      reachable rules and bug surfaces, so `broaden_action` hardens
+      (feature-breadth axis).
+
+  malformed_handling:
+    type: enum
+    values: [strict_drop, lax_default]
+    default: lax_default
+    notes: |
+      How a non-parseable-or-overlong request is handled: `strict_drop`
+      drops it (activates R1 and the malformed G2/G3 tests); `lax_default`
+      lets it fall through to R5's `${default_action}` (a forgiving
+      front-end that steers anything it cannot classify to a default
+      backend). Malformed covers: a leading token not in `${method_set}`;
+      a request-line whose method SP / target does not appear within
+      `${parse_window_bytes}`; (under ${host_match_enabled}) an absent Host
+      header (RFC 9110 §7.2 MUST violation) or a Host not within the
+      window; and a TCP segment that is not a parseable HTTP/1.1 request.
+      `strict_drop` is the security-conscious harden direction.
+
+  default_action:
+    type: enum
+    values: [drop, forward_default]
+    default: forward_default
+    notes: |
+      R5 catch-all behaviour for a well-formed request whose
+      (method, host_key, path_prefix_key) is not present in
+      `http_route_policy` (and, under ${malformed_handling} ==
+      lax_default, for malformed requests). `forward_default` steers to
+      `${default_backend_port}`; `drop` is the closed-world default-deny.
+      Coupled into the faithfulness ladder rather than carrying its own
+      operator pair.
+
+  default_backend_port:
+    type: int
+    range: "[1, 511]"
+    enforced_when: "${default_action} == forward_default"
+    notes: |
+      Egress port of the default / catch-all backend R5 forwards to under
+      `${default_action} == forward_default`. Bound by the seed.
+
+  case_normalization:
+    type: bool
+    default: false
+    notes: |
+      Whether the classifier case-folds the parsed Host value before
+      deriving the host key (RFC 9110 §7.2: the host authority is
+      case-insensitive). `false` keys on raw host bytes (a naive implementation
+      that mis-classifies `API.Example.COM`); `true` enforces the
+      case-insensitive compare. NOTE: the method token is case-SENSITIVE
+      (RFC 9110 §9), so case-folding applies to the host only, never the
+      method. `enable_case_insensitive_host` hardens — it surfaces the
+      implementation that forgets the Host authority is case-insensitive
+      (faithfulness axis: fidelity of the name-comparison semantics).
+
+  host_hash_algo:
+    type: enum
+    values: [crc16, crc32, truncate]
+    default: crc16
+    enforced_when: "${host_match_breadth} == exact_host"
+    notes: |
+      Function used to fold the variable-length exact-host bytes into a
+      fixed-width table key. `truncate` (keep the first K bytes) is the
+      cheapest but weakest — under an adversarial host workload it collides
+      distinct hosts sharing a prefix into one key. `swap_hash_to_truncate`
+      hardens the panel against implementations that copy a textbook CRC pattern
+      without considering key quality (hash-family axis).
+
+  route_policy_capacity:
+    type: int | unbounded
+    range: "[8, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of (method, host_key, path_prefix_key) entries the
+      classification table supports. Realistic L7-LB / WAF policy tables
+      sit in the 10²–10⁴ range; `shrink_policy_capacity_4x` exercises the
+      axis from the anchor band's `unbounded` baseline, forcing the SUT to
+      consider key aggregation rather than a row-per-rule TCAM (capacity
+      axis).
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of request shapes in the G1 traffic tests. `uniform` is
+      the anchor-band default. `zipfian` concentrates requests on a few hot
+      (method,host,path) classes. `adversarial` mixes requests whose
+      request-line / Host sits EXACTLY at the `${parse_window_bytes}` edge
+      with prefix-colliding hosts that stress `${host_hash_algo}` quality.
+      `raise_workload_skew` hardens (workload axis).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_route, D5.1_full_classify, D5.2_rewrite_dnat, D5.3_denylist_strict]
+    default: D5.0_anchor_route
+    notes: |
+      The faithfulness ladder for this pattern. D5.0 is the minimal
+      route-only steerer (method-only match, lax malformed handling,
+      case-sensitive, no host/path, forward-default). D5.1 lifts to the
+      full RFC 9110/9112 validation cascade (strict malformed drop, +host
+      match, case-insensitive host fold, Host-MUST enforcement). D5.2 adds
+      the rewrite/DNAT action and its TCP-checksum surface. D5.3 adds
+      denylist blocking (block action), +path-prefix match, and the
+      adversarial window-edge workload. `tighten_faithfulness` walks the
+      ladder up; `loosen_faithfulness` walks it down (the feature-breadth
+      ladder).
+
+  http_tcp_port:
+    type: int
+    range: "[1, 65535]"
+    default: 80
+    notes: |
+      TCP destination port that identifies a cleartext HTTP request. 80 is
+      the IANA assignment; exposed as a parameter so an instance can target
+      an alternate port. R0 and the well-formed-request guard test
+      `tcp.dst == ${http_tcp_port}`. (HTTPS / TLS is out of scope — the
+      payload is encrypted and unparseable; this pattern is CLEARTEXT
+      HTTP/1.1 only.)
+
+  service_vip:
+    type: address
+    notes: |
+      The service VIP that clients send HTTP requests to and that the
+      switch fronts. In `route` mode the IPv4 destination (this VIP) is
+      PRESERVED across the steering decision (only L2 + TTL change), so the
+      selected backend / downstream NAT tier handles the response path.
+      Anchor instances bind this to an RFC 1918 / documentation address.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+#
+# Shorthands used in the `when` clauses below:
+#   is_http_request    := header_present(http) ∧ match(tcp.dst, ${http_tcp_port})
+#                         ∧ http.leading_token ∈ ${method_set}
+#   req_well_formed    := the request-line (method SP target SP) terminates within
+#                         ${parse_window_bytes}
+#                         ∧ ( ¬${host_match_enabled} ∨ a Host field-line is present
+#                             and its value terminates within ${parse_window_bytes} )
+#                         ∧ ( ¬${path_match_enabled} ∨ the request-target is origin-form
+#                             (leading '/') )
+#   well_formed_req    := is_http_request ∧ req_well_formed
+#   class_key          := key(http.method, http.host, http.path_prefix,
+#                             ${host_match_enabled}, ${host_match_breadth},
+#                             ${path_match_enabled}, ${path_match_breadth},
+#                             ${case_normalization}, ${host_hash_algo})
+
+rules:
+
+  - id: R0_non_http_request_drop
+    when: |
+      ¬is_http_request
+    then:
+      - drop
+    notes: |
+      The switch is a dedicated HTTP-request steerer. Anything that is not
+      a TCP/${http_tcp_port} segment whose leading bytes are a recognised
+      method token (RFC 9112 §3 request-line, RFC 9110 §9 method) is out of
+      scope — non-HTTP traffic, TLS/HTTPS (encrypted, unparseable), HTTP
+      *responses* (status-line, not a method token), and TCP control
+      segments (SYN/ACK with no payload). Dropped. A production deployment
+      composes the non-HTTP forwarding path with P-IPv4Routing transitively
+      rather than re-encoding it here (the same scope-narrowing
+      P-DNSLoadBalancer / P-VXLANTunnel use). The `read_invalid_http_field_guard`
+      and `tls_handshake_dropped` G3 tests pin this gate.
+
+  - id: R1_malformed_strict_drop
+    when: |
+      is_http_request
+        ∧ ¬req_well_formed
+        ∧ ${malformed_handling} == strict_drop
+    then:
+      - drop
+    notes: |
+      RFC 9112 §2.1/§3 + RFC 9110 §7.2 strict-validation path: an HTTP
+      request whose request-line does not terminate within
+      `${parse_window_bytes}`, or (under ${host_match_enabled}) whose Host
+      field-line is absent (RFC 9110 §7.2 MUST violation) or does not
+      appear within the window, or (under ${path_match_enabled}) whose
+      request-target is not origin-form, is treated as malformed and
+      dropped under `strict_drop`. Under `lax_default` this guard is false
+      and the packet falls through to R5's default. R1 is disjoint from
+      R2/R3/R4 (which require `req_well_formed`) and is the explicit
+      strict-mode partner of R5's lax catch-all.
+      `request_line_exceeds_window` and `host_header_absent_malformed`
+      exercise it.
+
+  - id: R2_classify_block
+    when: |
+      well_formed_req
+        ∧ exists(http_route_policy, class_key)
+        ∧ http_route_policy.action == block
+    given:
+      http_route_policy: by_key(class_key)
+    then:
+      - drop
+    notes: |
+      Denylist / WAF-style blocking: a request whose
+      (method, host, path) class is installed with `action == block` is
+      dropped before steering. This is the D7:security half of the
+      pattern. Only reachable when `${action_breadth} ∈ {route_block, all}`
+      (the seed installs no block rows otherwise). The `denylist_drop` G3
+      test is the default-deny probe.
+
+  - id: R3_classify_route
+    when: |
+      well_formed_req
+        ∧ exists(http_route_policy, class_key)
+        ∧ http_route_policy.action == route
+    given:
+      http_route_policy: by_key(class_key)
+    then:
+      - "set(ethernet.src, http_route_policy.src_mac)"
+      - "set(ethernet.dst, http_route_policy.backend_mac)"
+      - "dec(ipv4.ttl, 1)"                                    # L3-forward to the backend
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - forward(http_route_policy.egress_port)
+    notes: |
+      The anchor-band steering action. The request is L3-forwarded to the
+      selected backend: MAC rewrite, TTL decrement, IPv4 header-checksum
+      recompute. The IPv4 *destination* (the `${service_vip}`) is PRESERVED
+      — a downstream NAT tier or anycast backend handles the response, so
+      no return-path state is needed here. The HTTP payload (request-line +
+      headers + any body bytes carried in the segment) is NOT touched —
+      the `http_payload_persistence` invariant pins the byte-for-byte
+      round-trip. Bridge anti-patterns: (a) editing the payload or
+      re-emitting a fixed-length request-line stand-in
+      (`conditional_deparser_payload_roundtrip`); (b) forgetting the
+      IPv4-checksum recompute after TTL-- (`envelope_checksum_validity`);
+      (c) rewriting `ipv4.dst` here (that is R4's job).
+
+  - id: R4_classify_rewrite
+    when: |
+      well_formed_req
+        ∧ exists(http_route_policy, class_key)
+        ∧ http_route_policy.action == rewrite
+    given:
+      http_route_policy: by_key(class_key)
+    then:
+      - "set(ipv4.dst, http_route_policy.backend_ip)"         # DNAT to the specific backend IP
+      - "set(ethernet.src, http_route_policy.src_mac)"
+      - "set(ethernet.dst, http_route_policy.backend_mac)"
+      - "dec(ipv4.ttl, 1)"
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - "set(tcp.checksum, tcp_checksum_recompute())"         # TCP checksum covers the pseudo-header (incl. ipv4.dst), so it MUST recompute after DNAT
+      - forward(http_route_policy.egress_port)
+    notes: |
+      The DNAT steering action (D5.2+). The IPv4 destination is rewritten
+      to a specific backend IP; because the TCP checksum covers the IPv4
+      pseudo-header (which includes the destination address), the TCP
+      checksum MUST be recomputed in addition to the IPv4 header checksum.
+      The HTTP payload is again untouched. Only reachable when
+      `${action_breadth} ∈ {route_rewrite, all}`. The `checksum_after_dnat`
+      G3 test catches the #1 silent failure (forgetting the TCP-checksum
+      recompute over the changed pseudo-header). The response de-NAT path
+      is out of scope for this stateless pattern and composes transitively
+      with P-NAT44.
+
+  - id: R5_default
+    when: |
+      is_http_request
+        ∧ ( ¬exists(http_route_policy, class_key)
+            ∨ ( ¬req_well_formed ∧ ${malformed_handling} == lax_default ) )
+    then:
+      - "forward(${default_backend_port}) if ${default_action} == forward_default else drop"
+    notes: |
+      The catch-all. A well-formed request whose
+      (method, host_key, path_prefix_key) is not installed, OR (under
+      `lax_default`) a malformed request, is handled per
+      `${default_action}`: steered to the default backend
+      (`forward_default`) or dropped (`drop`, closed-world default-deny).
+      R5 is the explicit partner of R1 (strict malformed drop) and the
+      no-match complement of R2/R3/R4. Under `forward_default` the default
+      forward is an L3 forward identical in envelope handling to R3 (MAC
+      rewrite, TTL--, IPv4 checksum) targeting `${default_backend_port}`;
+      the oracle applies the same envelope edits so a default-steered
+      request is still well-formed on egress.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The bounded prefix scan
+      terminates in at most `${parse_window_bytes}` steps (at the CRLF /
+      SP sentinels or at the window bound), and every rule is a single-pass
+      forward or drop. There is no recirculation in this pattern. This
+      invariant is the formal pin on the bounded-scan requirement: a parser
+      that loops on a byte-at-a-time `select` without a window guard would
+      not terminate on a request with no CRLF in the window — the common v1model
+      parser-edge-case bound-overrun boundary the
+      `request_line_exceeds_window` test probes.
+
+  - id: classification_determinism
+    clause: stability
+    target: "(forward_decision, http_route_policy.egress_port)"
+    while: "well_formed_req ∧ (R2 ∨ R3 ∨ R4) fires"
+    notes: |
+      Stable steering: two well-formed requests with the same derived
+      `class_key` (same method, same host under `${host_match_breadth}` /
+      `${case_normalization}`, same path-prefix under
+      `${path_match_breadth}`) always produce the same action and the same
+      backend. The router does not flap a request class between backends
+      packet-to-packet. Bridge anti-pattern: keying on a per-packet-varying
+      field (e.g. the TCP source port or a sequence number) instead of only
+      the parsed method/host/path — splits one logical class across
+      backends.
+
+  - id: http_payload_persistence
+    clause: persistence
+    target: "(http_request_line, http_headers, http_payload)"
+    while: "(R3 ∨ R4 ∨ R5-forward) fires"
+    free_under: []
+    notes: |
+      THE headline invariant. On every steered (non-dropped) request the
+      HTTP message bytes carried in the segment — the request-line, the
+      field-lines (incl. Host), and any body bytes — are delivered to the
+      backend BYTE-FOR-BYTE identical to what arrived; the switch edits
+      only the L2/L3/L4 envelope (Ethernet, IPv4, TCP-checksum). This is
+      the parse-then-deparse round-trip correctness the whole pattern turns
+      on: an implementation that scans the request into byte sub-headers but
+      re-emits them in the wrong order, drops a scanned byte, pads to a
+      fixed width, or omits the un-scanned tail corrupts the request even
+      though forwarding "works". `conditional_deparser_payload_roundtrip`
+      and `http_request_bytes_preserved` enumerate it.
+
+  - id: envelope_checksum_validity
+    clause: stability
+    target: "(ipv4.header_checksum, tcp.checksum)"
+    while: "(R3 ∨ R4 ∨ R5-forward) fires ∧ egress(packet)"
+    notes: |
+      Every steered request carries a valid IPv4 header checksum on egress
+      (recomputed after the TTL decrement) and, when R4 rewrote
+      `ipv4.dst`, a valid TCP checksum (recomputed over the changed
+      pseudo-header). The #1 silent failure per the v1model bug
+      taxonomy: omitting `update_checksum` after a field edit makes BMv2
+      emit a stale checksum the backend's NIC / kernel silently drops.
+      `checksum_after_dnat` catches the TCP half; the IPv4 half is pinned
+      on every forwarding rule.
+
+  - id: parser_window_safety
+    clause: stability
+    target: forward_decision
+    while: "is_http_request ∧ ¬req_well_formed"
+    notes: |
+      A request whose request-line or Host does not appear within the
+      `${parse_window_bytes}` window, or that is not origin-form when path
+      matching is on, produces a DETERMINISTIC decision — `strict_drop`
+      drops, `lax_default` steers to the default — and NEVER reads a
+      method/host/path field past the window bound (which would be an
+      unspecified-value read per P4-16 §8.25 / the bug-taxonomy "read from
+      invalid header"). Pins that the bounded scan degrades gracefully
+      rather than classifying on garbage. `request_line_exceeds_window` and
+      `read_invalid_http_field_guard` witness it.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation, organised by
+# the G1/G2/G3 test-goal framework and an empirical v1model bug taxonomy. Scapy ships NO native
+# HTTP-request layer the verifier can build from a layer spec, so every
+# instance needs an HTTP `custom_headers.py` (a Raw/text request payload
+# layer); see bridging_notes feasibility.
+
+test_scaffolding:
+
+  G1:
+    - id: http_route_basic
+      generate: |
+        Send a TCP/${http_tcp_port} HTTP request whose method ∈
+        ${method_set} and whose (method[,host][,path]) class is installed
+        with action=route → egress_port=P, backend_mac=MB, src_mac=MS.
+        Assert the egress packet on P is the same request with
+        ethernet.src=MS, ethernet.dst=MB, ipv4.ttl decremented by 1,
+        ipv4.dst UNCHANGED (== ${service_vip}), a valid recomputed IPv4
+        checksum, and the HTTP payload (request-line + headers + body)
+        byte-for-byte identical. (Anchor — the golden steering path,
+        G1-P1-T1 / G1-P1-T3.)
+
+    - id: method_discrimination
+      generate: |
+        Install two classes for the SAME host/path differing only in
+        method (e.g. GET→P2, POST→P3) under the configured breadths. Send
+        a GET and a POST. Assert each is steered to its method-specific
+        backend. Confirms the classifier actually keys on the parsed
+        leading method token, not a constant. (G1-P1-T2 protocol-branch
+        coverage; RFC 9110 §9.)
+
+    - id: http_request_bytes_preserved
+      generate: |
+        Send a route-classified request with a distinctive multi-header
+        payload (request-line + Host + a couple of other field-lines) that
+        sits within ${parse_window_bytes}. Parse the egress packet's TCP
+        payload top-to-bottom and assert the request-line, every
+        field-line, the CRLF delimiters, and any body bytes are
+        byte-for-byte identical to the input — no reordering, no dropped
+        byte, no fixed-width padding. (Pins the `http_payload_persistence`
+        invariant; the parse-then-deparse round-trip is the load-bearing
+        surface.)
+
+    - id: host_header_match
+      requires: "${host_match_enabled}"
+      generate: |
+        Install the SAME method with two Host values mapping to different
+        backends (e.g. GET api.example.com→P2, GET cdn.example.com→P3).
+        Send a request for each host. Assert each is steered to its
+        host-specific backend. Forces the SUT to scan past the
+        request-line to the first Host field-line and fold it into the key.
+        (G1-P1-T2 protocol-branch coverage; RFC 9110 §7.2 / RFC 9112 §5.)
+
+    - id: path_prefix_match
+      requires: "${path_match_enabled}"
+      generate: |
+        Install the SAME method/host with two path prefixes mapping to
+        different backends (e.g. POST /v1→P2, POST /v2→P3 under
+        first_segment). Send a request for each path. Assert each is
+        steered to its path-specific backend. Forces the SUT to parse the
+        request-target after the method's SP up to the path boundary.
+        (RFC 9112 §3.2 origin-form.)
+
+    - id: http_rewrite_dnat
+      requires: "${action_breadth} ∈ {route_rewrite, all}"
+      generate: |
+        Send a request whose class is installed with action=rewrite →
+        backend_ip=BIP. Assert the egress packet has ipv4.dst=BIP, a valid
+        recomputed IPv4 header checksum, a valid recomputed TCP checksum
+        (the pseudo-header changed), MAC rewrite, TTL--, and the HTTP
+        payload byte-for-byte preserved. (R4 path; G1-P1-T3 + G1-P1-T5
+        transformation assertions.)
+
+  G2:
+    - id: request_line_within_window_bound
+      generate: |
+        Send a route-classified request whose request-line (and Host, if
+        ${host_match_enabled}) ends EXACTLY at the ${parse_window_bytes}
+        boundary (the last parseable byte the scanner must accept). Assert
+        it classifies and steers correctly. The off-by-one partner of
+        `request_line_exceeds_window`. (Parser-boundary: "exactly N
+        bytes".)
+
+    - id: request_line_exceeds_window
+      generate: |
+        Send a request padded so the request-line's terminating SP/CRLF (or
+        the Host field-line, under ${host_match_enabled}) falls JUST past
+        ${parse_window_bytes} (e.g. an over-long request-target or many
+        leading headers before Host). Assert: drop under
+        `${malformed_handling} == strict_drop`, or forward to
+        `${default_backend_port}` (or drop) per `${default_action}` under
+        `lax_default`. The decision MUST be deterministic and MUST NOT
+        depend on bytes past the window. (Bound-overrun boundary; pins
+        `parser_window_safety`; edge_cases "scan at window boundary".)
+
+    - id: unknown_method_default
+      generate: |
+        Send a TCP/${http_tcp_port} segment whose leading token is NOT in
+        ${method_set} (e.g. a valid HTTP method the instance did not
+        configure, or a junk token). Assert it is handled deterministically
+        per the malformed path — drop (strict) or default-steer (lax) — and
+        is NOT classified against any installed (method,...) row.
+        (Method-set boundary; RFC 9110 §9.)
+
+    - id: asterisk_form_default
+      requires: "${path_match_enabled}"
+      generate: |
+        Send a well-formed request whose request-target is asterisk-form
+        (`OPTIONS * HTTP/1.1`) — there is no absolute-path to extract a path
+        prefix from. Assert the NF does not invent a path key from garbage
+        bytes; it is handled per the malformed/default path. (RFC 9112 §3.2
+        non-origin-form target; parser-edge boundary.)
+
+  G3:
+    - id: denylist_drop
+      requires: "${action_breadth} ∈ {route_block, all}"
+      generate: |
+        Install a (method,host,path) class with action=block (a denylisted
+        endpoint). Send a well-formed request for it. Assert drop — before
+        any steering. Then send a request for a non-blocked, route-classified
+        class and assert it still forwards (the block is class-scoped, not a
+        blanket deny). (WAF / denylist default-deny, R2; G3 bypass/security.)
+
+    - id: tls_handshake_dropped
+      generate: |
+        Send a TCP/${http_tcp_port} segment whose payload is a TLS
+        ClientHello (binary, leading byte 0x16) rather than a cleartext
+        HTTP request — i.e. HTTPS on the HTTP port. Assert it is NOT steered
+        as an HTTP request (drop at R0; the leading bytes are not a
+        recognised method token). Catches an implementation that gates only on
+        `tcp.dst == 80` and forgets to verify the leading method token.
+        (Bypass probe; cleartext-only scope.)
+
+    - id: conditional_deparser_payload_roundtrip
+      generate: |
+        Send a route-classified request with a distinctive multi-header
+        payload. Assert the egress packet's byte layout is exactly
+        Ether/IPv4/TCP/<request bytes> with the HTTP payload bytes identical
+        to the input, AND that NO scanned byte sub-header is emitted out of
+        order, duplicated, or dropped. Catches the common v1model conditional-deparser
+        bug where the deparser emits the scanned byte headers
+        unconditionally / in the wrong sequence rather than guarded by
+        `isValid()` — the dominant silent failure for variable-length parse
+        tasks.
+
+    - id: checksum_after_dnat
+      requires: "${action_breadth} ∈ {route_rewrite, all}"
+      generate: |
+        Same setup as `http_rewrite_dnat`. After R4 rewrites ipv4.dst,
+        recompute BOTH the IPv4 header checksum (over the 20-byte header)
+        and the TCP checksum (over the pseudo-header + TCP header + payload)
+        from the egress bytes and assert both match. Catches the implementation that
+        recomputes the IPv4 checksum but forgets the TCP checksum covers the
+        changed pseudo-header — the #1 silent failure per the v1model
+        bug taxonomy.
+
+    - id: read_invalid_http_field_guard
+      generate: |
+        Send (a) a non-HTTP TCP segment on a non-${http_tcp_port} port and
+        (b) a TCP/${http_tcp_port} segment with NO payload (a SYN/ACK
+        control segment, so no request-line is parsed). Assert the NF does
+        not classify on or forward based on unspecified method/host/path
+        bytes — both drop at R0 (`is_http_request` is false). Catches an
+        implementation that reads the request fields without guarding payload
+        presence / method validity (P4-16 §8.25 unspecified-value read;
+        G1-P2-T9 analog).
+
+    - id: host_header_absent_malformed
+      requires: "${host_match_enabled}"
+      generate: |
+        Send a syntactically-valid request-line with a recognised method
+        but NO Host field-line within ${parse_window_bytes} (RFC 9110 §7.2
+        MUST violation). Assert: drop under
+        `${malformed_handling} == strict_drop`, or default-steer/drop per
+        `${default_action}` under `lax_default` — deterministically, never
+        classifying on uninitialised host bytes. (RFC 9110 §7.2 Host MUST;
+        bypass/malformed probe.)
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Harden operators paired with ease counterparts; every operator declares
+# `direction` so difficulty recalibration by parameter rebinding can pick from the
+# matching pool depending on whether r > r* + δ (harden) or r < r* − δ (ease).
+# Every harden has an ease counterpart on the SAME axis.
+
+mutation_operators:
+
+  - id: widen_parse_window
+    applicable_when: "${parse_window_bytes} < 256"
+    effect: "${parse_window_bytes} ← min(${parse_window_bytes} * 2, 256)"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${parse_window_bytes} ≤ 256 ∧ ${parse_window_bytes} ≥ 16"
+    kind: parameter
+    notes: |
+      Increase the bounded scan window — more single-byte scan states to
+      unroll correctly, raising the off-by-one / bound-overrun risk on the
+      byte-at-a-time walk. The scan window is a structural memory bound, so
+      this moves the `capacity` axis (the specific resource is parser
+      scan-depth). Activates deeper `request_line_within_window_bound` /
+      `request_line_exceeds_window` boundaries.
+
+  - id: narrow_parse_window
+    applicable_when: "${parse_window_bytes} > 16"
+    effect: "${parse_window_bytes} ← max(${parse_window_bytes} / 2, 16)"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${parse_window_bytes} ≥ 16 ∧ ${parse_window_bytes} ≤ 256"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `widen_parse_window`. Halves (not
+      quarters) the window so the harden/ease asymmetry gives the
+      difficulty recalibration a slower climb back after an over-widen.
+
+  - id: enable_host_matching
+    applicable_when: "${host_match_enabled} == false"
+    effect: "${host_match_enabled} ← true"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${host_match_enabled} == true"
+    kind: parameter
+    notes: |
+      Fold the parsed Host value into the classification key. Forces the
+      SUT to scan past the variable-length request-line to the first Host
+      field-line within the window and (RFC 9110 §7.2) treat an absent Host
+      as malformed. Activates `host_header_match` and
+      `host_header_absent_malformed`. feature-breadth axis (method → +host).
+
+  - id: disable_host_matching
+    applicable_when: "${host_match_enabled} == true"
+    effect: "${host_match_enabled} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${host_match_enabled} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_host_matching`. The host-keyed
+      tests' `requires:` guards go false and they are skipped; the key
+      reduces to method-only.
+
+  - id: enable_path_matching
+    applicable_when: "${path_match_enabled} == false ∧ ${host_match_enabled} == true"
+    effect: "${path_match_enabled} ← true"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${path_match_enabled} == true"
+    kind: parameter
+    notes: |
+      Fold the request-target's leading path prefix into the key (the
+      +path step of the method→+host→+path feature ladder). Forces the SUT
+      to parse the bytes after the method's SP up to the path boundary and
+      handle non-origin-form targets. Gated on host matching already being
+      on so the ladder climbs in order. Activates `path_prefix_match` and
+      `asterisk_form_default`. feature-breadth axis.
+
+  - id: disable_path_matching
+    applicable_when: "${path_match_enabled} == true"
+    effect: "${path_match_enabled} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${path_match_enabled} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_path_matching`. Drops the path
+      dimension from the key; the path-keyed tests are skipped.
+
+  - id: broaden_method_set
+    applicable_when: "|${method_set}| < 9"
+    effect: "${method_set} ← ${method_set} ∪ {next recognised method token}"   # toward the full {GET,HEAD,POST,PUT,DELETE,CONNECT,OPTIONS,TRACE,PATCH}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "|${method_set}| ≤ 9 ∧ ${method_set} ⊆ {GET,HEAD,POST,PUT,DELETE,CONNECT,OPTIONS,TRACE,PATCH}"
+    kind: parameter
+    notes: |
+      Add a recognised method token. More leading-token branches the
+      fixed-offset classifier must discriminate, and a wider max method
+      width to scan before the first SP (CONNECT / OPTIONS are 7 bytes vs
+      GET's 3). feature-breadth axis.
+
+  - id: narrow_method_set
+    applicable_when: "|${method_set}| > 1"
+    effect: "${method_set} ← ${method_set} \\ {one method token, keeping it non-empty}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "|${method_set}| ≥ 1 ∧ ${method_set} ⊆ {GET,HEAD,POST,PUT,DELETE,CONNECT,OPTIONS,TRACE,PATCH}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_method_set`. Removes a method
+      token (never emptying the set), shrinking the classifier's branch
+      fan-out.
+
+  - id: broaden_host_match
+    applicable_when: "${host_match_enabled} == true ∧ ${host_match_breadth} == exact_host"
+    effect: "${host_match_breadth} ← registrable_suffix"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${host_match_breadth} == registrable_suffix"
+    kind: parameter
+    notes: |
+      Widen the host key from the exact authority to the registrable
+      two-label suffix — requires correctly finding the suffix boundary in
+      the scanned host bytes (one more dot-boundary scan). feature-breadth
+      axis.
+
+  - id: narrow_host_match
+    applicable_when: "${host_match_enabled} == true ∧ ${host_match_breadth} == registrable_suffix"
+    effect: "${host_match_breadth} ← exact_host"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${host_match_breadth} == exact_host"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_host_match`. Reverts to the full
+      exact-authority key.
+
+  - id: broaden_path_match
+    applicable_when: "${path_match_enabled} == true ∧ ${path_match_breadth} == first_segment"
+    effect: "${path_match_breadth} ← two_segments"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${path_match_breadth} == two_segments"
+    kind: parameter
+    notes: |
+      Widen the path key from the leading `/seg` to the first two segments
+      — requires scanning a second `/` boundary within the window.
+      feature-breadth axis.
+
+  - id: narrow_path_match
+    applicable_when: "${path_match_enabled} == true ∧ ${path_match_breadth} == two_segments"
+    effect: "${path_match_breadth} ← first_segment"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${path_match_breadth} == first_segment"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_path_match`.
+
+  - id: broaden_action
+    applicable_when: "${action_breadth} ∈ {route_only, route_block, route_rewrite}"
+    effect: "${action_breadth} ← next_action_breadth(${action_breadth})"   # route_only → {route_block | route_rewrite} → all
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${action_breadth} ∈ {route_block, route_rewrite, all}"
+    kind: parameter
+    notes: |
+      Add reachable steering actions: route_block activates R2 (the
+      denylist drop and `denylist_drop`), route_rewrite activates R4 (the
+      DNAT action and its TCP-checksum surface via `checksum_after_dnat`),
+      and `all` enables both. feature-breadth axis.
+
+  - id: narrow_action
+    applicable_when: "${action_breadth} ∈ {route_block, route_rewrite, all}"
+    effect: "${action_breadth} ← prev_action_breadth(${action_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${action_breadth} ∈ {route_only, route_block, route_rewrite}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_action`. Removes the
+      most-recently-added action and skips its `requires:`-guarded tests.
+
+  - id: strict_malformed_handling
+    applicable_when: "${malformed_handling} == lax_default"
+    effect: "${malformed_handling} ← strict_drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${malformed_handling} == strict_drop"
+    kind: parameter
+    notes: |
+      Activate R1 and the malformed G2/G3 cases (`request_line_exceeds_window`
+      strict branch, `host_header_absent_malformed`, `unknown_method_default`
+      strict branch). Catches implementations that classify on a partially-scanned /
+      Host-less request instead of rejecting it. strictness axis (default-deny
+      strictness on the malformed boundary).
+
+  - id: lax_malformed_handling
+    applicable_when: "${malformed_handling} == strict_drop"
+    effect: "${malformed_handling} ← lax_default"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${malformed_handling} == lax_default"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `strict_malformed_handling`. R1 is gated
+      off; malformed requests fall to R5's default and the strict-mode
+      malformed tests are skipped.
+
+  - id: enable_case_insensitive_host
+    applicable_when: "${host_match_enabled} == true ∧ ${case_normalization} == false"
+    effect: "${case_normalization} ← true"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${case_normalization} == true"
+    kind: parameter
+    notes: |
+      Enforce RFC 9110 §7.2's case-insensitive Host authority: the SUT must
+      case-fold the parsed Host bytes before deriving the key (the method
+      token stays case-SENSITIVE per RFC 9110 §9). Catches the implementation that
+      keys on raw host bytes and mis-classifies `API.Example.COM`.
+      faithfulness axis (fidelity of the name-comparison semantics —
+      exact-vs-prefix/case faithfulness, distinct from feature breadth).
+
+  - id: disable_case_insensitive_host
+    applicable_when: "${case_normalization} == true"
+    effect: "${case_normalization} ← false"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${case_normalization} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_case_insensitive_host`. Reverts to
+      byte-exact host comparison.
+
+  - id: swap_hash_to_truncate
+    applicable_when: "${host_match_enabled} == true ∧ ${host_match_breadth} == exact_host ∧ ${host_hash_algo} ∈ {crc16, crc32}"
+    effect: "${host_hash_algo} ← truncate"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${host_hash_algo} == truncate"
+    kind: parameter
+    notes: |
+      Weaken the exact-host key fold. Under an adversarial host workload the
+      prefix-truncation collapses distinct hosts sharing a prefix
+      (`api.example.com`, `api.example.net`) into one key, so an implementation that
+      copies the textbook CRC pattern without weighing key quality
+      mis-classifies colliding hosts. hash-family axis.
+
+  - id: swap_hash_to_crc32
+    applicable_when: "${host_match_enabled} == true ∧ ${host_match_breadth} == exact_host ∧ ${host_hash_algo} ∈ {truncate, crc16}"
+    effect: "${host_hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${host_hash_algo} == crc32"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `swap_hash_to_truncate`. CRC32 gives the
+      strongest entropy of the three options and minimises exact-host key
+      collisions.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"               # uniform → zipfian → adversarial
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the request-shape distribution skew. `adversarial` mixes
+      requests whose request-line / Host sits exactly at the
+      `${parse_window_bytes}` edge with prefix-colliding hosts — combined
+      with a weak `${host_hash_algo}` this drives the classifier toward
+      mis-steering. workload axis.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: shrink_policy_capacity_4x
+    applicable_when: "${route_policy_capacity} ≠ unbounded ∧ ${route_policy_capacity} > 32"
+    effect: "${route_policy_capacity} ← ${route_policy_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${route_policy_capacity} ≥ 8"
+    kind: parameter
+    notes: |
+      Tighten the classification-table capacity. The implementation cannot rely on
+      a row-per-rule TCAM and must consider key aggregation (host-suffix /
+      hashed keys). capacity axis. (Distinct from `widen_parse_window`,
+      which moves the scan-depth resource on the same axis — both are
+      capacity but on disjoint resources, so each carries its own
+      harden/ease pair.)
+
+  - id: enlarge_policy_capacity_2x
+    applicable_when: "${route_policy_capacity} ≠ unbounded ∧ ${route_policy_capacity} < 1048576"
+    effect: "${route_policy_capacity} ← ${route_policy_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${route_policy_capacity} ≤ 1048576"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_policy_capacity_4x`. Doubles (not
+      quadruples) for a slow climb back after an over-shrink.
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_route, D5.1_full_classify, D5.2_rewrite_dnat}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_full_classify then
+          ${malformed_handling} ← strict_drop ∧
+          ${host_match_enabled} ← true ∧
+          ${case_normalization} ← true ) ∧
+      ( if ${faithfulness}_post == D5.2_rewrite_dnat then
+          ${action_breadth} ← route_rewrite ) ∧
+      ( if ${faithfulness}_post == D5.3_denylist_strict then
+          ${action_breadth} ← all ∧
+          ${path_match_enabled} ← true ∧
+          ${workload_skew} ← adversarial ∧
+          ${default_action} ← drop )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_route ∧
+      ( ${faithfulness} ≠ D5.2_rewrite_dnat
+        ∨ ∃ entry ∈ ${http_route_policy_entries}: entry.action == rewrite ) ∧
+      ( ${faithfulness} ≠ D5.3_denylist_strict
+        ∨ ∃ entry ∈ ${http_route_policy_entries}: entry.action == block )
+    kind: parameter
+    notes: |
+      Lift the faithfulness ladder one band. D5.0 → D5.1 turns on the full
+      RFC 9110/9112 validation cascade (strict malformed drop, +host match,
+      case-insensitive host fold, Host-MUST enforcement). D5.1 → D5.2 adds
+      the rewrite/DNAT action. D5.2 → D5.3 adds denylist blocking,
+      +path-prefix match, the adversarial window-edge workload, and a
+      closed-world default. Couples several knobs in one step, so its
+      `feasibility_postcondition` requires the rewrite/block rows to exist
+      before the bands that need them.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_full_classify, D5.2_rewrite_dnat, D5.3_denylist_strict}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_route then
+          ${malformed_handling} ← lax_default ∧
+          ${host_match_enabled} ← false ∧
+          ${path_match_enabled} ← false ∧
+          ${case_normalization} ← false ∧
+          ${action_breadth} ← route_only ∧
+          ${default_action} ← forward_default ) ∧
+      ( if ${faithfulness}_post == D5.1_full_classify then
+          ${action_breadth} ← route_only ) ∧
+      ( if ${faithfulness}_post == D5.2_rewrite_dnat then
+          ${action_breadth} ← route_rewrite ∧
+          ${path_match_enabled} ← false ∧
+          ${workload_skew} ← uniform ∧
+          ${default_action} ← forward_default )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_denylist_strict
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the ladder
+      back one band and reverts the entailed parameter bindings.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source to task.description so the SUT sees a
+      host-side reference implementation in addition to the behavioural
+      spec — the heaviest hammer among the difficulty axes.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      From the starter mutation-operator library — laddering the input form from
+      behavioural spec to host-side reference EASES the SUT's job (it has a
+      Python bounded-prefix scanner to transliterate rather than design from
+      scratch). Used sparingly; pairs with the harden revert below.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`. The
+      SUT must design the bounded prefix scanner from RFC 9110/9112 alone.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  FEASIBILITY (read first — this NF is genuinely HARD/risky):
+
+    HTTP/1.1 is a VARIABLE-LENGTH TEXT protocol with NO length prefixes
+    (RFC 9112 §2.1). A v1model match-action parser CANNOT parse an
+    arbitrary-length HTTP request: there is no register-walk over an
+    unbounded byte stream, no general string search, and no
+    cross-segment reassembly. Full HTTP parsing (chunked transfer
+    coding, request pipelining, obsolete header folding, arbitrary
+    field-line order, multi-segment requests) is therefore V2-DEFERRED.
+
+    To make the NF GRADABLE under BMv2 `--use-files`, this pattern
+    constrains the parse to a BOUNDED layout that an unrolled parser can
+    handle:
+      - The whole graded request (request-line + the Host field-line, if
+        host matching is on) MUST fit in a SINGLE TCP segment within the
+        first `${parse_window_bytes}` bytes — the entity note and the
+        test scaffolding enforce single-segment requests.
+      - The METHOD is classified at a FIXED leading offset (offset 0): an
+        exact/ternary match on the first few payload bytes against the
+        recognised `${method_set}` tokens, or a small unrolled `select`.
+        Method tokens are short (≤ 7 bytes: CONNECT/OPTIONS) and
+        case-sensitive (RFC 9110 §9), so this is a fixed-width compare.
+      - The PATH PREFIX is the bytes from the method's trailing SP up to
+        the first `/`-delimited boundary (or `?`/SP), capped — a bounded
+        scan, NOT a full URL parse.
+      - The HOST is the value of the FIRST `Host:` field-line found within
+        the window — a bounded scan for the `Host:` field-name then read
+        to CRLF or a cap. Header order other than "Host early in the
+        window" is out of scope (the strict path drops it; the lax path
+        defaults it).
+      - The variable-length host/path bytes are folded into a FIXED-WIDTH
+        table key (hash or truncate) before the `apply` — exact-matching
+        an arbitrary string in a TCAM is infeasible.
+    All of the above is `[common-knowledge baseline]` P4-on-v1model
+    practice, NOT RFC-cited.
+
+    INSTANCES NEED AN HTTP `custom_headers.py`: Scapy ships no native
+    HTTP-*request* layer the verifier (evaluation/packet_builder.py) can
+    build from a task.yaml layer spec. Each instance must ship a
+    `custom_headers.py` defining an HTTP-request payload layer (typically
+    a Raw/text request line + headers bytes over TCP) so the harness can
+    build the input packets and the verifier can read the egress payload
+    bytes for the `http_payload_persistence` assertions. (The same
+    new-header constraint applies to IPv6/MPLS/GRE/SRH tasks.)
+
+  Common implementations of this pattern in v1model P4 (every entry below is
+  `[common-knowledge baseline]` rather than RFC-cited):
+
+    Anchor band (D5.0_anchor_route, method_set = {GET, POST},
+                 host_match_enabled = false, path_match_enabled = false,
+                 malformed_handling = lax_default, case_normalization =
+                 false, action_breadth = route_only, default_action =
+                 forward_default):
+      - Parser: state_start → parse_ethernet → (etherType == 0x0800 ?
+        parse_ipv4 : accept) → (ipv4.protocol == 6 ? parse_tcp :
+        accept) → (tcp.dst == 80 ? parse_http_prefix : accept). The
+        http_prefix parse extracts the first `${parse_window_bytes}` of
+        the TCP payload into a fixed-width header (or a bounded chain of
+        single-byte sub-headers) and classifies the method at offset 0.
+        A segment with no payload (SYN/ACK) or a non-method leading token
+        falls out of the HTTP path (R0 drop).
+      - One control-plane table: http_route_table, exact/ternary on the
+        method classifier output (plus the derived host_key when
+        ${host_match_enabled} and path_prefix_key when
+        ${path_match_enabled}), action set {route, rewrite, block,
+        default}. The key-derivation is an action/ALU step run BEFORE the
+        table apply.
+      - Route action: ethernet MAC rewrite + ipv4.ttl-- + update_checksum
+        on ipv4. ipv4.dst is NOT touched (VIP preserve). The parsed
+        payload sub-headers are left valid and untouched so the deparser
+        re-emits them verbatim.
+      - Deparser: emit ethernet, ipv4, tcp, then the payload-prefix
+        header(s) IN ORDER (or the byte sub-header chain), then the
+        residual Raw tail. The variable-length emit is the load-bearing
+        conditional-deparser surface.
+
+    D5.1 (full RFC 9110/9112 validation): adds the strict-flag/malformed
+    cascade (reject on no CRLF/SP within the window, on absent Host under
+    host matching), the case-fold of the host bytes (OR each ASCII letter
+    with 0x20 before keying — the RFC 9110 §7.2 case-insensitive host; the method
+    is NOT folded), the Host scan, and the Host fold into the table key.
+
+    D5.2 (rewrite/DNAT): the rewrite action sets ipv4.dst = backend_ip and
+    adds update_checksum for BOTH ipv4 (header) and tcp (the TCP checksum
+    covers the IPv4 pseudo-header, so it MUST recompute over the changed
+    destination — the canonical silent miss).
+
+    D5.3 (denylist + path match + adversarial): a block action that
+    `mark_to_drop(standard_metadata)`s before egress; the path-prefix scan
+    after the method SP; the exact-host key uses `hash(... crc32 ...)` or
+    truncate; the adversarial workload stresses the hash and the window
+    bound together; default_action = drop closes the world.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Re-emitting a FIXED-LENGTH request stand-in instead of the
+      variable-length payload bytes that were parsed — corrupts the
+      request even though forwarding "works". The #1 silent failure for
+      variable-length parse tasks.
+      `conditional_deparser_payload_roundtrip` + `http_payload_persistence`
+      catch it.
+
+    * Forgetting `update_checksum` for ipv4 after ttl-- (route) or for tcp
+      after the ipv4.dst DNAT (rewrite) — BMv2 emits a stale checksum the
+      backend silently drops. `checksum_after_dnat` and the
+      `envelope_checksum_validity` invariant catch it.
+
+    * An unbounded / unguarded byte-scan `select` loop that does not
+      terminate on a request with no CRLF in the window — hangs the parser
+      or reads past the buffer. The bounded `${parse_window_bytes}` +
+      `parser_window_safety` invariant + `request_line_exceeds_window` pin
+      the bound guard.
+
+    * Gating only on `tcp.dst == 80` and forgetting to verify the leading
+      method token — steers TLS/HTTPS handshakes or HTTP responses as if
+      they were requests. `tls_handshake_dropped` + `read_invalid_http_field_guard`
+      catch it.
+
+    * Case-folding the METHOD token — methods are case-SENSITIVE (RFC 9110
+      §9); only the Host is case-insensitive (§7.2). Folding the method
+      would mis-accept `get` / `Get` as `GET`.
+
+    * Keying on raw host bytes when case-insensitivity is required —
+      mis-classifies `API.Example.COM` vs `api.example.com`.
+      `enable_case_insensitive_host` + a mixed-case test catch it.
+
+    * Rewriting ipv4.dst in ROUTE mode (conflating R3 with R4) — breaks
+      the VIP-preserve response path. The route test asserts ipv4.dst is
+      unchanged.
+
+  v2-deferred (out of scope for this pattern, noted for reviewers):
+    * Cross-segment / pipelined / chunked-transfer requests — stateful TCP
+      reassembly, deferred to a v2 language extension; this pattern grades
+      single-segment requests only.
+    * HTTPS / TLS — encrypted payload, unparseable; cleartext HTTP/1.1
+      only.
+    * The request→response return path (de-NAT of the backend's response
+      in rewrite mode) is stateful and composes transitively with P-NAT44
+      rather than being re-encoded here — the pattern is the
+      request-steering half only.
+
+post_instantiation_hooks: |
+  For each instance, the public tests run through the oracle for the seed
+  must yield the expected outputs. The instance ships a `custom_headers.py` HTTP-request layer (see
+  bridging_notes feasibility) — the verifier cannot build HTTP inputs
+  without it.

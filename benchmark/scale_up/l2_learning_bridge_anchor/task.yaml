@@ -1,0 +1,218 @@
+task_name: l2_learning_bridge_anchor
+task_type: full_program
+complexity: medium
+source: tutorial
+pattern: P-L2LearningBridge
+pattern_version: '1.0'
+
+seed:
+  mac_table_capacity: unbounded
+  eviction: none
+  member_ports: [1, 2, 3]
+  faithfulness: D9.0_learn_flood
+
+description: |
+  Implement a transparent self-learning Ethernet bridge on a single switch s1
+  with three member ports (s1.p1, s1.p2, s1.p3) in one broadcast domain.
+
+  ## Required behaviour
+
+   - Every frame teaches the program that its source MAC is currently reachable
+     via the port it arrived on; if the same source MAC later appears on a
+     different port, the newer port supersedes the older.
+   - A frame whose destination MAC has been learned is forwarded, unchanged, out
+     that single learned port. If the learned port is the ingress port, the
+     frame is filtered (not sent).
+   - A frame whose destination MAC is the broadcast address (ff:ff:ff:ff:ff:ff)
+     or has not yet been learned is flooded to every member port except the
+     ingress port.
+   - Frames are forwarded unchanged — no address rewrite, no TTL change.
+
+  Forwarding decisions therefore depend on what earlier frames in the same run
+  have taught the program.
+
+  ## Topology
+
+  One switch s1, three member ports in one broadcast domain.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.0.10", mac: "00:00:00:00:00:0a", port: s1.p1}
+  h2: {ip: "10.0.0.11", mac: "00:00:00:00:00:0b", port: s1.p2}
+  h3: {ip: "10.0.0.12", mac: "00:00:00:00:00:0c", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: flood_unknown_dst
+    visibility: public
+    description: |
+      A frame from MAC ...0a on port 1 to a not-yet-learned unicast MAC ...ff.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+        - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: multicast
+      output_ports: [s1.p2, s1.p3]
+
+  - name: forward_to_learned
+    visibility: public
+    description: |
+      A frame from ...0a arrived on port 1 earlier; now a frame to ...0a arrives
+      on port 2.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:0a"}
+        - IP:    {src: "10.0.0.11", dst: "10.0.0.10", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.dst: {action: unchanged}
+        Ether.src: {action: unchanged}
+
+  - name: broadcast_flood
+    visibility: public
+    description: |
+      A broadcast frame (dst ff:ff:ff:ff:ff:ff) from port 1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "ff:ff:ff:ff:ff:ff"}
+        - IP:    {src: "10.0.0.10", dst: "10.0.0.255", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: multicast
+      output_ports: [s1.p2, s1.p3]
+
+  - name: forward_to_learned_p3
+    visibility: hidden
+    description: |
+      With ...0c learned on port 3, a frame to ...0c forwards out s1.p3.
+    prior_inputs:
+      - port: s1.p3
+        layers:
+          - Ether: {src: "00:00:00:00:00:0c", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.12", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - IP:    {src: "10.0.0.10", dst: "10.0.0.12", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+
+  - name: known_unicast_not_flooded
+    visibility: hidden
+    description: |
+      With ...0a learned on port 1, a frame from port 3 to ...0a forwards to the
+      SINGLE port s1.p1 — it is not flooded.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "00:00:00:00:00:0c", dst: "00:00:00:00:00:0a"}
+        - IP:    {src: "10.0.0.12", dst: "10.0.0.10", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+
+  - name: learn_two_then_forward
+    visibility: hidden
+    description: |
+      The program learns ...0a on port 1 and ...0b on port 2; a later frame to
+      ...0b forwards out s1.p2.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+      - port: s1.p2
+        layers:
+          - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:ee"}
+          - IP:    {src: "10.0.0.11", dst: "10.0.0.98", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "00:00:00:00:00:0c", dst: "00:00:00:00:00:0b"}
+        - IP:    {src: "10.0.0.12", dst: "10.0.0.11", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+
+# --- G2 ---
+
+  - name: unknown_floods_excluding_ingress
+    visibility: hidden
+    description: |
+      A frame from port 2 to an unknown unicast MAC floods to s1.p1 and s1.p3
+      (every member port except the ingress port 2).
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:ee"}
+        - IP:    {src: "10.0.0.11", dst: "10.0.0.98", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: multicast
+      output_ports: [s1.p1, s1.p3]
+
+  - name: same_port_filtered
+    visibility: hidden
+    description: |
+      With ...0a learned on port 1, a frame on the SAME port 1 destined to ...0a
+      is filtered — the learned port equals the ingress port, so the program does
+      not send the frame back out the port it arrived on.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+          - IP:    {src: "10.0.0.10", dst: "10.0.0.99", ttl: 64}
+          - UDP:   {sport: 4000, dport: 5000}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0d", dst: "00:00:00:00:00:0a"}
+        - IP:    {src: "10.0.0.13", dst: "10.0.0.10", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop

@@ -1,0 +1,292 @@
+task_name: sr_mpls_anchor_mut1
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-SR-MPLS
+pattern_version: '1.0'
+seed:
+  local_node_sids:
+  - 16001
+  local_adj_sids: {}
+  sid_fib:
+  - label: 16002
+    egress_port: 2
+    port_mac: 08:00:00:00:02:00
+    next_hop_mac: 08:00:00:00:02:02
+    out_label: 16002
+  - label: 16003
+    egress_port: 3
+    port_mac: 08:00:00:00:03:00
+    next_hop_mac: 08:00:00:00:03:03
+    out_label: 16003
+  - label: 16005
+    egress_port: 2
+    port_mac: 08:00:00:00:02:00
+    next_hop_mac: 08:00:00:00:02:02
+    out_label: 16005
+  sid_table_capacity: unbounded
+  enable_adj_sid: false
+  enable_php: false
+  sid_block: global_srgb
+  max_stack_depth: 1
+  reserved_label_policy: drop
+  faithfulness: D5.0_node_sid
+  ingress_port: 1
+  egress_p2: 2
+  egress_p3: 3
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+hosts:
+  h1:
+    note: upstream SR-MPLS neighbour; ingress on s1.p1
+  h2:
+    ip: n/a
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: n/a
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+description: |-
+  Implement a Segment Routing over MPLS (SR-MPLS) transit node for BMv2 (v1model).
+  The node forwards frames carrying a single MPLS label that is a Segment
+  Identifier (SID). Forwarding is driven by the meaning of that label.
+
+  Topology: one switch s1 with three ports. Port 1 is the ingress; ports 2 and 3
+  are egress links toward downstream nodes. The egress-port source MAC is
+  08:00:00:00:02:00 on port 2 and 08:00:00:00:03:00 on port 3.
+
+  A segment forwarding table maps an active SID label to where to send the frame
+  next; the control plane installs these entries:
+
+    | active SID label | egress port | next-hop MAC      |
+    |------------------|-------------|-------------------|
+    | 16002            | s1.p2       | 08:00:00:00:02:02 |
+    | 16003            | s1.p3       | 08:00:00:00:03:03 |
+    | 16005            | s1.p2       | 08:00:00:00:02:02 |
+
+  MPLS-labelled frames carry a single label (with its own hop count and the
+  bottom-of-stack marker set) followed by an inner IPv4 packet. Required
+  behaviour, per received frame, decided by that label:
+
+  - A frame that carries no MPLS label is dropped.
+
+  - A frame whose label arrives with a hop count of 0 or 1 is dropped (it cannot
+    be forwarded another hop).
+
+  - If the label has an entry in the segment forwarding table, the frame is in
+    transit: it is forwarded out that entry's egress port toward its next hop with
+    the label preserved as-is, the label's hop count decremented by one, the
+    Ethernet source set to the egress-port MAC and destination to the next-hop
+    MAC. The inner IPv4 packet (including its own hop count) is left intact.
+
+  - A frame whose label is not present in the segment forwarding table is dropped.
+    A reserved label (0..15) that is not installed as a SID is likewise dropped.
+
+  A frame's label hop count is decremented exactly once per traversal, and the
+  inner IPv4 hop count is never altered. Both the P4 program and its table entries
+  are yours to author.
+test_cases:
+- name: remote_sid_transit_global
+  visibility: public
+  goal_class: G1
+  description: 'A frame whose top label is a remote node''s SID (16005) that this node does not own but has a forwarding entry for. It is in transit: forwarded out p2 toward 08:00:00:00:02:02 with the label preserved as-is and its top hop count decremented by one.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+        type: 34887
+    - MPLS:
+        label: 16005
+        ttl: 64
+        s: 1
+        cos: 0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 55
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      MPLS.label:
+        action: change_to
+        value: 16005
+      MPLS.ttl:
+        action: change_to
+        value: 63
+      IP.ttl:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.src:
+        action: unchanged
+- name: drop_ttl_zero
+  visibility: hidden
+  goal_class: G2
+  description: A frame whose top label arrives with a hop count of 0 is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+        type: 34887
+    - MPLS:
+        label: 16005
+        ttl: 0
+        s: 1
+        cos: 0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 55
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: drop
+- name: remote_ttl_two_egress_one
+  visibility: hidden
+  goal_class: G2
+  description: A remote-SID transit frame (16005) whose top hop count is 2 is forwarded with an egress top hop count of 1 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+        type: 34887
+    - MPLS:
+        label: 16005
+        ttl: 2
+        s: 1
+        cos: 0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 55
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      MPLS.label:
+        action: change_to
+        value: 16005
+      MPLS.ttl:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.src:
+        action: unchanged
+- name: drop_unknown_sid
+  visibility: hidden
+  goal_class: G3
+  description: A frame whose top label (17000) is neither owned by this node nor present in the segment forwarding table is dropped — an attacker-chosen label must not leak a forward.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+        type: 34887
+    - MPLS:
+        label: 17000
+        ttl: 64
+        s: 1
+        cos: 0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 55
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: drop
+- name: drop_non_mpls
+  visibility: hidden
+  goal_class: G3
+  description: A plain IPv4 frame (no MPLS label stack) is out of scope for the SID engine and dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: drop
+- name: drop_reserved_label
+  visibility: hidden
+  goal_class: G3
+  description: A frame whose top label is a reserved label (0, explicit-null) not installed as a SID is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+        type: 34887
+    - MPLS:
+        label: 0
+        ttl: 64
+        s: 1
+        cos: 0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.9.9
+        ttl: 55
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 5000
+  expected:
+    behavior: drop

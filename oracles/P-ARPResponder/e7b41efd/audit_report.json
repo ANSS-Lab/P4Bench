@@ -1,0 +1,78 @@
+{
+  "oracle_hash": "49d2e6193b0fa29e35d19f7581bac8d57ac20f3b9d24ea349d44d52752e2683a",
+  "instance": "arp_responder_anchor-default",
+  "ran_at": "2026-06-17T00:50:47.294511Z",
+  "canonical_examples": {
+    "passed": 8,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_arp_reply_op_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_reply_origination_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_reply_origination_other_requester",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_unknown_target_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_unknown_requester_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_injected_table_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_injected_table_old_default_now_unknown",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "reply_op_and_sender": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "reply_to_requester": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "reply_op_and_sender",
+      "reply_to_requester"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC826"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

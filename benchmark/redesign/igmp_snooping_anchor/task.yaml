@@ -1,0 +1,795 @@
+task_name: igmp_snooping_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-IGMPSnooping
+pattern_version: '1.0'
+seed:
+  member_ports:
+  - 1
+  - 2
+  - 3
+  - 4
+  group_table_capacity: unbounded
+  eviction: none
+  mrouter_port: none
+  learn_mrouter_from_query: false
+  no_member_action: drop
+  flood_link_local_control: false
+  report_filter_mode: v2_membership
+  faithfulness: D5.0_v2_snoop
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: h2
+    to: s1.p2
+  - from: h3
+    to: s1.p3
+  - from: h4
+    to: s1.p4
+hosts:
+  h1:
+    ip: 10.0.0.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.0.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.0.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.0.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+description: |-
+  Implement an L2 multicast switch for BMv2 (v1model) that learns multicast
+  group membership directly in the data plane by observing IGMP messages, and
+  delivers multicast traffic only to the hosts that asked for it.
+
+  Topology: one switch with four host ports (p1..p4) sharing a single multicast
+  domain. Both the P4 program and any table / multicast-group entries are yours
+  to author.
+
+  Required behaviour, per IPv4 packet:
+
+  - Membership signalling. IGMP messages (IPv4 protocol 2) carry a message type
+    and a multicast group address. A Membership Report (an IGMPv2 report, type
+    0x16, or an IGMPv1 report, type 0x12) means the host on the ingress port
+    wants to receive the named group: that port becomes a member of that group.
+    A Leave Group message (type 0x17) means the host on the ingress port no
+    longer wants the group: that port stops being a member. A Membership Query
+    (type 0x11) causes no membership change here. Joining a port that is already
+    a member, or leaving a group a port never joined, has no extra effect. An
+    IGMP message is consumed by the switch — it is never itself delivered as
+    multicast traffic to the member hosts.
+
+  - Multicast delivery. A multicast data packet (an IPv4 packet that is not IGMP,
+    whose destination is a multicast address in 224.0.0.0/4) must be delivered to
+    exactly the set of ports that are currently members of its group, and to no
+    others — never to non-member ports, and never back out the port it arrived
+    on. If the group currently has no members, the packet is dropped. The packet
+    is delivered unmodified. Address range 224.0.0.0/24 is treated like any other
+    multicast group.
+
+  - Membership is learned only from the IGMP messages above; ordinary multicast
+    data packets never change which ports belong to a group. A port's membership
+    in a group persists until that port leaves the group — there is no timeout.
+
+  Anything that is not IPv4, and any IPv4 unicast traffic, is out of scope and
+  dropped.
+
+  The observable outcome is which ports receive a multicast data packet after a
+  sequence of joins and leaves. Your switch must compute the live member set from
+  the full history of those messages, not from a fixed configuration.
+test_cases:
+- name: join_then_data_to_member
+  visibility: public
+  goal_class: G1
+  description: A host on port 2 sends an IGMP Membership Report for a multicast group; then a multicast data packet for that group arrives on port 1. The data is delivered only to port 2 (the joined port) and to no other port.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: two_joins_then_data_to_both
+  visibility: public
+  goal_class: G1
+  description: Hosts on ports 2 and 3 each join the same multicast group; then a data packet for that group arrives on port 1. The data is delivered to exactly ports 2 and 3 — the union of the joined ports — and not to port 4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: data_no_member_drop
+  visibility: public
+  goal_class: G1
+  description: A multicast data packet arrives for a group that no host has joined. With no members, the packet is dropped — it is not flooded.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: drop
+- name: drop_after_leave
+  visibility: hidden
+  goal_class: G1
+  description: Ports 2 and 3 join a group, then port 2 leaves it; a subsequent data packet for that group (arriving on port 1) is delivered only to port 3. The departed port no longer receives the group.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p3
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 23
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: distinct_groups_independent
+  visibility: hidden
+  goal_class: G1
+  description: Port 2 joins group A and port 3 joins group B; a data packet for group A (on port 1) reaches only port 2 — per-group port-sets are independent.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.2.2.2
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.2.2.2
+- name: rejoin_idempotent
+  visibility: hidden
+  goal_class: G2
+  description: A host on port 2 sends the same Membership Report twice; a data packet for the group reaches port 2 exactly once — re-joining an already-member port adds no duplicate.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: leave_nonmember_noop
+  visibility: hidden
+  goal_class: G2
+  description: Port 2 joins a group; then port 3 (which never joined) sends a Leave for that group; a data packet still reaches port 2. A Leave for a non-member is a no-op.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 23
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: leave_to_empty_then_drop
+  visibility: hidden
+  goal_class: G2
+  description: The only member (port 2) of a group leaves it; a subsequent data packet for that now-empty group is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 23
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: v1_report_is_join
+  visibility: hidden
+  goal_class: G2
+  description: An IGMPv1 Membership Report (the older report type) on port 3 is treated as a join exactly like a v2 report; a data packet then reaches port 3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p3
+  prior_inputs:
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 18
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: data_not_flooded_to_nonmembers
+  visibility: hidden
+  goal_class: G3
+  description: Only port 2 is a member of the group; a data packet for it must reach port 2 and never ports 3 or 4. A switch that floods all multicast fails here.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: control_not_data_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: After port 2 joins a group, a second Membership Report for that group arrives on port 1; the report itself must not be delivered as multicast traffic to member port 2 — IGMP control packets are consumed, not forwarded.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: multicast_replication_two_members
+  visibility: hidden
+  goal_class: G3
+  description: 'A group with two members (ports 3 and 4); a data packet on port 1 must be correctly replicated to both members. This probes multicast-group replication: a switch that selects a group id but installs no replication list under-delivers.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p3
+    - s1.p4
+  prior_inputs:
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p4
+    layers:
+    - Ether:
+        src: 08:00:00:00:04:04
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.4
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: query_no_membership_change
+  visibility: hidden
+  goal_class: G3
+  description: A host on port 2 joins a group; an IGMP Membership Query then arrives; a subsequent data packet still reaches exactly port 2 — a Query causes no membership change.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.3
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 17
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: data_learns_nothing
+  visibility: hidden
+  goal_class: G3
+  description: A multicast data packet for a group arrives BEFORE any join (dropped, no members); then port 2 joins and a second data packet reaches only port 2. Data traffic must never create membership.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.1
+        dst: 239.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 1234
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 01:00:5e:01:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 239.1.1.1
+        ttl: 1
+        proto: 2
+    - IGMP:
+        type: 22
+        mrtime: 0
+        chksum: 0
+        gaddr: 239.1.1.1
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is out of scope and dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 01:00:5e:01:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.0.1
+        pdst: 10.0.0.9
+  expected:
+    behavior: drop
+- name: unicast_out_of_scope_drop
+  visibility: hidden
+  goal_class: G3
+  description: An IPv4 unicast packet (non-multicast destination) is out of scope for the multicast snooper and dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:09
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 5001
+  expected:
+    behavior: drop

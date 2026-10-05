@@ -1,0 +1,176 @@
+{
+  "oracle_hash": "6f3ec87f203e829118ab49ba5496b19fee3f739518826fdddf64694136a4923e",
+  "instance": "bfd_liveness_full_ceiling-default",
+  "ran_at": "2026-06-16T14:34:25.931878Z",
+  "canonical_examples": {
+    "passed": 20,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_bfd_icmp_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_bfd_no_fib_entry_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "detect_mult_zero_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "my_discr_zero_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "m_bit_set_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "your_discr_no_session_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "version_zero_d51_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "version_zero_d50_passes_structural",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_not_255_strict_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_not_255_relaxed_consumes",
+        "status": "pass"
+      },
+      {
+        "example_id": "valid_bfd_no_poll_consumed",
+        "status": "pass"
+      },
+      {
+        "example_id": "poll_bit_emits_final_reply",
+        "status": "pass"
+      },
+      {
+        "example_id": "handshake_then_poll_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "init_packet_your_discr0_both_advances",
+        "status": "pass"
+      },
+      {
+        "example_id": "init_packet_your_discr0_strict_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "multihop_4784_poll_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "echo_reflection_enabled",
+        "status": "pass"
+      },
+      {
+        "example_id": "echo_disabled_falls_through_r0",
+        "status": "pass"
+      },
+      {
+        "example_id": "alt_session_table_poll_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "alt_session_table_orig_discr_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_orphan_sessions": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "detection_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "local_discriminator_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "session_state_advance_monotonic_in_normal_path": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "emit_packet_structure_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "link_register_stability_under_no_state_change": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_255_on_emit_when_single_hop": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_orphan_sessions",
+      "detection_bounded_latency",
+      "local_discriminator_persistence",
+      "session_state_advance_monotonic_in_normal_path",
+      "no_loop",
+      "emit_packet_structure_completeness",
+      "link_register_stability_under_no_state_change",
+      "ttl_255_on_emit_when_single_hop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc5880",
+      "rfc5881",
+      "rfc5883"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

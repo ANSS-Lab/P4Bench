@@ -1,0 +1,83 @@
+{
+  "oracle_hash": "d1a07a681d0bbf37b9d2d9724b7f1702b52bd4b6e08563da789ae38202900530",
+  "instance": "packet_dedup_anchor-default",
+  "ran_at": "2026-06-15T21:43:25.589082Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "first_packet_forward_default_port",
+        "status": "pass"
+      },
+      {
+        "example_id": "first_packet_forward_injected_port",
+        "status": "pass"
+      },
+      {
+        "example_id": "duplicate_dropped_ttl_differs",
+        "status": "pass"
+      },
+      {
+        "example_id": "triple_replay_still_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "distinct_id_forwarded",
+        "status": "pass"
+      },
+      {
+        "example_id": "distinct_src_forwarded",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_arp_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "first_seen_forwarded": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "replay_suppressed": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "key_independence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "first_seen_forwarded",
+      "replay_suppressed",
+      "key_independence"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "bloom_dedup",
+      "RFC791"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

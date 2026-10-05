@@ -1,0 +1,1219 @@
+# P-DNSLoadBalancer — shallow-L7 DNS query classification and name-based steering
+#
+# TPL v1.0 task pattern. Fills the
+# (D5:routing ∪ D7:security × P12:shallow-L7-protocols) cell of the
+# NF design-space map — one of the five *publication-record
+# gap* prescriptive rows (shallow L7 has "no descriptive
+# counterpart in the surveyed corpus"), so the descriptive tags are
+# mechanism-assigned: name-based steering is a routing-family behaviour
+# (D5) and the blocklist / threat-blocking action is a security-family
+# behaviour (D7), the same mechanism-assignment precedent set by
+# P-BFDLiveness (P16→D5) and P-PTPTransparentClock (P14→D4).
+#
+# target_capability = relocate: DNS-based global server load balancing
+# / steering and DNS threat-blocking have historically lived on host-
+# side resolvers and GSLB appliances (dnsdist, BIND views, F5 GTM); the
+# data plane is now able to *receive* the function. The relocate
+# frontier's structural failure mode shows up here as the SUT
+# having to redesign a host-side string-matching algorithm — walk a
+# variable-length, length-prefixed label sequence — onto a loop-free,
+# bounded-depth match-action parser with no prior data-plane design to
+# copy. This is the cleanest probe of the L7-parse failure class in the
+# corpus: it stresses PARSER DEPTH and bounded-loop label walking harder
+# than any tunnelling pattern (P-VXLANTunnel's parse graph is fixed-
+# depth; here it is data-dependent and adversary-controlled).
+#
+# Grounded in RFC 1035 (canonical normative source for the DNS message +
+# label-encoding format) plus the NetCache shallow-L7 lineage from the
+# data-plane NF survey. Instances are produced by binding the parameters
+# below.
+
+pattern_id: P-DNSLoadBalancer
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing, D7:security]                     # mechanism-assigned: P12 is a publication-record-gap row with no native descriptive family. Name-based steering = routing (D5); blocklist / DNS threat-blocking = security (D7). Multi-tag straddle like P-StatefulFW [D1,D7].
+  prescriptive: [P12:shallow-L7-protocols]                    # parse upper-layer (DNS) headers; proxy-style steering — `relocate` row in the design-space table
+
+target_capability: relocate                                   # DNS GSLB / threat-blocking relocated from host resolvers / GSLB appliances down into the switch pipeline
+
+summary: >
+  A shallow-L7 DNS load balancer / steering switch. On a UDP/53 DNS
+  *query* (QR=0, QDCOUNT≥1) the switch parses the DNS header and the
+  first question's variable-length QNAME (a sequence of length-prefixed
+  labels terminated by the zero-length root label, RFC 1035 §3.1) and
+  QTYPE, derives a bounded fixed-width *name-class key* from the parsed
+  labels under the configured match breadth (whole QNAME, the
+  registrable two-label suffix, or the TLD label), optionally folding
+  in QTYPE and case-normalising labels per RFC 1035's mandatory
+  case-insensitive comparison, and looks the key up in a control-plane
+  `name_class_backend` table. The matched entry carries one of three
+  actions: *route* (L3-forward the query to the selected backend
+  resolver — MAC rewrite, TTL decrement, IPv4-checksum recompute, the
+  anycast-VIP destination preserved so the backend can answer the
+  client directly), *rewrite* (DNAT the destination to a specific
+  backend resolver IP with IPv4 + UDP checksum recompute), or *block*
+  (drop the query — DNS-based threat blocking / RPZ use
+  case). A query whose name exceeds the parser's `${max_label_count}`
+  bound, carries a compression pointer in the QNAME (a length octet
+  whose high two bits are 1 — RFC 1035 §4.1.4, disallowed in a client
+  query QNAME and unparseable by a bounded label walk), or arrives with
+  QR=1 is handled per `${malformed_handling}` (strict drop vs steer to
+  the default backend). Unclassified names fall to `${default_action}`.
+  The pattern is STATELESS — every decision derives from header fields
+  and the control-plane table — which is what differentiates it from
+  the stateful-flow `relocate`/`scale_up` patterns; its difficulty
+  lives entirely in the data-dependent bounded parse and the
+  parse-then-deparse round-trip of the QNAME. The headline invariant
+  pins the v1model silent-failure surfaces this NF concentrates: the
+  variable-length DNS payload (especially the QNAME) is delivered
+  byte-for-byte unmodified (the switch edits only the L2/L3 envelope),
+  the IPv4/UDP checksums are recomputed after every envelope edit, and
+  the bounded label walk never reads past its depth bound. Faithfulness
+  anchors at D5.0 (route-only, single-label TLD match, lax malformed
+  handling, byte-exact name compare) and ladders through D5.1 (full
+  RFC 1035 validation: strict malformed drop, two-label suffix match,
+  QTYPE discrimination, case-insensitive compare), D5.2 (add the
+  rewrite/DNAT action with UDP checksum), and D5.3 (add threat-blocking
+  + full-QNAME hashed match under adversarial deep-name workload).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # DNS data-plane processing is engineering-mature but has little coverage in the SIGCOMM/NSDI/CoNEXT literature. Its lineage is the out-of-venue NetCache shallow-L7-parse design (SOSP '17); no paper is cited because none was directly read.
+
+  rfcs:
+    - cite: rfc1035
+      title: "Domain Names — Implementation and Specification"
+      sections: ["§3.1 name space definitions (label encoding)", "§4.1.1 header section format", "§4.1.2 question section format", "§4.1.4 message compression"]
+      role: normative_behaviour
+      quote: "QNAME a domain name represented as a sequence of labels, where each label consists of a length octet followed by that number of octets."
+      quote_source: "RFC 1035 §4.1.2 Question section (verbatim; cached at patterns/P-DNSLoadBalancer/grounding/rfc1035.txt). Grounds the bounded length-prefixed label-sequence QNAME parse the load balancer keys classification on."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        The protocol's authoritative source and the spine of every
+        rule, invariant, and malformed-handling boundary in this
+        pattern. The clauses below were retrieved and bind directly on
+        the data-plane parse and decision:
+
+          - §3.1 label encoding — a domain name in a message is "a
+            sequence of labels", each "one octet length field (0–63),
+            that many octets of label data", terminated by a
+            zero-length octet (root). "The high order two bits of every
+            length octet must be zero" and "the remaining six bits of
+            the length field limit the label to 63 octets or less."
+            "the total length of a domain name (i.e., label octets and
+            label length octets) is restricted to 255 octets or less."
+            These three limits define the pattern's well-formedness
+            boundary: the `label_length_max_63` and
+            `name_exceeds_parse_bound` G2 tests pin the per-label and
+            total-name limits, and the bounded label walk to
+            `${max_label_count}` is the data-plane analogue of the
+            255-octet cap (a parser cannot walk an unbounded name).
+
+          - §3.1 case-insensitivity — "Name servers and resolvers must
+            compare labels in a case-insensitive manner (i.e., A=a)."
+            The `${case_normalization}` parameter turns this MUST into
+            an enforceable knob: a classifier that keys on raw label
+            bytes mis-classifies `Example.COM` vs `example.com`. This
+            is a faithfulness surface no other pattern carries.
+
+          - §4.1.1 header — the 12-byte DNS header carries QR (1 bit,
+            "specifies whether this message is a query (0), or a
+            response (1)"), QDCOUNT (question count), and ANCOUNT. The
+            pattern handles only the query direction (QR=0, QDCOUNT≥1);
+            R0 drops non-queries and the `qr_response_dropped` G3 test
+            pins that a QR=1 packet on the query path is never steered
+            as a query.
+
+          - §4.1.2 question — each question is QNAME (the variable-
+            length label sequence above), QTYPE ("a two octet code which
+            specifies the type of the query" — A=1, NS=2, CNAME=5, MX=15,
+            AAAA=28, …), and QCLASS (IN=1). `${qtype_match_enabled}`
+            folds QTYPE into the classification key so the same name can
+            steer A and AAAA queries to different backends
+            (`dns_qtype_discrimination` G1 test).
+
+          - §4.1.4 message compression — a domain name may be replaced
+            by "a two octet sequence" whose "first two bits are ones"
+            (a length octet ≥ 0xC0) pointing to an earlier offset. A
+            client query's single QNAME is normally uncompressed, and a
+            bounded data-plane label walk cannot follow a back-pointer;
+            so a length octet with its high two bits set inside the
+            QNAME is treated as malformed. The
+            `malformed_compression_pointer_drop` G3 test pins the
+            strict-mode drop on this exact byte pattern.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model implementation — the bounded label walk as an
+        unrolled chain of parser states (or a `header_stack` of label-
+        length + label-byte sub-headers walked by `select` on the length
+        octet, terminating on 0x00 or `error.StackOutOfBounds` at the
+        depth bound), the hash extern call that folds a multi-label name
+        into a fixed-width table key, and the `update_checksum` calls on
+        the IPv4 and (rewrite-mode) UDP headers — is widely-known
+        P4-on-v1model practice rather than RFC-cited, and is flagged
+        `[common-knowledge baseline]` in `bridging_notes:`.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Every steering decision derives from
+      the parsed DNS header + first-question fields, the ingress port,
+      and the control-plane-installed `name_class_backend` table. The
+      pattern is STATELESS — no `flow` / `connection` / `session` rows
+      are maintained. The query direction only is in scope: the switch
+      steers client→backend DNS queries; the backend answers the client
+      directly (anycast-VIP-preserving route mode) or via a return path
+      that composes transitively with P-NAT44 (rewrite mode). This is
+      what keeps the oracle cost bounded while still exercising the
+      full shallow-L7 parse surface.
+
+  name_class_backend:                                         # TPL `bucket` — aggregate state across a class of queries (per-name-class steering decision)
+    type: bucket
+    keyed_by_tuple: [name_key, qtype]                         # qtype participates only when ${qtype_match_enabled}; name_key is derived per ${name_match_breadth}
+    attrs:
+      action:       "enum {route, rewrite, block}"            # which rule (R3/R4/R2) the matched class fires
+      egress_port:  port                                      # backend resolver egress port (route + rewrite)
+      backend_ip:   "address | none"                          # DNAT target (rewrite only)
+      backend_mac:  address                                   # next-hop / backend MAC (L2 rewrite on route + rewrite)
+      src_mac:      address                                   # this switch's egress-port MAC
+    capacity: ${name_class_backend_capacity}
+    populated_from: ${name_class_backend_entries}             # rows the seed installs
+    notes: |
+      The (name-class, QTYPE) → steering-decision table that drives the
+      whole pattern. Control-plane installed (a GSLB controller, an RPZ
+      feed for the `block` rows, or a static map). `name_key` is the
+      bounded fixed-width key the classifier derives from the parsed
+      QNAME under `${name_match_breadth}` and `${case_normalization}`;
+      `qtype` participates in the key only when `${qtype_match_enabled}`.
+      At D5.0 the table is a handful of TLD/suffix → route rows; D5.3
+      ladders to full-QNAME hashed keys, block rows, and realistic
+      fan-out.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  name_class_backend_entries:
+    type: list[name_class_entry]
+    constraint: |
+      every entry has name_pattern (a dotted DNS name or label suffix,
+      e.g. "com", "example.com", "api.example.com"); qtype:int ∈
+      [0, 65535] (present iff ${qtype_match_enabled}); action ∈
+      {route, rewrite, block}; egress_port:int ∈ [1, 511] (required for
+      route/rewrite); backend_ip:address (required iff action == rewrite,
+      else none); backend_mac:address and src_mac:address (required for
+      route/rewrite). The (name_key, qtype) derived from each
+      name_pattern under ${name_match_breadth} is unique across the
+      list. action ∈ {rewrite} entries appear only when
+      ${action_breadth} ∈ {route_rewrite, all}; action ∈ {block}
+      entries only when ${action_breadth} ∈ {route_block, all}.
+    notes: |
+      The rows that populate the `name_class_backend` bucket. Bound by
+      the seed; the harness installs the corresponding classification
+      table at task start. The instantiation step renders each
+      name_pattern into the bounded fixed-width key the chosen
+      `${name_match_breadth}` produces.
+
+  max_label_count:
+    type: int
+    range: "[2, 16]"
+    default: 4
+    notes: |
+      The parser depth bound — the maximum number of QNAME labels the
+      data plane walks before the zero-length root terminator. RFC 1035
+      §3.1 caps a name at 255 octets, but a bounded match-action parser
+      must commit to a fixed unroll depth; this is that depth (the
+      declared `header_stack` size in the canonical implementation). A query
+      whose name does not terminate within `${max_label_count}` labels
+      is handled per `${malformed_handling}`. Deeper bounds force the
+      SUT to unroll more parser states correctly (more off-by-one and
+      `StackOutOfBounds` risk), so `deepen_parse_bound` hardens.
+
+  name_match_breadth:
+    type: enum
+    values: [tld_only, suffix_2label, full_qname]
+    default: suffix_2label
+    notes: |
+      How much of the parsed QNAME the classification key covers.
+      `tld_only` keys on the last label (e.g. `com`) — the cheapest
+      (one label, fixed-ish width). `suffix_2label` keys on the
+      registrable two-label suffix (e.g. `example.com`) — the canonical
+      GSLB key. `full_qname` keys on the entire parsed name, which a
+      realistic switch hashes into a fixed-width key (`${name_hash_algo}`)
+      because exact-matching an arbitrary-length string in a TCAM is
+      infeasible. Broader breadth requires parsing and keying more
+      labels correctly, so `broaden_name_match` hardens (feature-breadth
+      axis).
+
+  qtype_match_enabled:
+    type: bool
+    default: false
+    notes: |
+      Whether the classification key includes QTYPE (RFC 1035 §4.1.2) so
+      the same name can steer A (1) and AAAA (28) queries to different
+      backends — the split-horizon / v4-v6-affinity GSLB case. `true`
+      forces the SUT to parse past the QNAME to the two-octet QTYPE and
+      fold it into the key; the `dns_qtype_discrimination` G1 test's
+      `requires:` guard activates. feature-breadth axis.
+
+  action_breadth:
+    type: enum
+    values: [route_only, route_block, route_rewrite, all]
+    default: route_only
+    notes: |
+      Which of the three steering actions (R2 block / R3 route / R4
+      rewrite) the seed's table exercises. `route_only` is the anchor-
+      band minimum (R3 only). `route_block` adds the DNS threat-blocking
+      drop (R2). `route_rewrite` adds the DNAT action (R4) and its UDP-
+      checksum surface. `all` enables every action. Broader action sets
+      add reachable rules and bug surfaces, so `broaden_action` hardens
+      (feature-breadth axis).
+
+  malformed_handling:
+    type: enum
+    values: [strict_drop, lax_default]
+    default: lax_default
+    notes: |
+      How a syntactically-malformed-or-overlong query is handled:
+      `strict_drop` drops it (activates R1 and the malformed G2/G3
+      tests); `lax_default` lets it fall through to R5's
+      `${default_action}` (a forgiving resolver-front-end that steers
+      anything it cannot classify to a default backend). Malformed
+      covers: a QNAME that does not terminate within `${max_label_count}`
+      labels, a length octet with its high two bits set (RFC 1035 §4.1.4
+      compression pointer, disallowed in a client query QNAME), and a
+      label length octet > 63 (RFC 1035 §3.1). `strict_drop` is the
+      security-conscious harden direction.
+
+  default_action:
+    type: enum
+    values: [drop, forward_default]
+    default: forward_default
+    notes: |
+      R5 catch-all behaviour for a well-formed query whose (name_key,
+      qtype) is not present in `name_class_backend` (and, under
+      `${malformed_handling} == lax_default`, for malformed queries).
+      `forward_default` steers to `${default_backend_port}` (a catch-all
+      resolver); `drop` is the closed-world default-deny. Coupled into
+      the faithfulness ladder rather than carrying its own operator pair.
+
+  default_backend_port:
+    type: int
+    range: "[1, 511]"
+    enforced_when: "${default_action} == forward_default"
+    notes: |
+      Egress port of the default / catch-all backend resolver R5
+      forwards to under `${default_action} == forward_default`. Bound by
+      the seed.
+
+  case_normalization:
+    type: bool
+    default: false
+    notes: |
+      Whether the classifier case-folds QNAME labels before deriving the
+      key (RFC 1035 §3.1 MUST: "compare labels in a case-insensitive
+      manner (i.e., A=a)"). `false` keys on raw label bytes (a naive
+      program that mis-classifies `Example.COM`); `true` enforces the
+      MUST. `enable_case_insensitive_match` hardens — it surfaces the
+      program that forgets DNS is case-insensitive (faithfulness axis:
+      fidelity of the name-comparison semantics).
+
+  name_hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${name_match_breadth} == full_qname"
+    notes: |
+      Hash function used to fold the full parsed QNAME into a fixed-width
+      table key when `${name_match_breadth} == full_qname`. `xor_fold`
+      is the cheapest but weakest — under an adversarial name workload it
+      collides distinct names into one key. `swap_hash_to_xor_fold`
+      hardens the panel against programs that copy the textbook CRC
+      pattern without considering hash quality (hash-family axis).
+
+  name_class_backend_capacity:
+    type: int | unbounded
+    range: "[8, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of (name_key, qtype) entries the classification
+      table supports. Realistic GSLB / RPZ tables sit in the 10³–10⁵
+      range; `shrink_class_capacity_4x` exercises the axis from the
+      anchor band's `unbounded` baseline, forcing the SUT to consider
+      key aggregation rather than a row-per-name TCAM (capacity axis).
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of query names in the G1 traffic tests. `uniform` is
+      the anchor-band default. `zipfian` concentrates queries on a few
+      hot names (heavy-hitter domains). `adversarial` mixes maximally-
+      long names that sit exactly at the `${max_label_count}` parse
+      bound with collision-prone names that stress `${name_hash_algo}`
+      quality on the full-QNAME key. `raise_workload_skew` hardens
+      (workload axis).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_route, D5.1_full_classify, D5.2_rewrite_dnat, D5.3_threat_block_strict]
+    default: D5.0_anchor_route
+    notes: |
+      The faithfulness ladder for this pattern. D5.0 is the minimal
+      route-only steerer (tld_only match, lax malformed handling, byte-
+      exact compare, no QTYPE, forward-default). D5.1 lifts to the full
+      RFC 1035 validation cascade (strict malformed drop, two-label
+      suffix match, QTYPE discrimination, case-insensitive compare).
+      D5.2 adds the rewrite/DNAT action and its UDP-checksum surface.
+      D5.3 adds threat-blocking (block action), full-QNAME hashed match,
+      and the adversarial deep-name workload. `tighten_faithfulness`
+      walks the ladder up; `loosen_faithfulness` walks it down (the
+      feature-breadth ladder).
+
+  dns_udp_port:
+    type: int
+    range: "[1, 65535]"
+    default: 53
+    notes: |
+      UDP destination port that identifies a DNS query. 53 is the IANA
+      assignment; exposed as a parameter so an instance can target an
+      alternate resolver port. R0 and the well-formed-query guard test
+      `udp.dst == ${dns_udp_port}`.
+
+  local_vip:
+    type: address
+    notes: |
+      The anycast VIP that clients send DNS queries to and that the
+      switch fronts. In `route` mode the IPv4 destination (this VIP) is
+      PRESERVED across the steering decision (only L2 + TTL change), so
+      the selected backend answers the client from the VIP and the
+      client accepts the response. Anchor instances bind this to an
+      RFC 1918 / documentation address.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+#
+# Shorthands used in the `when` clauses below:
+#   is_dns_query        := header_present(dns) ∧ match(udp.dst, ${dns_udp_port})
+#                          ∧ dns.qr == 0 ∧ value(dns.qdcount, ≥, 1)
+#   qname_well_formed   := qname terminates with the zero-length root label
+#                          within ${max_label_count} labels
+#                          ∧ ¬∃ label-length-octet with high-two-bits set (no §4.1.4 pointer)
+#                          ∧ ∀ label: length ≤ 63 (RFC 1035 §3.1)
+#   well_formed_query   := is_dns_query ∧ qname_well_formed
+#   class_key           := key(qname, qtype, ${name_match_breadth},
+#                              ${qtype_match_enabled}, ${case_normalization},
+#                              ${name_hash_algo})
+
+rules:
+
+  - id: R0_non_dns_query_drop
+    when: |
+      ¬is_dns_query
+    then:
+      - drop
+    notes: |
+      The switch is a dedicated DNS-query steerer. Anything that is not a
+      UDP/${dns_udp_port} DNS *query* (QR=0, QDCOUNT≥1) is out of scope —
+      non-DNS traffic, DNS responses (QR=1; the
+      `qr_response_dropped` G3 test pins this), and zero-question
+      messages. Dropped. A production deployment composes the non-DNS
+      forwarding path with P-IPv4Routing transitively rather than
+      re-encoding it here (the same scope-narrowing P-VXLANTunnel uses
+      for its underlay path). RFC 1035 §4.1.1 QR / QDCOUNT.
+
+  - id: R1_malformed_strict_drop
+    when: |
+      is_dns_query
+        ∧ ¬qname_well_formed
+        ∧ ${malformed_handling} == strict_drop
+    then:
+      - drop
+    notes: |
+      RFC 1035 §3.1 + §4.1.4 strict-validation path: a DNS query whose
+      QNAME does not terminate within `${max_label_count}` labels, or
+      contains a length octet with its high two bits set (a §4.1.4
+      compression pointer, which a client query QNAME does not carry and
+      a bounded data-plane label walk cannot follow), or contains a
+      label longer than 63 octets, is treated as malformed and dropped
+      under `strict_drop`. Under `lax_default` this guard is false and
+      the packet falls through to R5's default. R1 fires AFTER nothing
+      it conflicts with: it is disjoint from R2/R3/R4 (which require
+      `qname_well_formed`) and is the explicit strict-mode partner of
+      R5's lax catch-all. `malformed_compression_pointer_drop` and
+      `name_exceeds_parse_bound` exercise it.
+
+  - id: R2_classify_block
+    when: |
+      well_formed_query
+        ∧ exists(name_class_backend, class_key)
+        ∧ name_class_backend.action == block
+    given:
+      name_class_backend: by_key(class_key)
+    then:
+      - drop
+    notes: |
+      DNS-based threat blocking / RPZ (data-plane NF survey, shallow-L7 row):
+      a query whose name-class is installed with `action == block` is
+      dropped before steering. This is the D7:security half of the
+      pattern. Only reachable when `${action_breadth} ∈ {route_block,
+      all}` (the seed installs no block rows otherwise). The
+      `blocklist_drop` G3 test is the default-deny probe.
+
+  - id: R3_classify_route
+    when: |
+      well_formed_query
+        ∧ exists(name_class_backend, class_key)
+        ∧ name_class_backend.action == route
+    given:
+      name_class_backend: by_key(class_key)
+    then:
+      - "set(ethernet.src, name_class_backend.src_mac)"
+      - "set(ethernet.dst, name_class_backend.backend_mac)"
+      - "dec(ipv4.ttl, 1)"                                    # L3-forward to the backend resolver
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - forward(name_class_backend.egress_port)
+    notes: |
+      The anchor-band steering action. The query is L3-forwarded to the
+      selected backend resolver: MAC rewrite, TTL decrement, IPv4 header-
+      checksum recompute. The IPv4 *destination* (the anycast
+      `${local_vip}`) is PRESERVED — the backend shares the VIP and
+      answers the client directly, so no return-path state is needed.
+      The DNS payload (header + question + any sections) is NOT touched
+      — the `dns_payload_persistence` invariant pins the byte-for-byte
+      QNAME round-trip. Implementation anti-patterns: (a) editing the DNS payload
+      or re-emitting a fixed-length QNAME stand-in
+      (`conditional_deparser_qname_roundtrip`); (b) forgetting the
+      IPv4-checksum recompute after TTL-- (`envelope_checksum_validity`);
+      (c) rewriting `ipv4.dst` here (that is R4's job, and doing it in
+      route mode breaks the anycast response path).
+
+  - id: R4_classify_rewrite
+    when: |
+      well_formed_query
+        ∧ exists(name_class_backend, class_key)
+        ∧ name_class_backend.action == rewrite
+    given:
+      name_class_backend: by_key(class_key)
+    then:
+      - "set(ipv4.dst, name_class_backend.backend_ip)"        # DNAT to the specific backend resolver IP
+      - "set(ethernet.src, name_class_backend.src_mac)"
+      - "set(ethernet.dst, name_class_backend.backend_mac)"
+      - "dec(ipv4.ttl, 1)"
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - "set(udp.checksum, udp_checksum_recompute())"         # UDP checksum covers the pseudo-header (incl. ipv4.dst), so it MUST recompute after DNAT
+      - forward(name_class_backend.egress_port)
+    notes: |
+      The DNAT steering action (D5.2+). The IPv4 destination is rewritten
+      to a specific backend resolver IP; because the UDP checksum covers
+      the IPv4 pseudo-header (which includes the destination address),
+      the UDP checksum MUST be recomputed in addition to the IPv4 header
+      checksum. The DNS payload is again untouched. Only reachable when
+      `${action_breadth} ∈ {route_rewrite, all}`. The
+      `checksum_after_dnat` G3 test catches the #1 silent failure
+      (forgetting the UDP-checksum recompute over the changed pseudo-
+      header). Note the return path (de-NAT of the backend's response)
+      is out of scope for this stateless pattern and composes
+      transitively with P-NAT44.
+
+  - id: R5_default
+    when: |
+      is_dns_query
+        ∧ ( ¬exists(name_class_backend, class_key)
+            ∨ ( ¬qname_well_formed ∧ ${malformed_handling} == lax_default ) )
+    then:
+      - "forward(${default_backend_port}) if ${default_action} == forward_default else drop"
+    notes: |
+      The catch-all. A well-formed query whose (name_key, qtype) is not
+      installed, OR (under `lax_default`) a malformed query, is handled
+      per `${default_action}`: steered to the default backend resolver
+      (`forward_default`) or dropped (`drop`, closed-world default-deny).
+      R5 is the explicit partner of R1 (strict malformed drop) and the
+      no-match complement of R2/R3/R4. Under `forward_default` the
+      default forward is an L3 forward identical in envelope handling to
+      R3 (MAC rewrite, TTL--, IPv4 checksum) targeting
+      `${default_backend_port}`; the oracle applies the same envelope
+      edits so a default-steered query is still well-formed on egress.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The bounded QNAME label walk
+      terminates in at most `${max_label_count}` steps (either at the
+      zero-length root label or at the depth bound), and every rule is a
+      single-pass forward or drop. There is no recirculation in this
+      pattern. This invariant is the formal pin on the bounded-loop
+      requirement: a parser that loops on the label-length `select`
+      without a depth guard would not terminate on a crafted unterminated
+      name — the v1model-bug / parser-edge-case `StackOutOfBounds` boundary the
+      `name_exceeds_parse_bound` test probes.
+
+  - id: classification_determinism
+    clause: stability
+    target: "(forward_decision, name_class_backend.egress_port)"
+    while: "well_formed_query ∧ (R2 ∨ R3 ∨ R4) fires"
+    notes: |
+      Stable steering: two well-formed queries with the same derived
+      `class_key` (same name under `${name_match_breadth}` /
+      `${case_normalization}`, same QTYPE under `${qtype_match_enabled}`)
+      always produce the same action and the same backend. The load
+      balancer does not flap a name between backends packet-to-packet —
+      DNS resolver affinity. Implementation anti-pattern: keying on a hash that
+      includes a per-packet-varying field (e.g. the DNS transaction ID
+      or UDP source port) instead of only the name/QTYPE — splits one
+      logical name across backends.
+
+  - id: dns_payload_persistence
+    clause: persistence
+    target: "(dns_header, dns_question.qname, dns_payload)"
+    while: "(R3 ∨ R4 ∨ R5-forward) fires"
+    free_under: []
+    notes: |
+      THE headline invariant. On every steered (non-dropped) query the
+      DNS message — the 12-byte header, the variable-length QNAME, the
+      QTYPE/QCLASS, and any trailing sections — is delivered to the
+      backend BYTE-FOR-BYTE identical to what arrived; the switch edits
+      only the L2/L3 envelope (Ethernet, IPv4, UDP-checksum). This is the
+      parse-then-deparse round-trip correctness the whole pattern turns
+      on: a program that parses the QNAME into label sub-headers but
+      re-emits them in the wrong order, drops a label, pads to a fixed
+      width, or omits the variable-length tail corrupts the query even
+      though forwarding "works". `conditional_deparser_qname_roundtrip`
+      and `dns_qname_payload_preserved` enumerate it.
+
+  - id: envelope_checksum_validity
+    clause: stability
+    target: "(ipv4.header_checksum, udp.checksum)"
+    while: "(R3 ∨ R4 ∨ R5-forward) fires ∧ egress(packet)"
+    notes: |
+      Every steered query carries a valid IPv4 header checksum on egress
+      (recomputed after the TTL decrement) and, when R4 rewrote
+      `ipv4.dst`, a valid UDP checksum (recomputed over the changed
+      pseudo-header). The #1 silent failure per the v1model bug catalogue's
+      cross-cutting taxonomy: omitting `update_checksum` after a field edit makes BMv2
+      emit a stale checksum the backend's NIC / kernel silently drops.
+      `checksum_after_dnat` catches the UDP half; the IPv4 half is pinned
+      on every forwarding rule.
+
+  - id: parser_depth_safety
+    clause: stability
+    target: forward_decision
+    while: "is_dns_query ∧ ¬qname_well_formed"
+    notes: |
+      A query whose QNAME exceeds the `${max_label_count}` bound, carries
+      a compression pointer, or has an over-long label produces a
+      DETERMINISTIC decision — `strict_drop` drops, `lax_default` steers
+      to the default — and NEVER reads a label/QTYPE field past the parse
+      bound (which would be an unspecified-value read per P4-16 §8.25 /
+      the bug-taxonomy "read from invalid header"). Pins that the bounded
+      walk degrades gracefully rather than classifying on garbage.
+      `name_exceeds_parse_bound` and `read_invalid_dns_field_guard`
+      witness it.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-goal rules and the v1model bug taxonomy for per-entry
+# materialisation. Scapy ships native DNS /
+# DNSQR layers, so instances need no custom_headers.py for the query.
+
+test_scaffolding:
+
+  G1:
+    - id: dns_route_basic
+      generate: |
+        Send a UDP/${dns_udp_port} DNS query (QR=0, QDCOUNT=1) for a name
+        whose class is installed with action=route → egress_port=P,
+        backend_mac=MB, src_mac=MS. Assert the egress packet on P is the
+        same query with ethernet.src=MS, ethernet.dst=MB, ipv4.ttl
+        decremented by 1, ipv4.dst UNCHANGED (== ${local_vip}, the
+        anycast preserve), a valid recomputed IPv4 checksum, and the DNS
+        payload (header + QNAME + QTYPE) byte-for-byte identical.
+        (Anchor — the golden steering path, G1-P1-T1 / G1-P1-T3.)
+
+    - id: dns_classify_two_names
+      generate: |
+        Install two name-classes mapping to two different backends
+        (e.g. `api.example.com`→P2, `cdn.example.net`→P3) under the
+        configured `${name_match_breadth}`. Send one query for each.
+        Assert each is steered to its own backend port. Confirms the
+        classifier actually keys on the parsed name, not a constant.
+        (G1-P1-T1 per-forwarding-path coverage.)
+
+    - id: dns_qname_payload_preserved
+      generate: |
+        Send a route-classified query whose QNAME is a multi-label name
+        near (but within) the parse bound (e.g. 4 labels
+        `a.b.example.com`). Parse the egress packet's DNS section
+        top-to-bottom and assert the QNAME labels, lengths, root
+        terminator, QTYPE, and QCLASS are byte-for-byte identical to the
+        input — no reordering, no dropped label, no fixed-width padding.
+        (Pins the `dns_payload_persistence` invariant; the parse-then-
+        deparse round-trip is the pattern's load-bearing surface.)
+
+    - id: dns_qtype_discrimination
+      requires: "${qtype_match_enabled}"
+      generate: |
+        Install the SAME name with two QTYPEs mapping to different
+        backends (e.g. `example.com`/A→P2, `example.com`/AAAA→P3). Send
+        an A query and an AAAA query for that name. Assert each is
+        steered to the QTYPE-specific backend. Forces the SUT to parse
+        past the QNAME to the QTYPE and fold it into the key. (G1-P1-T2
+        protocol-branch coverage; RFC 1035 §4.1.2.)
+
+    - id: dns_rewrite_dnat
+      requires: "${action_breadth} ∈ {route_rewrite, all}"
+      generate: |
+        Send a query whose class is installed with action=rewrite →
+        backend_ip=BIP. Assert the egress packet has ipv4.dst=BIP, a
+        valid recomputed IPv4 header checksum, a valid recomputed UDP
+        checksum (the pseudo-header changed), MAC rewrite, TTL--, and the
+        DNS payload byte-for-byte preserved. (R4 path; G1-P1-T3 +
+        G1-P1-T5 transformation assertions.)
+
+  G2:
+    - id: name_at_parse_depth_bound
+      generate: |
+        Send a route-classified query whose QNAME has EXACTLY
+        `${max_label_count}` labels then the root terminator (the
+        boundary the parser must accept). Assert it classifies and steers
+        correctly. The off-by-one partner of `name_exceeds_parse_bound`.
+        (Parser-boundary; the "Full stack — exactly N headers" feature
+        test.)
+
+    - id: name_exceeds_parse_bound
+      generate: |
+        Send a query whose QNAME has MORE than `${max_label_count}`
+        labels (no root terminator within the bound). Assert: drop under
+        `${malformed_handling} == strict_drop`, or forward to
+        `${default_backend_port}` (or drop) per `${default_action}` under
+        `lax_default`. The decision MUST be deterministic and MUST NOT
+        depend on bytes past the parse bound. (The `StackOutOfBounds` /
+        parser-depth boundary; pins `parser_depth_safety`; the
+        "nextIndex at size boundary" edge case.)
+
+    - id: label_length_max_63
+      generate: |
+        Send a route-classified query containing a single label of
+        EXACTLY 63 octets (the 6-bit length-field maximum, RFC 1035
+        §3.1). Assert it parses and steers correctly (boundary accept).
+        Optionally pair with a label-length octet of 64+ with high bits
+        clear is impossible (6-bit field), so the over-long case is the
+        compression-pointer probe below. (Boundary; the max-width
+        extraction feature test.)
+
+    - id: short_question_truncated_packet
+      generate: |
+        Send a UDP/${dns_udp_port} datagram with QR=0 and QDCOUNT=1 but a
+        QNAME truncated mid-label (the declared label length runs past
+        the packet end). Assert the parser rejects / the NF drops rather
+        than reading past the buffer (`error.PacketTooShort`). (G2
+        malformed-input; the "Short packet" feature test.)
+
+  G3:
+    - id: blocklist_drop
+      requires: "${action_breadth} ∈ {route_block, all}"
+      generate: |
+        Install a name-class with action=block (a threat domain / RPZ
+        entry). Send a well-formed query for it. Assert drop — before any
+        steering. Then send a query for a non-blocked, route-classified
+        name and assert it still forwards (the block is name-scoped, not
+        a blanket deny). (DNS threat-blocking default-deny, R2; G3
+        bypass/security.)
+
+    - id: qr_response_dropped
+      generate: |
+        Send a UDP/${dns_udp_port} packet with QR=1 (a DNS *response*,
+        not a query) on the query path. Assert it is NOT steered as a
+        query (drop at R0). Catches a program that gates only on
+        `udp.dst == 53` and forgets the QR bit, mis-steering responses.
+        (RFC 1035 §4.1.1 QR; bypass probe.)
+
+    - id: conditional_deparser_qname_roundtrip
+      generate: |
+        Send a route-classified query with a distinctive multi-label
+        QNAME. Assert the egress packet's byte layout is exactly
+        Ether/IPv4/UDP/DNS-header/QNAME(labels in order)/QTYPE/QCLASS
+        with the QNAME bytes identical to the input, AND that NO label
+        sub-header is emitted out of order, duplicated, or dropped.
+        Catches the common v1model conditional-deparser bug where the deparser
+        emits the parsed label headers unconditionally / in parse order
+        rather than guarded by `isValid()` in the correct sequence — the
+        dominant silent failure for variable-length parse tasks.
+
+    - id: checksum_after_dnat
+      requires: "${action_breadth} ∈ {route_rewrite, all}"
+      generate: |
+        Same setup as `dns_rewrite_dnat`. After R4 rewrites ipv4.dst,
+        recompute BOTH the IPv4 header checksum (over the 20-byte header)
+        and the UDP checksum (over the pseudo-header + UDP header +
+        payload) from the egress bytes and assert both match. Catches the
+        program that recomputes the IPv4 checksum but forgets the UDP
+        checksum covers the changed pseudo-header — the #1 silent failure
+        per the v1model bug catalogue's cross-cutting taxonomy.
+
+    - id: read_invalid_dns_field_guard
+      generate: |
+        Send (a) a non-DNS UDP packet on a non-${dns_udp_port} port and
+        (b) a UDP/${dns_udp_port} packet whose DNS header is present but
+        QDCOUNT=0 (no question section parsed). Assert the NF does not
+        classify on or forward based on unspecified QNAME/QTYPE bytes —
+        (a) is out of scope (R0 drop) and (b) drops at R0
+        (`value(dns.qdcount, ≥, 1)` is false). Catches a program that
+        reads the question fields without guarding header / question
+        validity (P4-16 §8.25 unspecified-value read; G1-P2-T9 analog).
+
+    - id: ttl_one_boundary_route
+      generate: |
+        Send a route-classified query with ipv4.ttl=1. Assert the
+        decrement-and-forward behaviour matches the spec the instance
+        adopts: either drop (RFC 1812 TTL-expired, the router-faithful
+        choice) or forward with ttl=0 — but applied CONSISTENTLY with a
+        valid recomputed checksum, never an off-by-one that forwards
+        ttl=255 (unsigned underflow). (Cross-cutting TTL boundary; bug
+        taxonomy "TTL boundary".)
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Eleven harden operators paired with eleven ease counterparts; every
+# operator declares `direction` so parameter rebinding during difficulty
+# recalibration can pick from the matching pool depending on whether r > r* + δ (harden)
+# or r < r* − δ (ease). Every harden has an ease counterpart on the SAME axis.
+
+mutation_operators:
+
+  - id: deepen_parse_bound
+    applicable_when: "${max_label_count} < 16"
+    effect: "${max_label_count} ← min(${max_label_count} * 2, 16)"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${max_label_count} ≤ 16 ∧ ${max_label_count} ≥ 2"
+    kind: parameter
+    notes: |
+      Increase the parser depth bound — more label sub-states to unroll
+      correctly, raising the off-by-one / `StackOutOfBounds` risk on the
+      bounded walk. The header-stack `size` is a structural memory bound,
+      so this moves the `capacity` axis (the specific resource is parser
+      depth). Activates deeper `name_at_parse_depth_bound` /
+      `name_exceeds_parse_bound` boundaries.
+
+  - id: shallow_parse_bound
+    applicable_when: "${max_label_count} > 2"
+    effect: "${max_label_count} ← max(${max_label_count} / 2, 2)"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${max_label_count} ≥ 2 ∧ ${max_label_count} ≤ 16"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `deepen_parse_bound`. Halves (not
+      quarters) the bound so the harden/ease asymmetry gives the
+      difficulty recalibration a slower climb back after an over-deepen.
+
+  - id: broaden_name_match
+    applicable_when: "${name_match_breadth} ∈ {tld_only, suffix_2label}"
+    effect: "${name_match_breadth} ← next_breadth(${name_match_breadth})"   # tld_only → suffix_2label → full_qname
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${name_match_breadth} ∈ {suffix_2label, full_qname}"
+    kind: parameter
+    notes: |
+      Widen the classification key from the TLD label to the two-label
+      suffix to the full hashed QNAME — each step requires parsing and
+      keying more labels correctly. The full_qname step also activates
+      the `${name_hash_algo}` surface. feature-breadth axis.
+
+  - id: narrow_name_match
+    applicable_when: "${name_match_breadth} ∈ {suffix_2label, full_qname}"
+    effect: "${name_match_breadth} ← prev_breadth(${name_match_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${name_match_breadth} ∈ {tld_only, suffix_2label}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_name_match`.
+
+  - id: enable_qtype_matching
+    applicable_when: "${qtype_match_enabled} == false"
+    effect: "${qtype_match_enabled} ← true"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${qtype_match_enabled} == true"
+    kind: parameter
+    notes: |
+      Fold QTYPE into the classification key. Forces the SUT to parse
+      past the variable-length QNAME to reach the two-octet QTYPE — a
+      common implementation failure when the QNAME length is data-dependent.
+      Activates `dns_qtype_discrimination`. feature-breadth axis.
+
+  - id: disable_qtype_matching
+    applicable_when: "${qtype_match_enabled} == true"
+    effect: "${qtype_match_enabled} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${qtype_match_enabled} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_qtype_matching`. The
+      `dns_qtype_discrimination` test's `requires:` guard goes false and
+      it is skipped.
+
+  - id: broaden_action
+    applicable_when: "${action_breadth} ∈ {route_only, route_block, route_rewrite}"
+    effect: "${action_breadth} ← next_action_breadth(${action_breadth})"   # route_only → {route_block | route_rewrite} → all
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${action_breadth} ∈ {route_block, route_rewrite, all}"
+    kind: parameter
+    notes: |
+      Add reachable steering actions: route_block activates R2 (the
+      DNS-threat-blocking drop and `blocklist_drop`), route_rewrite
+      activates R4 (the DNAT action and its UDP-checksum surface via
+      `checksum_after_dnat`), and `all` enables both. feature-breadth
+      axis.
+
+  - id: narrow_action
+    applicable_when: "${action_breadth} ∈ {route_block, route_rewrite, all}"
+    effect: "${action_breadth} ← prev_action_breadth(${action_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${action_breadth} ∈ {route_only, route_block, route_rewrite}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_action`. Removes the
+      most-recently-added action and skips its `requires:`-guarded tests.
+
+  - id: strict_malformed_handling
+    applicable_when: "${malformed_handling} == lax_default"
+    effect: "${malformed_handling} ← strict_drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${malformed_handling} == strict_drop"
+    kind: parameter
+    notes: |
+      Activate R1 and the malformed G2/G3 cases
+      (`malformed_compression_pointer_drop`, the strict branch of
+      `name_exceeds_parse_bound`). Catches programs that classify on a
+      partially-parsed / pointer-bearing name instead of rejecting it.
+      strictness axis.
+
+  - id: lax_malformed_handling
+    applicable_when: "${malformed_handling} == strict_drop"
+    effect: "${malformed_handling} ← lax_default"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${malformed_handling} == lax_default"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `strict_malformed_handling`. R1 is
+      gated off; malformed queries fall to R5's default and the
+      strict-mode malformed tests are skipped.
+
+  - id: enable_case_insensitive_match
+    applicable_when: "${case_normalization} == false"
+    effect: "${case_normalization} ← true"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${case_normalization} == true"
+    kind: parameter
+    notes: |
+      Enforce RFC 1035 §3.1's mandatory case-insensitive label
+      comparison: the SUT must case-fold each QNAME label before deriving
+      the key. Catches the program that keys on raw label bytes and
+      mis-classifies `Example.COM`. faithfulness axis (fidelity of the
+      name-comparison semantics).
+
+  - id: disable_case_insensitive_match
+    applicable_when: "${case_normalization} == true"
+    effect: "${case_normalization} ← false"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${case_normalization} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_case_insensitive_match`. Reverts
+      to byte-exact label comparison.
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: "${name_match_breadth} == full_qname ∧ ${name_hash_algo} ∈ {crc16, crc32}"
+    effect: "${name_hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${name_hash_algo} == xor_fold"
+    kind: parameter
+    notes: |
+      Weaken the full-QNAME key hash. Under an adversarial name workload
+      the xor_fold output collapses distinct names into one key, so a
+      program that copies the textbook CRC pattern without weighing hash
+      quality mis-classifies colliding names. hash-family axis.
+
+  - id: swap_hash_to_crc32
+    applicable_when: "${name_match_breadth} == full_qname ∧ ${name_hash_algo} ∈ {xor_fold, crc16}"
+    effect: "${name_hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${name_hash_algo} == crc32"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `swap_hash_to_xor_fold`. CRC32 gives the
+      strongest entropy of the three options and minimises full-QNAME key
+      collisions.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"               # uniform → zipfian → adversarial
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the query-name distribution skew. `adversarial` mixes
+      maximally-long names sitting exactly at the parse bound with
+      collision-prone names — combined with a weak `${name_hash_algo}`
+      this drives the classifier toward mis-steering. workload axis.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: shrink_class_capacity_4x
+    applicable_when: "${name_class_backend_capacity} ≠ unbounded ∧ ${name_class_backend_capacity} > 32"
+    effect: "${name_class_backend_capacity} ← ${name_class_backend_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${name_class_backend_capacity} ≥ 8"
+    kind: parameter
+    notes: |
+      Tighten the classification-table capacity. The program cannot rely
+      on a row-per-name TCAM and must consider key aggregation (suffix /
+      hashed keys). capacity axis. (Distinct from `deepen_parse_bound`,
+      which moves the parser-depth resource on the same axis — both are
+      capacity but on disjoint resources, so each carries its own
+      harden/ease pair.)
+
+  - id: enlarge_class_capacity_2x
+    applicable_when: "${name_class_backend_capacity} ≠ unbounded ∧ ${name_class_backend_capacity} < 1048576"
+    effect: "${name_class_backend_capacity} ← ${name_class_backend_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${name_class_backend_capacity} ≤ 1048576"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_class_capacity_4x`. Doubles (not
+      quadruples) for a slow climb back toward the target difficulty after an over-shrink.
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_route, D5.1_full_classify, D5.2_rewrite_dnat}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_full_classify then
+          ${malformed_handling} ← strict_drop ∧
+          ${name_match_breadth} ← suffix_2label ∧
+          ${qtype_match_enabled} ← true ∧
+          ${case_normalization} ← true ) ∧
+      ( if ${faithfulness}_post == D5.2_rewrite_dnat then
+          ${action_breadth} ← route_rewrite ) ∧
+      ( if ${faithfulness}_post == D5.3_threat_block_strict then
+          ${action_breadth} ← all ∧
+          ${name_match_breadth} ← full_qname ∧
+          ${workload_skew} ← adversarial ∧
+          ${default_action} ← drop )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_route ∧
+      ( ${faithfulness} ≠ D5.2_rewrite_dnat
+        ∨ ∃ entry ∈ ${name_class_backend_entries}: entry.action == rewrite ) ∧
+      ( ${faithfulness} ≠ D5.3_threat_block_strict
+        ∨ ∃ entry ∈ ${name_class_backend_entries}: entry.action == block )
+    kind: parameter
+    notes: |
+      Lift the faithfulness ladder one band. D5.0 → D5.1 turns on the
+      full RFC 1035 validation cascade (strict malformed drop, two-label
+      suffix match, QTYPE discrimination, case-insensitive compare).
+      D5.1 → D5.2 adds the rewrite/DNAT action. D5.2 → D5.3 adds threat-
+      blocking, full-QNAME hashed match, the adversarial workload, and a
+      closed-world default. Couples several knobs in one step, so its
+      `feasibility_postcondition` requires the rewrite/block rows to
+      exist before the bands that need them.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_full_classify, D5.2_rewrite_dnat, D5.3_threat_block_strict}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_route then
+          ${malformed_handling} ← lax_default ∧
+          ${name_match_breadth} ← tld_only ∧
+          ${qtype_match_enabled} ← false ∧
+          ${case_normalization} ← false ∧
+          ${action_breadth} ← route_only ∧
+          ${default_action} ← forward_default ) ∧
+      ( if ${faithfulness}_post == D5.1_full_classify then
+          ${action_breadth} ← route_only ) ∧
+      ( if ${faithfulness}_post == D5.2_rewrite_dnat then
+          ${action_breadth} ← route_rewrite ∧
+          ${name_match_breadth} ← suffix_2label ∧
+          ${workload_skew} ← uniform ∧
+          ${default_action} ← forward_default )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_threat_block_strict
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the ladder
+      back one band and reverts the entailed parameter bindings.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source to task.description so the SUT sees
+      a host-side reference implementation in addition to the behavioural
+      spec — the heaviest hammer among the difficulty axes.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      From the starter operator library — laddering the input form from
+      behavioural spec to host-side reference EASES the SUT's job (it has
+      a Python label-walk to transliterate rather than design from
+      scratch). Used sparingly; pairs with the harden revert below.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`. The
+      SUT must design the bounded label walk from RFC 1035 alone.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4 (every entry below is
+  `[common-knowledge baseline]` rather than RFC-cited):
+
+    Anchor band (D5.0_anchor_route, name_match_breadth = tld_only,
+                 malformed_handling = lax_default, case_normalization =
+                 false, qtype_match_enabled = false, action_breadth =
+                 route_only, default_action = forward_default):
+      - Parser: state_start → parse_ethernet → (etherType == 0x0800 ?
+        parse_ipv4 : accept) → (ipv4.protocol == 17 ? parse_udp :
+        accept) → (udp.dst == 53 ? parse_dns : accept) →
+        parse_dns_header → parse_qname_label. The label walk is the
+        crux: either an unrolled chain of `parse_label_0 … parse_label_K`
+        states (K = ${max_label_count}), each extracting a one-octet
+        length then advancing/extracting that many bytes and
+        `select`-ing on the next length octet (0x00 → done; high-bits-set
+        → malformed; else → next label state), OR a `header_stack
+        dns_label_t[${max_label_count}]` walked with `hs.next` and a
+        loop-back `select`, terminating on the root label or
+        `error.StackOutOfBounds` at the bound. Variable-width per-label
+        extraction uses the two-argument `extract(hdr, lenBits)` form.
+      - One control-plane table: dns_class_table, exact (or, at
+        full_qname, exact on the hashed key) on the derived name_key
+        (plus qtype when ${qtype_match_enabled}), action set
+        {route, rewrite, block, default}. The key-derivation is an
+        action/ALU step that concatenates or hashes the parsed label
+        bytes into a fixed-width field BEFORE the table apply.
+      - Route action: ethernet MAC rewrite + ipv4.ttl-- +
+        update_checksum on ipv4. ipv4.dst is NOT touched (anycast VIP
+        preserve). The DNS headers + label sub-headers are left valid and
+        untouched so the deparser re-emits them verbatim.
+      - Deparser: emit ethernet, ipv4, udp, dns_header, then EVERY label
+        sub-header in order (or the header_stack), then qtype/qclass.
+        The variable-length emit is the load-bearing
+        conditional-deparser surface.
+
+    D5.1 (full RFC 1035 validation): adds the strict-flag/malformed
+    cascade (reject on a length octet ≥ 0xC0, on no root terminator
+    within the bound, on label length > 63), the case-fold of each label
+    byte (OR each label byte with 0x20 for ASCII letters before keying —
+    the RFC §3.1 A=a rule), the two-label-suffix key derivation, and the
+    QTYPE fold into the table key.
+
+    D5.2 (rewrite/DNAT): the rewrite action sets ipv4.dst = backend_ip
+    and adds update_checksum for BOTH ipv4 (header) and udp (the UDP
+    checksum covers the IPv4 pseudo-header, so it MUST recompute over the
+    changed destination — the canonical silent miss).
+
+    D5.3 (threat-block + full-QNAME hashed match): a block action that
+    `mark_to_drop(standard_metadata)`s before egress; the full-QNAME key
+    is `hash(key, HashAlgorithm.crc32, 0, {concatenated_label_bytes},
+    width)`; the adversarial workload stresses the hash and the parse
+    bound together; default_action = drop closes the world.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Re-emitting a FIXED-LENGTH QNAME stand-in (e.g. a single padded
+      header) instead of the variable-length label sequence that was
+      parsed — corrupts the query payload even though forwarding
+      "works". The #1 silent failure for variable-length parse tasks.
+      `conditional_deparser_qname_roundtrip` + `dns_payload_persistence`
+      catch it.
+
+    * Forgetting `update_checksum` for ipv4 after ttl-- (route) or for
+      udp after the ipv4.dst DNAT (rewrite) — BMv2 emits a stale
+      checksum the backend silently drops. `checksum_after_dnat` and the
+      `envelope_checksum_validity` invariant catch it.
+
+    * An unbounded / unguarded label-walk `select` loop that does not
+      terminate on a crafted unterminated name — hangs the parser or
+      reads past the buffer. The bounded `${max_label_count}` +
+      `parser_depth_safety` invariant + `name_exceeds_parse_bound` pin
+      the depth guard.
+
+    * Gating only on `udp.dst == 53` and forgetting the QR bit — steers
+      DNS RESPONSES as if they were queries. `qr_response_dropped`
+      catches it.
+
+    * Keying on raw label bytes when case-insensitivity is required —
+      mis-classifies `Example.COM` vs `example.com`.
+      `enable_case_insensitive_match` + a mixed-case test catch it.
+
+    * Following a §4.1.4 compression pointer (length octet ≥ 0xC0) as if
+      it were a label length — reads garbage label bytes from a wrong
+      offset. The strict-mode `malformed_compression_pointer_drop`
+      catches it; a bounded data-plane walk must treat a pointer as
+      malformed, not chase it.
+
+    * Rewriting ipv4.dst in ROUTE mode (conflating R3 with R4) — breaks
+      the anycast response path (the backend would answer from the
+      backend IP, not the VIP the client targeted). The route test
+      asserts ipv4.dst is unchanged.
+
+  v2-deferred (out of scope for this pattern, noted for reviewers):
+    * The query→response return path (de-NAT of the backend's answer in
+      rewrite mode) is stateful and composes transitively with P-NAT44
+      rather than being re-encoded here — the pattern is the query-
+      steering half only.
+    * DNS response caching (answering a query from an in-switch RR cache)
+      is a P17-storage / NetCache-style behaviour, a separate pattern
+      (P-NetCacheKV) rather than a faithfulness band of this one.

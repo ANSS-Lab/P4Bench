@@ -1,0 +1,192 @@
+{
+  "oracle_hash": "87d63ebf8c0881a1331690e3664f2eddb26fa157513e4c6aaf32411ea30ac3a7",
+  "instance": "lb_failover_anchor-default",
+  "ran_at": "2026-05-30T00:04:22.824896Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_vip_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_tcp_to_vip_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_exhausted_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_primary_golden_path",
+        "status": "pass"
+      },
+      {
+        "example_id": "existing_flow_same_backend",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_on_down_primary_uses_backup",
+        "status": "pass"
+      },
+      {
+        "example_id": "pin_survives_failover_backup_path",
+        "status": "pass"
+      },
+      {
+        "example_id": "noncascaded_backup_used_even_if_backup_down",
+        "status": "pass"
+      },
+      {
+        "example_id": "cascaded_double_down_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_relaxed_golden_path",
+        "status": "pass"
+      },
+      {
+        "example_id": "single_backend_pool_pins_only_member",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "pin_precedes_path": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "backend_pin_survives_failover": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "failover_does_not_rebalance": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "persistence_across_failover": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "src_addr_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "persistence_under_pool_addition": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_flow_state": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_primary": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_backup": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "failover_decision_per_packet": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "failover_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_links": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "pin_precedes_path",
+      "backend_pin_survives_failover",
+      "failover_does_not_rebalance",
+      "persistence_across_failover",
+      "src_addr_preservation",
+      "persistence_under_pool_addition",
+      "no_orphan_flow_state",
+      "ttl_quantum_one",
+      "ether_rewrite_correctness_on_primary",
+      "ether_rewrite_correctness_on_backup",
+      "failover_decision_per_packet",
+      "failover_bounded_latency",
+      "no_orphan_links",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "silkroad_sigcomm17",
+      "purr_conext19",
+      "rfc793"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

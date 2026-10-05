@@ -1,0 +1,537 @@
+task_name: nat64_anchor_mut2
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-NAT64
+pattern_version: '1.0'
+seed:
+  wkp: 64:ff9b::/96
+  v4_base: 203.0.113.10
+  v6_client_subnet: 2001:db8:64::/64
+  mode: dynamic
+  eviction_policy: none
+  binding_capacity: unbounded
+  v4_pool_range:
+  - 14000
+  - 14002
+  l4_classes:
+  - tcp
+  - udp
+  faithfulness: D5.1_dynamic
+  checksum_strict: true
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8
+description: |
+  Implement a stateful NAT64 translator on a single switch s1 (RFC 6146 + RFC
+  6052) that bridges IPv6-only clients to IPv4-only servers. The switch has two
+  sides: an IPv6-facing client port (s1.client) and an IPv4-facing server port
+  (s1.server). It TRANSLATES between the two IP families — the IP header that
+  egresses is a different family from the one that ingressed.
+
+  ## Public addressing
+
+    - Well-known prefix (translation target): 64:ff9b::/96 (RFC 6052).
+    - Served IPv6 client subnet:              2001:db8:64::/64.
+    - Single public IPv4 source address:      203.0.113.10.
+
+  ## Dynamic public-port allocation
+
+  There is NO pre-installed binding table. Bindings are created in the data plane
+  on demand. The public side has a FINITE pool of exactly THREE allocatable IPv4
+  L4 ports on 203.0.113.10: ports 14000, 14001, and 14002. When a new IPv6 client
+  flow needs translating, the switch allocates one free public port from that pool
+  to the flow and remembers the mapping; the return traffic is reversed by that
+  remembered mapping. A flow is identified by its (IPv6 source address, L4 source
+  port, protocol) triple.
+
+  Allocation is deterministic: a new flow is always assigned the LOWEST-NUMBERED
+  free port in the pool. So the first new flow gets 14000, the next distinct new
+  flow gets 14001, the third gets 14002; once all three are in use the pool is
+  exhausted. (A port returns to the pool only if its flow's binding is removed,
+  which does not happen within a test here.)
+
+  ## Required behaviour
+
+  ### IPv6 -> IPv4 (a packet arriving on s1.client)
+
+  A packet is a translation candidate when its IPv6 source is in 2001:db8:64::/64
+  and its IPv6 destination is in 64:ff9b::/96.
+
+    - If the flow (IPv6 source, L4 source port, protocol) already has an allocated
+      public port, reuse it. Otherwise, if a public port is still free in the pool,
+      allocate one to this flow.
+    - On a hit or a fresh allocation the switch EMITS AN IPv4 PACKET (the IPv6
+      header is replaced by an IPv4 header) out s1.server:
+        - IPv4 destination = the 32-bit IPv4 address embedded in the low 32 bits of
+          the IPv6 destination (RFC 6052 /96, e.g. 64:ff9b::203.0.113.9 ->
+          203.0.113.9).
+        - IPv4 source = 203.0.113.10.
+        - L4 source port = the public port allocated to this flow.
+        - IPv4 TTL = the incoming IPv6 Hop Limit minus one.
+        - A valid IPv4 header checksum is computed (IPv6 has no header checksum to
+          carry over) and the L4 (TCP/UDP) checksum is recomputed.
+        - The L4 destination port and payload are unchanged.
+    - If the flow has no allocated port AND the public pool is EXHAUSTED (all three
+      ports are already in use by other live flows), the packet is dropped — there
+      is no public transport left to allocate.
+
+  A v6 packet that is not a translation candidate — IPv6 destination outside
+  64:ff9b::/96, or IPv6 source outside 2001:db8:64::/64 — is dropped.
+
+  ### IPv4 -> IPv6 (a packet arriving on s1.server)
+
+  An inbound IPv4 packet whose destination is 203.0.113.10 and whose (203.0.113.10,
+  L4 destination port, protocol) matches an allocated flow's public port is
+  reversed. The switch EMITS AN IPv6 PACKET (the IPv4 header is replaced by an
+  IPv6 header) out s1.client:
+
+    - IPv6 destination = the original IPv6 client address of the matched flow.
+    - L4 destination port = the original IPv6 client L4 source port of that flow.
+    - IPv6 source = 64:ff9b:: with the inbound IPv4 source embedded in its low 32
+      bits (RFC 6052, e.g. IPv4 203.0.113.9 -> 64:ff9b::203.0.113.9).
+    - IPv6 Hop Limit = the incoming IPv4 TTL minus one.
+    - The L4 (TCP/UDP) checksum is recomputed; the L4 source port and payload are
+      unchanged.
+
+  An inbound IPv4 packet to any other destination, or to 203.0.113.10 on a public
+  port not currently allocated to any flow, is dropped (fail-closed).
+
+  ### General
+
+    - Only TCP and UDP are handled; any other frame (e.g. ARP, a non-IP frame) is
+      dropped.
+
+  ## Topology
+
+  One switch s1 with two hosts:
+    - h_v6 at s1.client (IPv6 side). IPv6 2001:db8:64::a, MAC 08:00:00:00:01:01.
+      s1.client MAC 08:00:00:00:01:00.
+    - h_v4 at s1.server (IPv4 side). IPv4 203.0.113.9, MAC 08:00:00:00:02:02.
+      s1.server MAC 08:00:00:00:02:00.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      client: 1
+      server: 2
+  links:
+  - from: h_v6
+    to: s1.client
+  - from: s1.server
+    to: h_v4
+hosts:
+  h_v6:
+    ip: 2001:db8:64::a
+    mac: 08:00:00:00:01:01
+    port: s1.client
+  h_v4:
+    ip: 203.0.113.9
+    mac: 08:00:00:00:02:02
+    port: s1.server
+test_cases:
+- name: dynamic_alloc_first_flow
+  visibility: public
+  description: |
+    The FIRST v6 client flow (2001:db8:64::a, UDP sport 5000) to a well-known-prefix destination 64:ff9b::203.0.113.9 has NO pre-installed binding. The data plane allocates the first free public IPv4 L4 port from the pool and EGRESSES a translated IPv4 packet out s1.server.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 63
+      IP.chksum:
+        action: checksum_valid
+      UDP.sport:
+        action: change_to
+        value: 14000
+      UDP.chksum:
+        action: checksum_valid
+- name: dynamic_alloc_second_flow_distinct_port
+  visibility: hidden
+  description: |
+    A SECOND distinct flow (same host, UDP sport 6000), after the first flow has already taken a public port, is allocated a DIFFERENT free public port (no collision) and translated. Tests v4-port uniqueness under allocation.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 40
+    - UDP:
+        sport: 6000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 39
+      IP.chksum:
+        action: checksum_valid
+      UDP.sport:
+        action: change_to
+        value: 14001
+      UDP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+- name: dynamic_alloc_third_flow_fills_pool
+  visibility: hidden
+  description: |
+    A THIRD distinct flow (host 2001:db8:64::b, TCP sport 7000) takes the LAST free public port, filling the pool. Translated and forwarded.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::b
+        dst: 64:ff9b::203.0.113.9
+        hlim: 40
+    - TCP:
+        sport: 7000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 39
+      IP.chksum:
+        action: checksum_valid
+      TCP.sport:
+        action: change_to
+        value: 14002
+      TCP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 6000
+        dport: 53
+- name: dynamic_reverse_path_after_alloc
+  visibility: hidden
+  description: |
+    The inbound IPv4 return for the FIRST dynamically-allocated flow: after the first flow allocated its public port, an inbound IPv4 UDP packet to 203.0.113.10 on that allocated port reverses back to the original IPv6 client (2001:db8:64::a, port 5000) and EGRESSES IPv6 out s1.client.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 40
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: forward
+    output_port: s1.client
+    transformations:
+      IPv6.src:
+        action: change_to
+        value: 64:ff9b::cb00:7109
+      IPv6.dst:
+        action: change_to
+        value: 2001:db8:64::a
+      IPv6.hlim:
+        action: change_to
+        value: 39
+      UDP.dport:
+        action: change_to
+        value: 5000
+      UDP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+- name: pool_exhaustion_drop
+  visibility: public
+  description: |
+    Once all THREE public ports are allocated to three live flows, a FOURTH distinct flow (host 2001:db8:64::b, UDP sport 8000) finds the pool EXHAUSTED and MUST be dropped — no public transport remains to allocate.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::b
+        dst: 64:ff9b::198.51.100.7
+        hlim: 40
+    - UDP:
+        sport: 8000
+        dport: 53
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 6000
+        dport: 53
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::b
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - TCP:
+        sport: 7000
+        dport: 80
+        flags: S
+- name: pool_exhaustion_drop_distinct_dst
+  visibility: hidden
+  description: |
+    A second pool-exhaustion check with the pool fully drained: a NEW flow to a different well-known-prefix destination is still dropped because the pool, not the destination, is the binding resource that is exhausted.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::198.51.100.7
+        hlim: 40
+    - TCP:
+        sport: 9000
+        dport: 443
+        flags: S
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 6000
+        dport: 53
+  - port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::b
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - TCP:
+        sport: 7000
+        dport: 80
+        flags: S
+- name: inbound_unallocated_port_drop
+  visibility: hidden
+  description: |
+    An inbound IPv4 packet to 203.0.113.10 on a public port that was NEVER allocated (port 14002, before any flow takes it) has no binding and MUST be dropped (fail-closed).
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 64
+    - UDP:
+        sport: 53
+        dport: 14002
+  expected:
+    behavior: drop
+- name: out_of_scope_v6_dst_drop
+  visibility: hidden
+  description: |
+    A v6 packet whose destination is a NATIVE IPv6 address (NOT in the well-known prefix) is not a translation candidate and MUST be dropped — no allocation is attempted.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 2001:db8:99::9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: v6_src_outside_client_subnet_drop
+  visibility: hidden
+  description: |
+    A v6 packet to the well-known prefix whose SOURCE is outside the served client subnet (2001:db8:99::a) MUST be dropped before any allocation.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:99::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: v4_wrong_dst_drop
+  visibility: hidden
+  description: |
+    An inbound IPv4 packet whose destination is not the public address (198.51.100.1, not 203.0.113.10) MUST be dropped — no leak of the v6 client side.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 198.51.100.1
+        ttl: 64
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: drop
+- name: non_ip_frame_drop
+  visibility: hidden
+  description: |
+    A non-IP frame (ARP) is out of scope for a NAT64 translator and MUST be dropped.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 203.0.113.10
+        psrc: 203.0.113.9
+  expected:
+    behavior: drop

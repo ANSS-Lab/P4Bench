@@ -1,0 +1,281 @@
+# P-DDoSScrubber — DDoS scrubbing edge: stateless ACL ∘ sketch heavy-hitter ∘ SYN-cookie gate
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass scrubbing data plane a DDoS-mitigation edge runs:
+# a stateless ternary ACL (P-ACL, P4) on the original 5-tuple, an in-network
+# count-min sketch heavy-hitter detector (P-SketchHeavyHitter, P9) on the
+# source IP, and a stateless SYN-cookie challenge gate (P-SYNCookieGuard, P8)
+# that originates a cookie SYN-ACK without allocating per-flow state. The
+# value of the *chained* pattern over instantiating the three apart is the
+# cross-stage ORDERING and the data dependence between stages — invisible
+# when each half is tested alone:
+#   (a) ACL-PRIORITY-OVER-BOTH — the ACL verdict keys on the ORIGINAL 5-tuple
+#       and a deny short-circuits BEFORE the sketch is updated and BEFORE the
+#       cookie decision; a blocklisted source is dropped whether or not it is
+#       heavy and whether or not it is a SYN. Neither half binds this:
+#       standalone P-ACL has no rate signal or challenge to precede; the
+#       sketch/cookie halves have no policy gate.
+#   (b) DETECT-BEFORE-CHALLENGE — the sketch increment + heavy check run on
+#       the SAME packet BEFORE the cookie decision. A new SYN from a source
+#       the sketch flags heavy is RATE-DROPPED (synflood mitigation) rather
+#       than challenged; only a non-heavy new SYN is issued a cookie. The
+#       common v1model inc-first-then-check trap promoted from a single-stage hazard to
+#       a cross-stage contract (P-SketchHeavyHitter ∘ P-SYNCookieGuard).
+#   (c) COOKIE CORRECTNESS — the challenge originates a SYN-ACK whose seq is a
+#       stable per-5-tuple cookie (cookie = hash(5tuple) & 0xffffffff), with
+#       IP src/dst and TCP sport/dport swapped and flags SYN+ACK; the inbound
+#       SYN is consumed (no connection state allocated). A validated flow
+#       (cookie-bearing ACK, or an established benign packet) is forwarded to
+#       the protected server. This is the P-SYNCookieGuard origination surface.
+
+pattern_id: P-DDoSScrubber
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D4:telemetry"
+    - "D7:security"
+  prescriptive:
+    - "P4:stateless-classification"
+    - "P8:security"
+    - "P9:telemetry"
+
+target_capability: composition   # chains a redesign (P-ACL), a scale_up (P-SketchHeavyHitter) and a scale_up/security (P-SYNCookieGuard) primitive; failure modes are cross-cutting
+
+summary: >
+  Single-pass DDoS scrubbing edge. Every IPv4 packet is (1) classified by a
+  stateless ternary ACL on its original 5-tuple — a deny (blocklisted source)
+  drops it before any detection or challenge; (2) measured by a count-min
+  sketch keyed on the source IP — the increment and heavy check run on the
+  same packet, and a source whose post-increment estimate reaches
+  heavy_threshold is flagged heavy; (3) gated by a SYN-cookie challenge — a
+  new TCP SYN to a protected server from a heavy source is rate-dropped, from
+  a non-heavy source is answered with an originated SYN-ACK whose sequence
+  number encodes the per-5-tuple cookie (cookie = hash(5tuple) & 0xffffffff,
+  swapped addresses/ports, flags SYN+ACK, reflected toward the untrusted
+  side), and a non-SYN packet carrying a valid cookie (or belonging to an
+  established flow) is forwarded to the protected server. The pipeline order
+  ACL → sketch-detect → cookie-gate and the detect-before-challenge data
+  dependence are the load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC4987
+      title: "TCP SYN Flooding Attacks and Common Mitigations"
+      sections: ["3.1", "3.6"]
+      role: SYN-cookie challenge / no-state-on-SYN semantics
+      quote: "SYN cookies go a step further and allocate no state at all for connections in SYN-RECEIVED."
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: ACL classification vocabulary (permit/deny)
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute on the forward path
+  papers:
+    - cite: "Liu et al., Jaqen: A High-Performance Switch-Native Approach for Detecting and Mitigating Volumetric DDoS Attacks, USENIX Security 2021"
+      role: switch-native sketch detection + mitigation pipeline (detect → classify → mitigate)
+    - cite: "Zhang et al., Poseidon: Mitigating Volumetric DDoS Attacks with Programmable Switches, NDSS 2020"
+      role: programmable-switch DDoS defence as a policy over a data-plane detection signal
+    - cite: "Yang et al., Elastic Sketch: Adaptive and Fast Network-wide Measurements, SIGCOMM 2018"
+      role: count-min / sketch heavy-hitter estimation under a bounded register budget
+
+entities:
+  acl_table:
+    type: bucket
+    key: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {action: "permit|deny", priority: int}
+    capacity: ${rule_count_capacity}
+    eviction: none
+    notes: stateless ternary first-match-by-priority; evaluated on the original 5-tuple, ahead of detection and challenge.
+  sketch_counters:
+    type: bucket
+    keyed_by_tuple: [sketch_row_index, sketch_column_index]
+    attrs: {count: int}
+    capacity: ${sketch_depth} × ${sketch_width}
+    notes: count-min R×W counter matrix keyed on the source IP; one inc per row per IPv4 packet, min-across-rows estimate is the heavy signal.
+  detected_heavy:
+    type: flow
+    key: [src_ip]
+    attrs: {est_count: int}
+    capacity: ${heavy_capacity}
+    notes: source IPs whose post-inc estimate has reached heavy_threshold in the current epoch; consumed by the cookie gate to rate-drop new SYNs.
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM forwarding table for validated/benign traffic toward the protected servers.
+
+parameters:
+  protected_subnet:     {type: cidr,   default: "10.0.2.0/24"}
+  untrusted_subnet:     {type: cidr,   default: "10.0.1.0/24"}
+  acl_rules:            {type: list,   default: []}
+  rule_count_capacity:  {type: int,    default: 256}
+  match_field_breadth:  {type: enum,   values: [dst_only, tuple3, tuple5], default: tuple5}
+  priority_depth:       {type: int,    default: 16}
+  default_acl_action:   {type: enum,   values: [permit, deny], default: permit}
+  sketch_depth:         {type: int,    default: 2,    constraint: "sketch_depth >= 2"}
+  sketch_width:         {type: int,    default: 64,   constraint: "sketch_width is a power of two"}
+  counter_width_bits:   {type: int,    default: 32}
+  heavy_threshold:      {type: int,    default: 8,    constraint: "heavy_threshold >= 1"}
+  heavy_capacity:       {type: int,    default: 256}
+  epoch_packets:        {type: int,    default: 4096}
+  cookie_secret:        {type: int,    default: 0}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [acl_detect_cookie], default: acl_detect_cookie}
+  untrusted_port:       {type: int,    default: 1}
+  protected_port:       {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no classifiable / measurable / challengeable header.
+
+  - id: R1_acl_classify
+    when: "header_present(IPv4)"
+    given: {match: "acl_table on original 5-tuple by descending priority"}
+    then: ["drop(pkt) if matched action == deny or (miss and default_acl_action == deny)"]
+    notes: stateless classification on the ORIGINAL tuple; the deny path short-circuits before the sketch is updated and before the cookie decision (acl_priority_over_both).
+
+  - id: R2_sketch_detect
+    when: "header_present(IPv4) and not denied"
+    given: {match: "sketch_counters by hash(src_ip) over sketch_depth rows"}
+    then:
+      - "inc(sketch_counters[h(src_ip)]) on every row"
+      - "heavy(src_ip) := (min-across-rows estimate >= heavy_threshold)"
+      - "bind(detected_heavy, src_ip) if heavy(src_ip)"
+    notes: count-min update + heavy check on the SAME packet, BEFORE the cookie decision (detect_before_challenge); the crossing packet itself is heavy (post-inc estimate).
+
+  - id: R3_heavy_synflood_drop
+    when: "not denied and TCP SYN (and not ACK) to a protected server and heavy(src_ip)"
+    then: ["drop(pkt)"]
+    notes: a new SYN from a sketch-flagged heavy source is rate-dropped (synflood mitigation) BEFORE being challenged — detection wins over the challenge.
+
+  - id: R4_syn_cookie_challenge
+    when: "not denied and TCP SYN (and not ACK) to a protected server and not heavy(src_ip) and no established flow"
+    then:
+      - "cookie := hash(5tuple) & 0xffffffff"
+      - "emit(SYN-ACK on ingress untrusted_port: swap IP.src/dst, swap L4.sport/dport, flags := SYN+ACK, seq := cookie, ack := orig_seq + 1)"
+      - "consume(pkt) -- the inbound SYN allocates NO per-flow state"
+    notes: the origination surface; the SYN-ACK is built fresh and reflected toward the untrusted side, no connection state is bound (RFC 4987 §3.6 no-state-on-SYN).
+
+  - id: R5_validated_or_benign_forward
+    when: "not denied and a non-SYN TCP carrying a valid cookie, or an established / benign packet to a protected server"
+    given: {match: "fib LPM on IP.dst"}
+    then:
+      - "drop(pkt) if no LPM match or IP.ttl == 0"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, protected_port)"
+    notes: a cookie-validated ACK (ack-1 == cookie(5tuple)) or an established benign packet is forwarded to the protected server; one checksum recompute covers the TTL decrement.
+
+invariants:
+  - id: acl_priority_over_both
+    clause: stability
+    target: "a denied flow updates no sketch counter and is never challenged"
+    notes: the ACL verdict is computed on the original tuple and a deny short-circuits before R2/R3/R4.
+  - id: detect_before_challenge
+    clause: stability
+    target: "the sketch inc + heavy check precede the cookie decision on the same packet"
+    notes: a heavy source's new SYN is rate-dropped (R3) before R4 can challenge it; the post-inc estimate is what the heavy check reads.
+  - id: cookie_correctness
+    clause: stability
+    target: "the originated SYN-ACK seq encodes cookie = hash(5tuple) & 0xffffffff and a returning ACK validates iff ack-1 == that cookie"
+    notes: the cookie binds all 5-tuple fields; a constant or partial-key cookie is rejected.
+  - id: no_state_on_unvalidated_syn
+    clause: persistence
+    target: "a challenged SYN allocates no per-flow connection state"
+    notes: RFC 4987 §3.6 — only a validated ACK pins a flow; the SYN path is stateless.
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases on the forward path; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: benign_validated_forward
+      generate: "a non-heavy validated/benign packet to a protected server is forwarded out the protected port, TTL-1, Ether.dst rewritten"
+    - id: syn_cookie_challenge
+      generate: "a new TCP SYN from a non-heavy untrusted source to a protected server is answered with an originated SYN-ACK (swapped addresses/ports, flags SA, seq == cookie) reflected to the untrusted side; the SYN is consumed"
+    - id: acl_deny_drop
+      generate: "a packet from a blocklisted source matching an ACL deny rule is dropped before detection or challenge"
+  G2:
+    - id: heavy_synflood_drop
+      generate: "a source driven over heavy_threshold then sending a new SYN is rate-dropped (not challenged) — detect_before_challenge"
+    - id: below_threshold_challenged
+      generate: "a source just below heavy_threshold sending a new SYN is still challenged (the boundary just-under case)"
+    - id: non_ipv4_drop
+      generate: "a non-IPv4 frame (ARP) is dropped before classification"
+  G3:
+    - id: deny_short_circuits_detection
+      generate: "a blocklisted heavy SYN source is dropped by the ACL — the deny wins over both the rate-drop and the challenge (acl_priority_over_both)"
+    - id: cookie_binds_all_fields
+      generate: "two SYNs differing only in sport produce different cookies; a cookie minted for one 5-tuple does not validate an ACK on another (cookie_correctness)"
+    - id: crossing_packet_is_heavy
+      generate: "the packet whose post-inc estimate first reaches heavy_threshold is itself treated as heavy (post-inc, not pre-inc, read)"
+  coverage_floor: {G1: 3, G2: 1, G3: 2}
+
+mutation_operators:
+  - id: flip_default_to_deny
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "${default_acl_action}: permit -> deny (only explicit permits pass the ACL gate)"
+    feasibility_postcondition: "at least one explicit permit rule exists"
+  - id: lower_heavy_threshold_2x
+    direction: harden
+    kind: parameter
+    axis: detection_sensitivity
+    effect: "${heavy_threshold} /= 2 (more sources flagged heavy; more new SYNs rate-dropped before challenge)"
+    feasibility_postcondition: "heavy_threshold >= 1"
+  - id: shrink_sketch_width_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "sketch_width /= 4 (more hash collisions; the min-across-rows estimator must still clip an innocent single-row collision)"
+    feasibility_postcondition: "sketch_width >= 8 and remains a power of two"
+  - id: expand_match_field_breadth
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "match_field_breadth: dst_only -> tuple5 (full 5-tuple ACL matching)"
+  - id: disable_acl
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "${acl_rules}: [] and ${default_acl_action}: permit (the ACL stage is a pass-through; detect + cookie only)"
+  - id: raise_heavy_threshold_2x
+    direction: ease
+    kind: parameter
+    axis: detection_sensitivity
+    effect: "${heavy_threshold} *= 2 (fewer sources flagged heavy; almost every new SYN is challenged rather than rate-dropped)"
+    feasibility_postcondition: "heavy_threshold <= 1000000"
+
+bridging_notes: |
+  - The ACL is stateless first-match by descending priority on the ORIGINAL
+    5-tuple. A miss falls through to default_acl_action. A deny short-circuits
+    before the sketch is touched and before the cookie decision.
+  - The sketch is a count-min R×W matrix keyed on the source IP. Each IPv4
+    packet that survives the ACL increments one cell per row (sketch_depth
+    rows), and the heavy signal is min-across-rows >= heavy_threshold on the
+    POST-increment estimate, so the crossing packet is itself heavy.
+  - The cookie is cookie = hash(5tuple) & 0xffffffff over (src, dst, proto,
+    sport, dport). The challenge originates a SYN-ACK reflected to the ingress
+    untrusted_port with IP.src/dst swapped, L4.sport/dport swapped, flags
+    SYN+ACK, seq == cookie, ack == orig_seq + 1; the inbound SYN is consumed
+    with NO per-flow state allocated.
+  - Heavy gating wins over the challenge: a heavy source's new SYN is
+    rate-dropped (R3) before R4 can mint a cookie. The ACL wins over both.
+  - A validated ACK (ack-1 == cookie(5tuple)) or an established benign packet
+    is L3-forwarded to the protected server (protected_port) with one TTL
+    decrement and one checksum recompute.
+  - NOTE on the harness vantage: the originated SYN-ACK leaves via the INGRESS
+    (untrusted) port, which the evaluation engine excludes from observed
+    output (engine.py excludes p == input_port). The oracle models the
+    challenge as admitted=true / output_port=untrusted_port (the true
+    behaviour); the test generator translates that ingress-port emission to a
+    `drop` expectation in task.yaml because the harness cannot observe a packet
+    on the ingress port — exactly the P-SYNCookieGuard disc convention.

@@ -1,0 +1,874 @@
+task_name: stateful_l4_lb_bounded_v2
+task_type: full_program
+complexity: high
+source: synthesis
+pattern: P-StatefulLB-v2
+pattern_version: '1.0'
+seed:
+  vip: 10.0.100.1
+  backends:
+  - 10.0.2.10
+  - 10.0.2.20
+  - 10.0.2.30
+  - 10.0.2.40
+  assign: hash_5tuple
+  flow_table_capacity: 1024
+  eviction_policy: FIFO_collision_displace
+  faithfulness: D5.0_exact
+  persistence_strict: false
+  observe_bind: clone_to_monitor
+failure_modes:
+- monitor_copy_emitted_on_every_packet
+- monitor_copy_omitted_on_new_flow_admission
+- collision_treated_as_hit_without_identity_check
+- displacement_silently_drops_evictee_instead_of_treating_as_new
+- evicted_flow_resend_does_not_re_emit_monitor
+- ether_dst_not_rewritten_on_monitor_copy
+- monitor_copy_carries_pre_rewrite_ip_dst
+description: "A switch s1 fronts a single virtual service address (VIP) with four\nback-end servers, distributing\
+  \ TCP connections across them and\npreserving the connection-to-server binding for the life of each\n\
+  connection within a bounded amount of per-connection state. In\naddition, the switch emits an observability\
+  \ copy on a dedicated\nmonitor connection point every time a NEW connection is admitted, so\nthat an\
+  \ out-of-band auditor can record the binding decision.\n\n## Topology and roles\n\n  - s1.p1 — client-facing\
+  \ connection point.\n  - s1.p2 — connection point facing back-end B0\n            (10.0.2.10, hardware\
+  \ 08:00:00:00:02:01).\n  - s1.p3 — connection point facing back-end B1\n            (10.0.2.20, hardware\
+  \ 08:00:00:00:02:02).\n  - s1.p4 — connection point facing back-end B2\n            (10.0.2.30, hardware\
+  \ 08:00:00:00:02:03).\n  - s1.p5 — connection point facing back-end B3\n            (10.0.2.40, hardware\
+  \ 08:00:00:00:02:04).\n  - s1.p6 — monitor connection point\n            (08:00:00:00:06:01).\n  - The\
+  \ advertised service address is 10.0.100.1; no host owns it.\n  - The switch's own hardware address\
+  \ is 08:00:00:00:00:01.\n\n## Eligibility\n\nA frame is eligible for admission only when ALL of the\
+  \ following\nhold, in this short-circuited order:\n\n  1. The frame is an IPv4 datagram.\n  2. The IPv4\
+  \ destination address equals the service address\n     (10.0.100.1).\n  3. The IPv4 payload is TCP.\n\
+  \nAny frame that fails any of these (ARP, non-VIP IPv4, UDP-to-VIP,\nICMP-to-VIP, etc.) MUST be discarded\
+  \ with no output on any port,\nincluding the monitor port, and MUST NOT alter any internal state.\n\n\
+  ## Connection identity\n\nTwo TCP packets belong to the SAME connection if and only if they\nagree on\
+  \ the 5-tuple\n(IPv4.src, IPv4.dst, TCP.sport, TCP.dport, IPv4.proto). Any\ndifference in any component\
+  \ yields a different connection.\n\n## Per-connection slot and backend selection\n\nCompute, for every\
+  \ eligible packet, a 32-bit identity word formed\nby:\n\n    ident = ipv4.src\n            XOR ipv4.dst\n\
+  \            XOR ((tcp.sport << 16) | tcp.dport)\n            XOR ipv4.proto\n\nusing bitwise XOR over\
+  \ 32-bit words (the IPv4 protocol number is\nzero-extended to 32 bits). From `ident`, derive two independent\n\
+  quantities:\n\n    slot         = (ident >> 2) AND 0x3FF       // 10 bits, 0..1023\n    backend_idx\
+  \  =  ident        AND 0x3        // 2 bits,  0..3\n\nThe bit-disjoint layout (slot uses bits 2..11;\
+  \ backend_idx uses bits\n0..1) is part of the contract; two distinct connections may share a\nslot while\
+  \ differing in backend_idx, and conversely.\n\nBackend mapping is fixed:\n\n    backend_idx == 0  →\
+  \  B0 (10.0.2.10, 08:00:00:00:02:01, port s1.p2)\n    backend_idx == 1  →  B1 (10.0.2.20, 08:00:00:00:02:02,\
+  \ port s1.p3)\n    backend_idx == 2  →  B2 (10.0.2.30, 08:00:00:00:02:03, port s1.p4)\n    backend_idx\
+  \ == 3  →  B3 (10.0.2.40, 08:00:00:00:02:04, port s1.p5)\n\n## Per-connection state — bounded, single-binding-per-slot\n\
+  \nThe switch maintains EXACTLY 1024 binding slots, indexed 0..1023.\nEach slot is either empty or holds\
+  \ exactly one connection's binding:\nthe connection's identity (sufficient to test 5-tuple equality\n\
+  against an arriving connection) and the connection's backend_idx.\n\nAt power-on every slot is empty.\n\
+  \n## Admission\n\nFor each eligible packet, with `slot` and `backend_idx` computed as\nabove:\n\n  A.\
+  \ If `slot` is empty:\n       Install: mark `slot` occupied with the arriving connection's\n       identity\
+  \ and `backend_idx`. This is a NEW-CONNECTION\n       admission. The packet is forwarded to backend\
+  \ B[backend_idx]\n       (see \"Forwarding\" below), and EXACTLY one observability copy\n       is emitted\
+  \ on s1.p6 (see \"Observability\" below).\n\n  B. If `slot` is occupied AND its stored identity equals\
+  \ the\n     arriving connection's identity:\n       Use the stored binding. This is an ESTABLISHED-CONNECTION\n\
+  \       packet. The packet is forwarded to its bound back-end. NO\n       observability copy is emitted.\
+  \ Internal state is unchanged.\n\n  C. If `slot` is occupied AND its stored identity DIFFERS from the\n\
+  \     arriving connection's:\n       Displace the resident: overwrite the slot's stored identity\n \
+  \      and backend_idx with the arriving connection's values. This\n       is a NEW-CONNECTION admission.\
+  \ The packet is forwarded to\n       B[backend_idx for the arriving connection] (computed from the\n\
+  \       arriving connection's `ident`, not the displaced resident's),\n       and EXACTLY one observability\
+  \ copy is emitted on s1.p6.\n\nAfter displacement at slot K, the displaced connection's identity\nis\
+  \ GONE. The displaced connection's next arriving packet — should\none arrive — falls into case A or\
+  \ C of admission for THAT slot, and\nis therefore a NEW-CONNECTION admission again. Its `backend_idx`\n\
+  derives anew from its `ident` and may equal or differ from its\noriginal binding.\n\nTwo independence\
+  \ properties follow and are probed by the test suite:\n\n  (i)   A displacement at slot K MUST NOT perturb\
+  \ any slot J ≠ K.\n  (ii)  As long as no two admitted connections share a slot, every\n        admitted\
+  \ connection remains bound to its originally-assigned\n        back-end across replays.\n\n## Forwarding\n\
+  \nOn admission of any eligible packet (cases A, B, or C, after any\nstate update), the switch emits\
+  \ ONE data output packet at the bound\nback-end's connection point. This packet is the received frame\
+  \ with\nthe following modifications:\n\n  - The Ethernet destination address is replaced by the bound\n\
+  \    back-end's hardware address.\n  - The Ethernet source address is replaced by the switch's hardware\n\
+  \    address (08:00:00:00:00:01).\n  - The IPv4 destination address is replaced by the bound back-end's\n\
+  \    address.\n  - The IPv4 hop count is exactly one less than on ingress, and the\n    datagram remains\
+  \ a well-formed IPv4 packet that an unmodified\n    downstream receiver would accept.\n  - All other\
+  \ fields of the frame are byte-identical to the received\n    packet (including the IPv4 source address,\
+  \ the TCP source and\n    destination ports, the TCP flags, and any TCP payload).\n\n## Observability\
+  \ — NEW-connection admissions only\n\nEXCLUSIVELY when the admission is a new-connection admission (case\n\
+  A or case C — never case B), the switch emits a SECOND output\npacket on the monitor connection point\
+  \ s1.p6. This monitor packet\nis BYTE-IDENTICAL to the data output packet described in\n\"Forwarding\"\
+  \ above (same backend-rewritten Ethernet/IP headers,\nsame TTL-decremented IPv4, same TCP payload).\
+  \ The only difference\nbetween the data output and the monitor output is the egress port\non which they\
+  \ are observed.\n\nNo observability copy is emitted for ESTABLISHED-connection packets\n(case B), and\
+  \ no observability copy is emitted for discarded\nframes.\n\n## Notes\n\nDiscarded packets produce NO\
+  \ output on any port (including the\nmonitor port) and MUST NOT alter any internal state — neither slot\n\
+  occupancy nor stored bindings.\n\nNo control-plane per-flow configuration is supplied; the VIP, the\n\
+  back-end pool, the slot count, the hash, and the observability\npolicy are determined entirely by the\
+  \ switch's program and its\npower-on state. A static observability session/group binding may\nbe installed\
+  \ at start-up.\n"
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+      p6: 6
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: b0
+  - from: s1.p3
+    to: b1
+  - from: s1.p4
+    to: b2
+  - from: s1.p5
+    to: b3
+  - from: s1.p6
+    to: monitor
+  hosts:
+    client:
+      mac: 08:00:00:00:01:01
+    b0:
+      ip: 10.0.2.10
+      mac: 08:00:00:00:02:01
+    b1:
+      ip: 10.0.2.20
+      mac: 08:00:00:00:02:02
+    b2:
+      ip: 10.0.2.30
+      mac: 08:00:00:00:02:03
+    b3:
+      ip: 10.0.2.40
+      mac: 08:00:00:00:02:04
+    monitor:
+      mac: 08:00:00:00:06:01
+test_cases:
+- name: new_flow_emits_data_and_monitor
+  visibility: public
+  description: 'Fresh switch. First TCP packet of a new connection (FLOW_A:
+
+    10.0.0.1:12345 → 10.0.100.1:80) admits; its ident = 0x30396456,
+
+    slot 277, backend_idx 2 → B2. The data packet is forwarded on
+
+    s1.p4 and a byte-identical observability copy is emitted on s1.p6.
+
+    '
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p4
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: established_flow_resend_no_monitor
+  visibility: public
+  description: 'FLOW_A admitted as warm-up. Resending the same 5-tuple is an
+
+    established-connection packet (case B) — it forwards to B2 on
+
+    s1.p4 but emits NO observability copy.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: A
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p4
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: bucket_collision_displaces_resident
+  visibility: public
+  description: 'FLOW_A (slot 277, B2) admitted as warm-up. FLOW_E
+
+    (10.0.0.2:12345 → 10.0.100.1:80, ident 0x30396455) hashes to the
+
+    SAME slot 277 but backend_idx 1 → B1. It is a different
+
+    connection identity, so case C fires: FLOW_A''s binding is
+
+    displaced, FLOW_E is installed, the packet forwards to B1 on
+
+    s1.p3 and an observability copy is emitted on s1.p6.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: non_tcp_to_vip_dropped
+  visibility: public
+  description: An ICMP echo request to the VIP fails the TCP-only eligibility check and must be dropped
+    — no data output, no monitor output, no state change.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: distinct_flow_lands_on_b0_with_monitor
+  visibility: hidden
+  description: 'FLOW_C (10.0.0.3:11000 → 10.0.100.1:8080) has ident 0x2AF87B94 →
+
+    slot 741, backend_idx 0 → B0. As a fresh new-connection
+
+    admission, it forwards on s1.p2 and emits a monitor copy on s1.p6.
+
+    '
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: same_flow_third_packet_no_monitor
+  visibility: hidden
+  description: 'FLOW_C admitted, then a second identical FLOW_C packet (still
+
+    case B). The third packet of FLOW_C is also case B — forwards on
+
+    s1.p2, NO monitor copy. Confirms case B does not re-emit the
+
+    observability event on every packet.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: A
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: A
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: evicted_flow_resend_is_new_flow_with_monitor
+  visibility: hidden
+  description: 'FLOW_A admitted (slot 277, B2). FLOW_E displaces FLOW_A at slot
+
+    277 (case C). Now FLOW_A returns: slot 277 holds FLOW_E''s
+
+    identity, so FLOW_A is case C again — it displaces FLOW_E and
+
+    forwards to B2 with a fresh monitor copy. Probes that the
+
+    evictee''s resend is treated as new (not as established).
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: A
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p4
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: non_colliding_flows_independent
+  visibility: hidden
+  description: 'FLOW_A (slot 277) and FLOW_C (slot 485) admitted. They do not
+
+    share a slot, so neither perturbs the other. Resending FLOW_A is
+
+    case B — forwards to B2 on s1.p4, NO monitor copy. Probes
+
+    invariant (i): displacement-at-K-does-not-affect-J.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: A
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p4
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: four_distinct_slots_capacity_check
+  visibility: hidden
+  description: 'Four distinct connections at distinct slots (277, 741, 740, 366)
+
+    admitted as warm-ups, exercising backends B2, B0, B3, B1. The
+
+    test packet resends FLOW_D — case B — must forward to B3 on
+
+    s1.p5 with NO monitor copy. Confirms no spurious eviction below
+
+    capacity and that each slot independently retains its binding.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.4
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33333
+        dport: 8080
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.5
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 54321
+        dport: 443
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.4
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 33333
+        dport: 8080
+        flags: A
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p5
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.40
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:04
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: adversarial_collision_burst_three_displacements
+  visibility: hidden
+  description: 'Three same-slot connections engineered to collide at slot 277
+
+    with distinct backend_idx values: FLOW_A (B2) admitted, FLOW_E
+
+    (B1) displaces FLOW_A, then test packet FLOW_G
+
+    (10.0.0.3:12345 → 10.0.100.1:80, ident 0x30396454, slot 277,
+
+    B0) displaces FLOW_E. Expects forward on s1.p2 + monitor on
+
+    s1.p6, asserting the burst yields a clean displacement chain
+
+    rather than collapsing to a single resident or aliasing
+
+    backends.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: fourth_distinct_admission_uses_b1
+  visibility: hidden
+  description: 'Three distinct new-connection admissions at three distinct
+
+    slots use backends B2, B0, B3. The fourth distinct admission
+
+    (FLOW_F, slot 366, B1) must forward on s1.p3 + emit monitor on
+
+    s1.p6. Confirms all four backends are reachable through the
+
+    hash and confirms a fresh new-flow admission still triggers
+
+    monitor after several prior admissions.
+
+    '
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 11000
+        dport: 8080
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.4
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33333
+        dport: 8080
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.5
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 54321
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p6
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: tcp_to_non_vip_dropped
+  visibility: hidden
+  description: A TCP SYN to a non-VIP IPv4 destination (10.0.99.99) fails the VIP-match eligibility check
+    and must be dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.99.99
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 12345
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: arp_request_dropped
+  visibility: hidden
+  description: An ARP request (non-IPv4) on the client port must be dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.0.1
+        pdst: 10.0.100.1
+        hwsrc: 08:00:00:00:01:01
+        hwdst: 00:00:00:00:00:00
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

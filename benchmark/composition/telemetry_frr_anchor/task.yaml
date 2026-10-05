@@ -1,0 +1,512 @@
+task_name: telemetry_frr_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-TelemetryFRR
+pattern_version: '1.0'
+seed:
+  fib_capacity: 1024
+  primary_port: 2
+  backup_port: 3
+  primary_initial_state: up
+  reroute_policy: backup_on_down
+  liveness_capacity: 256
+  maintenance_proto: 253
+  switch_id: 1
+  telemetry_field_width: 16
+  pipeline_order: demux_stamp_forward
+  ingress_port: 1
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: ingress
+    to: s1.p1
+  - from: s1.p2
+    to: primary
+  - from: s1.p3
+    to: backup
+hosts:
+  ingress:
+    note: ingress traffic + maintenance frames on s1.p1
+  primary:
+    note: primary egress next hop (NH-A/NH-B) on s1.p2
+  backup:
+    note: fast-reroute backup egress on s1.p3
+description: |-
+  Implement a telemetry-stamping router with fast reroute for BMv2 (v1model)
+  that forwards IPv4 traffic, survives a next-hop failure by diverting to a
+  backup path, and records the path it actually took into the packet — all in a
+  single pass.
+
+  Topology: port 1 is the ingress; port 2 is the primary egress; port 3 is the
+  backup egress.
+
+  Forwarding table. Route only the two destination prefixes below; every other
+  IPv4 destination has no known route. Each route names a next hop with a fixed
+  next-hop MAC (the new Ethernet destination written on forward):
+
+    | destination prefix | next hop | next-hop MAC        |
+    |---------------------|----------|---------------------|
+    | 198.51.100.0/24     | NH-A     | 08:00:00:00:02:02   |
+    | 203.0.113.0/24      | NH-B     | 08:00:00:00:03:03   |
+
+  Both next hops share the primary egress (port 2) when reachable and the backup
+  egress (port 3) on failover. The control plane (table entries) is yours to
+  author from this table.
+
+  Required behaviour, per IPv4 packet:
+
+  - Reachability maintenance. A maintenance frame addressed to a next hop tells
+    the router that next hop is no longer reachable. Such a frame is not
+    forwarded; it only updates the router's view of which next hops are up. A
+    next hop is reachable until a maintenance frame says otherwise. (A
+    maintenance frame is an IPv4 packet carrying protocol number 253.) Marking
+    one next hop unreachable does not affect any other next hop.
+
+  - Forwarding with failover. An ordinary packet is forwarded toward its
+    destination: it leaves on the port toward the next hop for that destination,
+    with its hop count decremented and its L2/L3 integrity preserved. If the next
+    hop for the destination is currently reachable, the packet takes the primary
+    path (port 2); if that next hop has been marked unreachable, the packet takes
+    the backup path instead (port 3). A packet with no known route is dropped.
+    A packet whose hop count is already 0 on arrival is dropped (expired);
+    otherwise the hop count is decremented exactly once, so a packet arriving
+    with hop count 1 is forwarded with an outgoing hop count of 0.
+
+  - Telemetry. Every forwarded packet carries a record of the egress it actually
+    left on, written into its 16-bit identification field. This record must
+    reflect the real path: a packet that failed over to the backup carries the
+    backup egress, not the primary the route nominally names.
+
+  Both the P4 program and its table entries are yours to author. The router must
+  behave correctly across a maintenance-then-traffic exchange: the same
+  destination is delivered over the primary path until a maintenance frame marks
+  its next hop unreachable, after which it is delivered over the backup path and
+  its telemetry record changes accordingly. A single checksum recompute must
+  cover both the telemetry write and the hop-count decrement.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: forward_primary_stamped
+  visibility: public
+  goal_class: G1
+  description: An ordinary IPv4 packet to a routed destination, with its next hop reachable, leaves on the primary egress (port 2). The 16-bit identification field is stamped with the actual egress port (2), the hop count is decremented once, and the L2 destination is rewritten to the next hop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: forward_backup_stamped
+  visibility: public
+  goal_class: G1
+  description: After a maintenance frame has marked the destination's next hop unreachable, the SAME destination fails over to the backup egress (port 3). The identification field is stamped with the backup egress (3) — the real path — not the primary the route nominally names.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 3
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 253
+- name: liveness_update_consumed
+  visibility: public
+  goal_class: G1
+  description: 'A maintenance frame (protocol 253) addressed to a next hop is consumed: it is not forwarded, it only updates reachability state.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 253
+  expected:
+    behavior: drop
+- name: no_lpm_drop
+  visibility: hidden
+  goal_class: G2
+  description: An IPv4 packet to a destination with no matching route is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 192.0.2.250
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: ttl_zero_drop
+  visibility: hidden
+  goal_class: G2
+  description: An IPv4 packet that arrives with an expired hop count (ttl==0) is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 0
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A packet with ttl==1 is forwarded out the primary egress with egress ttl==0 (the hop count is decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 1
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: liveness_isolated_per_nexthop
+  visibility: hidden
+  goal_class: G2
+  description: Marking one next hop unreachable does not divert traffic to a different routed destination whose next hop is still reachable — the second route still takes its primary egress (2).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 203.0.113.5
+        ttl: 64
+        id: 0
+        proto: 253
+- name: stamp_matches_backup_not_primary
+  visibility: hidden
+  goal_class: G3
+  description: A packet that failed over carries the backup egress (3) in its identification field — proving the telemetry stamp ran AFTER and observed the reroute decision, not the primary (2) the route names. The egress port and the stamped value agree.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 3
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 253
+- name: second_route_primary_stamped
+  visibility: hidden
+  goal_class: G3
+  description: A second routed destination (203.0.113.5, next hop NH-B) with its next hop reachable leaves on the primary egress (2) and is stamped with 2; the next-hop MAC matches NH-B.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 203.0.113.5
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: stamp_overwrites_input_id
+  visibility: hidden
+  goal_class: G3
+  description: An incoming packet whose identification field is preset to a nonzero value has that value OVERWRITTEN by the telemetry stamp (the egress port), not preserved — the stamp is authoritative.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 4321
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: checksum_after_stamp_and_ttl
+  visibility: hidden
+  goal_class: G3
+  description: A forwarded packet has a valid IPv4 checksum recomputed over BOTH the telemetry stamp (identification field) and the hop-count decrement — a single recompute covers both mutations.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        id: 0
+        proto: 6
+    - TCP:
+        sport: 7000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.id:
+        action: change_to
+        value: 2
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before routing.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 198.51.100.9
+  expected:
+    behavior: drop

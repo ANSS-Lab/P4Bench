@@ -1,0 +1,528 @@
+task_name: lb_fw_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-LoadBalancedFW
+pattern_version: '1.0'
+seed:
+  conntrack_capacity: 256
+  conntrack_eviction: none
+  syn_opens_only: true
+  service_vip: 10.0.9.9
+  backend_pool:
+  - 10.0.2.11
+  - 10.0.2.12
+  - 10.0.2.13
+  backend_pool_size: 3
+  client_subnet: 10.0.1.0/24
+  backend_subnet: 10.0.2.0/24
+  fib_capacity: 1024
+  pipeline_order: fw_lb_route
+  client_port: 1
+  backend_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: backend
+hosts:
+  client:
+    note: clients in 10.0.1.0/24; ingress on s1.p1
+  backend:
+    note: backend pool 10.0.2.11-13 in 10.0.2.0/24; ingress on s1.p2; service VIP 10.0.9.9
+description: |-
+  Implement a load-balanced service front-end for BMv2 (v1model) that screens
+  connections, distributes them across a pool of backend servers, and forwards
+  IPv4 traffic — all in a single pass.
+
+  Topology: port 1 faces the client side (clients in 10.0.1.0/24); port 2 faces
+  the backend side (servers in 10.0.2.0/24). Clients reach the service through a
+  single published address, the virtual IP 10.0.9.9; behind it sits a pool of
+  interchangeable backend servers in 10.0.2.0/24.
+
+  Required behaviour, per IPv4 packet:
+
+  - Connection screening. Traffic is admitted only if it belongs to a connection
+    a client legitimately opened. A client opens a connection by initiating it in
+    the normal way; a client-side packet that neither belongs to an open
+    connection nor opens one is dropped and leaves no trace.
+
+  - Load balancing. A client's connection to the service address is assigned to
+    one of the backend servers by a fixed rule: take the connection's source IP,
+    destination IP, protocol number, source port and destination port each as an
+    integer, sum them, and reduce modulo the number of backends (3); the result
+    indexes the backend pool in the fixed order [10.0.2.11, 10.0.2.12, 10.0.2.13].
+    The connection then stays with that backend for its entire life — every packet
+    of the connection reaches the same server (the destination is rewritten to
+    that server). A reply coming back from a backend that belongs to a tracked
+    connection is rewritten so the client sees the reply as coming from the
+    service address, never from the individual backend; a reply that corresponds
+    to no tracked connection is dropped.
+
+  - Forwarding. A packet that survives screening and load balancing is delivered
+    toward its (rewritten) destination: it leaves on the correct port toward the
+    correct next hop, with its hop count decremented and its L2/L3 integrity
+    preserved. A packet with an expired hop count, or with no known route, is
+    dropped.
+
+  Both the P4 program and its table entries are yours to author. The service must
+  behave correctly across the full request/reply exchange: a client's connection
+  is consistently served by one backend, and a backend's reply reaches the client
+  only if the client first opened the connection.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: new_flow_pinned_forward
+  visibility: public
+  goal_class: G1
+  description: 'A new client connection to the service address (10.0.1.10:40000 -> 10.0.9.9:80, a TCP SYN) is admitted, assigned to a backend server, and routed out the backend-side port: IP.dst becomes the chosen backend, TTL is decremented, and Ether.dst is rewritten to the backend next hop. The source is unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+- name: established_flow_reuse
+  visibility: public
+  goal_class: G1
+  description: 'The next packet of an already-open connection (10.0.1.10:40000 -> 10.0.9.9:80) reaches the SAME backend it was first assigned to: IP.dst is rewritten to that same backend, TTL-1, Ether.dst to the backend next hop.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+- name: backend_return_forward
+  visibility: public
+  goal_class: G1
+  description: 'The reply from the assigned backend for the open connection (10.0.2.12:80 -> 10.0.1.10:40000) is rewritten so its source becomes the service address 10.0.9.9, then routed to the client-side port: IP.src becomes the VIP, TTL-1, Ether.dst to the client next hop. The destination is unchanged.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.1.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 40000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: change_to
+        value: 10.0.9.9
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+- name: nonsyn_no_conntrack_drop
+  visibility: hidden
+  goal_class: G2
+  description: A client packet that belongs to no open connection and does not open one (a non-SYN to the service address with no prior SYN) is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: A
+  expected:
+    behavior: drop
+- name: untracked_return_drop
+  visibility: hidden
+  goal_class: G2
+  description: A backend->client packet that corresponds to no tracked connection is dropped.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.1.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 40000
+        flags: A
+  expected:
+    behavior: drop
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A new client connection with ttl==1 is forwarded with egress ttl==0 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.9.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.2.13
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+- name: ttl_zero_drop
+  visibility: hidden
+  goal_class: G2
+  description: A new client connection with ttl==0 is dropped (the hop count is already expired).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.12
+        dst: 10.0.9.9
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: sticky_across_packets
+  visibility: hidden
+  goal_class: G3
+  description: A third packet of an open connection still reaches the same backend assigned on the connection's first packet — the assignment is sticky across the connection's lifetime, not recomputed per packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: A
+- name: distinct_flow_distinct_pin
+  visibility: hidden
+  goal_class: G3
+  description: A different client connection (10.0.1.11:40000 -> 10.0.9.9) is assigned to a DIFFERENT backend than 10.0.1.10's connection, so the two flows remain demultiplexable; this SYN is admitted and routed to the backend side.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.2.13
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+- name: admit_before_pin_no_orphan
+  visibility: hidden
+  goal_class: G3
+  description: A client non-SYN that is dropped by the screening stage creates no backend assignment, so a backend reply for that same 5-tuple later arrives with no tracked connection and is dropped — the screening drop short-circuits before the load-balancing stage.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.1.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 40000
+        flags: A
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: A
+- name: return_only_after_open
+  visibility: hidden
+  goal_class: G3
+  description: Once the client has opened the connection, the assigned backend's reply is reverse-mapped (source restored to the service address) and routed to the client port — the return path exists only because the matching forward connection was opened first.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.1.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 40000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: change_to
+        value: 10.0.9.9
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before connection screening.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.10
+        pdst: 10.0.9.9
+  expected:
+    behavior: drop

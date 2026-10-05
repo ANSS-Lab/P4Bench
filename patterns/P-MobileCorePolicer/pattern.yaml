@@ -1,0 +1,249 @@
+# P-MobileCorePolicer — UPF uplink: GTP-U decap ∘ per-subscriber sketch policer ∘ source-NAT44 ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the uplink data plane of a 5G User Plane Function (UPF): GTP-U
+# tunnel termination (P-GTPUEncap, P13), per-subscriber heavy-hitter rate
+# policing with a count-min sketch (P-SketchHeavyHitter, P9), and stateful
+# source-NAT44 with LPM forwarding (P-NAT44 ∘ P-IPv4Routing, P2 ∪ P1). The
+# value of the *chained* pattern over instantiating the parts apart is the
+# cross-stage ORDERING and the data dependence — invisible when each is tested
+# alone:
+#   (a) DECAP-BEFORE-DETECT — the policer's flowkey is the INNER UE source IP,
+#       which is only visible AFTER the outer IP/UDP/GTP-U headers are stripped.
+#       Standalone sketch detection sees the outer (gNB) source; only the
+#       composite keys policing on the subscriber.
+#   (b) DETECT-BEFORE-NAT — the per-subscriber heavy check precedes NAT
+#       allocation, so a policed (heavy) UE is dropped BEFORE a NAT binding is
+#       allocated; a drop must not leave a stale flow-table entry or burn a
+#       pool port.
+#   (c) NAT-BEFORE-ROUTE — the LPM lookup runs on the inner (decapped)
+#       destination after the source has been NATed to the public pool.
+#   (d) COMPOUND CHECKSUM — one pass strips the tunnel, rewrites the inner
+#       IP.src + L4 src port (NAT), and decrements the inner TTL (route): a
+#       single inner-IPv4 (and L4) checksum recompute must cover all mutations.
+
+pattern_id: P-MobileCorePolicer
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D5:address-rewriting"
+    - "D6:traffic-measurement"
+    - "D7:connection-state"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P2:stateful-address-translation"
+    - "P9:sketch-frequency-estimation"
+    - "P13:tunnel-encapsulation"
+
+target_capability: composition   # chains a relocate (P-GTPUEncap), a scale_up (P-SketchHeavyHitter/P-NAT44) and a redesign (P-IPv4Routing) primitive; failure modes are cross-cutting.
+
+summary: >
+  Single-pass UPF uplink data plane. Every access-side packet arrives as a
+  GTP-U tunnelled frame (outer IP/UDP:2152/GTP-U carrying an inner UE IPv4
+  packet). The switch (1) terminates the tunnel — strips the outer headers to
+  expose the inner UE packet; (2) updates a count-min sketch keyed on the inner
+  UE source IP and rate-polices the subscriber — a UE whose estimate reaches the
+  heavy threshold is dropped before any further state is touched; (3) source-NATs
+  the admitted inner packet (rewrite UE src IP/port to the public pool, install
+  a per-flow binding); (4) forwards by LPM on the inner destination with TTL
+  decrement and next-hop MAC rewrite, emitting on the internet-facing port. The
+  pipeline order decap → detect → NAT → route and the inner-keyed
+  detect-before-NAT dependence are the load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: "3GPP TS 29.281"
+      title: "GPRS Tunnelling Protocol User Plane (GTPv1-U)"
+      sections: ["4", "5.1"]
+      role: GTP-U tunnel header + uplink decapsulation semantics
+    - id: RFC3022
+      quote: "Basic Network Address Translation or Basic NAT is a method by which IP addresses are mapped from one group to another, transparent to end users."
+      title: "Traditional IP Network Address Translator (Traditional NAT)"
+      sections: ["2.1", "3", "4"]
+      role: NAT44 binding + reverse-mapping semantics
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+  papers:
+    - cite: "Yang et al., Elastic Sketch, SIGCOMM 2018"
+      role: count-min frequency estimation for per-subscriber heavy-hitter detection in the data plane
+
+entities:
+  sketch:
+    type: bucket
+    key: [inner_ue_src]
+    attrs: {count: int}
+    capacity: ${sketch_width}
+    eviction: none
+    notes: count-min sketch over ${sketch_depth} rows, keyed on the INNER UE source IP exposed by decap; min-across-rows estimate.
+  nat_table:
+    type: flow
+    keyed_by_tuple: [inner_ue_src, l4_src, proto]
+    attrs: {pool_ip: ipv4, pool_port: int, orig_ip: ipv4, orig_port: int}
+    capacity: ${nat_capacity}
+    eviction: ${nat_eviction}
+    notes: per-flow source-NAT bindings on the decapped inner packet; reuse returns the existing pool port.
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table consulted on the inner (decapped) destination.
+
+parameters:
+  gtpu_udp_port:        {type: int,    default: 2152}
+  sketch_depth:         {type: int,    default: 2,    constraint: "sketch_depth >= 1"}
+  sketch_width:         {type: int,    default: 64,   constraint: "sketch_width >= 1"}
+  heavy_threshold:      {type: int,    default: 8,    constraint: "heavy_threshold >= 1"}
+  counter_max:          {type: int,    default: 4294967295}
+  epoch_packets:        {type: int,    default: 4096}
+  nat_pool_ip:          {type: ipv4,   default: "203.0.113.1"}
+  nat_pool_port_base:   {type: int,    default: 20000, constraint: "1024 <= nat_pool_port_base <= 60000"}
+  nat_capacity:         {type: int,    default: 256,  constraint: "nat_capacity >= 1"}
+  nat_eviction:         {type: enum,   values: [none, LRU, FIFO], default: none}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [decap_detect_nat_route], default: decap_detect_nat_route}
+  access_port:          {type: int,    default: 1}
+  internet_port:        {type: int,    default: 2}
+
+rules:
+  - id: R0_non_gtpu_drop
+    when: "ingress(pkt) on access_port"
+    given: {header_present: "not a GTP-U tunnelled IPv4 inner packet (outer IPv4/UDP:gtpu_udp_port/GTP-U/inner IPv4)"}
+    then: ["drop(pkt)"]
+    notes: only GTP-U uplink frames carrying an inner IPv4 packet are processed.
+
+  - id: R1_decap
+    when: "header_present(GTP-U inner IPv4)"
+    given: {action: "strip outer IPv4 + UDP + GTP-U; expose inner IPv4 packet"}
+    then: ["promote(inner IPv4) as the working packet"]
+    notes: tunnel termination; everything downstream keys on the inner UE packet (decap_before_detect).
+
+  - id: R2_sketch_detect
+    when: "after decap"
+    given: {match: "count-min sketch on inner UE source IP across sketch_depth rows"}
+    then:
+      - "inc each row; est = min-across-rows post-increment"
+      - "drop(pkt) if est >= heavy_threshold (subscriber policed)"
+    notes: per-subscriber rate policing on the INNER source; the heavy check precedes NAT (detect_before_nat). A policed UE is dropped before a binding is allocated.
+
+  - id: R3_nat_source
+    when: "admitted (not policed) inner packet"
+    given: {match: "nat_table by (inner_src, l4_src, proto)"}
+    then:
+      - "bind(nat_table, (inner_src,l4_src,proto) -> (nat_pool_ip, allocated_port)) if absent"
+      - "rewrite(inner IP.src -> nat_pool_ip)"
+      - "rewrite(inner L4.src -> allocated_port)"
+    notes: source-NAT the subscriber; allocate a pool port on first packet of a flow, reuse thereafter.
+
+  - id: R4_route_forward
+    when: "not dropped by R0-R2"
+    given: {match: "fib LPM on the inner (post-NAT) IP.dst"}
+    then:
+      - "drop(pkt) if no LPM match or inner IP.ttl == 0"
+      - "dec(inner IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, internet_port)"
+    notes: LPM forward on the inner destination toward the internet; one checksum recompute covers the NAT rewrite and the TTL decrement.
+
+invariants:
+  - id: decap_precedes_detect
+    clause: stability
+    target: "the sketch flowkey is the INNER UE source IP, available only after decap"
+    notes: a policer keyed on the outer (gNB) source would mis-attribute every subscriber to the same tunnel endpoint.
+  - id: detect_precedes_nat
+    clause: stability
+    target: "a heavy (policed) UE installs no nat_table binding"
+    notes: the heavy check short-circuits before R3, so a drop burns no pool port.
+  - id: nat_binding_reuse
+    clause: persistence
+    target: "the same inner UE flow reuses its allocated pool port across packets"
+    free_under: [nat_eviction]
+  - id: post_nat_routing
+    clause: stability
+    target: "the LPM lookup keys on the inner IP.dst after source-NAT"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "inner IPv4 and L4 checksums are valid over the combined decap + NAT-rewrite + TTL-decrement"
+  - id: no_loop
+    clause: no_loop
+    target: "inner TTL strictly decreases; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: uplink_decap_nat_forward
+      generate: "a benign GTP-U uplink packet: decapped, inner src/port NATed to the pool, routed out internet_port, inner TTL-1"
+    - id: heavy_ue_policed
+      generate: "a UE whose sketch estimate reaches heavy_threshold is dropped (policed) before NAT"
+    - id: non_gtpu_drop
+      generate: "an access-side frame that is not a GTP-U inner IPv4 packet is dropped"
+  G2:
+    - id: nat_binding_reuse
+      generate: "second uplink packet of the same inner UE flow reuses the same pool port"
+    - id: second_flow_distinct_port
+      generate: "a distinct inner UE flow gets a different pool port"
+    - id: ttl_one_forwards_zero
+      generate: "inner ttl==1 forwards with egress inner ttl==0; inner ttl==0 drops"
+  G3:
+    - id: policed_leaves_no_binding
+      generate: "after a UE is policed, no NAT binding exists for it (detect-before-NAT)"
+    - id: inner_keyed_detection
+      generate: "two UEs behind the SAME gNB outer tunnel are policed independently — detection keys on the inner src, not the outer gNB src"
+    - id: checksum_after_compound_rewrite
+      generate: "an uplink decap+NAT+route packet has valid inner IPv4/L4 checksum over all mutations"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: lower_heavy_threshold
+    direction: harden
+    kind: parameter
+    axis: detection_sensitivity
+    effect: "${heavy_threshold} halved (more subscribers cross into policing sooner)"
+    feasibility_postcondition: "heavy_threshold >= 1"
+  - id: shrink_nat_capacity_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "nat_capacity /= 4 and nat_eviction: none -> LRU (binding pressure + eviction)"
+  - id: shrink_sketch_width_4x
+    direction: harden
+    kind: parameter
+    axis: estimator_collision
+    effect: "sketch_width /= 4 (more cross-flow collisions; min-across-rows must still clip innocents)"
+  - id: enable_nat_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "nat_eviction: none -> LRU (a re-arriving evicted flow is re-bound to a new port)"
+  - id: disable_policer
+    direction: ease
+    kind: parameter
+    axis: detection_sensitivity
+    effect: "heavy_threshold raised above any test rate (the policing stage becomes a pass-through; decap+NAT+route only)"
+  - id: static_nat_only
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "replace dynamic allocation with control-plane static 1:1 bindings (no per-flow allocation); oracle regenerated"
+    feasibility_postcondition: "every UE has a pre-installed binding"
+
+bridging_notes: |
+  - Uplink only: every access-side packet is Ether/IP/UDP(gtpu_udp_port)/GTP-U/
+    inner IPv4/L4. A frame that is not this shape drops (R0).
+  - Decap strips the outer IPv4 + UDP + GTP-U; the inner IPv4 packet becomes the
+    working packet. All downstream stages key on the INNER headers.
+  - The count-min sketch is keyed on the INNER UE source IP. est = min across
+    sketch_depth rows after the post-increment; est >= heavy_threshold drops the
+    packet (subscriber policed) BEFORE NAT — a policed UE installs no binding.
+  - Source-NAT: rewrite inner IP.src -> nat_pool_ip and inner L4.src -> an
+    allocated pool port. allocated_port = nat_pool_port_base + (live binding
+    count) at install; reuse returns the existing port. This makes the pool port
+    observable and unit-testable. Binding key = (inner_src, inner_l4_src, proto).
+  - LPM forwards on the inner (post-NAT) IP.dst. inner TTL is decremented exactly
+    once; ttl==0 drops. One checksum recompute covers the NAT rewrite and TTL.
+  - The decap-before-detect and detect-before-NAT orderings are the cross-stage
+    contracts: the policer must see the inner subscriber (not the gNB tunnel
+    endpoint), and a heavy UE must be dropped before a NAT pool port is burned.

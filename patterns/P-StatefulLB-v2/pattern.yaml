@@ -1,0 +1,516 @@
+# P-StatefulLB-v2 — Stateful L4 Load Balancer (v2)
+#
+# TPL v1.0 task pattern. Instances are produced by binding the
+# parameters below.
+#
+# Lineage: derived from P-StatefulLB v1.0 by adding two mutation
+# operators (require_recirculation_for_bind, inject_adversarial_hash_collisions)
+# and a no_loop invariant. Behavioural rules R1–R3 and the
+# persistence/no_orphan invariants are unchanged. New operators lift the
+# previously-untouched D4 and D6.2 axes.
+
+pattern_id: P-StatefulLB-v2
+version: "1.0"
+
+# Design-space tags. `descriptive` is from the literature survey;
+# `prescriptive` is enumerated from primitive composition. Each entry is
+# `ID:kebab-name`.
+nf_categories:
+  descriptive:  [D1:stateful-flow-tracking]
+  prescriptive: [P3:flow-tracking]
+
+# Capability programmability is asked to deliver for this NF.
+# Stateful L4 LB scales a data-plane NF through ASIC capacity walls
+# (SilkRoad, Tiara) → `scale_up`. The failure modes here are missing
+# scaling-trick recall, which matches the P3 stratification.
+target_capability: scale_up
+
+summary: >
+  Stateful L4 load balancer that hashes a flow's 5-tuple to a backend,
+  optionally maintains stickiness under backend-pool changes, and supports
+  fast/slow-path partitioning at higher faithfulness levels. v2 extends
+  v1 with D4 (recirculation/clone observability) and D6.2 (adversarial
+  hash-collision workload) mutation operators.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: silkroad_sigcomm17
+      id: silkroad_sigcomm17
+      role: canonical_implementation
+      quote: "During a DIP pool change, it is critical to ensure per\nconnection consistency (PCC), which means all the packets\nof a connection should be delivered to the same DIP.\n"
+      quote_source: patterns/P-StatefulLB-v2/grounding/silkroad_sigcomm17.txt
+      relevance: |
+        First demonstration of stateful L4 LB on programmable switching ASICs
+        at line rate (~10 M connections, 400 LOC P4). Establishes the
+        digest + Bloom-filter trick that makes the persistence invariant
+        achievable under DIP-pool changes — without re-hashing live flows
+        when the pool shrinks. Provides terminology: "DIP", "VIP",
+        "connection consistency", "DIP version digest".
+
+    - cite: tiara_nsdi22
+      role: scaling_approach
+      relevance: |
+        Three-tier (P4 switch + FPGA SmartNIC w/ HBM + x86) hybrid for
+        connection counts >> on-chip SRAM (80 M flows, 1.6 Tbps). Switch
+        does stateless encap/decap; FPGAs hold the connection table; servers
+        run slow path. Informs Tier-3 instances where flow_table_capacity
+        exceeds switch SRAM and faithfulness lifts to D5.2_partition.
+
+    - cite: cetus_nsdi22
+      role: optimisation
+      relevance: |
+        Production P4 LB programs at Alibaba's edge often fail to compile
+        because action-dependency chains exceed the available pipeline
+        stages. Cetus auto-rewrites the program to make it fit. Useful as
+        a difficulty knob: tighter capacity / more stages-of-state pushes
+        the implementation toward Cetus-style action-chain awareness.
+
+  rfcs: []
+
+  tutorials:
+    - path: tutorials/exercises/load_balance
+      role: baseline_topology
+      relevance: |
+        Provides the canonical 1-VIP / N-backend topology and packet-flow
+        conventions for L4 LB exercises. Reused directly when this pattern
+        is instantiated for `provenance: tutorial`.
+
+  # No knowledge-base entry is attached; the grounding block above is
+  # non-empty (papers + tutorials).
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  # `flow` is the v1.0 vocabulary entity for "per-flow state, 5-tuple-keyed"
+  # (TPL entity vocabulary). State attributes live on the entity directly; there is
+  # no separate flow_state entity in the closed v1.0 vocabulary.
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.tcp.sport
+      - hdr.tcp.dport
+      - hdr.ipv4.proto
+    attrs:
+      bound_backend: address
+    capacity: ${flow_table_capacity}
+    eviction: ${eviction_policy}
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  vip:
+    type: address
+    constraint: ipv4
+
+  backends:
+    type: list[address]
+    constraint: "len ≥ 2"
+
+  assign:
+    type: enum
+    values: [round_robin, hash_5tuple, consistent_hash]
+
+  flow_table_capacity:
+    type: int | unbounded
+    range: "[256, 1048576]"
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO, LRU, FIFO_collision_displace]
+    # FIFO_collision_displace is the Tier-2 (bounded) variant: a single
+    # slot per bucket; a colliding flow displaces the resident binding.
+    # Pure insertion-order FIFO is not realisable in BMv2 within typical
+    # pipeline-stage budgets — FIFO_collision_displace is the implementable
+    # approximation that the bounded LB instance uses.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_exact, D5.2_partition]
+    default: D5.0_exact
+
+  persistence_strict:
+    type: bool
+    default: false
+
+  observe_bind:
+    type: enum
+    values: [none, clone_to_monitor, recirc_then_forward]
+    default: none
+    # `none`         — R1 binds and forwards in a single pass; no externally
+    #                  observable bind event. (v1 behaviour.)
+    # `clone_to_monitor` — R1 must additionally emit a copy of the new-flow
+    #                  packet on a dedicated monitor egress, carrying the
+    #                  assigned bound_backend in a custom metadata header.
+    # `recirc_then_forward` — R1 must recirculate the first packet of a new
+    #                  flow once (with an "observed" metadata bit set) before
+    #                  forwarding, so subsequent stages see a coherent
+    #                  flow_state. Both modes lift D4 from 4.1 to 4.2.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# Order matters: first matching `when` fires.
+
+rules:
+
+  - id: R1_new_flow
+    when: |
+      match(hdr.ipv4.dst, ${vip}) ∧ header_present(tcp) ∧ ¬exists(flow, flow.key)
+    given:
+      flow: deduce_from_packet
+    then:
+      - bind(flow, flow.key, {bound_backend: ${assign}(${backends}, flow.key)})
+      - rewrite(hdr.ipv4.dst, flow[flow.key].bound_backend)
+      - forward(lookup_egress(flow[flow.key].bound_backend))
+    notes: |
+      First packet of a new flow → backend selection per ${assign} +
+      mapping installed + DNAT rewrite. Whether this is a hash-into-register,
+      a TCAM exact-match insertion, or a digest-Bloom-filter combo is the
+      implementation problem.
+
+  - id: R2_existing_flow
+    when: |
+      match(hdr.ipv4.dst, ${vip}) ∧ exists(flow, flow.key)
+    given:
+      flow: deduce_from_packet
+    then:
+      - rewrite(hdr.ipv4.dst, flow[flow.key].bound_backend)
+      - forward(lookup_egress(flow[flow.key].bound_backend))
+    notes: |
+      Subsequent packets of an established flow follow the bound backend.
+      The persistence invariant (below) constrains this rule under churn.
+
+  - id: R3_unrecognized
+    when: "¬match(hdr.ipv4.dst, ${vip})"
+    then:
+      - drop
+    notes: |
+      Anything not destined for the VIP is dropped. This is a default-deny
+      G3 anchor; non-TCP traffic to the VIP is also caught here because R1
+      requires header_present(tcp).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: persistence_under_pool_addition
+    clause: persistence
+    target: flow[*].bound_backend
+    while: "flow ∈ live_flows"
+    free_under: ["add_backend(_)"]
+    enforced_when: "${persistence_strict}"
+    notes: |
+      Live flows must continue mapping to their original backend even when
+      a NEW backend is added to ${backends}. SilkRoad's digest+Bloom trick
+      is the canonical realisation; consistent hashing is a simpler weaker
+      realisation that survives addition but not removal.
+
+  - id: no_orphan_flow_state
+    clause: no_orphan
+    target: flow
+    enforced_when: "${flow_table_capacity} ≠ unbounded"
+    notes: |
+      Bounded flow tables MUST have an eviction policy that eventually
+      removes stale entries — otherwise the table fills and new flows are
+      blackholed. Test scaffolding's eviction_on_overflow case checks this.
+
+  - id: no_loop_under_recirc
+    clause: no_loop
+    target: packet
+    enforced_when: "${observe_bind} == clone_to_monitor ∨ ${observe_bind} == recirc_then_forward"
+    notes: |
+      When the require_recirculation_for_bind operator is applied, R1 may
+      emit a clone or take an extra pipeline pass. The implementation MUST
+      guarantee that any single packet visits the recirc/clone path at most
+      once (e.g., a metadata "observed" bit set on the second pass).
+      Without this, BMv2 will happily spin a packet indefinitely.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Per-test format
+# conventions: TTL=64 warm-ups, TTL=1 test packet for stateful tests, etc.
+
+test_scaffolding:
+
+  G1:
+    - id: even_distribution
+      generate: |
+        Send 1000 distinct TCP SYNs (varied 5-tuples) to ${vip}. Assert
+        each backend in ${backends} receives within ±10% of its expected
+        share (1000 / |${backends}|).
+
+    - id: existing_flow_consistency
+      generate: |
+        Send 5 packets sharing one 5-tuple to ${vip} (distinct TTLs:
+        warm-ups=64, test=1). Assert all 5 land on the same backend.
+
+    - id: persistence_under_pool_addition
+      requires: "${persistence_strict}"
+      generate: |
+        Establish flow F1 → backend B0 (warm-up TTL=64). Add a new backend
+        B_new to ${backends}. Resend F1 (test TTL=1). Assert F1 still
+        maps to B0.
+
+    - id: persistence_under_unrelated_backend_removal
+      requires: "${persistence_strict}"
+      generate: |
+        Establish flows F1→B0, F2→B1 (warm-up TTL=64). Remove B2 (a
+        backend none of F1/F2 is bound to). Resend F1 and F2 (test TTL=1).
+        Assert both flows still map to their original backends.
+
+    - id: new_flow_bind_observed
+      requires: "${observe_bind} ≠ none"
+      generate: |
+        Send a single TCP SYN to ${vip} on a fresh 5-tuple (test TTL=1).
+        Assert TWO output packets: (a) the rewritten data packet on the
+        bound backend's egress, and (b) a monitor copy on the `monitor`
+        egress carrying the same bound_backend in its metadata header.
+        Resend the same 5-tuple again — assert ONLY the data packet
+        appears (no monitor copy on the second packet). Verifies that
+        the observability event fires exactly once per new flow.
+
+  G2:
+    - id: eviction_on_overflow
+      requires: "${flow_table_capacity} ≠ unbounded ∧ ${eviction_policy} ≠ none"
+      generate: |
+        Open ${flow_table_capacity} + 1 distinct flows (warm-up TTL=64).
+        Send the new (overflow) flow as the test packet (TTL=1). Then
+        re-send the OLDEST flow. Under ${eviction_policy} = FIFO: the
+        oldest flow's mapping was evicted, so it is treated as a new flow.
+        Under LRU: the least-recently-used flow's mapping was evicted.
+
+    - id: capacity_boundary_no_eviction
+      requires: "${flow_table_capacity} ≠ unbounded"
+      generate: |
+        Open exactly ${flow_table_capacity} distinct flows (warm-up TTL=64).
+        Re-send any of them (test TTL=1). Assert it maps to its original
+        backend (no spurious eviction below capacity).
+
+  G3:
+    - id: non_tcp_dropped
+      generate: |
+        Send an ICMP echo to ${vip}. Assert drop (R3 / R1's
+        header_present(tcp) precondition).
+
+    - id: non_vip_dropped
+      generate: |
+        Send a TCP SYN to a non-VIP IP. Assert drop (R3).
+
+    - id: malformed_5tuple_rejected
+      generate: |
+        Send a TCP packet to ${vip} with src_port = 0 (RFC-invalid).
+        Assert behavior is well-defined: either drop or forward consistently
+        — the reference's choice MUST match every replay. (Confirms that
+        flow-key derivation is deterministic and total.)
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Each operator carries the mandatory TPL fields:
+#   id, applicable_when, effect, direction (harden|ease), feasibility_postcondition.
+# `d_axis_delta` is an informal authoring annotation retained for provenance;
+# it is not part of the v1.0 schema.
+
+mutation_operators:
+
+  - id: shrink_capacity_4x
+    applicable_when: "${flow_table_capacity} ≠ unbounded ∧ ${flow_table_capacity} > 256"
+    effect: "${flow_table_capacity} ← ${flow_table_capacity} / 4"
+    axis: capacity
+    direction: harden
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${flow_table_capacity} ≥ 64"
+    notes: |
+      Tighten the state-capacity axis. At 256 → 64 the implementation starts to
+      need real eviction; below that the working set won't fit at all.
+
+  - id: enable_persistence
+    applicable_when: "${persistence_strict} == false"
+    effect: "${persistence_strict} ← true"
+    axis: strictness
+    direction: harden
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "${assign} ≠ round_robin"
+    notes: |
+      Persistence under churn is incompatible with stateless round-robin
+      (the round-robin counter resets on any state-table reset). Switch to
+      hash_5tuple or consistent_hash before applying.
+
+  - id: switch_to_consistent_hash
+    applicable_when: "${assign} ≠ consistent_hash"
+    effect: "${assign} ← consistent_hash"
+    axis: hash-family
+    direction: harden
+    d_axis_delta: {D3: +1}
+    feasibility_postcondition: "true"
+    notes: |
+      Consistent hashing makes persistence under pool *addition* trivial
+      and persistence under pool *removal* survivable for the unaffected
+      majority of flows. Implementation complexity rises (hash-ring computation
+      across stages).
+
+  - id: enable_partition_mode
+    applicable_when: "${faithfulness} == D5.0_exact"
+    effect: "${faithfulness} ← D5.2_partition"
+    axis: faithfulness
+    direction: harden
+    d_axis_delta: {D5: +2}
+    feasibility_postcondition: "${flow_table_capacity} == unbounded ∨ ${flow_table_capacity} ≥ 65536"
+    notes: |
+      Partition mode says: switch handles fast path, slow path is mocked.
+      Useful for Tier-3 instances where capacity exceeds on-chip SRAM and
+      a Tiara-style hybrid is required.
+
+  - id: swap_eviction_to_LRU
+    applicable_when: "${eviction_policy} ≠ LRU ∧ ${flow_table_capacity} ≠ unbounded"
+    effect: "${eviction_policy} ← LRU"
+    axis: strictness
+    direction: harden
+    d_axis_delta: {D5: +1}
+    feasibility_postcondition: "true"
+    notes: |
+      LRU requires per-flow recency tracking — substantially harder than
+      FIFO in P4 (no native timestamp arithmetic on registers). Common
+      implementation: approximate LRU via second-chance or aging counters.
+
+  - id: add_dip_churn_test
+    applicable_when: "'persistence_under_repeated_churn' ∉ test_scaffolding.G1"
+    effect: |
+      Add G1 test `persistence_under_repeated_churn`: open 10 flows, then
+      add and remove backends 3 times in alternation; assert all 10 flows
+      remain on their original backends throughout.
+    axis: hidden-coverage
+    direction: harden
+    d_axis_delta: {test_rigor: +1}
+    feasibility_postcondition: "true"
+
+  - id: inject_zipfian_workload
+    applicable_when: true
+    effect: |
+      Replace G1 even_distribution test with skewed: 80% of traffic to
+      20% of source IPs (Zipfian α=1.0); assert backend distribution is
+      still within ±15% (loosened from ±10% per workload realism).
+    axis: workload
+    direction: harden
+    d_axis_delta: {D6: +1}
+    feasibility_postcondition: "true"
+
+  - id: require_recirculation_for_bind
+    applicable_when: "${observe_bind} == none"
+    effect: "${observe_bind} ← clone_to_monitor"
+    axis: algebra-breadth
+    direction: harden
+    d_axis_delta: {D4: +1}
+    feasibility_postcondition: |
+      BMv2 simple_switch supports clone() and recirculate() via v1model
+      externs. The harness USE_FILES_DELAY=1s
+      comfortably accommodates one extra pipeline pass — validate on
+      first instantiation if the clone egress is heavily-loaded.
+      Requires the no_loop_under_recirc invariant.
+    notes: |
+      Lifts the pattern from D4.1 (registers only) to D4.2
+      (recirculation/resubmit/clone). R1 must additionally emit a copy
+      of the first-packet-of-flow on a dedicated `monitor` egress,
+      annotated with the assigned bound_backend in a custom metadata
+      header. The observability requirement is behavioural — visible at
+      the egress trace — and is verified by a new G1 test
+      `new_flow_bind_observed`. The implementation choice
+      between clone-to-egress and recirculate-and-mirror is left to the
+      implementation; both are valid. Test scaffolding asserts exactly one
+      monitor copy per new flow (no duplicates, no drops).
+
+  - id: inject_adversarial_hash_collisions
+    applicable_when: "${assign} == hash_5tuple ∧ ${flow_table_capacity} ≠ unbounded"
+    effect: |
+      Replace G1 even_distribution test with adversarial-collision:
+      construct 200 distinct flows whose 5-tuples all hash to the same
+      flow-table bucket under ${assign}. Assert eviction-induced loss is
+      bounded: under ${eviction_policy} == FIFO_collision_displace, at
+      most one bound flow per inserted collision is remapped; under
+      ${eviction_policy} == none, the overflowing flows are
+      deterministically dropped (R3 path) rather than mis-bound.
+    axis: workload
+    direction: harden
+    d_axis_delta: {D6: +1}
+    feasibility_postcondition: |
+      Requires a known-good colliding-input generator keyed to the
+      implementation's chosen hash function. If the LLM picks an opaque hash,
+      the test generator falls back to brute-force collision search over
+      reference-hash output before instantiation. Test is skipped (not
+      failed) when colliding inputs cannot be found within the search
+      budget.
+    notes: |
+      Workload-realism bump from D6.1 (Zipfian) to D6.2 (adversarial).
+      Probes whether the implementation's hash-into-register design
+      degrades gracefully — i.e., whether the eviction policy and
+      collision-handling logic are correctly entangled. This is the
+      empirical bug class from cetus_nsdi22 §3 ("opaque hash collisions
+      cause silent backend re-mapping").
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Tier-1 (capacity unbounded, no persistence):
+      - register<bit<W>>(N) flow_table; hash-into-index keyed by 5-tuple.
+      - Round-robin via a single global counter register (counter mod N_b).
+      - No eviction; capacity is "effectively unbounded" by sizing register
+        N to traffic-volume estimates.
+
+    Tier-2 (bounded capacity, persistence under add):
+      - register<bit<W>>(N) flow_table + a small Bloom filter for
+        membership probe (SilkRoad-style digest).
+      - On miss + Bloom-clear: assign and bind. On miss + Bloom-set:
+        treat as hash collision; either evict or fail-over to slow path.
+      - For consistent-hash: a small ring over backends, with version
+        counters incremented on pool change; live flows keyed by their
+        original ring version.
+
+    Tier-3 (capacity > on-chip, partition):
+      - Tiara-style: switch holds only the fast-path TCAM (most-recent N
+        flows); slow path holds the long tail. Slow-path is mocked under
+        D5.2 — represented as a dedicated `slow_path` egress port that
+        the harness routes back via test scaffolding.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Rebuilding the entire flow table on every backend change. (Violates
+      persistence invariant.)
+    * Using a counter-based round-robin AND requiring persistence. (R1
+      becomes nondeterministic across resets.)
+    * Sizing flow_table register larger than v1model's per-stage register
+      width — BMv2 will accept it, but the Tofino implementation will fail.
+    * Under observe_bind ≠ none: emitting a monitor copy on every packet
+      of an established flow. The contract is one-copy-per-new-flow;
+      mirroring every packet inflates monitor-port volume and breaks the
+      new_flow_bind_observed assertion.
+    * Under observe_bind == recirc_then_forward: failing to set an
+      "observed" metadata bit on the recirculated copy. This causes the
+      packet to recirculate indefinitely and trips no_loop_under_recirc.
+
+  Notes on the v2-only operators:
+
+    * require_recirculation_for_bind: behaviourally, one extra monitor
+      packet per new flow. Implementation choice: clone() to the monitor
+      port at the end of R1 (cheap, single-pass) OR recirculate() with
+      an "observed" bit and emit on second pass (heavier, but composes
+      with implementations that want to read flow_state in the same packet that
+      installed it). Both are accepted; the test only inspects the
+      monitor-port output trace.
+
+    * inject_adversarial_hash_collisions: the test generator must know
+      the implementation's hash function to construct true collisions. For
+      implementations that pick crc32 over the 5-tuple, the harness precomputes
+      a colliding set; for opaque hashes, the harness either probes the
+      implementation for collisions empirically (warm-up phase) or skips the
+      test with a logged reason. The skip path is acceptable — the
+      operator's purpose is to discriminate implementations that handle
+      collisions correctly when they DO occur, not to penalise the
+      choice of hash function.

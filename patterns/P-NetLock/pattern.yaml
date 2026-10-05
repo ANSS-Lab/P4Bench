@@ -1,0 +1,716 @@
+# P-NetLock — In-Switch Exclusive/Shared Lock Service (register-resident lock table)
+#
+# TPL v1.0 task pattern. A coordination primitive RELOCATED
+# into the switch (D10:distributed-systems-primitives,
+# P10:in-network-compute): a host/coordinator lock manager is moved down into
+# the data plane so the switch itself grants and releases locks held in
+# register state. Per-lock state lives in a register array — free, or held with
+# a holder-id — driven entirely by received LOCK / UNLOCK control packets. A
+# LOCK on a free lock binds the holder and forwards a GRANT; a LOCK on a lock
+# held by another is denied (drop or NACK); an UNLOCK from the holder evicts the
+# binding and, if a waiter is queued, grants the head of a small in-register
+# FIFO. Grounded in NetLock (Yu et al., NSDI 2020).
+
+pattern_id: P-NetLock
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D10:distributed-systems-primitives]    # in-network lock / coordination service
+  prescriptive: [P10:in-network-compute]                # stateful compute relocated into the switch
+target_capability: relocate                             # a coordinator-side lock manager moved down into the data plane
+summary: >
+  An in-switch lock service: per-lock state (free, or held + holder-id) kept in
+  a register array and driven by received LOCK / UNLOCK control packets. A LOCK
+  request on a free lock binds the requester as holder and forwards a GRANT; a
+  LOCK on a lock already held by another client is denied — dropped, or
+  forwarded with a NACK marker, per ${deny_mode}. An UNLOCK from the current
+  holder releases (evicts) the binding; if a waiter FIFO is enabled and
+  non-empty, the head waiter is granted in the holder's place and a GRANT is
+  forwarded to it. The canonical instance is exclusive-only locking with
+  immediate deny; mutation lifts to shared (read) locks with a holder count,
+  a bounded in-register waiter FIFO whose head is served on release, and a
+  scaled lock table with hash-indexed lock IDs.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: "Yu et al., NetLock: Fast, Centralized Lock Management Using Programmable Switches, ACM SIGCOMM 2020"
+      role: canonical_implementation
+      quote: "If the lock can be granted, the switch directly responds to the client (line 3-4). If the lock cannot be granted immediately, the switch queues the request if it has enough memory (line 5-6)."
+      quote_source: "NetLock §4.1 (Algorithm 1, switch lock processing); verbatim, cached at patterns/P-NetLock/grounding/netlock_sigcomm20.txt. Grounds R1 (grant on a free lock) and R3/R3b (deny-or-enqueue when held). The companion release passage 'If the request is to release a lock, the current head in the queue is removed, and the lock is resubmitted to grant the following request' (§4.2, Algorithm 2) grounds R4/R5; 'The FCFS policy stores lock requests in a first-in-first-out (FIFO) queue, and always grants locks to the head of the queue' (§5) grounds lock_fairness — both cached in the same file."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        NetLock is the canonical in-switch lock manager. It keeps lock state in
+        switch register memory and processes lock-acquire / lock-release as data
+        plane operations rather than coordinator RPCs — the exact relocation
+        this pattern captures (host lock manager → data plane). The design
+        informs:
+          - Per-lock register state with a holder identity (R1/R2 bind on a free
+            lock; R3 deny when held by another) — the "grant if free, deny if
+            held" core.
+          - Release-then-grant-next handoff: an UNLOCK from the holder frees the
+            lock and the manager serves the next queued request (R4/R5) — the
+            basis for the in-register waiter FIFO whose head is granted on
+            release. NetLock's full design uses an on-switch queue with shared
+            and exclusive modes and overflows long queues to a server; this
+            pattern models the on-switch FIFO head-of-line grant and treats
+            overflow / server-assist as out of scope (see bridging_notes).
+          - Shared vs exclusive locking: a shared (read) lock admits multiple
+            concurrent holders while an exclusive (write) lock admits one — the
+            basis for ${lock_mode} and the shared holder-count rule R2.
+    - cite: "Mellor-Crummey & Scott, Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors (MCS locks), ACM TOCS 1991"
+      role: domain_concepts
+      relevance: |
+        The MCS queue-lock formalises FIFO lock fairness: waiters form an
+        ordered queue and the lock is handed to the queue head on release, which
+        bounds starvation. This is the fairness target the waiter-FIFO variant
+        approximates in-switch (lock_fairness invariant) — the head waiter, not
+        an arbitrary re-requester, is granted on the next UNLOCK. Used to
+        motivate the FIFO-vs-immediate-deny strictness axis, not any wire
+        format.
+
+  rfcs: []
+  tutorials: []
+  posts: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic control message. The op (LOCK / UNLOCK) and the target lock id and
+      client id are carried in header fields (parsed from a lock-request header
+      riding on UDP, or a custom ethertype). No per-packet state.
+
+  lock:                                   # the TPL `bucket` role — class-keyed register state
+    type: bucket
+    keyed_by_tuple: [lock_id]
+    attrs:
+      state:      "enum(free, held)"      # per-lock binding status (register cell)
+      holders:    "set[address]"          # client ids currently holding the lock (valid iff state==held)
+      holder_id:  address                 # the exclusive holder (== the sole element of `holders` when kind==exclusive)
+      kind:       "enum(exclusive, shared)" # mode the lock is held in (valid iff state==held)
+      share_count: int                    # |holders| — number of concurrent shared holders (only meaningful when ${lock_mode}==shared_exclusive)
+    capacity: ${lock_table_capacity}
+    notes: |
+      One register slot per lock id. The holder is tracked as a SET, not a single
+      id: an EXCLUSIVE lock has a singleton holder set, a SHARED lock one-or-more
+      readers. share_count == |holders|. The canonical instance is exclusive-only,
+      so the holder set is always a singleton and share_count == 0/1. Tracking the
+      set (not just a count) is what makes release correct: a reader's UNLOCK must
+      remove THAT reader and keep the lock held while others remain (R4s), and the
+      holder check (R5x) must recognise ANY reader as a legitimate holder. lock_id
+      is taken directly from the packet (direct-indexed) or hashed into the table
+      under ${index_mode}.
+
+  waiter_queue:                           # also a `bucket` — bounded FIFO of pending requesters per lock
+    type: bucket
+    keyed_by_tuple: [lock_id]
+    attrs:
+      fifo:  "list[address]"              # client ids waiting for this lock, head served first
+      depth: int                          # current occupancy, 0..${waiter_fifo_depth}
+    enforced_when: "${waiter_fifo_depth} > 0"
+    capacity: ${waiter_fifo_depth}
+    notes: |
+      A small per-lock register FIFO. Enabled only when ${waiter_fifo_depth}>0.
+      On a contended LOCK the requester is enqueued (if room); on the holder's
+      UNLOCK the head is dequeued, bound as the new holder, and granted. Pure
+      egress-scheduling queueing is NOT modelled — see bridging_notes.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  lock_ids:
+    type: list[int]
+    constraint: "non-empty; each id in [0, ${lock_table_capacity}); distinct"
+    notes: "The set of lock ids the service manages (control-plane provisioned)."
+
+  lock_mode:
+    type: enum
+    values: [exclusive, shared_exclusive]
+    default: exclusive
+    notes: |
+      exclusive        → every lock is mutually exclusive (one holder).
+      shared_exclusive → a LOCK carries a shared/exclusive bit; multiple shared
+                         holders coexist, an exclusive holder is alone, and an
+                         exclusive request is denied while any shared holder
+                         exists (R2). Activates the share_count attribute.
+
+  deny_mode:
+    type: enum
+    values: [drop, nack]
+    default: drop
+    notes: |
+      Behaviour when a LOCK targets a lock held by another and no FIFO slot is
+      taken. drop → silently discard; nack → forward back to the requester with
+      a NACK status marker set in the lock header (observable header-field).
+
+  waiter_fifo_depth:
+    type: int
+    range: "[0, 16]"
+    default: 0
+    notes: |
+      0 → no queue: a contended LOCK is denied immediately per ${deny_mode}
+      (canonical instance). >0 → enqueue contended requesters up to this depth;
+      the head is granted on the holder's UNLOCK (R5). Enables waiter_queue.
+
+  grant_response:
+    type: enum
+    values: [forward_to_requester, forward_to_port]
+    default: forward_to_requester
+    notes: |
+      How a GRANT is delivered. forward_to_requester → swap src/dst and send the
+      GRANT back to the requesting client; forward_to_port → send to a fixed
+      egress (e.g. a coordinator mirror). Drives the egress-port assertion.
+
+  release_check_holder:
+    type: bool
+    default: true
+    notes: |
+      Strictness guard. When true (canonical), an UNLOCK is honoured only if it
+      comes from the current holder (R4 gate value(lock.holder_id == client));
+      a spoofed UNLOCK from a non-holder is rejected per ${deny_mode}. When
+      false, any UNLOCK frees the lock (ease — removes the holder check).
+
+  index_mode:
+    type: enum
+    values: [direct, hash]
+    default: direct
+    notes: |
+      direct → lock_id directly indexes the register array (id == slot).
+      hash   → lock_id is hashed into ${lock_table_capacity} slots; collisions
+               share a slot (faithfulness/capacity stress on a scaled table).
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32]
+    default: crc16
+    enforced_when: "${index_mode} == hash"
+
+  lock_table_capacity:
+    type: int
+    range: "[4, 65536]"
+    default: 1024
+    notes: "Register-array slot count. shrink_lock_table_4x exercises this axis."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_exclusive, D5.1_shared, D5.2_fifo_fairness]
+    default: D5.0_exclusive
+    notes: "Semantic-fidelity ladder: exclusive-only → +shared holders → +FIFO fairness."
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters: deny/holder gates precede the grant.
+
+rules:
+
+  - id: R0_non_lock_drop
+    when: "¬header_present(lock_msg)"
+    then:
+      - drop
+    notes: |
+      The service handles lock control messages only. Any frame without a
+      parsed lock-request header is out of scope and MUST NOT be forwarded.
+
+  - id: R1_lock_free_grant
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, LOCK)
+        ∧ ¬exists(lock, held(hdr.lock_msg.lock_id))
+    given:
+      lock: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - "bind(lock, hdr.lock_msg.lock_id, {state: held, holder_id: hdr.lock_msg.client_id})"
+      - set(hdr.lock_msg.status, GRANT)
+      - forward(grant_target(hdr.lock_msg, ${grant_response}))
+    notes: |
+      LOCK on a free lock: bind the requester as holder and forward a GRANT.
+      Under ${lock_mode}==shared_exclusive a shared LOCK also takes this path
+      and increments share_count instead of marking exclusive (see R2 for the
+      shared/exclusive distinction). GRANT delivery per ${grant_response}.
+
+  - id: R2_shared_compatible_grant
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, LOCK)
+        ∧ match(hdr.lock_msg.mode, SHARED)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ value(lock.holder_kind, ==, shared)
+    enforced_when: "${lock_mode} == shared_exclusive"
+    given:
+      lock: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - inc(lock.share_count)
+      - set(hdr.lock_msg.status, GRANT)
+      - forward(grant_target(hdr.lock_msg, ${grant_response}))
+    notes: |
+      Shared-lock compatibility (RFC: NetLock shared/exclusive modes). A SHARED
+      LOCK on a lock currently held in SHARED mode is compatible: admit another
+      concurrent reader by incrementing share_count and forwarding a GRANT. An
+      EXCLUSIVE request, or a SHARED request while an EXCLUSIVE holder exists,
+      falls through to R3 (deny). Only active when ${lock_mode} lifts off
+      exclusive.
+
+  - id: R3_lock_held_deny
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, LOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ ¬(${waiter_fifo_depth} > 0 ∧ value(waiter_queue.depth, <, ${waiter_fifo_depth}))
+    given:
+      lock: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - "${deny_mode}"                          # drop, OR set(hdr.lock_msg.status, NACK) + forward back
+    notes: |
+      LOCK on a lock held by another (and either no FIFO, or the FIFO is full):
+      deny. ${deny_mode}==drop discards; ==nack sets a NACK status marker and
+      forwards back to the requester (grant_target with the requester as dst).
+      The deny decision is the contention-correctness core.
+
+  - id: R3b_lock_held_enqueue
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, LOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ value(waiter_queue.depth, <, ${waiter_fifo_depth})
+    enforced_when: "${waiter_fifo_depth} > 0"
+    given:
+      lock:         by_key(hdr.lock_msg.lock_id, ${lock_ids})
+      waiter_queue: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - "bind(waiter_queue, hdr.lock_msg.lock_id, {enqueue: hdr.lock_msg.client_id})"
+      - drop
+    notes: |
+      LOCK on a held lock WITH FIFO room: enqueue the requester at the tail and
+      drop the request (no immediate response — the GRANT arrives later on the
+      holder's UNLOCK, R5). Observable only via the eventual grant; the queue
+      ordering itself is not wire-visible (see bridging_notes).
+
+  - id: R4s_shared_release_decrement
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, UNLOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ (¬${release_check_holder} ∨ holds(lock, hdr.lock_msg.client_id))
+        ∧ value(lock.share_count, >, 1)
+    enforced_when: "${lock_mode} == shared_exclusive"
+    given:
+      lock: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - dec(lock.share_count)
+      - drop
+    notes: |
+      A SHARED holder releases while OTHER readers remain: remove this reader from
+      the holder set (decrement share_count) but keep the lock HELD by the
+      remaining readers; the UNLOCK is consumed (drop). The lock returns to free
+      only when the LAST reader releases (R4). This is the release-side counterpart
+      of R2 — without it a multi-reader lock would free on the first release and
+      admit an incompatible writer (reader/writer exclusion break). Only active
+      when ${lock_mode} lifts off exclusive (under exclusive the holder set is a
+      singleton, so share_count is never > 1 and this rule is inert).
+
+  - id: R4_unlock_release
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, UNLOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ (¬${release_check_holder} ∨ holds(lock, hdr.lock_msg.client_id))
+        ∧ value(lock.share_count, ≤, 1)
+        ∧ ¬(${waiter_fifo_depth} > 0 ∧ value(waiter_queue.depth, >, 0))
+    given:
+      lock: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - evict(lock, hdr.lock_msg.lock_id)
+      - drop
+    notes: |
+      UNLOCK from the LAST holder (or any client when ${release_check_holder}==
+      false) with no waiter queued: release the binding back to free. The UNLOCK
+      itself is consumed (drop); freeing is observable because a subsequent LOCK
+      now takes the R1 grant path. A release that leaves other readers behind is
+      handled by R4s (lock stays held); a spoofed UNLOCK from a non-holder under
+      ${release_check_holder}==true does not match here and falls to R5x.
+
+  - id: R5_unlock_grant_next
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, UNLOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ (¬${release_check_holder} ∨ holds(lock, hdr.lock_msg.client_id))
+        ∧ value(lock.share_count, ≤, 1)
+        ∧ value(waiter_queue.depth, >, 0)
+    enforced_when: "${waiter_fifo_depth} > 0"
+    given:
+      lock:         by_key(hdr.lock_msg.lock_id, ${lock_ids})
+      waiter_queue: by_key(hdr.lock_msg.lock_id, ${lock_ids})
+    then:
+      - "next ← dequeue_head(waiter_queue, hdr.lock_msg.lock_id)"
+      - "bind(lock, hdr.lock_msg.lock_id, {state: held, holder_id: next})"
+      - set(hdr.lock_msg.status, GRANT)
+      - set(hdr.lock_msg.client_id, next)
+      - forward(grant_target_for(next, ${grant_response}))
+    notes: |
+      UNLOCK from the holder WITH a waiter queued: hand the lock to the FIFO head
+      (MCS-style fairness) — rebind holder to the dequeued waiter and forward a
+      GRANT to that waiter. This is the head-of-line handoff; deeper queue
+      positions remain pending until their turn. Only active with a FIFO.
+
+  - id: R5x_unlock_not_holder_deny
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, UNLOCK)
+        ∧ exists(lock, held(hdr.lock_msg.lock_id))
+        ∧ ¬holds(lock, hdr.lock_msg.client_id)
+    enforced_when: "${release_check_holder}"
+    then:
+      - "${deny_mode}"
+    notes: |
+      RFC: only a holder may release. A spoofed/buggy UNLOCK from a client that is
+      NOT in the holder set is rejected (drop or NACK) and the lock stays held.
+      Membership, not equality with a single holder id: under shared mode ANY of
+      the concurrent readers is a legitimate holder and may release its own grant.
+      Active only when the holder check is on; the default-deny G3 probe pins it.
+
+  - id: R6_unlock_not_held_noop
+    when: |
+      header_present(lock_msg) ∧ match(hdr.lock_msg.op, UNLOCK)
+        ∧ ¬exists(lock, held(hdr.lock_msg.lock_id))
+    then:
+      - drop
+    notes: "UNLOCK on an already-free lock: no-op, consume the packet."
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: mutual_exclusion
+    clause: stability
+    target: lock.holder_id
+    while: "value(lock.state, ==, held) ∧ (${lock_mode} == exclusive ∨ exists exclusive holder)"
+    notes: |
+      At most one exclusive holder per lock: once R1 binds a holder, no second
+      LOCK is granted (R3 denies) until an UNLOCK frees it. The defining safety
+      property of a lock service — granting a held lock to a second client is
+      the cardinal bug. fwd_grant_then_deny pins it.
+
+  - id: reader_writer_exclusion
+    clause: stability
+    target: lock.kind
+    while: "value(lock.state, ==, held) ∧ value(lock.share_count, >, 0)"
+    enforced_when: "${lock_mode} == shared_exclusive"
+    notes: |
+      A held lock is never simultaneously held SHARED by a reader and granted
+      EXCLUSIVE to a writer. While ANY reader holds the lock (share_count > 0) an
+      EXCLUSIVE request is denied/queued (R3), and the lock returns to free only
+      when the LAST reader releases (R4s decrements, R4 frees) — so a writer is
+      admitted strictly after every reader has left. Granting a writer while a
+      co-reader remains (e.g. freeing the lock on the first of several readers'
+      releases) is the reader/writer-exclusion bug. r4s_shared_release_coreader_
+      blocks_exclusive pins it.
+
+  - id: holder_persistence
+    clause: persistence
+    target: "(lock.state, lock.holder_id)"
+    while: "value(lock.state, ==, held)"
+    free_under: [R4s_shared_release_decrement, R4_unlock_release, R5_unlock_grant_next]
+    notes: |
+      A held lock's binding MUST NOT change except on a valid UNLOCK (R4/R5).
+      A LOCK that loses (R3 deny) MUST NOT overwrite the holder; a non-holder
+      UNLOCK (R5x) MUST NOT free it. State persists across denied requests.
+
+  - id: release_grants_free
+    clause: stability
+    target: lock.state
+    while: "rule R4_unlock_release fires"
+    notes: |
+      After a holder's UNLOCK with no waiter, the lock returns to free and the
+      very next LOCK is granted via R1. Failing to clear the holder leaves the
+      lock wedged (deadlock) — the release-correctness counterpart to mutual
+      exclusion. fwd_lock_unlock_relock pins it.
+
+  - id: no_orphan_locks
+    clause: no_orphan
+    target: lock
+    notes: |
+      Every bound lock is eventually released: an UNLOCK from the holder frees
+      it (or hands it to the next waiter, who can in turn release). No client
+      can hold a lock with no release path — the eviction guarantee.
+
+  - id: lock_fairness
+    clause: fairness
+    target: waiter_grant_order
+    while: "rule R5_unlock_grant_next fires"
+    enforced_when: "${waiter_fifo_depth} > 0"
+    notes: |
+      MCS-style FIFO fairness: on release the FIFO HEAD (oldest waiter) is
+      granted, not an arbitrary re-requester. Granting out of order starves
+      early waiters. fwd_fifo_head_served pins it. Only enforced with a FIFO.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_lock_free_grant
+      generate: |
+        Send LOCK(lock=L, client=A) to a free lock L. Assert: a GRANT is
+        forwarded (status==GRANT) to A per ${grant_response} (egress port /
+        swapped src-dst), and L is now held by A.
+    - id: fwd_grant_then_deny
+      generate: |
+        LOCK(L, A) then LOCK(L, B) with B != A. Assert the first is GRANTed and
+        the second is denied per ${deny_mode} (drop, or NACK forwarded to B).
+        Pins mutual_exclusion: a second client never gets a held lock.
+    - id: fwd_lock_unlock_relock
+      generate: |
+        LOCK(L, A); UNLOCK(L, A); LOCK(L, B). Assert A is granted, the unlock is
+        consumed, and B is then granted (the lock was actually freed). Pins
+        release_grants_free.
+    - id: fwd_unlock_not_held_noop
+      generate: |
+        UNLOCK(L, A) on a never-locked L. Assert no GRANT, packet consumed
+        (R6), and a following LOCK(L, A) is still granted.
+    - id: fwd_independent_locks
+      generate: |
+        LOCK(L1, A) and LOCK(L2, B) on distinct ids. Assert both granted
+        independently — holding L1 does not block L2 (per-lock state isolation).
+    - id: fwd_fifo_head_served
+      requires: "${waiter_fifo_depth} > 0"
+      generate: |
+        LOCK(L, A) [grant]; LOCK(L, B) [enqueue]; LOCK(L, C) [enqueue];
+        UNLOCK(L, A). Assert the GRANT on release goes to B (the FIFO head),
+        not C. Pins lock_fairness.
+    - id: fwd_shared_concurrent
+      requires: "${lock_mode} == shared_exclusive"
+      generate: |
+        Shared LOCK(L, A) then shared LOCK(L, B). Assert BOTH granted
+        (share_count==2), then an exclusive LOCK(L, C) is denied while shared
+        holders exist (R2 vs R3).
+
+  G2:
+    - id: deny_fifo_full
+      requires: "${waiter_fifo_depth} > 0"
+      generate: |
+        Fill the FIFO to ${waiter_fifo_depth} waiters behind a holder, then send
+        one more LOCK. Assert the overflow request is denied per ${deny_mode}
+        (capacity boundary: R3 vs R3b).
+    - id: drop_unlock_wrong_holder
+      requires: "${release_check_holder}"
+      generate: |
+        LOCK(L, A); UNLOCK(L, B) with B != A. Assert the unlock is rejected per
+        ${deny_mode} and L remains held by A (R5x; holder_persistence).
+    - id: drop_lock_unknown_id
+      generate: |
+        LOCK(L', A) for an L' not in ${lock_ids} (or beyond capacity under
+        ${index_mode}==direct). Assert handled deterministically — denied /
+        dropped, never a spurious grant.
+
+  G3:
+    - id: drop_non_lock_frame
+      generate: |
+        Send a plain IPv4/UDP frame with no lock header; assert drop (R0), no
+        register mutation.
+    - id: deny_steal_held_lock
+      generate: |
+        LOCK(L, A) [grant]; adversarial LOCK(L, Mallory) repeated. Assert every
+        steal attempt is denied and A stays the holder (default-deny on
+        contention; mutual_exclusion under adversarial load).
+    - id: bug_register_read_modify_write
+      generate: |
+        Probe the v1model RAW hazard: two LOCKs for the SAME free lock in one
+        test sequence. A correct program reads-tests-writes the register so
+        exactly ONE wins (grant) and the other is denied — assert no
+        double-grant. Targets the register read/modify/write bug pattern.
+    - id: bug_drop_then_forward
+      generate: |
+        A denied LOCK under ${deny_mode}==nack must NOT also be forwarded as a
+        GRANT (no drop-and-forward / mark_to_drop-then-emit confusion). Assert a
+        single coherent response. Targets the standard_metadata.drop misuse
+        bug pattern.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Every harden pairs with an ease on the SAME axis.
+
+mutation_operators:
+
+  - id: enable_waiter_fifo
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${waiter_fifo_depth} == 0"
+    effect: |
+      ${waiter_fifo_depth} ← 4 ∧ ${faithfulness} ← D5.2_fifo_fairness
+    feasibility_postcondition: "${waiter_fifo_depth} ≥ 1 ∧ ${waiter_fifo_depth} ≤ 16"
+    notes: |
+      Lift from immediate-deny to a bounded waiter FIFO with head-of-line grant
+      on release (R3b/R5). Activates the waiter_queue entity and the
+      lock_fairness invariant — adds enqueue logic and a release-time handoff.
+
+  - id: disable_waiter_fifo
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${waiter_fifo_depth} > 0"
+    effect: |
+      ${waiter_fifo_depth} ← 0 ∧ ${faithfulness} ← D5.0_exclusive
+    feasibility_postcondition: "${waiter_fifo_depth} == 0"
+    notes: |
+      Ease counterpart of enable_waiter_fifo: drop the queue, reverting to
+      immediate deny on contention (R3 only). Removes lock_fairness and the
+      fwd_fifo_head_served / deny_fifo_full cases.
+
+  - id: enable_shared_locks
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${lock_mode} == exclusive"
+    effect: |
+      ${lock_mode} ← shared_exclusive ∧ ${faithfulness} ← max(${faithfulness}, D5.1_shared)
+    feasibility_postcondition: "${lock_mode} == shared_exclusive"
+    notes: |
+      Add shared/exclusive compatibility (R2 + share_count). The SUT must track
+      a holder count and a shared/exclusive kind, not just a single holder —
+      broadens the message/role surface NetLock supports.
+
+  - id: disable_shared_locks
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${lock_mode} == shared_exclusive"
+    effect: |
+      ${lock_mode} ← exclusive ∧ ${faithfulness} ← D5.0_exclusive
+    feasibility_postcondition: "${lock_mode} == exclusive"
+    notes: "Ease counterpart: exclusive-only locking; drops R2 and the shared test cases."
+
+  - id: enable_holder_check
+    axis: strictness
+    direction: harden
+    applicable_when: "¬${release_check_holder}"
+    effect: "${release_check_holder} ← true"
+    feasibility_postcondition: "${release_check_holder} == true"
+    notes: |
+      Strictness: require UNLOCK to come from the current holder (R5x rejects
+      spoofed releases). Activates drop_unlock_wrong_holder and tightens
+      holder_persistence under adversarial release.
+
+  - id: disable_holder_check
+    axis: strictness
+    direction: ease
+    applicable_when: "${release_check_holder}"
+    effect: "${release_check_holder} ← false"
+    feasibility_postcondition: "${release_check_holder} == false"
+    notes: "Ease counterpart: any client may release any lock; drops R5x."
+
+  - id: switch_to_nack_deny
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${deny_mode} == drop"
+    effect: "${deny_mode} ← nack"
+    feasibility_postcondition: "${deny_mode} == nack"
+    notes: |
+      Deny by forwarding a NACK-marked response rather than silently dropping —
+      forces a second response path (set status + forward-back) and exposes the
+      drop-then-forward bug (bug_drop_then_forward). Feature-breadth: an extra
+      message type the deny path must emit.
+
+  - id: switch_to_drop_deny
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${deny_mode} == nack"
+    effect: "${deny_mode} ← drop"
+    feasibility_postcondition: "${deny_mode} == drop"
+    notes: "Ease counterpart: silent drop on deny; removes the NACK response path."
+
+  - id: hash_index_lock_table
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${index_mode} == direct"
+    effect: "${index_mode} ← hash ∧ ${hash_algo} ← crc16"
+    feasibility_postcondition: "${index_mode} == hash"
+    notes: |
+      Move from direct-indexed lock ids to a hashed lock table — lock_id hashed
+      into ${lock_table_capacity} slots, so collisions share a register cell.
+      Faithfulness: the exact direct map degrades to an approximate hash map
+      (a key-aliasing hazard the SUT must handle), distinct from feature surface.
+
+  - id: direct_index_lock_table
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${index_mode} == hash"
+    effect: "${index_mode} ← direct"
+    feasibility_postcondition: "${index_mode} == direct"
+    notes: "Ease counterpart: restore the exact direct-indexed lock table (no aliasing)."
+
+  - id: shrink_lock_table_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${lock_table_capacity} > 16"
+    effect: "${lock_table_capacity} ← ${lock_table_capacity} / 4"
+    feasibility_postcondition: "${lock_table_capacity} ≥ 4"
+    notes: "Shrink the register array; tightens the lock-id space (esp. under hash indexing)."
+
+  - id: enlarge_lock_table_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${lock_table_capacity} < 65536"
+    effect: "${lock_table_capacity} ← min(${lock_table_capacity} * 2, 65536)"
+    feasibility_postcondition: "${lock_table_capacity} ≤ 65536"
+    notes: "Ease counterpart of shrink_lock_table_4x: widen the lock-id space."
+
+# ─── Coverage floor for difficulty calibration ──────────────────────────────
+# G1≥3, G2≥1, G3≥1 satisfied above (G1=7 incl. 2 gated, G2=3, G3=5).
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations to v1model P4:
+
+    Canonical (lock_mode: exclusive, waiter_fifo_depth: 0, deny_mode: drop,
+               index_mode: direct, release_check_holder: true):
+      - Parser: a lock-request header (op, lock_id, client_id, mode, status)
+        on a custom ethertype or riding UDP; R0 drops frames where it is
+        invalid.
+      - Two register arrays indexed by lock_id: lock_state[id] (0=free,
+        1=held) and lock_holder[id] (client id). On LOCK: read lock_state;
+        if free → write held + holder=client, set status=GRANT, send back; if
+        held → drop (or set NACK + send back). On UNLOCK: read lock_holder;
+        if ==client (holder check) → write free; else drop.
+      - GRANT delivery: swap eth/ip src-dst (forward_to_requester) — the same
+        recirculation-free "reply to sender" idiom used by NetCache/NetChain
+        responders.
+      - The read-test-write of the lock register MUST be a single coherent
+        action so two same-tick LOCKs cannot both win (bug_register_*).
+
+    Shared + FIFO + hash variants:
+      - share_count register per lock; SHARED compatible iff held-kind==shared.
+      - waiter FIFO: a per-lock ring (head/tail indices + a value array in a
+        register). Enqueue on contended LOCK with room; on UNLOCK dequeue head,
+        rebind holder, send GRANT to it.
+      - hash index: hash(lock_id) % capacity; collisions alias — the SUT must
+        still behave deterministically (deny/drop) on an aliased id.
+
+  v1.0 / harness limitations (v2-deferred gaps):
+    * NO wall-clock / time_tick: a lock TIMEOUT (lease expiry) is NOT modelled,
+      because the `--use-files` harness injects only packets and exposes no
+      time source. Lock release is therefore
+      PACKET-DRIVEN — an explicit UNLOCK control packet, never a timer. A
+      lease-based auto-release variant is a v2 extension once a tick source is
+      gradable.
+    * NO egress-queue scheduling visibility: real NetLock queues waiters in
+      switch egress queues and serves them by qid; `--use-files` exposes no
+      qid / scheduling order, so genuine queue-driven delivery is ungradable.
+      The waiter FIFO is therefore modelled as REGISTER state whose head is
+      granted on the next UNLOCK packet — every decision stays observable as
+      drop / forward / header-field (status, holder). Deep-queue position and
+      true scheduling latency are out of scope.
+    * NetLock's server-assisted overflow (spilling long queues to a host) needs
+      cross-device coordination outside the single-switch v1.0 model — out of
+      scope; the FIFO is bounded and overflow is denied (deny_fifo_full).
+
+  Anti-pattern implementations to reject:
+    * Granting a held lock to a second client (broken mutual exclusion).
+    * Forgetting to clear holder/state on UNLOCK (wedged lock / deadlock).
+    * Honouring an UNLOCK from a non-holder when release_check_holder is on.
+    * Drop-and-forward: marking a denied request to drop AND emitting a GRANT.
+    * Granting an out-of-order waiter instead of the FIFO head (unfair).
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance (schema, bindings, oracle
+  audit) and hand-run the public tests through the oracle for the seed. Confirm the
+  read-test-write of the lock register is single-coherent (no double-grant)
+  and that GRANT delivery matches ${grant_response}.

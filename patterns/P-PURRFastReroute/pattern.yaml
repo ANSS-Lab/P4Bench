@@ -1,0 +1,838 @@
+# P-PURRFastReroute — Primary/Backup Fast-Reroute Primitive
+#
+# TPL v1.0 task pattern. A reusable template for the
+# P7:resilience-and-failover prescriptive cell of the design space.
+# target_capability = redesign: programmability
+# is asked to move a previously baked-in ASIC fast-reroute primitive into
+# logic-level iteration.
+
+pattern_id: P-PURRFastReroute
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                                  # destination-based forwarding with failover semantics
+  prescriptive: [P7:resilience-and-failover]                  # the canonical fast-reroute / port-liveness cell
+
+target_capability: redesign                                   # FRR is a fixed-function ASIC primitive being moved into programmable logic
+
+summary: >
+  Primary/Backup fast-reroute (PURR-style): destination prefix maps to a
+  pair of next-hops with per-port liveness driving a one-table demux —
+  the primary next-hop is used while its egress port is up, otherwise
+  the backup next-hop. No per-packet recirculation, no per-packet ECMP
+  work; failure response is structural rather than reactive (CoNEXT 2019
+  PURR §1). Anchor faithfulness (D5.0) is a single (primary, backup)
+  pair per prefix with a control-plane-driven port-down table; higher
+  rungs ladder to LPM-keyed groups with overlapping prefix stress
+  (D5.1), cascaded-backup protection on simultaneous primary+backup
+  failure (D5.2), and a dataplane-register liveness source that
+  eliminates the control-plane intermediation (D5.3).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: purr_conext19
+      title: "PURR: A Primitive for Reconfigurable Fast Reroute"
+      venue: "ACM CoNEXT 2019"
+      role: canonical_implementation
+      relevance: |
+        PURR motivates the two-table FRR primitive this pattern formalises:
+        a forwarding table that emits, for each destination, a *pair* of
+        next-hops (primary + backup), and a failure-bit lookup keyed on the
+        primary's egress port. The cited contribution this pattern preserves:
+          - Per-packet failure response is "structural" — the demux that
+            selects primary-vs-backup is a single match-action lookup, not
+            recirculation or a per-packet probe.
+          - Failure detection is control-plane-driven in the v1.0 anchor
+            (the controller publishes which ports are down); the pattern's
+            ${liveness_source} parameter exposes the dataplane-register
+            variant at higher faithfulness rungs.
+          - Tolerates multiple concurrent failures with minimal memory
+            footprint — distinct from ECMP-fallback (RESISTING, NFV-SDN
+            2024) and recirculation-based fast-reroute approaches.
+        The paper validates on Tofino; the rule set is pure-table P4 and
+        runs in BMv2 unchanged.
+      common_knowledge_baseline_used: |
+        Beyond the abstract-level details accessible in this environment,
+        the rule sequence, parameter ladder, and bridging notes draw on
+        widely-known fast-reroute design conventions (LFA-style primary/
+        backup pairing, port-liveness bitmap representation, equivalent
+        of standard IPv4 forwarding-pipeline integration). These are
+        flagged as `common-knowledge baseline` in `bridging_notes:` rather
+        than cited verbatim from the PDF.
+
+  rfcs: []                                                    # no FRR RFC in our `sources/rfcs/` corpus; LFA-family RFCs (RFC 5286 / 7490) deliberately not cited because they were not retrieved during ingestion
+
+  tutorials: []                                               # no p4lang/tutorials FRR exercise
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. All decisions are derived from
+      hdr.ethernet, hdr.ipv4, std.ingress_port, and the control-plane-
+      installed FRR group / port-down bindings.
+
+  bucket:                                                     # the FRR group — a class of flows sharing one (primary, backup) pair
+    name: frr_group
+    keyed_by: hdr.ipv4.dst                                    # match_kind selected by ${frr_match_kind}
+    attrs:
+      primary_port:   port
+      backup_port:    port
+      primary_mac:    address
+      backup_mac:     address
+    capacity: ${frr_table_capacity}
+    notes: |
+      A control-plane-installed FRR binding. ${frr_match_kind} chooses
+      between `exact` (anchor — keyed on the exact destination IP) and
+      `lpm` (faithfulness rung 1+ — keyed on the destination prefix
+      with longest-prefix priority). Each binding ships a pair of
+      next-hops; the demux in R2/R3 picks one per packet.
+
+  link:                                                       # per-port liveness — the FRR "is_down?" probe surface
+    keyed_by: egress_port
+    attrs:
+      is_down: bool
+    capacity: ${port_down_capacity}
+    notes: |
+      The set of ports currently considered down. In the anchor
+      (${liveness_source} == control_plane_table), the binding is a
+      table entry installed by the controller — a port is "down" iff
+      it has a `mark_down` entry in this table. At ${liveness_source}
+      == dataplane_register, the binding is a register slot the data
+      plane itself flips on locally-detected loss-of-signal; the rule
+      surface is identical, only the population mechanism changes.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  frr_groups:
+    type: list[frr_group_entry]
+    constraint: |
+      every entry has dst:ipv4_address or (prefix:ipv4_cidr +
+      prefix_len ∈ [0, 32]); primary_port, backup_port ∈ valid port
+      ids; primary_mac, backup_mac:mac_address. primary_port ≠
+      backup_port (the backup must be distinct from the primary —
+      otherwise FRR has nothing to fail over to).
+    notes: |
+      Control-plane-installed FRR bindings. Determines which
+      destinations are reachable and what their (primary, backup) pair
+      is. Anchor seeds typically install 3–4 prefixes covering all
+      hosts in the topology.
+
+  port_down:
+    type: list[port]
+    constraint: "subset of ports declared in the topology; |port_down| ≤ ${port_down_capacity}"
+    default: []
+    notes: |
+      The set of ports currently considered down. Empty in the
+      "no-failures" sub-scenario; non-empty for backup-path tests.
+      Updated only by the control plane in the anchor; updated by the
+      data plane (loss-of-signal register) at the dataplane-liveness
+      rung.
+
+  frr_match_kind:
+    type: enum
+    values: [exact, lpm]
+    default: exact
+    notes: |
+      How the FRR table keys are matched. `exact` keys on the literal
+      destination IP and is the anchor (/32 effective keys when only a
+      handful of distinct hosts exist). `lpm` keys on the destination prefix
+      with longest-prefix priority, opening the door to overlapping
+      prefixes and the implementation bug of using ternary without explicit
+      prefix-length priorities.
+
+  frr_table_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: |
+      Maximum number of FRR bindings the table holds. Realistic
+      single-pipeline ASIC FRR groups sit in the 10²–10³ range
+      (PURR §5 / §6); the `shrink_frr_capacity_4x` mutation walks the
+      pattern down toward that regime.
+
+  port_down_capacity:
+    type: int
+    range: "[1, 64]"
+    default: 64
+    notes: |
+      Maximum number of distinct ports the port-down structure can
+      mark as down simultaneously. Anchor seeds use the default;
+      higher rungs shrink this to expose the implementation to a tighter
+      memory budget.
+
+  liveness_source:
+    type: enum
+    values: [control_plane_table, dataplane_register]
+    default: control_plane_table
+    notes: |
+      How the link-down state is communicated to the demux:
+        control_plane_table → A `mark_down` match-action table keyed
+                              on the primary's egress port. A port is
+                              "down" iff it has a table entry. This is
+                              the anchor.
+        dataplane_register  → A register array indexed by port id; the
+                              switch flips the bit locally on
+                              loss-of-signal. Higher-rung variant; the
+                              implementation must read the register and treat
+                              `value(link.is_down, ==, 1)` as the
+                              port-down predicate.
+
+  cascaded_backup:
+    type: bool
+    default: false
+    notes: |
+      When false, R3 unconditionally uses the backup next-hop if the
+      primary is down — even if the backup port is itself down (the
+      packet then leaves a black-holed port; this is realistic for
+      single-failure protection).
+      When true, R3 additionally checks the backup port's liveness;
+      if both primary and backup are down, R3 drops. Equivalent of
+      PURR's N-1-protection mode.
+
+  ttl_decrement_strict:
+    type: bool
+    default: true
+    notes: |
+      When true, every R2/R3 firing decrements hdr.ipv4.ttl by exactly
+      one (and the ttl_quantum_one invariant is enforced rather than
+      advisory). Some FRR designs that wrap tunnel-style encapsulation
+      do not decrement TTL; setting this false relaxes the rule to
+      match that design. Anchor is true.
+
+  default_action_on_miss:
+    type: enum
+    values: [drop, use_default_route]
+    default: drop
+    notes: |
+      Behaviour when the FRR table has no match. `drop` is the v1.0
+      anchor. `use_default_route` adds a
+      pattern-augmenting case where the FRR table holds a default
+      0.0.0.0/0 binding that absorbs misses; only realisable at
+      ${frr_match_kind} == lpm.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_basic_pair, D5.1_lpm_groups, D5.2_cascaded_protection, D5.3_dataplane_liveness]
+    default: D5.0_basic_pair
+    notes: |
+      Faithfulness ladder. D5.0 is the
+      basic-pair anchor; D5.1 lifts match kind to LPM and
+      stresses overlapping prefixes; D5.2 adds cascaded backup
+      protection on simultaneous primary+backup failure; D5.3 swaps
+      the liveness source to a dataplane register, removing the
+      control-plane intermediation. Seed-only parameter; not an
+      nf_categories design-space tag.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The pattern is IPv4-only fast-reroute. ARP, IPv6, MPLS, LLDP, and
+      any other ethertype are out of scope and MUST NOT be forwarded.
+
+  - id: R1_no_frr_match
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+    then:
+      - "${default_action_on_miss}"
+    notes: |
+      No FRR binding covers this destination.
+      `drop` is the anchor default; ${default_action_on_miss} is
+      retained as a parameter so a future seed can wire a 0.0.0.0/0
+      catch-all at ${frr_match_kind} == lpm.
+
+  - id: R2_primary_up_forward
+    when: |
+      header_present(ipv4)
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ ¬(
+            exists(link, frr_group.primary_port)
+            ∧ value(link.is_down, ==, 1)
+          )
+    given:
+      frr_group: by_key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})
+    then:
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_group.primary_mac)
+      - forward(frr_group.primary_port)
+    notes: |
+      Primary path. The primary's egress port is not in the down set
+      (or has no `mark_down` binding installed), so the implementation picks
+      the primary next-hop. L2 rewrite uses the ingress dst-MAC as the
+      new src-MAC (see bridging_notes for when this convention is/isn't
+      safe). TTL
+      decrement is gated by ${ttl_decrement_strict} so the rule still
+      reads cleanly when a tunnel-style seed disables it.
+
+  - id: R3_primary_down_forward_backup
+    when: |
+      header_present(ipv4)
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ exists(link, frr_group.primary_port)
+        ∧ value(link.is_down, ==, 1)
+        ∧ ¬(
+            ${cascaded_backup} ∧ exists(link, frr_group.backup_port)
+            ∧ value(link.is_down, ==, 1)
+          )
+    given:
+      frr_group: by_key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})
+    then:
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_group.backup_mac)
+      - forward(frr_group.backup_port)
+    notes: |
+      Backup path. The primary's egress port is marked down; the
+      implementation fails over to the backup next-hop. When
+      ${cascaded_backup} is false (anchor), the backup is used
+      regardless of its own liveness; when true, R3 additionally
+      requires the backup's liveness, deferring the both-down case
+      to R4. The L2 rewrite MUST use the BACKUP MAC, not the primary
+      MAC — see invariant `ether_rewrite_correctness_on_backup`.
+
+  - id: R4_cascaded_double_down_drop
+    when: |
+      ${cascaded_backup}
+        ∧ header_present(ipv4)
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ exists(link, frr_group.primary_port)
+        ∧ value(link.is_down, ==, 1)
+        ∧ exists(link, frr_group.backup_port)
+        ∧ value(link.is_down, ==, 1)
+    enforced_when: "${cascaded_backup}"
+    then:
+      - drop
+    notes: |
+      Both primary and backup are down. Only fires at
+      ${cascaded_backup} == true; otherwise R3 absorbs this case via
+      its negated guard, the backup is "used", and the packet egresses
+      a black-holed port. The cascaded variant explicitly drops
+      instead — matches PURR's N-1 protection mode.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The mechanism is the absence
+      of any recirculation rule plus TTL decrement on every forward
+      (R2/R3) when ${ttl_decrement_strict} is true. PURR's design
+      explicitly avoids per-packet recirculation; this invariant is the
+      pattern-level expression of that property.
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "rule R2 fires ∨ rule R3 fires"
+    enforced_when: "${ttl_decrement_strict}"
+    notes: |
+      RFC 1812 §5.3.1 — TTL is decremented by EXACTLY one per forward.
+      A common implementation bug is double-decrement (e.g., applying TTL-- in
+      both MyIngress and MyEgress); the ttl_decrement_check G2 case
+      catches it. Gated on ${ttl_decrement_strict} so the invariant
+      relaxes coherently when a tunnel-style seed disables the
+      decrement.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "rule R2 fires ∨ rule R3 fires"
+    free_under: []
+    notes: |
+      IP source and destination addresses MUST NOT be modified during
+      FRR-mediated forwarding. Distinguishes this pattern from NAT and
+      tunnels. The implementation anti-pattern is overwriting dst in an action
+      meant to set the next-hop MAC.
+
+  - id: ether_rewrite_correctness_on_primary
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "rule R2 fires"
+    notes: |
+      On R2 firing, hdr.ethernet.dst MUST equal frr_group.primary_mac.
+      Implementation bug: forgetting the dst-MAC rewrite (frame carries the
+      ingress dst-MAC and is silently rejected by the downstream peer's
+      MAC filter) — the L2-rewrite assertion in fwd_primary_up catches
+      it.
+
+  - id: ether_rewrite_correctness_on_backup
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "rule R3 fires"
+    notes: |
+      On R3 firing, hdr.ethernet.dst MUST equal frr_group.backup_mac
+      — NOT primary_mac. The mac-confusion bug (using primary_mac on
+      the backup egress) silently sends packets out the correct port
+      but with the wrong destination MAC; the test
+      `fwd_backup_uses_backup_mac_not_primary_mac` surfaces this.
+
+  - id: failover_decision_per_packet
+    clause: stability
+    target: forward_decision
+    while: "exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})) ∧ link.is_down state unchanged"
+    notes: |
+      Under a fixed link-liveness state, the per-packet primary-vs-
+      backup decision is a deterministic function of the packet's dst
+      and the installed liveness — i.e., two packets to the same dst
+      under identical liveness MUST land on the same egress port.
+      Implementation bug: hashing or randomising the demux ⇒ flow splits and
+      breaks TCP ordering even on the unfailed primary path.
+
+  - id: no_orphan_links
+    clause: no_orphan
+    target: link
+    notes: |
+      Every `link` entity (port-down binding) is sourced from a
+      well-defined population mechanism — either an explicit
+      control-plane `mark_down` table entry (default) or a register
+      slot written by the data plane (high-faithfulness variant).
+      The pattern declares no implicit decay; bindings persist until
+      explicitly cleared by the control plane (or by the register
+      flipping back).
+
+  - id: failover_bounded_latency
+    clause: bounded_latency
+    target: failover_response
+    bound: 1                                                  # one packet — failover decision must be made in-pipeline, not deferred
+    notes: |
+      The first packet observing the primary's `is_down == 1` MUST
+      take the backup. PURR's whole point is one-packet failover; any
+      implementation that defers the demux to a control-plane upcall fails
+      this. Cannot be satisfied if the implementation implements failover via
+      recirculation + control-plane mirror (no_loop ANDed with this
+      invariant rules that out).
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+# Every entry maps to a G{1,2,3}-P{n}-T{m} rule from the goal framework.
+
+test_scaffolding:
+
+  G1:                                                         # functional correctness
+    - id: fwd_primary_up
+      rule_ref: G1-P1-T1                                      # one test per forwarding path
+      generate: |
+        Pick a frr_group entry whose primary_port is NOT in
+        ${port_down}. Send an IPv4 packet from any ingress with dst
+        covered by that group. Assert:
+          - output_port == frr_group.primary_port
+          - hdr.ethernet.dst rewritten to frr_group.primary_mac
+          - hdr.ethernet.src rewritten to the prior dst-MAC
+          - hdr.ipv4.ttl decremented by 1 IF ${ttl_decrement_strict}
+          - hdr.ipv4.src, hdr.ipv4.dst unchanged
+
+    - id: fwd_backup_on_down
+      rule_ref: G1-P1-T1
+      generate: |
+        Pick a frr_group whose primary_port IS in ${port_down}
+        (instantiation guarantees ≥1 such entry exists when
+        materialising this scaffold). Send an IPv4 packet with dst in
+        that group. Assert:
+          - output_port == frr_group.backup_port
+          - hdr.ethernet.dst rewritten to frr_group.backup_mac
+          - hdr.ipv4.ttl decremented by 1 IF ${ttl_decrement_strict}
+          - hdr.ipv4 addrs preserved
+
+    - id: fwd_backup_uses_backup_mac_not_primary_mac
+      rule_ref: G1-P1-T5                                      # explicit transformation assertion
+      generate: |
+        Same scenario as fwd_backup_on_down, but with a different
+        source address to defeat a 5-tuple-hash implementation bug. Assert
+        the dst-MAC is EXACTLY the backup_mac, not primary_mac.
+        Tests ether_rewrite_correctness_on_backup.
+
+    - id: fwd_ttl_decrement_check
+      rule_ref: G1-P1-T5
+      requires: "${ttl_decrement_strict}"
+      generate: |
+        Send a packet with ipv4.ttl = 10 on the primary path; assert
+        output ipv4.ttl == 9. Repeat with ttl = 1; assert output
+        ipv4.ttl == 0 (forwarded, not dropped — the pattern
+        explicitly does NOT pre-drop on ttl ≤ 1, only decrements).
+
+  G2:                                                         # resource robustness / boundary
+    - id: drop_frr_table_miss
+      rule_ref: G2-P1-T1                                      # table-miss / default action
+      generate: |
+        Send an IPv4 packet with dst not covered by any entry in
+        ${frr_groups} (and no 0.0.0.0/0 catch-all installed). Assert
+        drop.
+
+    - id: drop_truncated_ipv4
+      rule_ref: G2-P1-T2                                      # parser reject path
+      generate: |
+        Send an Ethernet frame with ethertype 0x0800 but no IPv4
+        payload (truncated). Assert drop (parser cannot extract
+        ipv4 → header_present(ipv4) is false → R0 fires).
+
+    - id: frr_capacity_overflow
+      rule_ref: G2-P1-T3                                      # capacity / overflow
+      requires: "${frr_table_capacity} != unbounded"
+      generate: |
+        Install ${frr_table_capacity} FRR bindings successfully.
+        Attempt to install one more. Assert: either the additional
+        install is rejected at the control plane, or it evicts a
+        prior entry (impl-defined). Then send a packet that would
+        have matched the evicted/rejected entry; assert drop.
+
+  G3:                                                         # security / bypass / regression for v1model bug patterns
+    - id: drop_non_ipv4
+      rule_ref: G3-P2-T1                                      # bypass: non-target protocol must drop
+      generate: |
+        Send a frame with ethertype 0x0806 (ARP) and arbitrary payload
+        to any port. Assert drop. Probes the parser-reject path and
+        the implementation's habit of leaking ARP through the default action.
+
+    - id: regression_conditional_deparser_smoke
+      rule_ref: G3-P2-T2                                      # bug-driven: conditional deparser
+      generate: |
+        Send a packet that R2 forwards on the primary path. Verify
+        the OUTPUT structure is exactly Ether + IPv4, with all IPv4
+        fields preserved (proto, totalLen, identification, flags,
+        fragOffset, srcAddr, dstAddr) and a valid recomputed
+        checksum. Catches implementations that conditionally emit hdr.ipv4
+        inside the deparser ("packet.emit(hdr.ipv4)" inside an
+        `if`), which silently corrupts the output frame when the
+        condition mis-evaluates. The implementation anti-pattern is
+        documented in the v1model bug taxonomy.
+
+    - id: regression_std_metadata_drop_smoke
+      rule_ref: G3-P2-T3                                      # bug-driven: std_metadata.drop misread
+      generate: |
+        Send two consecutive packets: (a) a non-IPv4 frame that R0
+        drops, then (b) an IPv4 packet on the primary path that R2
+        forwards. Assert (b) is forwarded normally — i.e., the prior
+        drop did NOT corrupt the implementation's per-packet drop decision via
+        a misread of `standard_metadata.drop`. Catches implementations that
+        read `std.drop` to test "was the packet dropped?" (the field
+        is reserved; reading produces unspecified results that can
+        cross-contaminate the decision on subsequent packets).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pair every harden with an ease on the same axis. Twelve operators across
+# six paired axes (capacity, match-kind, cascaded-protection, liveness-
+# source, route-overlap, test-rigor).
+
+mutation_operators:
+
+  - id: shrink_frr_capacity_4x
+    applicable_when: "${frr_table_capacity} ≠ unbounded ∧ ${frr_table_capacity} > 64"
+    effect: "${frr_table_capacity} ← ${frr_table_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${frr_table_capacity} ≥ 16"
+    notes: |
+      Tighten the FRR-binding-capacity axis. At 256 → 64 the implementation
+      cannot rely on storing every (dst, primary, backup) tuple
+      individually and must consider aggregation or pair-sharing.
+
+  - id: enlarge_frr_capacity_2x
+    applicable_when: "${frr_table_capacity} ≠ unbounded"
+    effect: "${frr_table_capacity} ← ${frr_table_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${frr_table_capacity} ≤ 65536"
+    notes: |
+      Loosen the capacity axis. Pairs with shrink_frr_capacity_4x so
+      difficulty recalibration can recover from over-tightening.
+
+  - id: swap_match_kind_to_lpm
+    applicable_when: "${frr_match_kind} == exact"
+    effect: |
+      ${frr_match_kind} ← lpm ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_lpm_groups)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${frr_groups} entries can be re-expressed as (prefix, prefix_len) — they are or can be widened from /32 host routes"
+    notes: |
+      Lift D5.0 → D5.1. Activates the implementation bug of using ternary or
+      exact match on hdr.ipv4.dst when LPM with explicit prefix-
+      length priority is required. Pair with the
+      `inflate_routes_with_overlap_stress` operator below to actually
+      exercise the longest-prefix-match property.
+
+  - id: swap_match_kind_to_exact
+    applicable_when: "${frr_match_kind} == lpm"
+    effect: |
+      ${frr_match_kind} ← exact ∧
+      ${faithfulness} ← min(${faithfulness}, D5.0_basic_pair)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no two ${frr_groups} entries share the same dst (exact-match disambiguation is unique)"
+    notes: |
+      Drop back to exact match. Used to ease an instance that is too hard
+      because its LPM rule set is too forgiving to fail.
+
+  - id: enable_cascaded_backup
+    applicable_when: "${cascaded_backup} == false"
+    effect: |
+      ${cascaded_backup} ← true ∧
+      ${faithfulness} ← max(${faithfulness}, D5.2_cascaded_protection)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "R4 is added to the rule sequence and a `double_down_drop` G3 entry is materialised at instantiation"
+    notes: |
+      Activates R4 and the both-down-drop semantics. The implementation must
+      add a second port-liveness check on the backup's egress port —
+      a small but easy-to-miss step the basic primary/backup design
+      doesn't need.
+
+  - id: disable_cascaded_backup
+    applicable_when: "${cascaded_backup} == true"
+    effect: "${cascaded_backup} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "R4 is removed from the active rule set"
+    notes: |
+      Strip the cascaded protection. Pairs with enable_cascaded_backup.
+
+  - id: swap_liveness_to_dataplane_register
+    applicable_when: "${liveness_source} == control_plane_table"
+    effect: |
+      ${liveness_source} ← dataplane_register ∧
+      ${faithfulness} ← max(${faithfulness}, D5.3_dataplane_liveness)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "the harness can pre-populate the dataplane register at task start (no live-link-detection requirement)"
+    notes: |
+      Lift to D5.3. The implementation must read a register array indexed by
+      port id and test `link.is_down == 1` from the register slot
+      rather than from a table-match outcome. Catches implementations that
+      conflate the two abstractions (e.g., trying to test `port_down
+      .apply().hit` against a register).
+
+  - id: swap_liveness_to_control_plane_table
+    applicable_when: "${liveness_source} == dataplane_register"
+    effect: "${liveness_source} ← control_plane_table"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the seed's port_down list is realisable as table entries"
+    notes: |
+      Drop back to the table-driven liveness source. Pairs with
+      swap_liveness_to_dataplane_register.
+
+  - id: inflate_routes_with_overlap_stress
+    applicable_when: "${frr_match_kind} == lpm ∧ 'lpm_longest_match_priority' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${frr_groups} so that ≥ 30% of installed prefixes
+      overlap (a /16 plus several /24s and /32s within it). Add G2
+      test `lpm_longest_match_priority` that sends packets requiring
+      3 levels of LPM tie-break and asserts the longest-prefix entry
+      wins.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${frr_table_capacity} ≥ 64 ∨ ${frr_table_capacity} == unbounded"
+    notes: |
+      Pattern-augmenting at D5.1+. Catches the implementation bug of using a
+      ternary table without explicit prefix-length priorities.
+
+  - id: restrict_to_disjoint_prefixes
+    applicable_when: "${frr_match_kind} == lpm ∧ overlapping prefixes present in ${frr_groups}"
+    effect: |
+      Replace ${frr_groups} with a disjoint set (no two entries
+      share any address). Remove G2 `lpm_longest_match_priority` if
+      present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "every dst address is matched by at most one entry"
+    notes: |
+      Pairs with inflate_routes_with_overlap_stress.
+
+  - id: relax_ttl_invariant
+    applicable_when: "${ttl_decrement_strict} == true"
+    effect: |
+      ${ttl_decrement_strict} ← false ∧
+      ttl_quantum_one invariant moves to advisory (enforced_when ⇒ false)
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "fwd_ttl_decrement_check is dropped from the G1 floor (the `requires:` guard turns it off)"
+    notes: |
+      Tunnel-style FRR seeds (encap-mediated) sometimes don't change
+      TTL on the FRR demux itself. Ease op for too-hard instances
+      whose only failures are TTL pedantry.
+
+  - id: enable_strict_ttl_invariant
+    applicable_when: "${ttl_decrement_strict} == false"
+    effect: "${ttl_decrement_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "fwd_ttl_decrement_check is re-included in the G1 set"
+    notes: |
+      Pairs with relax_ttl_invariant.
+
+  - id: add_simultaneous_multi_port_down_g2
+    applicable_when: "'simultaneous_multi_port_down' ∉ test_scaffolding.G2"
+    effect: |
+      Add a G2 test `simultaneous_multi_port_down` that puts two
+      ports in ${port_down} simultaneously and sends one packet per
+      FRR group whose primary's port is in the set. Assert each
+      packet lands on its own group's backup port. Probes PURR's
+      claimed multi-failure tolerance (CoNEXT 2019 §1).
+    axis: hidden-coverage
+    direction: harden
+    feasibility_postcondition: "|${frr_groups}| ≥ 2 ∧ ${port_down_capacity} ≥ 2"
+    notes: |
+      Test-rigor harden. PURR's headline claim is multi-failure
+      tolerance; without this test, the suite cannot
+      discriminate an implementation that hardcodes a single-failure assumption.
+
+  - id: drop_simultaneous_multi_port_down_g2
+    applicable_when: "'simultaneous_multi_port_down' ∈ test_scaffolding.G2"
+    effect: |
+      Remove the `simultaneous_multi_port_down` G2 test.
+    axis: hidden-coverage
+    direction: ease
+    feasibility_postcondition: "G2 still contains at least one entry"
+    notes: |
+      Pairs with add_simultaneous_multi_port_down_g2.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4. Tagged with the
+  faithfulness rung each addresses; items marked [common-knowledge
+  baseline] are synthesised from internalised P4 / networking
+  knowledge rather than retrieved from a cited source.
+
+    D5.0 anchor (frr_match_kind: exact, cascaded_backup: false,
+                 liveness_source: control_plane_table,
+                 ttl_decrement_strict: true):
+      - Two tables: `frr_table` (key: hdr.ipv4.dstAddr, match_kind:
+        exact for anchor — switch to lpm at D5.1) → action
+        `set_frr(primary_port, backup_port, primary_mac, backup_mac)`
+        that stashes all four into metadata; default_action: drop().
+      - `port_down` (key: meta.primary_port, exact) → action
+        `mark_down()` setting meta.primary_down = 1; default_action:
+        NoAction (i.e., primary stays up by default). [common-
+        knowledge baseline]
+      - Apply sequence in MyIngress:
+          frr_table.apply();
+          if (meta.frr_hit == 1) {
+            port_down.apply();                  // sets meta.primary_down
+            if (meta.primary_down == 0) {
+              egress_spec = meta.primary_port;
+              dst_mac = meta.dmac_primary;
+            } else {
+              egress_spec = meta.backup_port;
+              dst_mac = meta.dmac_backup;
+            }
+            ttl--;
+            ether.src = ether.dst (old);        // see anti-pattern note
+            ether.dst = dst_mac;
+          }
+      - MyComputeChecksum: incremental update on the TTL change.
+        Forgetting this is the silent failure that
+        `regression_conditional_deparser_smoke` would NOT catch
+        (it would, however, surface as checksum-invalid on a real
+        peer; BMv2 emits the packet as-is).
+
+    D5.1 (frr_match_kind: lpm):
+      - `frr_table` becomes lpm-keyed; the implementation must use match_kind
+        `lpm` in P4, not `ternary` or `exact-with-prefix-mask`.
+        Implementation bug: using ternary without explicit prefix-length
+        priorities ⇒ wrong route may win when prefixes overlap.
+
+    D5.2 (cascaded_backup: true):
+      - Add a second port-liveness lookup against meta.backup_port
+        after the first, into meta.backup_down. The demux becomes a
+        2-bit case (primary_down, backup_down) → 4 outcomes (one
+        drop, three forwards). [common-knowledge baseline]
+
+    D5.3 (liveness_source: dataplane_register):
+      - Replace the `port_down` table with `register<bit<1>>(N)
+        port_down_reg`. Read `port_down_reg.read(reg_val,
+        meta.primary_port);` then `meta.primary_down = reg_val;`.
+        The harness pre-populates the register at task init via the
+        same instance-bindings YAML — the SUT need not implement
+        link-failure detection itself. [common-knowledge baseline —
+        the BMv2 register API is documented in the v1model.p4
+        header]
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Setting hdr.ethernet.src = hdr.ethernet.dst (the "shift" trick)
+      is only correct on point-to-point links between routers that
+      share identical MAC conventions. A fixed topology can use it
+      when its MACs are wired to make it work, but generalised instances at D5.1+ should install a `port_mac` per
+      next-hop and rewrite from there. The pattern's
+      `ether_rewrite_correctness_on_primary` / `_on_backup` invariants
+      pin the egress dst-MAC; src-MAC pinning is a Tier-3 extension
+      (not currently in the operator set — flag for v1.1).
+
+    * Conditionally emitting hdr.ipv4 inside MyDeparser (`if
+      (hdr.ipv4.isValid()) packet.emit(hdr.ipv4)` is fine; `if
+      (some_other_condition) packet.emit(hdr.ipv4)` is the bug). The
+      `regression_conditional_deparser_smoke` G3 case catches this
+      by asserting the full IPv4 structure is preserved on a known-
+      forward packet.
+
+    * Reading `standard_metadata.drop` to test "did I drop?" — this
+      is a reserved-field misread (v1model bug taxonomy,
+      "Backend resource mapping error"). The correct pattern is to
+      use `mark_to_drop(standard_metadata)` and let the engine
+      handle disposition; never read `.drop` to make subsequent
+      decisions. The `regression_std_metadata_drop_smoke` G3 case
+      catches cross-packet contamination from this misuse.
+
+    * At D5.2, forgetting that R4 must fire BEFORE R3 in
+      first-match order — otherwise R3's negated cascaded guard
+      doesn't get a chance to fail-through to R4. The rule sequence
+      above lists R4 last because R3's `when` already excludes the
+      both-down case at ${cascaded_backup} == true; the implementation MUST
+      either implement the same negated guard in its R3-equivalent
+      conditional, or move the both-down drop ahead of the backup
+      action.
+
+    * Implementing the failover demux via recirculation —
+      P4_16/v1model `recirculate()` followed by a "tried backup
+      already?" metadata bit. This violates
+      `failover_bounded_latency`, even though it produces the
+      correct forwarding outcome on the second pass. PURR's whole
+      point is structural failover; the test suite must
+      reject this implementation pattern.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and (once the oracle
+       exists) the oracle audit must all pass validation.
+
+    2. For anchor instances (D5.0_basic_pair, default seeds),
+       the resulting task SHOULD reduce to a single primary/backup pair
+       per destination with a control-plane port-down table.
+       Cross-check by running the public test set through the
+       generated oracle.
+
+    3. The pattern intentionally does NOT carry a `port_mac` per
+       next-hop (only `primary_mac` and `backup_mac` on the FRR
+       group). If a future seed needs realistic per-port source-MAC
+       rewriting (matching production router conventions), add a
+       parameter `port_mac_table` and an invariant
+       `ether_src_rewrite_correctness` — flagged for v1.1.

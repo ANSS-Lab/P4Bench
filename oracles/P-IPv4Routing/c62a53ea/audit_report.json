@@ -1,0 +1,152 @@
+{
+  "oracle_hash": "621a84d10e39de98200b4a2b038a3a78d37fd53642f814ead496519a5884bd46",
+  "instance": "ipv4_routing_anchor-default",
+  "ran_at": "2026-06-17T04:03:28.207539Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "forward_lpm_hit_24",
+        "status": "pass"
+      },
+      {
+        "example_id": "forward_host_route_32_tiebreak",
+        "status": "pass"
+      },
+      {
+        "example_id": "forward_covering_prefix_near_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_one_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "limited_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "directed_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "martian_src_not_filtered_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "martian_filter_enabled_drops_martian_src",
+        "status": "pass"
+      },
+      {
+        "example_id": "rebound_fib_default_action_icmp_multipath",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "ttl_quantum_one": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ip_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_traffic_distribution": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "wcmp_weighted_distribution": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "lpm_longest_match_correctness",
+      "ecmp_flow_consistency",
+      "ecmp_traffic_distribution",
+      "wcmp_weighted_distribution"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "contra_nsdi20",
+      "RFC1812",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,233 @@
+# P-MPLSLabelSwitch — MPLS Label-Switched-Router forwarding (LFIB swap/pop/push)
+#
+# TPL v1.0 task pattern. A transit Label-Switching Router:
+# parse the MPLS shim, look the top label up in the LFIB, perform the bound
+# label operation (swap / pop / push), decrement the MPLS TTL, and rewrite L2.
+# Introduces the corpus's first variable-depth header-stack edit (the existing
+# tunnel patterns only PREPEND fixed headers). Grounded in RFC 3031/3032.
+
+pattern_id: P-MPLSLabelSwitch
+version: "1.0"
+nf_categories:
+  descriptive:  [D5:routing]              # label-based forwarding (a routing discipline)
+  prescriptive: [P1:forwarding]           # match-action on the label + header-stack edit
+target_capability: redesign               # programmability redesigns the fixed-function LSR label engine
+summary: >
+  Transit MPLS Label-Switching Router. The canonical instance performs the
+  core LSR operation — top-label SWAP via the LFIB, MPLS-TTL decrement, and
+  Ethernet rewrite — on a single- or multi-label stack, preserving the label
+  stack below the top and the encapsulated payload. Mutation lifts to
+  penultimate-hop POP (expose the inner packet) and ingress PUSH, deeper
+  stacks, and EXP/TC-aware queue selection. RFC 3031 (architecture),
+  RFC 3032 (label-stack encoding + TTL processing).
+
+grounding:
+  rfcs:
+    - id: RFC3032
+      cite: "RFC 3032 §2.1 / §2.4 / §3"
+      sections: ["2.1", "2.2", "2.3", "2.4", "3"]
+      role: canonical_spec
+      quote: >-
+        The label stack is represented as a sequence of label stack entries. Each
+        label stack entry is four octets and encodes a Label value (20 bits),
+        Traffic Class (3 bits), a bottom of stack S bit (1 bit), and a Time to
+        Live (8 bits). When an LSR receives a labeled packet it decrements the TTL
+        of the top label and discards the packet if the TTL becomes zero. The
+        label at the top of the stack may be replaced (swap), removed (pop), or a
+        new label may be pushed onto the stack.
+      grounds: [R1_decrement_ttl, R2_lfib_lookup, R3_label_op, mpls_ttl_quantum_one]
+      relevance: |
+        MPLS Label Stack Encoding — the shim and the operations:
+          - §2.1  The 4-octet shim: Label(20), EXP/TC(3), S bottom-of-stack(1),
+                  TTL(8). Basis for the header definition and the S-bit
+                  stack-bottom semantics.
+          - §2.3  Bottom of Stack: S==1 marks the last label; the next header
+                  is the network-layer packet. Basis for parse termination and
+                  the preserve-stack-below-top invariant.
+          - §2.4  TTL: each LSR decrements the TTL of the top label by 1 and
+                  discards the packet if it reaches 0. Basis for R1 + the
+                  mpls_ttl_quantum_one invariant.
+          - §3    Label operations: swap (replace top label), pop (remove top
+                  label), push (prepend). Basis for R3's per-LFIB-entry op.
+    - id: RFC3031
+      cite: "RFC 3031 §3.10 (NHLFE) / §3.18"
+      sections: ["3.10", "3.18", "3.22"]
+      role: normative_behaviour
+      quote: >-
+        The "Next Hop Label Forwarding Entry" (NHLFE) is used when forwarding a
+        labeled packet. It contains the packet's next hop and the operation to
+        perform on the packet's label stack: replace the label at the top of the
+        stack with a specified new label, pop the label stack, or replace the
+        label and then push one or more specified new labels. The Incoming Label
+        Map maps each incoming label to a set of NHLFEs.
+      grounds: [R2_lfib_lookup, R3_label_op]
+      relevance: |
+        MPLS Architecture — the LFIB (label→NHLFE) lookup model: the incoming
+        top label selects a Next-Hop Label-Forwarding Entry carrying the
+        operation, the outgoing label, and the next hop. Basis for the
+        `lfib` entity and R2/R3.
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "Atomic. Decisions derive from the top MPLS label + the LFIB."
+  lfib:                                     # the TPL `bucket` role
+    keyed_by_tuple: [in_label]
+    attrs:
+      op:        "enum(swap, pop, push)"
+      out_label: int                        # for swap/push
+      egress_port: port
+      next_hop_mac: address
+      port_mac:  address
+    capacity: ${lfib_capacity}
+    notes: "Next-Hop Label-Forwarding Entry keyed on the incoming top label."
+
+parameters:
+  lfib:
+    type: list[lfib_entry]
+    constraint: "each entry has in_label ∈ [0,2^20), op, egress_port, MACs; swap/push carry out_label"
+  lfib_capacity:
+    type: int | unbounded
+    default: unbounded
+  enable_pop:
+    type: bool
+    default: false
+    notes: "When true, R3_lfib_pop is active (penultimate-hop pop). Canonical: false."
+  enable_push:
+    type: bool
+    default: false
+    notes: "When true, ingress label imposition (push) is active. Canonical: false."
+  reserved_label_policy:
+    type: enum
+    values: [drop, process]
+    default: drop
+    notes: "Labels 0..15 are reserved (RFC 3032 §2.1); canonical drops them as unmatched."
+  faithfulness:
+    type: enum
+    values: [D.swap_only, D.swap_pop, D.full_stack]
+    default: D.swap_only
+
+rules:
+  - id: R0_non_mpls_drop
+    when: "¬header_present(mpls)"
+    then: [drop]
+    notes: "Non-MPLS ether-types (0x0800 IPv4, ARP, …) are out of scope → drop."
+  - id: R1_mpls_ttl_exhausted
+    when: "header_present(mpls) ∧ mpls.top.ttl ≤ 1"
+    then: [drop]
+    notes: "RFC 3032 §2.4 — decrement top-label TTL; discard if it reaches 0."
+  - id: R2_lfib_miss_drop
+    when: "header_present(mpls) ∧ mpls.top.ttl > 1 ∧ ¬exists(lfib, by_key(mpls.top.label))"
+    then: [drop]
+    notes: "Unknown top label (incl. reserved 0..15 under drop policy) → drop."
+  - id: R3_lfib_swap
+    when: "header_present(mpls) ∧ mpls.top.ttl > 1 ∧ exists(lfib, by_key(mpls.top.label)) ∧ entry.op == swap"
+    given:
+      entry: by_key(mpls.top.label, ${lfib})
+    then:
+      - set(mpls.top.label, entry.out_label)
+      - dec(mpls.top.ttl, 1)
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: |
+      The core transit-LSR step. ONLY the top label is rewritten; the label
+      stack below (S==0 labels) and the encapsulated network-layer payload
+      (including its own TTL) are preserved. EXP/TC and S bits of the top
+      label are preserved.
+  - id: R3_lfib_pop
+    when: "header_present(mpls) ∧ exists(lfib, by_key(mpls.top.label)) ∧ entry.op == pop ∧ ${enable_pop}"
+    enforced_when: "${enable_pop}"
+    then:
+      - "pop(mpls.top)"
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: "Penultimate-hop pop: remove the top label, forward the exposed packet. Mutation-only."
+
+invariants:
+  - id: mpls_ttl_quantum_one
+    clause: stability
+    target: mpls.top.ttl_decrement
+    while: "rule R3_lfib_swap fires"
+    notes: "RFC 3032 §2.4 — top-label TTL decremented by EXACTLY one."
+  - id: label_stack_below_top_preserved
+    clause: persistence
+    target: "mpls.labels[1:]"
+    while: "rule R3_lfib_swap fires"
+    notes: "Swap touches only the top label; inner labels are untouched."
+  - id: payload_preservation
+    clause: persistence
+    target: "encapsulated_payload"
+    while: "rule R3_lfib_swap fires"
+    notes: "The network-layer packet (and its TTL) is not modified on swap."
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ rule R3 fires"
+    notes: "Egress Ether.src ← egress port MAC; Ether.dst ← next-hop MAC."
+
+test_scaffolding:
+  G1:
+    - id: swap_single_label
+      generate: "MPLS(label=L,ttl=T,s=1)/IP to a swap LFIB entry → top label→out_label, ttl-1, L2 rewrite, port."
+    - id: swap_distinct_label
+      generate: "A second swap entry to a different out_label/port; assert independent routing."
+    - id: swap_two_label_stack_top_only
+      generate: "MPLS(top,s=0)/MPLS(inner,s=1)/IP; assert ONLY the top label is swapped, ttl-1; inner label preserved."
+    - id: swap_ttl_two_egress_one
+      generate: "TTL==2 → forwarded with egress TTL==1."
+    - id: swap_preserves_inner_ip
+      generate: "Assert the inner IP dst and IP ttl are unchanged across the swap."
+  G2:
+    - id: drop_ttl_one
+      generate: "MPLS top TTL==1 → drop (would decrement to 0)."
+    - id: drop_ttl_zero
+      generate: "MPLS top TTL==0 → drop."
+    - id: drop_unknown_label
+      generate: "Top label not in the LFIB → drop."
+  G3:
+    - id: drop_non_mpls
+      generate: "A plain IPv4 frame (etherType 0x0800) → drop (out of scope)."
+    - id: drop_reserved_label
+      requires: "${reserved_label_policy} == drop"
+      generate: "A reserved label (e.g. 0 explicit-null) not installed in the LFIB → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_php_pop
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${enable_pop} == false"
+    effect: "${enable_pop} ← true ∧ ${faithfulness} ← D.swap_pop"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    notes: "Add penultimate-hop pop: the LSR must remove the top shim and forward the exposed packet."
+  - id: enable_ingress_push
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${enable_push} == false"
+    effect: "${enable_push} ← true ∧ ${faithfulness} ← D.full_stack"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    notes: "Add ingress label imposition: classify IP → push a label and forward as MPLS."
+  - id: deepen_label_stack
+    axis: workload
+    direction: harden
+    applicable_when: "true"
+    effect: "Use 3+ label stacks; add a deep-stack swap test."
+    d_axis_delta: {D2: +1, test_rigor: +1}
+    notes: "Stresses variable-depth stack parsing."
+
+bridging_notes: |
+  Canonical (swap-only) implementation:
+    - Parser: Ether type 0x8847 → parse mpls[0]; while S==0 parse the next
+      MPLS shim; on S==1 the next header is the payload (IP).
+    - LFIB table keyed EXACTLY on mpls[0].label → action mpls_swap(out_label,
+      port, port_mac, next_hop_mac): mpls[0].label = out_label;
+      mpls[0].ttl = mpls[0].ttl - 1; Ether rewrite; egress.
+    - Gate: if (mpls[0].isValid() && mpls[0].ttl > 1).
+    - default_action = drop (R2 miss + reserved labels).
+  Anti-patterns to reject:
+    * Decrementing the INNER IP TTL on swap (only the MPLS TTL changes).
+    * Rewriting labels below the top.
+    * Treating the swap like an IP forward (keying on IP dst, not the label).

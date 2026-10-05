@@ -1,0 +1,242 @@
+task_name: vlan_bridge_anchor
+task_type: full_program
+complexity: medium
+source: tutorial
+pattern: P-VLANBridge
+pattern_version: '1.0'
+
+seed:
+  unknown_unicast_policy: drop
+  faithfulness: D9.0_static_fib
+
+description: |
+  Implement an IEEE 802.1Q VLAN-aware bridge on a single switch s1. Each port is
+  either an ACCESS port (an untagged member of exactly one VLAN, its PVID) or a
+  TRUNK port (carrying 802.1Q-tagged frames for a set of allowed VLANs).
+
+  ## Port roles
+
+    | port  | role   | VLAN(s) |
+    |-------|--------|---------|
+    | s1.p1 | access | PVID 10 |
+    | s1.p2 | access | PVID 20 |
+    | s1.p3 | trunk  | 10, 20  |
+    | s1.p4 | trunk  | 10, 20  |
+
+  ## Per-VLAN forwarding policy (VLAN, destination MAC → egress port)
+
+  The control plane installs these as table entries.
+
+    | VLAN | dst MAC           | egress port |
+    |------|-------------------|-------------|
+    | 10   | 00:00:00:00:00:0a | s1.p1       |
+    | 10   | 00:00:00:00:00:0c | s1.p4       |
+    | 20   | 00:00:00:00:00:0d | s1.p4       |
+
+  ## Required behaviour
+
+   - A frame's VLAN is determined on ingress: an untagged frame on an access port
+     belongs to that port's PVID; a tagged frame on a trunk belongs to its tag's
+     VLAN id. A tagged frame on an access port, an untagged frame on a trunk, and
+     a trunk frame whose VLAN id is not in that trunk's allowed set are all
+     dropped.
+   - A frame is forwarded by looking up (its VLAN, its Ethernet destination MAC)
+     in the forwarding policy. On a hit it egresses the bound port: a frame
+     leaving on a trunk carries the 802.1Q tag for its VLAN; a frame leaving on
+     an access port carries no 802.1Q tag. The Ethernet source and destination
+     MAC addresses are not rewritten.
+   - A (VLAN, destination MAC) pair with no policy entry is dropped.
+
+  ## Topology
+
+  One switch s1 with four ports as in the role table above.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3, p4: 4}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+    - {from: s1.p4, to: h4}
+
+hosts:
+  h1: {ip: "10.0.10.1", mac: "00:00:00:00:00:0a", port: s1.p1}
+  h2: {ip: "10.0.20.1", mac: "00:00:00:00:00:0b", port: s1.p2}
+  h3: {ip: "10.0.10.3", mac: "00:00:00:00:00:0c", port: s1.p3}
+  h4: {ip: "10.0.20.4", mac: "00:00:00:00:00:0d", port: s1.p4}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: access_ingress_push_to_trunk
+    visibility: public
+    description: |
+      Untagged frame on access port s1.p1 to MAC ...0c.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - IP:    {src: "10.0.10.1", dst: "10.0.10.3", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p4
+      transformations:
+        Dot1Q.vlan: {action: change_to, value: 10}
+        Ether.type: {action: change_to, value: 33024}
+        Ether.dst:  {action: unchanged}
+        Ether.src:  {action: unchanged}
+
+  - name: trunk_to_access_pop
+    visibility: public
+    description: |
+      Tagged VLAN-10 frame on trunk s1.p3 to MAC ...0a.
+    input:
+      port: s1.p3
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0c", dst: "00:00:00:00:00:0a"}
+        - Dot1Q:  {vlan: 10}
+        - IP:     {src: "10.0.10.3", dst: "10.0.10.1", ttl: 64}
+        - UDP:    {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.type: {action: change_to, value: 2048}
+        Ether.dst:  {action: unchanged}
+
+  - name: trunk_to_trunk_keep_tag
+    visibility: public
+    description: |
+      Tagged VLAN-10 frame on trunk s1.p3 to MAC ...0c.
+    input:
+      port: s1.p3
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - Dot1Q:  {vlan: 10}
+        - IP:     {src: "10.0.10.1", dst: "10.0.10.3", ttl: 64}
+        - UDP:    {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p4
+      transformations:
+        Dot1Q.vlan: {action: unchanged}
+        Ether.type: {action: unchanged}
+
+  - name: access_vlan20_push_to_trunk
+    visibility: hidden
+    description: |
+      Untagged frame on access port s1.p2 (PVID 20) to MAC ...0d (→ trunk
+      s1.p4). Forwarded TAGGED with VLAN 20.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "00:00:00:00:00:0b", dst: "00:00:00:00:00:0d"}
+        - IP:    {src: "10.0.20.1", dst: "10.0.20.4", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p4
+      transformations:
+        Dot1Q.vlan: {action: change_to, value: 20}
+        Ether.type: {action: change_to, value: 33024}
+
+# --- G2: isolation / membership ---
+
+  - name: vlan_isolation_unknown_drop
+    visibility: hidden
+    description: |
+      Untagged frame on access s1.p1 (VLAN 10) to MAC ...0d, which exists only
+      in VLAN 20. In VLAN 10 it is unknown → drop (VLAN isolation).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0d"}
+        - IP:    {src: "10.0.10.1", dst: "10.0.20.4", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: trunk_unconfigured_vlan_drop
+    visibility: hidden
+    description: |
+      Tagged frame with VLAN 99 on trunk s1.p3 — VLAN 99 is not in the trunk's
+      allowed set {10,20} → drop.
+    input:
+      port: s1.p3
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - Dot1Q:  {vlan: 99}
+        - IP:     {src: "10.0.10.1", dst: "10.0.10.3", ttl: 64}
+        - UDP:    {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: unknown_unicast_in_vlan_drop
+    visibility: hidden
+    description: |
+      Tagged VLAN-10 frame on trunk s1.p3 to an unknown MAC ...ff (in VLAN 10
+      but no table entry) → drop (no flooding in this task).
+    input:
+      port: s1.p3
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:ff"}
+        - Dot1Q:  {vlan: 10}
+        - IP:     {src: "10.0.10.1", dst: "10.0.10.9", ttl: 64}
+        - UDP:    {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+# --- G3: role/tag mismatch ---
+
+  - name: access_port_tagged_drop
+    visibility: hidden
+    description: |
+      A tagged frame arriving on access port s1.p1 (which expects untagged) is
+      dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - Dot1Q:  {vlan: 10}
+        - IP:     {src: "10.0.10.1", dst: "10.0.10.3", ttl: 64}
+        - UDP:    {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: trunk_untagged_drop
+    visibility: hidden
+    description: |
+      An untagged frame arriving on trunk s1.p3 (which expects tagged frames,
+      no native VLAN) is dropped.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "00:00:00:00:00:0a", dst: "00:00:00:00:00:0c"}
+        - IP:    {src: "10.0.10.1", dst: "10.0.10.3", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: trunk_p4_to_access_p1_pop
+    visibility: hidden
+    description: |
+      Tagged VLAN-10 frame arriving on trunk s1.p4 destined to a VLAN-10 host
+      on access port s1.p1.
+    input:
+      port: s1.p4
+      layers:
+        - Ether:  {src: "00:00:00:00:00:0c", dst: "00:00:00:00:00:0a"}
+        - Dot1Q:  {vlan: 10}
+        - IP:     {src: "10.0.10.3", dst: "10.0.10.1", ttl: 64}
+        - UDP:    {sport: 4001, dport: 5001}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.type: {action: change_to, value: 2048}
+        Ether.dst:  {action: unchanged}

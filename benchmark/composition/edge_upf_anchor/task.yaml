@@ -1,0 +1,492 @@
+task_name: edge_upf_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-EdgeUPF
+pattern_version: '1.0'
+seed:
+  acl_rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 10.0.9.66/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_acl_action: permit
+  access_subnet: 10.0.1.0/24
+  core_subnet: 198.51.100.0/24
+  ue_subnet: 10.0.9.0/24
+  upf_n3_ip: 10.0.1.1
+  gtpu_udp_port: 2152
+  bearer_table:
+  - ue_ip: 10.0.9.5
+    egress_teid: 100
+    gnb_ip: 10.0.1.5
+  bearer_capacity: 256
+  fib_capacity: 1024
+  pipeline_order: acl_tunnel_route
+  access_port: 1
+  core_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: access
+    to: s1.p1
+  - from: s1.p2
+    to: core
+hosts:
+  access:
+    note: gNB / radio access in 10.0.1.0/24; ingress on s1.p1; UPF N3 IP 10.0.1.1
+  core:
+    note: internet hosts in 198.51.100.0/24; ingress on s1.p2; subscribers in 10.0.9.0/24
+description: |-
+  Implement a 5G edge gateway for BMv2 (v1model) that sits between a mobile-access
+  network and the internet core. It enforces an access policy, moves user traffic
+  in and out of per-subscriber tunnels, and forwards IPv4 traffic — all in a
+  single pass.
+
+  Topology: port 1 faces the access side (the radio/gNB network, 10.0.1.0/24; the
+  gateway's own access-side address is 10.0.1.1); port 2 faces the core
+  (internet, 198.51.100.0/24). Subscriber devices are addressed in 10.0.9.0/24.
+
+  Required behaviour, per IPv4 packet:
+
+  - Access policy. A packet's USER (subscriber-level) addressing is checked
+    against an administrator-defined permit/deny policy before anything else —
+    even when that user datagram arrives wrapped inside a tunnel. A denied packet
+    is dropped and leaves no trace. Subscriber source 10.0.9.66 is denied;
+    everything else is permitted by default.
+
+  - Tunnelling, by direction:
+    - Traffic arriving from the access side is carried inside a per-subscriber
+      tunnel. The gateway removes the tunnel wrapping so the user's own datagram
+      is what continues through the pipeline. Access-side traffic that is not
+      tunnelled is dropped.
+    - Traffic arriving from the core toward a subscriber must be placed into that
+      subscriber's tunnel before it can be delivered. The gateway looks up the
+      subscriber's tunnel binding and wraps the packet accordingly: a new outer
+      IPv4/UDP carrier (UDP port 2152) plus a GTP-U header carrying the binding's
+      tunnel identifier, with the outer source set to the gateway's own access-side
+      address 10.0.1.1 and the outer destination set to the serving radio node's
+      address. The control plane provisions one binding for this gateway:
+      subscriber 10.0.9.5 is served by the radio node at 10.0.1.5 with tunnel
+      identifier 100. A packet toward a subscriber with no established tunnel
+      binding is dropped.
+
+  - Forwarding. A packet that survives the policy and tunnelling steps is
+    delivered toward its destination: for access-originated traffic, toward the
+    user's own (now unwrapped) destination on the core side; for core-originated
+    traffic, toward the serving radio node on the access side. The packet leaves
+    on the correct port toward the correct next hop, with the forwarded header's
+    hop count decremented and its L2/L3 integrity preserved. A packet with an
+    expired hop count, or with no known route, is dropped.
+
+  Both the P4 program and its table entries are yours to author (the access
+  policy, the per-subscriber tunnel bindings, and the routes). The gateway must
+  behave correctly in both directions: a core-to-subscriber packet is delivered
+  only if that subscriber has an established tunnel binding, and a subscriber's
+  own destination — hidden inside the tunnel on the way in — is what governs where
+  access-originated traffic is forwarded.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: uplink_decap_forward
+  visibility: public
+  goal_class: G1
+  description: 'An uplink subscriber packet arrives tunnelled (inner user datagram 10.0.9.5 -> 198.51.100.9). The gateway removes the tunnel wrapping and forwards the user''s own datagram toward its destination on the core port: the inner hop count is decremented by one, Ether.dst is rewritten to the core next hop, and the inner source/destination are unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: change_to
+        value: 10.0.9.5
+      IP.dst:
+        action: change_to
+        value: 198.51.100.9
+      IP.chksum:
+        action: checksum_valid
+- name: downlink_encap_forward
+  visibility: public
+  goal_class: G1
+  description: 'A downlink packet from the core (198.51.100.9 -> subscriber 10.0.9.5) is placed into that subscriber''s tunnel and forwarded toward the serving radio node on the access port: a new outer header is built with the gateway''s access-side address as source, the serving radio node (10.0.1.5) as destination, the tunnel transport ports, and the subscriber''s tunnel identifier (100). The user''s inner destination is preserved.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 443
+        dport: 4000
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      layers[1].IP.src:
+        action: change_to
+        value: 10.0.1.1
+      layers[1].IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      layers[1].IP.chksum:
+        action: checksum_valid
+      layers[2].UDP.sport:
+        action: change_to
+        value: 2152
+      layers[2].UDP.dport:
+        action: change_to
+        value: 2152
+      layers[3].GTP_U_Header.teid:
+        action: change_to
+        value: 100
+      layers[4].IP.dst:
+        action: change_to
+        value: 10.0.9.5
+- name: acl_deny_drop
+  visibility: public
+  goal_class: G1
+  description: A downlink packet toward the denied subscriber address (10.0.9.66) is dropped by the access policy before any tunnelling or forwarding.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.9.66
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 443
+        dport: 4000
+  expected:
+    behavior: drop
+- name: downlink_no_bearer_drop
+  visibility: hidden
+  goal_class: G2
+  description: A downlink packet toward a subscriber with no established tunnel binding (10.0.9.200) is dropped — there is no tunnel to place it into.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.9.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 443
+        dport: 4000
+  expected:
+    behavior: drop
+- name: uplink_inner_dst_routing
+  visibility: hidden
+  goal_class: G2
+  description: An uplink tunnelled packet whose inner destination is itself in the access subnet (10.0.1.9) is forwarded back toward the access next hop, not the core — proving the forwarding decision keys on the inner (unwrapped) destination, not the outer tunnel header.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.5
+        dst: 10.0.1.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: change_to
+        value: 10.0.9.5
+      IP.dst:
+        action: change_to
+        value: 10.0.1.9
+      IP.chksum:
+        action: checksum_valid
+- name: uplink_ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: An uplink tunnelled packet whose inner hop count is 1 is forwarded with the inner hop count decremented to 0 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.5
+        dst: 198.51.100.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: change_to
+        value: 10.0.9.5
+      IP.dst:
+        action: change_to
+        value: 198.51.100.9
+      IP.chksum:
+        action: checksum_valid
+- name: uplink_ttl_zero_drop
+  visibility: hidden
+  goal_class: G2
+  description: An uplink tunnelled packet whose inner hop count is already 0 is dropped (expired before forwarding).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.5
+        dst: 198.51.100.9
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: drop
+- name: acl_deny_on_inner_uplink
+  visibility: hidden
+  goal_class: G3
+  description: An uplink tunnelled packet whose INNER subscriber source (10.0.9.66) is denied is dropped — the access policy peers through the tunnel to the user tuple, even though that tuple is buried under the tunnel header.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.66
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: drop
+- name: uplink_non_gtpu_drop
+  visibility: hidden
+  goal_class: G3
+  description: A plain (non-tunnelled) IPv4 packet arriving on the access port is dropped — access-side user traffic must arrive inside a subscriber tunnel.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: drop
+- name: downlink_udp_encap
+  visibility: hidden
+  goal_class: G3
+  description: A downlink UDP packet toward subscriber 10.0.9.5 is tunnelled exactly like TCP — the tunnel binding keys on the subscriber address, not the L4 type; the new outer header carries the tunnel identifier and the serving radio node address.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 4000
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      layers[1].IP.src:
+        action: change_to
+        value: 10.0.1.1
+      layers[1].IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      layers[1].IP.chksum:
+        action: checksum_valid
+      layers[2].UDP.sport:
+        action: change_to
+        value: 2152
+      layers[2].UDP.dport:
+        action: change_to
+        value: 2152
+      layers[3].GTP_U_Header.teid:
+        action: change_to
+        value: 100
+      layers[4].IP.dst:
+        action: change_to
+        value: 10.0.9.5
+- name: uplink_inner_no_route
+  visibility: hidden
+  goal_class: G3
+  description: An uplink tunnelled packet whose inner destination matches no route (203.0.113.7) is dropped after decap — the no-route check runs on the unwrapped inner destination.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.0.9.5
+        dst: 203.0.113.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 443
+  expected:
+    behavior: drop
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.5
+        pdst: 10.0.1.1
+  expected:
+    behavior: drop

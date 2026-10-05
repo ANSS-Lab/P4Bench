@@ -1,0 +1,93 @@
+{
+  "oracle_hash": "ca1340978fa69dd33aab5e159204334c19816f1f1af4ae48bcee37611a7d8e0e",
+  "instance": "afq_per_flow_budget_mut1-default",
+  "ran_at": "2026-05-30T05:33:09.555975Z",
+  "canonical_examples": {
+    "passed": 5,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "tight_share_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "loose_window_admits",
+        "status": "pass"
+      },
+      {
+        "example_id": "big_quantum_admits",
+        "status": "pass"
+      },
+      {
+        "example_id": "small_quantum_narrow_sketch_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "cold_start_admit",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "state_unchanged_on_reject": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_persistence_within_lifetime": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "fair_round_gap_bounded": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "byte_accuracy_under_default_accounting": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_pipeline_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "state_unchanged_on_reject",
+      "counter_persistence_within_lifetime",
+      "fair_round_gap_bounded",
+      "byte_accuracy_under_default_accounting",
+      "no_pipeline_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "afq_nsdi18",
+      "calendarq_nsdi20",
+      "sppifo_nsdi20",
+      "sketchlib_nsdi22"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

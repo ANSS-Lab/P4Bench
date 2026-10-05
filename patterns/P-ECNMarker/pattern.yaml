@@ -1,0 +1,1271 @@
+# P-ECNMarker — Queue-depth-driven IPv4 ECN marking (RFC 3168 / RFC 8257)
+#
+# TPL v1.0 task pattern. Grounded in RFC 3168 §6 (ECN codepoint
+# semantics + AQM marking MUST clauses) and RFC 8257 §3 (DCTCP
+# single-threshold marking).
+#
+# Design-space cell: (D8:transport-assistance, P6:congestion-control-assistance).
+# Target capability `scale_up`: a fixed-function ASIC ships a single
+# RED/WRED block; programmability lets the same silicon swap marking laws
+# (DCTCP single-threshold, RED proportional, per-class thresholds, WRED)
+# without a hardware respin — the P6 row of the NF-category table.
+
+pattern_id:        P-ECNMarker
+version:           "1.1"
+nf_categories:                                # NF-category tags (ID:name pairs)
+  descriptive:  [D8:transport-assistance]     # congestion signalling on the data-plane path
+  prescriptive: [P6:congestion-control-assistance]
+target_capability: scale_up                   # P6 row's column; programmability scales the marking-law surface beyond a single ASIC-baked RED
+
+summary: >
+  Per-packet IPv4 ECN marking driven by an observed egress-queue-depth
+  signal. The pattern is the data-plane portion of an AQM block: read
+  the depth metadata at packet processing time, compare against a
+  marking threshold K, and either pass the packet through unchanged, or
+  rewrite the 2-bit IP ECN field from ECT(0)/ECT(1) (`01`/`10`) to CE
+  (`11`) and recompute the IPv4 header checksum, or drop the packet if
+  its ECN field is Not-ECT (`00`) per RFC 3168 §6.1.2. CE (`11`) on
+  ingress is preserved verbatim (RFC 3168 §6.1.5 — no unmark). The
+  parameter axes control the marking threshold strictness, the
+  Not-ECT-on-congestion action (drop vs unsafe passthrough), the
+  faithfulness ladder (D5.0 strict RFC 3168 ↔ D5.1 DCTCP single-
+  threshold ↔ D5.2 RED proportional), the eligibility breadth, the
+  workload skew, the IPv4 checksum-recompute requirement, and the
+  DSCP-preservation strictness (only the low 2 bits of the diffserv
+  byte may change on mark — a frequent implementation oversight).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+grounding:
+
+  papers: []                                  # ECN/DCTCP have no in-corpus (SIGCOMM 2017+ / NSDI / CoNEXT) paper grounding the data-plane MUST clauses; the protocol's reference is the RFC family.
+
+  rfcs:
+
+    - cite: rfc3168
+      title: "The Addition of Explicit Congestion Notification (ECN) to IP"
+      sections:
+        - "§5 ECN field codepoints"
+        - "§6.1.1 codepoint semantics (ECT/Not-ECT/CE)"
+        - "§6.1.2 marking-vs-drop policy at the router"
+        - "§6.1.5 CE persistence (no unmark on the same hop)"
+        - "§19 IANA codepoint registry"
+      role: normative_behaviour
+      relevance: |
+        The base ECN spec. The pattern's rule sequence preserves the
+        five MUST-clauses that bind data-plane behaviour, drawn verbatim
+        from §6.1:
+          - §6.1.1 codepoint semantics. The 2-bit ECN field encodes:
+            `00` = Not-ECT (the endpoints do not support ECN);
+            `01` = ECT(1); `10` = ECT(0) (both ECT codepoints indicate
+            ECN-capable transport, are equivalent for marking purposes);
+            `11` = CE (Congestion Experienced). These four codepoints
+            are the only legal field values; the pattern's R3-R5 rules
+            partition packets exactly along this enum.
+          - §6.1.2 marking-vs-drop. "When a router decides to drop a
+            packet … if the ECT codepoint is set in that packet's IP
+            header … the router MAY instead set the CE codepoint, and
+            forward the packet"; conversely, "the router MUST NOT mark
+            a packet as CE if the ECN field is `00` (Not-ECT)" — the
+            router MUST drop those packets instead. R3 (Not-ECT drop)
+            and R4 (ECT-to-CE mark) implement this disjoint policy.
+          - §6.1.5 CE persistence. "Once the CE codepoint is set …
+            routers MUST NOT change the codepoint back to ECT or
+            Not-ECT" — single-hop irreversibility. R5 (CE-already
+            preserve) makes this testable; an implementation that recomputes
+            the ECN field unconditionally (e.g., always writes `10`
+            on forward) silently unmarks CE and violates this clause,
+            which the `ce_no_silent_unmark_below_threshold` G3
+            scaffold catches.
+          - §19 IANA registry. The 6 DSCP bits (the high 6 bits of the
+            same diffserv byte) MUST NOT be modified during ECN
+            marking — DSCP and ECN occupy the same byte but are
+            semantically independent. The `dscp_preservation_under_mark`
+            G3 scaffold probes this; an implementation that rewrites the full
+            8-bit `diffserv` field instead of bit-extracting the low 2
+            ECN bits clobbers traffic-class marking on the marked
+            packets.
+          - Implicit IP header invariant. "Whenever the IP header is
+            modified … the IP checksum MUST be recomputed" (RFC 791
+            §3.1, inherited). The pattern's R4 transformations imply a
+            recompute; the `checksum_consistency_after_mark` G2
+            scaffold + the `outer_ipv4_checksum_validity`-style
+            invariant catch the v1model bug-taxonomy anchor "missing
+            MyComputeChecksum after multi-field rewrite".
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model implementation detail — that the depth signal lives
+        in `standard_metadata.enq_qdepth` or `standard_metadata.deq_qdepth`,
+        that `update_checksum(...)` in the MyComputeChecksum control
+        recomputes the IPv4 header checksum, that the 8-bit
+        `hdr.ipv4.diffserv` field can be split into a 6-bit DSCP +
+        2-bit ECN by either declaring the header with that split or by
+        masking — is widely-known P4-on-v1model practice rather than
+        RFC-cited. These implementation notes are flagged
+        `[common-knowledge baseline]` in `bridging_notes:` rather than
+        re-attributed to the RFC.
+
+    - cite: rfc8257
+      title: "Data Center TCP (DCTCP): TCP Congestion Control for Data Centers"
+      sections:
+        - "§3.1 DCTCP marking on switches"
+        - "§3.4 recommended marking threshold K"
+      role: normative_behaviour
+      relevance: |
+        The IETF codification of DCTCP. Two binding contributions over
+        RFC 3168:
+          - §3.1 marking law. DCTCP replaces RED's probabilistic-marking
+            ramp with a single-threshold step function: "switch
+            instantaneous queue length is greater than the threshold K
+            ⇒ packets are marked with the CE codepoint". The pattern's
+            R4 predicate `count_exceeds(bucket.depth, K - 1)`
+            (equivalently `bucket.depth ≥ K`) is exactly this. The
+            `marking_mode == single_threshold` faithfulness rung
+            corresponds to this DCTCP-strict semantics. (D5.2
+            recovers the RED-proportional regime as a higher-
+            faithfulness rung.)
+          - §3.4 K recommendation. "For a 10 Gbps link, K is
+            recommended to be 65 packets; for a 1 Gbps link, 20
+            packets" — bytes-vs-packets accounting tied to MTU. The
+            pattern's `${marking_threshold_k}` range [1, 1024] covers
+            both regimes; the default 64 sits at the DCTCP 10G
+            recommendation.
+
+    - cite: rfc8087
+      title: "The Benefits of Using Explicit Congestion Notification (ECN)"
+      sections:
+        - "§3 ECN benefits for routers and end hosts"
+        - "§5 known issues with ECN deployment"
+      role: domain_concepts
+      relevance: |
+        Operational guidance that informs two of the parameter axes:
+          - §3 motivation. Marking-instead-of-drop on transient
+            congestion reduces FCT for short flows and the tail
+            latency on long ones — the operational benefit DCTCP
+            quantifies. Cited so the pattern's seed defaults
+            (`not_ect_action: drop`, `ce_persistence_strict: true`)
+            are grounded in the deployed-ECN behaviour the RFC
+            documents, not just the RFC 3168 minimum.
+          - §5 deployment hazards. Known middlebox issues — header-
+            mangling NATs, DSCP-blank routers, AQM blocks that mark
+            without recomputing the IPv4 checksum — directly motivate
+            the `dscp_preservation_strict` and `checksum_recompute`
+            parameter axes and their paired harden/ease operators.
+
+  tutorials: []                               # No p4lang/tutorials repository entry covers ECN marking directly.
+
+  posts: []
+
+
+# ─── Entities (pick from the 8 entity types) ───────────────────────────────
+entities:
+
+  packet:                                     # per-packet, stateless
+    notes: |
+      All eligibility checks (R0–R2), the ECN-codepoint match (R3–R6),
+      the depth threshold check (R3, R4, R5, R6), and the ECN-bit
+      rewrite (R4) operate on this entity. The packet's observed
+      depth signal is read from `bucket.depth` (the egress-port
+      queue-depth cell, see below); the ECN field is read and written
+      via `hdr.ipv4.ecn` (the 2 low bits of the diffserv byte). No
+      packet-bound state persists across packets — the per-flow state
+      of an AQM block lives outside this pattern (the actual queue, in
+      the architecture).
+
+  bucket:                                     # per-egress-port queue-depth signal — read-only from the marker's perspective
+    key:
+      - egress_port_id                        # 0 .. (n_ports - 1)
+    attrs:
+      depth: int                              # current queue depth at processing time
+    capacity: "one cell per egress port; populated by the v1model architecture's enq_qdepth or deq_qdepth metadata at packet processing time, selected by ${queue_depth_signal}"
+    notes: |
+      The egress queue is modelled as a per-port bucket with one
+      `depth` attribute, read by R3 / R4 / R5 / R6's
+      `count_exceeds(bucket.depth, ...)` predicate. The bucket is
+      read-only from this pattern's perspective: the depth is driven
+      by the architecture (BMv2 packet enqueueing in v1model populates
+      `standard_metadata.enq_qdepth` and `standard_metadata.deq_qdepth`),
+      not by any rule in this pattern. The `${queue_depth_signal}`
+      parameter selects which architectural metadata field the implementation
+      wires into `bucket.depth`. A canonical-examples synthesis (the
+      oracle-audit input set) supplies depth values directly in
+      `state[config][queue_depth]` so that single-packet unit tests
+      can reproduce above-/below-threshold behaviour without having
+      to fill a real BMv2 queue.
+
+# ─── Parameters (with difficulty axes) ──────────────────────────────────────
+parameters:
+
+  marking_threshold_k:
+    type: int
+    range: "[1, 1024]"
+    default: 64
+    notes: |
+      DCTCP single-threshold K (packets). A packet is marked / dropped
+      / preserved per the R3-R6 disjoint policy when `bucket.depth ≥
+      ${marking_threshold_k}` and passed unchanged otherwise. RFC 8257
+      §3.4 recommends K = 65 for 10 Gbps links; the default 64 sits
+      at this DCTCP recommendation. The `shrink_marking_threshold_2x`
+      harden walks the pattern toward more aggressive marking; the
+      paired `enlarge_marking_threshold_2x` ease walks back. Used by
+      R3, R4, R5, R6 in the predicate `count_exceeds(bucket.depth,
+      ${marking_threshold_k} - 1)`, which is semantically
+      `bucket.depth ≥ ${marking_threshold_k}` — the boundary is
+      strict (`≥`, not `>`); the off-by-one trap is what the
+      `boundary_at_exactly_threshold_ect_marked` G2 scaffold probes.
+
+  marking_mode:
+    type: enum
+    values: [single_threshold, red_proportional, tail_drop_passthrough]
+    default: single_threshold
+    notes: |
+      Marking law. `single_threshold` is the DCTCP step function
+      (RFC 8257 §3.1) — the R3-R6 rules express this directly.
+      `red_proportional` is RFC 2309 RED: linear-ramp marking
+      probability between `${min_threshold}` and `${marking_threshold_k}`;
+      requires a per-packet random draw and modifies R4's predicate.
+      `tail_drop_passthrough` disables marking entirely — packets at
+      depth ≥ K are tail-dropped regardless of ECN field, equivalent
+      to a non-ECN AQM block; the pattern's R4 becomes vacuous and R3
+      additionally catches ECT codepoints. The faithfulness ladder
+      walks through these three rungs via paired operators.
+
+  min_threshold:
+    type: int
+    range: "[1, 1024]"
+    default: 32
+    notes: |
+      RED low watermark. Only used when `${marking_mode} ==
+      red_proportional`; vacuous under single_threshold or
+      tail_drop_passthrough. Below `${min_threshold}`, no marking;
+      between `${min_threshold}` and `${marking_threshold_k}`, mark
+      with probability proportional to `(depth - min_threshold) /
+      (marking_threshold_k - min_threshold) * ${marking_probability_max}`;
+      at or above `${marking_threshold_k}`, mark with
+      `${marking_probability_max}` (or drop if Not-ECT). Constraint:
+      `${min_threshold} ≤ ${marking_threshold_k}`. The faithfulness
+      ladder's D5.2 rung binds this.
+
+  marking_probability_max:
+    type: float
+    range: "[0.0, 1.0]"
+    default: 1.0
+    notes: |
+      RED max marking probability. Only used when `${marking_mode} ==
+      red_proportional`. RFC 2309's RED uses 0.1 (10%) as the
+      reference value; the default 1.0 collapses RED into a step
+      function equivalent to single_threshold marking at
+      `${marking_threshold_k}`, so a seed transitioning between
+      `single_threshold` and `red_proportional` modes can do so
+      without changing the binary admit/mark verdict on the unit
+      tests. Probed by the D5.2-band scaffolding only.
+
+  not_ect_action:
+    type: enum
+    values: [drop, passthrough]
+    default: drop
+    notes: |
+      RFC 3168 §6.1.2 strictness knob. `drop` (the RFC default)
+      enforces "MUST drop Not-ECT on congestion" — R3 fires. `passthrough`
+      is the relaxed (unsafe) mode: Not-ECT packets above threshold
+      are forwarded unchanged. The `enable_strict_not_ect_drop`
+      harden and `relax_not_ect_passthrough` ease pair this axis;
+      this is the only knob where the harden direction is the
+      RFC-compliant one and the ease direction is technically a
+      relaxation away from the spec.
+
+  ce_persistence_strict:
+    type: bool
+    default: true
+    notes: |
+      RFC 3168 §6.1.5 strictness gate. When true, R5 preserves CE
+      verbatim (no unmark) regardless of `bucket.depth`. When false,
+      the pattern allows the implementation to "renormalise" CE to ECT
+      on below-threshold packets — a known incorrect implementation
+      pattern. The harden direction (strict CE persistence) is the
+      RFC-compliant default; ease relaxes for instances that
+      deliberately probe the violation.
+
+  queue_depth_signal:
+    type: enum
+    values: [enq_qdepth, deq_qdepth, synthetic_qdepth]
+    default: synthetic_qdepth
+    notes: |
+      Which architecture-supplied numeric value `bucket.depth` is
+      wired to. In BMv2/v1model: `enq_qdepth` is the egress queue
+      depth observed at enqueue time (visible in egress control);
+      `deq_qdepth` is the depth observed at dequeue time (also egress).
+      `synthetic_qdepth` is a control-plane-installed table that maps
+      ingress 5-tuple → synthetic depth value — used for
+      unit-testability (a single-packet test cannot otherwise create
+      a non-zero depth in BMv2's queue). The default `synthetic_qdepth`
+      lets the audit's canonical examples reproduce
+      above-/below-threshold behaviour deterministically; production
+      seeds typically pick `enq_qdepth`.
+
+  checksum_recompute:
+    type: enum
+    values: [required, omitted]
+    default: required
+    notes: |
+      Whether the implementation must recompute the IPv4 header checksum
+      after R4's ECN-bit rewrite. RFC 791 §3.1 (inherited by RFC 3168)
+      requires recompute on every header modification; the `required`
+      setting (default) is the RFC-compliant choice and is what the
+      `checksum_consistency_after_mark` G2 scaffold asserts. `omitted`
+      relaxes the requirement (the test set will not check checksum
+      validity on marked packets); used in ease-direction instances
+      that decouple ECN marking from the IPv4-checksum surface to
+      isolate other failure modes.
+
+  non_ipv4_action:
+    type: enum
+    values: [drop, passthrough]
+    default: drop
+    notes: |
+      What happens to non-IPv4 packets (ARP, IPv6, MPLS, raw
+      Ethernet). ECN is an IPv4 / IPv6 feature; non-IP traffic has
+      no ECN field, so the marker has nothing to do for it. `drop`
+      (default) discards such packets — clean eligibility short-
+      circuit. `passthrough` forwards them unchanged, which is the
+      transparent-AQM behaviour deployed on real switches that mix
+      ECN-marking with non-IP traffic. Used by R1's predicate.
+
+  eligibility_protocol:
+    type: enum
+    values: [any_l4, tcp_only]
+    default: any_l4
+    notes: |
+      L4 short-circuit. `tcp_only` restricts marking to TCP traffic
+      — RFC 3168 mandates ECN applies to all IP transports, but
+      DCTCP deployments often run TCP-only to avoid marking UDP
+      flows that have no congestion-response. `any_l4` (default)
+      marks all IPv4 packets regardless of L4 protocol. Used by R2
+      as a fail-closed short-circuit when `tcp_only`; vacuous under
+      `any_l4` (R2 collapses into R3/R4/R5/R6 directly).
+
+  dscp_preservation_strict:
+    type: bool
+    default: true
+    notes: |
+      Whether the implementation MUST preserve the 6-bit DSCP field
+      (high 6 bits of the IPv4 diffserv byte) on R4's mark
+      transformation. RFC 3168 §19 mandates DSCP-and-ECN
+      independence; the strict-true setting is the RFC-compliant
+      default. The lax-false setting relaxes the test set's DSCP
+      check — used for instances that probe ECN marking without
+      asserting DSCP preservation. The harden-direction operator
+      `enable_strict_dscp_preservation` and the ease counterpart
+      `disable_dscp_preservation` walk this axis.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_rfc3168_strict             # RFC 3168 §6.1.2 + §6.1.5 + DSCP preservation + checksum recompute; tail_drop only on Not-ECT
+      - D5.1_dctcp_single_threshold     # RFC 8257 §3.1 single-threshold step + RFC 3168 §6.1.2/§6.1.5 (default)
+      - D5.2_red_proportional           # RFC 2309 RED with linear-ramp marking probability between min_threshold and marking_threshold_k
+      - D5.3_tail_drop_no_mark          # Degraded mode: no ECN marking, just tail-drop above threshold (ease-direction collapse target)
+    default: D5.1_dctcp_single_threshold
+    notes: |
+      Faithfulness ladder (pattern-specific
+      `D5.x_<descriptor>` codes). D5.0 is the RFC 3168 strictness
+      anchor — strict drop on Not-ECT, strict CE persistence, strict
+      DSCP preservation, strict checksum recompute, all four
+      simultaneously. D5.1 is the canonical DCTCP semantics (default
+      seed: single-threshold step function with RFC 3168 §6.1 MUST-
+      clause envelope). D5.2 lifts to RED's probabilistic ramp; the
+      `${min_threshold}` / `${marking_probability_max}` parameters
+      activate. D5.3 collapses the marker into a non-ECN tail-drop —
+      ECN bits are never modified; packets at depth ≥ K are dropped
+      regardless of ECN field. The ladder rungs are tied to the
+      `marking_mode` parameter via paired operators.
+
+  workload_skew:
+    type: enum
+    values: [uniform, bursty_above_threshold, adversarial_not_ect]
+    default: uniform
+    notes: |
+      Assumed traffic-distribution axis. `uniform` is the easy case:
+      mixed ECN codepoints (ECT(0)/ECT(1)/Not-ECT/CE) at uniform depth
+      distribution; rules fire in roughly equal proportions on a
+      random workload. `bursty_above_threshold` skews depth such that
+      most packets see `bucket.depth ≥ K` — R3 and R4 fire heavily;
+      stresses the marking path. `adversarial_not_ect` mixes mostly
+      Not-ECT packets at depths just above K to maximise R3 firings;
+      probes the RFC 3168 §6.1.2 MUST-clause boundary at scale (an implementation that
+      silently marks Not-ECT instead of dropping fails the entire
+      adversarial workload).
+
+  access_port:
+    type: int
+    range: "[1, 511]"
+    default: 1
+    notes: Topology binding — the ingress port at which the marker applies.
+
+  core_port:
+    type: int
+    range: "[1, 511]"
+    default: 2
+    notes: Topology binding — the egress port that marked / forwarded packets are sent to. Also the port the `bucket.depth` cell tracks.
+
+  # ─── v1.1: multi-priority queue support (added by pattern augmentation) ──
+
+  priority_queue_count:
+    type: int
+    range: "[1, 2]"
+    default: 1
+    notes: |
+      Number of priority classes the marker treats independently. With
+      `priority_queue_count: 1` (default, v1.0 behaviour) the marker
+      uses a single depth signal and a single (MIN_TH, K) pair; R3-R6
+      fire on that one pair. With `priority_queue_count: 2` the marker
+      classifies each eligible packet into one of two priority classes
+      using `${priority_classifier}` and applies class-specific
+      thresholds (`class_0_min_threshold` / `class_0_marking_threshold_k`
+      for low-priority, `class_1_min_threshold` /
+      `class_1_marking_threshold_k` for high-priority). High-priority
+      traffic typically has tighter thresholds so it signals congestion
+      earlier. The depth signal carried in the synthetic-qdepth field
+      represents the depth of THAT priority's queue (per-class queueing
+      is a deployment assumption; the marker is told the relevant
+      depth). The `enable_two_priority_queues` harden adds this axis;
+      `disable_two_priority_queues` reverts.
+
+  priority_classifier:
+    type: enum
+    values: [none, dscp_high_bit]
+    default: none
+    notes: |
+      How the marker maps each packet to a priority class. `none` is
+      the v1.0 single-queue behaviour. `dscp_high_bit` reads bit 5 of
+      the IPv4 DSCP field (equivalently, bit 7 of the IPv4 ToS byte —
+      the most significant bit) as the priority indicator: 0 = class 0
+      (low-priority, e.g. best-effort or AF1x), 1 = class 1 (high-
+      priority, e.g. CS4-CS7, EF, AF2x+). This deliberately reuses the
+      DSCP bit pattern as the classifier so the marker does NOT modify
+      DSCP under marking (the DSCP-preservation invariant still binds);
+      an implementation that DOES modify DSCP would break the cross-priority
+      classification on subsequent packets too.
+
+  class_0_min_threshold:
+    type: int
+    range: "[1, 1023]"
+    default: 32
+    notes: |
+      RED ramp lower threshold for priority class 0 (low-priority). Used
+      only when `priority_queue_count > 1`. Mirrors the single-queue
+      `min_threshold` parameter and defaults to its value so that an
+      instance toggling `priority_queue_count` while keeping class-0
+      thresholds at their defaults reproduces v1.0 behaviour for class-0
+      traffic.
+
+  class_0_marking_threshold_k:
+    type: int
+    range: "[2, 1024]"
+    default: 64
+    notes: |
+      RED ramp upper threshold for priority class 0. Mirrors
+      `marking_threshold_k`; same default for back-compat.
+
+  class_1_min_threshold:
+    type: int
+    range: "[1, 1023]"
+    default: 16
+    notes: |
+      RED ramp lower threshold for priority class 1 (high-priority).
+      Default 16 — half of class_0_min_threshold, expressing the
+      "high-priority signals earlier" deployment convention.
+
+  class_1_marking_threshold_k:
+    type: int
+    range: "[2, 1024]"
+    default: 32
+    notes: |
+      RED ramp upper threshold for priority class 1. Default 32 — half
+      of class_0_marking_threshold_k; same rationale.
+
+# ─── Rules (TPL rule vocabulary; first-match priority) ─────────────────────
+# State writes inside `then` are visible to subsequent rules on subsequent
+# packets only (TPL rule semantics). This pattern has no state-writing
+# postconditions (the bucket is read-only from the marker's perspective),
+# so this discipline is vacuously satisfied.
+
+rules:
+
+  - id: R0_wrong_port_drop
+    when: "¬ingress(${access_port})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      First eligibility short-circuit. Frames arriving on any port
+      other than ${access_port} are discarded BEFORE the parser
+      outcome is inspected. This rule is the standard pattern-wide
+      port eligibility guard — present in P-IPv4Routing, P-NAT44,
+      P-ApproxFairQueueing, and others.
+
+  - id: R1_non_ipv4_action
+    when: "ingress(${access_port}) ∧ ¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop                              # default per ${non_ipv4_action} == drop; when == passthrough the implementation forwards instead
+    notes: |
+      Second eligibility short-circuit. ARP, IPv6, MPLS, and other
+      non-IPv4 EtherTypes have no ECN field to inspect. The default
+      `${non_ipv4_action} == drop` makes R1 fire as a clean drop.
+      When the seed binds `${non_ipv4_action} == passthrough` the
+      P4 program MUST forward non-IPv4 frames unchanged on
+      ${core_port} — this is a parameter-driven action choice; the
+      pattern's rule expresses the default (drop) and the alternate
+      is documented in the parameter notes and exercised by the
+      `relax_non_ipv4_passthrough` operator.
+
+  - id: R2_non_eligible_l4_drop
+    when: "ingress(${access_port}) ∧ header_present(ipv4) ∧ ¬header_present(${eligibility_protocol})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Third eligibility short-circuit. Under the default
+      `${eligibility_protocol} == any_l4`, the predicate
+      `header_present(any_l4)` is vacuously true for every IPv4
+      packet and this rule never fires — the pipeline collapses into
+      R3 / R4 / R5 / R6 directly. Under the harden setting
+      `${eligibility_protocol} == tcp_only`, IPv4/UDP and IPv4/ICMP
+      are dropped before any ECN check; only IPv4/TCP packets reach
+      the marking rules. Catches the DCTCP-deployment "mark TCP only"
+      pattern.
+
+  - id: R3_above_threshold_not_ect_drop
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      count_exceeds(bucket.depth, ${marking_threshold_k} - 1) ∧
+      match(hdr.ipv4.ecn, 0b00)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(${core_port})
+    then:
+      - drop
+    notes: |
+      RFC 3168 §6.1.2 MUST: "the router MUST NOT mark a packet as CE
+      if the ECN field is `00` (Not-ECT)". The packet is dropped
+      instead. The predicate `count_exceeds(bucket.depth,
+      ${marking_threshold_k} - 1)` is semantically `bucket.depth ≥
+      ${marking_threshold_k}` — the drop / mark boundary is strict
+      (`≥`, not `>`); the off-by-one trap is what the
+      `boundary_at_exactly_threshold_*` G2 scaffolds probe. Under
+      `${not_ect_action} == passthrough` (ease mode), this rule is
+      disabled and the Not-ECT packet falls through to R6 instead.
+      Under `${marking_mode} == tail_drop_passthrough` (D5.3), this
+      rule's predicate widens to drop Not-ECT *and* CE *and* ECT
+      uniformly above threshold; the P4 expression for that
+      collapse is documented in `bridging_notes:`.
+
+  - id: R4_above_threshold_ect_mark
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      count_exceeds(bucket.depth, ${marking_threshold_k} - 1) ∧
+      (match(hdr.ipv4.ecn, 0b01) ∨ match(hdr.ipv4.ecn, 0b10))
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(${core_port})
+    then:
+      - "set(hdr.ipv4.ecn, 0b11)"
+      - "forward(${core_port})"
+    notes: |
+      RFC 3168 §6.1.2 MUST: "When a router decides to drop a packet
+      as an indication of congestion, … if the ECT codepoint is set
+      in that packet's IP header … the router MAY instead set the CE
+      codepoint, and forward the packet." Both ECT codepoints
+      (`01` = ECT(1), `10` = ECT(0)) are equivalent for marking — the
+      `g1_above_threshold_ect_one_also_marked` G1 scaffold asserts
+      this. The transformation set is exactly two header writes:
+      `hdr.ipv4.ecn ← 0b11` and (implicit, mandated by RFC 791 §3.1
+      inheritance) IPv4 checksum recompute. Under
+      `${dscp_preservation_strict} == true`, the implementation MUST NOT
+      modify any of the other 6 bits in the diffserv byte — the v1model
+      bug-taxonomy anchor "write-too-wide on bit-packed field"
+      surfaces here. Under `${marking_mode} == red_proportional`
+      (D5.2), this rule's `when:` predicate gains a probabilistic
+      term derived from `${min_threshold}` / `${marking_probability_max}`;
+      under `${marking_mode} == tail_drop_passthrough` (D5.3), this
+      rule is dormant (R3 widens to subsume ECT packets).
+
+  - id: R5_above_threshold_ce_preserve
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      count_exceeds(bucket.depth, ${marking_threshold_k} - 1) ∧
+      match(hdr.ipv4.ecn, 0b11)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(${core_port})
+    then:
+      - "forward(${core_port})"
+    notes: |
+      RFC 3168 §6.1.5 MUST: "Once the CE codepoint is set in a
+      packet, the router MUST NOT change the codepoint back to ECT
+      or Not-ECT." CE-already packets above threshold pass through
+      verbatim — no further marking, no header modification, no
+      checksum recompute. The implementation MUST NOT
+      unconditionally re-write `hdr.ipv4.ecn` to `0b11` on this rule
+      (which would invalidate the checksum unnecessarily); the
+      RFC-correct behaviour is "leave alone". Probed by the
+      `ce_persists_above_threshold` G1 scaffold and the
+      `ce_no_silent_unmark_below_threshold` G3 scaffold (which
+      asserts the same persistence on below-threshold packets via R6).
+
+  - id: R6_below_threshold_passthrough
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(bucket.depth, ${marking_threshold_k} - 1)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(${core_port})
+    then:
+      - "forward(${core_port})"
+    notes: |
+      Below-threshold passthrough — the not-congested path. Every
+      eligible IPv4 packet at `bucket.depth < ${marking_threshold_k}`
+      is forwarded unchanged on ${core_port}, regardless of its ECN
+      field. CE-on-ingress packets MUST stay CE on egress (the
+      strict CE-persistence clause from RFC 3168 §6.1.5 binds here
+      too); Not-ECT packets MUST stay Not-ECT (not silently coerced
+      to ECT — the `ce_no_silent_unmark_below_threshold` G3 catches
+      that direction also). This rule is the highest-frequency
+      firing rule on a typical workload (most packets see uncongested
+      queues), so a checksum-recompute bug or a DSCP-clobber bug that
+      fires here is caught more often than one that only fires on
+      R4 — a `workload_skew == uniform` test set probes this heavily.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: ce_persistence_no_unmark
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every packet whose ingress `hdr.ipv4.ecn == 0b11` (CE) and
+      whose firing rule is R5 or R6, the egress `hdr.ipv4.ecn`
+      MUST equal `0b11`. CE is irreversible at a single hop
+      (RFC 3168 §6.1.5). `free_under: {}` — no rule may transition CE
+      to any other codepoint. An implementation that recomputes the ECN field
+      unconditionally (e.g., always writes `10` on forward, or
+      writes `00` to "reset" congestion state) violates this
+      invariant; the `ce_no_silent_unmark_below_threshold` and
+      `ce_persists_above_threshold` scaffolds make it testable.
+    enforced_when: "${ce_persistence_strict} == true"
+
+  - id: not_ect_never_marked
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every packet whose ingress `hdr.ipv4.ecn == 0b00`
+      (Not-ECT): the packet either is dropped (R3 under
+      `${not_ect_action} == drop`) or is forwarded with egress
+      `hdr.ipv4.ecn == 0b00` (R6 below threshold; R3 disabled under
+      `${not_ect_action} == passthrough`). No rule may transition
+      Not-ECT to CE — that would violate RFC 3168 §6.1.2's "MUST
+      NOT mark Not-ECT as CE". The `not_ect_above_threshold_drop_not_silent_mark`
+      G3 scaffold probes this directly.
+    enforced_when: "true"
+
+  - id: dscp_preserved_under_mark
+    clause: persistence
+    binds: [packet]
+    statement: |
+      For every packet whose firing rule is R4 (above-threshold ECT
+      mark): the egress diffserv byte's high 6 bits (DSCP) MUST equal
+      the ingress diffserv byte's high 6 bits. Only the low 2 bits
+      (ECN) may change. RFC 3168 §19 mandates DSCP-and-ECN
+      independence; an implementation that writes the full 8-bit diffserv
+      field instead of bit-extracting the 2-bit ECN field clobbers
+      DSCP. The `dscp_preservation_under_mark` G3 scaffold catches
+      this.
+    enforced_when: "${dscp_preservation_strict} == true"
+
+  - id: ipv4_checksum_validity_after_mark
+    clause: stability
+    binds: [packet]
+    statement: |
+      For every packet whose firing rule is R4 (the only rule that
+      modifies the IPv4 header): the egress `hdr.ipv4.hdrChecksum`
+      MUST equal the RFC 791 §3.1 ones-complement checksum of the
+      egress IPv4 header bytes. Equivalently, the implementation MUST
+      recompute the checksum after the ECN-bit rewrite — the v1model
+      bug-taxonomy anchor "missing MyComputeChecksum after multi-
+      field rewrite" surfaces here. R0-R3 either drop the packet or
+      do not modify the IPv4 header, so checksum validity is preserved
+      trivially. R5 and R6 do not modify the IPv4 header. Only R4
+      requires the implementation to act.
+    enforced_when: "${checksum_recompute} == required"
+
+  - id: stable_marking_decision
+    clause: stability
+    target: forward_decision
+    statement: |
+      For two packets with identical `hdr.ipv4.ecn` ingress value and
+      identical observed `bucket.depth`, the firing rule (and hence
+      the egress action: drop / mark / passthrough) MUST be the same
+      under `${marking_mode} == single_threshold` or
+      `tail_drop_passthrough`. Marking is a deterministic function of
+      (depth, ecn-codepoint, parameters). Under `${marking_mode} ==
+      red_proportional` (D5.2), this clause is RELAXED — the marking
+      decision is probabilistic with `${marking_probability_max}`
+      ceiling.
+    enforced_when: "${marking_mode} ≠ red_proportional"
+
+  - id: no_pipeline_loop
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every packet traverses the marker pipeline exactly once. No
+      recirculation, no resubmit. Both the depth read and the
+      ECN-bit rewrite (R4) happen in a single ingress→egress pass;
+      the checksum recompute is computed in the implementation's
+      `MyComputeChecksum` control block which is a single-pass
+      arithmetic over the rewritten header.
+    enforced_when: "true"
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Follows the G1/G2/G3 test-generation framework (property-first
+# methodology) and the empirical
+# v1model bug taxonomy — three anchors probed: missing checksum
+# recompute, write-too-wide on bit-packed field, conditional deparser).
+
+test_scaffolding:
+
+  G1:                                         # functional correctness
+
+    - id: below_threshold_ect_passthrough
+      generate: |
+        Single eligible packet on ${access_port}. Synthetic depth =
+        ${marking_threshold_k} - 1 (below boundary). ECN = 0b10
+        (ECT(0)). Assert: forwarded on ${core_port} with ECN = 0b10
+        unchanged, DSCP unchanged, IPv4 checksum valid. Probes R6 +
+        G1-P1-T5 (explicit transformation: NO transformation should
+        occur).
+
+    - id: above_threshold_ect_marked
+      generate: |
+        Single eligible packet on ${access_port}. Synthetic depth =
+        ${marking_threshold_k} (at boundary). ECN = 0b10 (ECT(0)).
+        Assert: forwarded on ${core_port} with ECN = 0b11 (CE), DSCP
+        unchanged, IPv4 checksum valid (recomputed). Probes R4 +
+        G1-P1-T5 (explicit per-field transformation) +
+        the `ipv4_checksum_validity_after_mark` invariant.
+
+    - id: above_threshold_ect_one_also_marked
+      generate: |
+        Same as above_threshold_ect_marked but with ECN = 0b01
+        (ECT(1)) on ingress. Assert: forwarded with ECN = 0b11 (CE);
+        both ECT codepoints map to CE per RFC 3168 §6.1.1. Probes R4
+        + RFC 3168 §6.1.1 codepoint-equivalence (ECT(0) and ECT(1)
+        are equivalent for marking purposes).
+
+    - id: ce_persists_above_threshold
+      generate: |
+        Single eligible packet on ${access_port}. Synthetic depth =
+        ${marking_threshold_k} (at boundary). ECN = 0b11 (CE).
+        Assert: forwarded on ${core_port} with ECN = 0b11 (unchanged),
+        DSCP unchanged, IPv4 checksum unchanged (NOT recomputed since
+        no header modification occurred). Probes R5 + the
+        `ce_persistence_no_unmark` invariant.
+
+    - id: ce_persists_below_threshold
+      generate: |
+        Single eligible packet on ${access_port}. Synthetic depth = 0
+        (deep below threshold). ECN = 0b11 (CE). Assert: forwarded
+        unchanged with ECN = 0b11. Same as above but firing R6.
+        Probes R6 + the `ce_persistence_no_unmark` invariant on the
+        below-threshold path.
+
+  G2:                                         # robustness / boundary
+
+    - id: boundary_at_exactly_threshold_ect_marked
+      generate: |
+        Synthetic depth = ${marking_threshold_k} exactly (the strict
+        boundary). ECN = ECT. Assert: marked. Probes the strict
+        `≥` vs `>` boundary; an off-by-one implementation that uses
+        `>` instead of `≥` admits this packet unmarked and fails.
+
+    - id: boundary_at_threshold_minus_one_passthrough
+      generate: |
+        Synthetic depth = ${marking_threshold_k} - 1 (just below the
+        boundary). ECN = ECT. Assert: passthrough unchanged (R6).
+        Pairs with the above to enclose the boundary on both sides
+        — an implementation that uses `>` instead of `≥` would also
+        FAIL this one in the opposite direction (still passthrough
+        but wrong rule firing if the predicate is `>`).
+
+    - id: checksum_consistency_after_mark
+      generate: |
+        Synthetic depth ≥ K. ECN = ECT. Send a packet with a
+        deliberately non-canonical IPv4 payload (e.g., a known TCP
+        SYN with a specific 5-tuple and 16-byte payload). Assert:
+        egress packet's IPv4 checksum equals the RFC 791 §3.1
+        ones-complement checksum of the egress header bytes (with
+        ECN bits set to `11` and all other fields unchanged). Probes
+        the v1model bug-taxonomy anchor "missing MyComputeChecksum
+        after multi-field rewrite" + G1-P4-T1 (output structure
+        correctness on a multi-field rewrite path).
+
+  G3:                                         # security / bypass
+
+    - id: not_ect_above_threshold_drop_not_silent_mark
+      generate: |
+        Synthetic depth ≥ K. ECN = 0b00 (Not-ECT). Assert: packet
+        DROPPED (not forwarded; not silently coerced to CE).
+        Probes R3 + the `not_ect_never_marked` invariant + RFC 3168
+        §6.1.2 MUST. An implementation that applies "any packet above K →
+        mark with CE" violates this and fails the test. (Only under
+        ${not_ect_action} == drop; the relaxed mode tests via
+        `relax_not_ect_passthrough` exercise the other branch.)
+
+    - id: dscp_preservation_under_mark
+      generate: |
+        Synthetic depth ≥ K. ECN = ECT(0). Send a packet with
+        diffserv = 0b101000_10 (DSCP = 0b101000 = AF11, ECN =
+        ECT(0)). Assert: egress diffserv = 0b101000_11 (DSCP
+        unchanged; ECN now CE). An implementation that writes the full 8-bit
+        diffserv field (e.g., `hdr.ipv4.diffserv = 8w0b00000011`)
+        clobbers DSCP and fails. Probes the v1model bug-taxonomy anchor
+        "write-too-wide on bit-packed field" + the
+        `dscp_preserved_under_mark` invariant.
+
+    - id: ce_no_silent_unmark_below_threshold
+      generate: |
+        Synthetic depth = 0 (well below threshold). ECN = 0b11 (CE).
+        Assert: forwarded with ECN = 0b11 unchanged. An implementation that
+        implements "below threshold → write ECN = 0b10" (e.g., a
+        "renormalise to ECT" misreading) silently unmarks CE and
+        fails. Probes R6's CE-preservation duty + the
+        `ce_persistence_no_unmark` invariant on the more-frequent
+        below-threshold path.
+
+    - id: conditional_deparser_after_mixed_drop_and_mark
+      generate: |
+        Probes the v1model bug-taxonomy anchor "conditional deparser".
+        Send three packets back-to-back, all same flowkey:
+          (a) synthetic_depth ≥ K, ECN = 0b00 (Not-ECT): MUST drop
+              (R3) — the dropped branch must not leave deparser state
+              that corrupts the next packet.
+          (b) synthetic_depth ≥ K, ECN = 0b10 (ECT(0)): MUST mark
+              (R4) and forward with ECN = 0b11, checksum recomputed.
+          (c) synthetic_depth < K, ECN = 0b10 (ECT(0)): MUST
+              passthrough (R6) with ECN unchanged.
+        Assert each output is bit-exact-correct (drop = no egress
+        packet; mark = single ECN-bit + checksum change; passthrough
+        = no change). Probes the conditional-deparser surface — a
+        implementation that places the ECN write inside an `if-else` with a
+        common deparser may emit ipv4 only on the mark branch or
+        omit it on the passthrough branch.
+
+  coverage_floor:
+    G1: 5
+    G2: 3
+    G3: 4
+
+# ─── Mutation operators (4 required fields each) ───────────────────────────
+
+mutation_operators:
+
+  # === Capacity axis: marking threshold strictness ==========================
+  - id: shrink_marking_threshold_2x
+    applicable_when: "${marking_threshold_k} >= 4"
+    effect: "${marking_threshold_k} ← ${marking_threshold_k} / 2"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${marking_threshold_k} >= 2 ∧ ${marking_threshold_k} >= ${min_threshold}"
+    notes: |
+      Halves the marking threshold; more packets cross the boundary,
+      stressing the R3 / R4 / R5 paths and the v1model bug surface they
+      probe. Catches implementations that hardcode K = 64 or other constants
+      rather than reading the parameter.
+
+  - id: enlarge_marking_threshold_2x
+    applicable_when: "${marking_threshold_k} <= 512"
+    effect: "${marking_threshold_k} ← ${marking_threshold_k} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${marking_threshold_k} <= 1024"
+
+  # === Strictness axis: Not-ECT-on-congestion action =======================
+  - id: enable_strict_not_ect_drop
+    applicable_when: "${not_ect_action} == passthrough"
+    effect: "${not_ect_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Enforces RFC 3168 §6.1.2's MUST drop on Not-ECT. The
+      `not_ect_above_threshold_drop_not_silent_mark` G3 scaffold
+      becomes load-bearing — under the eased setting it tests the
+      passthrough branch instead. This is the only axis where the
+      harden direction is the RFC-correct one (the ease direction
+      relaxes spec strictness, not the test-set strictness).
+
+  - id: relax_not_ect_passthrough
+    applicable_when: "${not_ect_action} == drop"
+    effect: "${not_ect_action} ← passthrough"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Strictness axis: CE persistence enforcement =========================
+  - id: enable_ce_persistence_strict
+    applicable_when: "${ce_persistence_strict} == false"
+    effect: "${ce_persistence_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Activates the `ce_persistence_no_unmark` invariant, making
+      the `ce_no_silent_unmark_below_threshold` and
+      `ce_persists_above_threshold` scaffolds load-bearing. Pairs
+      the RFC 3168 §6.1.5 MUST with test enforcement.
+
+  - id: disable_ce_persistence_strict
+    applicable_when: "${ce_persistence_strict} == true"
+    effect: "${ce_persistence_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Strictness axis: DSCP preservation ==================================
+  - id: enable_strict_dscp_preservation
+    applicable_when: "${dscp_preservation_strict} == false"
+    effect: "${dscp_preservation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Activates the `dscp_preserved_under_mark` invariant.
+      Force-probes the v1model bug "write-too-wide on bit-packed field"
+      anchor: an implementation that writes `hdr.ipv4.diffserv = 8w...`
+      instead of `hdr.ipv4.ecn = 2w0b11` clobbers DSCP and fails.
+
+  - id: disable_dscp_preservation
+    applicable_when: "${dscp_preservation_strict} == true"
+    effect: "${dscp_preservation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Strictness axis: IPv4 checksum recompute ============================
+  - id: require_checksum_recompute
+    applicable_when: "${checksum_recompute} == omitted"
+    effect: "${checksum_recompute} ← required"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Activates the `ipv4_checksum_validity_after_mark` invariant
+      and the `checksum_consistency_after_mark` G2 scaffold becomes
+      load-bearing. Probes the v1model bug "missing MyComputeChecksum after
+      multi-field rewrite" anchor. RFC-compliant default.
+
+  - id: omit_checksum_recompute
+    applicable_when: "${checksum_recompute} == required"
+    effect: "${checksum_recompute} ← omitted"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Faithfulness ladder: D5.0 ↔ D5.1 ↔ D5.2 ↔ D5.3 =====================
+  - id: lift_to_strict_rfc3168
+    applicable_when: "${faithfulness} == D5.1_dctcp_single_threshold"
+    effect: |
+      ${faithfulness}              ← D5.0_rfc3168_strict
+      ${not_ect_action}            ← drop
+      ${ce_persistence_strict}     ← true
+      ${dscp_preservation_strict}  ← true
+      ${checksum_recompute}        ← required
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Locks every strictness knob to its RFC-compliant setting
+      simultaneously. The D5.0 band requires the implementation to honour
+      all four RFC 3168 MUST-clauses (drop Not-ECT, persist CE,
+      preserve DSCP, recompute checksum) — a single missed clause
+      fails the band.
+
+  - id: revert_to_dctcp_single_threshold
+    applicable_when: "${faithfulness} == D5.0_rfc3168_strict"
+    effect: |
+      ${faithfulness}              ← D5.1_dctcp_single_threshold
+      ${ce_persistence_strict}     ← true
+      ${not_ect_action}            ← drop
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Steps down to DCTCP single-threshold while keeping the core
+      RFC 3168 MUST clauses (CE persistence + Not-ECT drop). DSCP-
+      preservation and checksum-recompute strictness remain seed-
+      bound and may be relaxed independently.
+
+  - id: lift_to_red_proportional
+    applicable_when: "${faithfulness} == D5.1_dctcp_single_threshold ∧ ${min_threshold} < ${marking_threshold_k}"
+    effect: |
+      ${faithfulness}     ← D5.2_red_proportional
+      ${marking_mode}     ← red_proportional
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${min_threshold} >= 1 ∧ ${min_threshold} < ${marking_threshold_k} ∧ ${marking_probability_max} > 0.0"
+    notes: |
+      Switches to the RED probabilistic-ramp marking law. The
+      implementation must perform a per-packet random draw and a
+      proportional-marking decision between `${min_threshold}` and
+      `${marking_threshold_k}`. The `stable_marking_decision`
+      invariant relaxes (it is enforced_when ≠ red_proportional).
+      The `marking_probability_max` parameter activates; the test
+      set's G2 boundary scaffolds widen to probabilistic tolerances.
+
+  - id: revert_to_single_threshold
+    applicable_when: "${faithfulness} == D5.2_red_proportional"
+    effect: |
+      ${faithfulness}     ← D5.1_dctcp_single_threshold
+      ${marking_mode}     ← single_threshold
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: collapse_to_tail_drop
+    applicable_when: "${faithfulness} == D5.1_dctcp_single_threshold ∨ ${faithfulness} == D5.2_red_proportional"
+    effect: |
+      ${faithfulness}     ← D5.3_tail_drop_no_mark
+      ${marking_mode}     ← tail_drop_passthrough
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Degraded mode: no ECN marking at all. R4 and R5 become dormant;
+      R3's predicate widens to subsume ECT and CE codepoints
+      (everything above threshold is dropped). The test set's
+      mark-asserting scaffolds (above_threshold_ect_marked,
+      above_threshold_ect_one_also_marked,
+      dscp_preservation_under_mark, checksum_consistency_after_mark,
+      conditional_deparser_after_mixed_drop_and_mark) all flip to
+      assert "dropped" instead. Used as the ease-direction collapse
+      target when even DCTCP single-threshold is unreachable for
+      the SUT.
+
+  - id: lift_from_tail_drop_to_dctcp
+    applicable_when: "${faithfulness} == D5.3_tail_drop_no_mark"
+    effect: |
+      ${faithfulness}     ← D5.1_dctcp_single_threshold
+      ${marking_mode}     ← single_threshold
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+
+  # === Eligibility axis: TCP-only vs any-L4 ================================
+  - id: tighten_eligibility_to_tcp
+    applicable_when: "${eligibility_protocol} == any_l4"
+    effect: "${eligibility_protocol} ← tcp_only"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Restricts marking to TCP traffic. The implementation must parse the
+      IP protocol field and conditionally apply R3 / R4 / R5 / R6
+      only when proto == 6 (TCP); UDP / ICMP / others go through
+      R2's drop path. This is the DCTCP-deployment "mark TCP only"
+      convention. Adds parser-conditional logic.
+
+  - id: relax_eligibility_to_any_l4
+    applicable_when: "${eligibility_protocol} == tcp_only"
+    effect: "${eligibility_protocol} ← any_l4"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Workload axis: adversarial vs uniform ===============================
+  - id: workload_to_adversarial_not_ect
+    applicable_when: "${workload_skew} ∈ {uniform, bursty_above_threshold}"
+    effect: "${workload_skew} ← adversarial_not_ect"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${not_ect_action} == drop"
+    notes: |
+      Skews the test workload to mostly Not-ECT packets at depths
+      just above K. Maximises R3 firings; probes the RFC 3168 §6.1.2 MUST-
+      clause boundary at scale. An implementation that silently marks Not-
+      ECT instead of dropping fails every adversarial-workload test.
+
+  - id: workload_to_uniform
+    applicable_when: "${workload_skew} ∈ {bursty_above_threshold, adversarial_not_ect}"
+    effect: "${workload_skew} ← uniform"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Non-IPv4 action axis ================================================
+  - id: tighten_non_ipv4_drop
+    applicable_when: "${non_ipv4_action} == passthrough"
+    effect: "${non_ipv4_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Tightens R1 to drop non-IPv4 frames. Bridges that forward
+      ARP / IPv6 / MPLS unchanged fail; this also probes the parser
+      eligibility surface (the implementation must correctly identify
+      non-IPv4 packets even when the diffserv byte is undefined).
+
+  - id: relax_non_ipv4_passthrough
+    applicable_when: "${non_ipv4_action} == drop"
+    effect: "${non_ipv4_action} ← passthrough"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === v1.1: multi-priority queue axis (added mutation operator) ============
+  - id: enable_two_priority_queues
+    applicable_when: "${priority_queue_count} == 1"
+    effect: |
+      ${priority_queue_count}      ← 2
+      ${priority_classifier}       ← dscp_high_bit
+      ${class_0_min_threshold}     ← ${min_threshold}
+      ${class_0_marking_threshold_k} ← ${marking_threshold_k}
+      ${class_1_min_threshold}     ← ${min_threshold} / 2
+      ${class_1_marking_threshold_k} ← ${marking_threshold_k} / 2
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${class_1_min_threshold} >= 1 ∧ ${class_1_min_threshold} < ${class_1_marking_threshold_k}"
+    notes: |
+      Adds a second priority class with tighter thresholds. The implementation
+      must read the DSCP MSB on every eligible packet and dispatch to
+      class-specific thresholds. Existing single-queue tests at class-0
+      thresholds remain valid (they were authored assuming DSCP MSB=0);
+      new tests probe class-1 packets at depths that are in the
+      no-pressure zone for class 0 but in the ramp zone for class 1 —
+      an implementation that ignores the priority classifier and applies class-0
+      thresholds universally forwards class-1 packets unmarked and
+      fails. The v1model bug-catalogue conditional-on-DSCP-MSB
+      surface becomes load-bearing.
+
+      Added by operator-library extension (pattern augmentation).
+      Requires oracle
+      regeneration because R3/R4/R5/R6 predicates change semantically
+      (the `count_exceeds(bucket.depth, K-1)` clause now resolves to
+      either class_0_marking_threshold_k or class_1_marking_threshold_k
+      depending on the packet's classifier reading).
+
+  - id: disable_two_priority_queues
+    applicable_when: "${priority_queue_count} == 2"
+    effect: |
+      ${priority_queue_count}    ← 1
+      ${priority_classifier}     ← none
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+# ─── Implementation notes (advisory only — author-side, not LLM-visible) ───
+bridging_notes: |
+  Canonical BMv2 / v1model implementation sketch (D5.1 default seed):
+
+    header ipv4_t {
+      bit<4>   version;
+      bit<4>   ihl;
+      bit<6>   dscp;             # split the 8-bit diffserv byte into 6+2
+      bit<2>   ecn;              # so `hdr.ipv4.ecn` is bit-accessible
+      bit<16>  totalLen;
+      ...
+      bit<16>  hdrChecksum;
+      ...
+    }
+
+    control MyIngress(...) {
+      apply {
+        if (standard_metadata.ingress_port != ${access_port}) {
+          mark_to_drop(standard_metadata);                                       # R0
+          return;
+        }
+        if (!hdr.ipv4.isValid()) {                                              # R1
+          if (${non_ipv4_action} == drop) { mark_to_drop(...); return; }
+          else { standard_metadata.egress_spec = ${core_port}; return; }
+        }
+        if (${eligibility_protocol} == tcp_only && hdr.ipv4.protocol != 6) {    # R2
+          mark_to_drop(...); return;
+        }
+        # synthetic_qdepth lookup table populates meta.qdepth at ingress;
+        # enq_qdepth/deq_qdepth would be read in egress control instead.
+        if (meta.qdepth >= ${marking_threshold_k}) {                            # depth >= K
+          if (hdr.ipv4.ecn == 2w0b00) {                                         # R3
+            mark_to_drop(...); return;
+          }
+          if (hdr.ipv4.ecn == 2w0b01 || hdr.ipv4.ecn == 2w0b10) {               # R4
+            hdr.ipv4.ecn = 2w0b11;
+            standard_metadata.egress_spec = ${core_port};
+            return;
+          }
+          # else: CE already, fall through to passthrough                       # R5
+        }
+        standard_metadata.egress_spec = ${core_port};                           # R6 (and R5 fallthrough)
+      }
+    }
+
+    control MyComputeChecksum(...) {
+      apply {
+        update_checksum(
+          hdr.ipv4.isValid(),
+          { hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.dscp, hdr.ipv4.ecn,
+            hdr.ipv4.totalLen, hdr.ipv4.identification, hdr.ipv4.flags,
+            hdr.ipv4.fragOffset, hdr.ipv4.ttl, hdr.ipv4.protocol,
+            hdr.ipv4.srcAddr, hdr.ipv4.dstAddr },
+          hdr.ipv4.hdrChecksum,
+          HashAlgorithm.csum16);
+      }
+    }
+
+  [common-knowledge baseline] v1model bug-catalogue anchors hit by
+  this pattern:
+
+    (a) "missing MyComputeChecksum after multi-field rewrite" — the
+        ECN-bit rewrite invalidates the IPv4 checksum; an implementation that
+        omits the update_checksum() call leaves a stale checksum on
+        every marked packet. Caught by `checksum_consistency_after_mark`
+        (G2) and `ipv4_checksum_validity_after_mark` (invariant).
+
+    (b) "write-too-wide on bit-packed field" — writing the full 8-bit
+        diffserv byte (e.g., `hdr.ipv4.diffserv = 8w0b00000011`)
+        clobbers DSCP. The implementation MUST either declare the header with
+        the 6-bit DSCP + 2-bit ECN split (as above), or use explicit
+        bit-masking. Caught by `dscp_preservation_under_mark` (G3) and
+        `dscp_preserved_under_mark` (invariant).
+
+    (c) "conditional deparser" — the marker has three branches at the
+        rule-firing level (drop in R0/R1/R2/R3, mark in R4, passthrough
+        in R5/R6). All branches that emit a packet must emit the same
+        header set (ethernet + ipv4 + payload). Caught by
+        `conditional_deparser_after_mixed_drop_and_mark` (G3).
+
+  v2 deferral notes:
+
+    - Cross-port queue depth (e.g., a shared buffer pool's depth
+      signalled instead of per-port enq_qdepth) needs a `link`-keyed
+      bucket and inter-port aggregation — deferred to v2.
+
+    - Per-class marking (different K per DSCP class — WRED) needs
+      multiple `marking_threshold_k` values keyed by ingress DSCP;
+      modelled here as a single-class instance for v1.0 and lifted via
+      a v2 multi-rate operator.
+
+    - Egress-control marking (reading deq_qdepth, applying the mark in
+      the egress pipeline rather than at ingress) is supported by the
+      `${queue_depth_signal} == deq_qdepth` seed but is not the v1.0
+      default — most v1model implementations put the marking decision in
+      ingress for testability. The `deq_qdepth` setting is the most
+      production-realistic choice but the hardest to unit-test.

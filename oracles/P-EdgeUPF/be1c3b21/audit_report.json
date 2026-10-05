@@ -1,0 +1,108 @@
+{
+  "oracle_hash": "cfd36d13f1c96257cfd46ea508bc4e079c2aa93276598cbbda9291cd7a14ea9f",
+  "instance": "edge_upf_anchor-default",
+  "ran_at": "2026-05-30T00:04:21.014539Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "uplink_non_gtpu_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "uplink_decap_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "downlink_encap_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "downlink_no_bearer_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "acl_deny_on_inner_uplink",
+        "status": "pass"
+      },
+      {
+        "example_id": "uplink_inner_ttl_one",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "decap_before_route": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "acl_on_inner": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "bearer_dependence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "encap_outer_header_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "decap_before_route",
+      "acl_on_inner",
+      "bearer_dependence",
+      "encap_outer_header_completeness",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Jeyakumar et al., Millions of Little Minions, SIGCOMM 2014",
+      "RFC1812",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

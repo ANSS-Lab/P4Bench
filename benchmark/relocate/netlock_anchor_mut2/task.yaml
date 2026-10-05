@@ -1,0 +1,1321 @@
+task_name: netlock_anchor_mut2
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-NetLock
+pattern_version: '1.0'
+seed:
+  lock_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  lock_mode: shared_exclusive
+  deny_mode: drop
+  waiter_fifo_depth: 4
+  grant_response: forward_to_port
+  release_check_holder: true
+  index_mode: direct
+  hash_algo: crc16
+  lock_table_capacity: 256
+  faithfulness: D5.2_fifo_fairness
+description: "Implement an in-switch reader/writer lock service with a fair waiter queue on a\nsingle switch s1. A lock manager that would normally live on a host/coordinator\nis relocated into the data\
+  \ plane: the switch itself grants, queues, and releases\nlocks, holding per-lock state on the switch and driven entirely by the lock\ncontrol messages it receives. Grounded in NetLock (Yu et al., NSDI\
+  \ 2020).\n\n## Lock control messages\n\nClients coordinate by sending lock control messages. Each message is a small\nheader riding on UDP addressed to the lock-service UDP port (0xABCD). The header\n\
+  carries:\n\n  - op         the operation: LOCK (1) or UNLOCK (2)\n  - mode       requested lock mode: EXCLUSIVE (0) or SHARED (1)\n  - status     a result marker the switch sets on a reply: REQ (0), GRANT\
+  \ (1),\n               NACK (2). Requests arrive with status REQ.\n  - lock_id    which lock the message targets\n  - client_id  the id of the requesting client\n\nThe service manages four locks, with\
+  \ ids 0, 1, 2, and 3.\n\n## Topology\n\nOne switch s1 with four ports:\n  - s1.p1 \u2014 client A (10.0.0.1, MAC 08:00:00:00:00:01, client id 1)\n  - s1.p2 \u2014 client B (10.0.0.2, MAC 08:00:00:00:00:02,\
+  \ client id 2)\n  - s1.p3 \u2014 client C (10.0.0.3, MAC 08:00:00:00:00:03, client id 3)\n  - s1.p4 \u2014 the coordinator port (10.0.0.254), where the switch delivers every\n            GRANT reply.\n\
+  \nClients send their requests with the Ethernet destination set to the switch\nMAC 08:00:00:00:00:fe.\n\n## Required behaviour\n\nEach lock is either FREE, or HELD in one of two modes:\n  - SHARED  \u2014\
+  \ held concurrently by one or more clients (readers);\n  - EXCLUSIVE \u2014 held by exactly one client (a writer), with no other holders.\nA lock starts FREE. Process each received message in order; per-lock\
+  \ state (the\nholders and the waiter queue) persists across messages.\n\nA SHARED request is COMPATIBLE with a lock currently held SHARED; an EXCLUSIVE\nrequest is incompatible with any current holder,\
+  \ and any request is incompatible\nwith a current EXCLUSIVE holder. Each lock also has a bounded FIFO waiter queue\n(capacity 4) of clients waiting for it, served oldest-first.\n\n 1. A frame that does\
+  \ not carry a lock-message header (e.g. ordinary UDP to a\n    different port, or ARP) is out of scope: it MUST be dropped and MUST NOT\n    change any lock or waiter state.\n\n 2. LOCK on a FREE lock:\
+  \ grant it. Bind the requesting client as a holder in the\n    requested mode (SHARED makes the lock SHARED-held with that one reader;\n    EXCLUSIVE makes it EXCLUSIVE-held), set the message status to\
+  \ GRANT, leave\n    the granted client id in the message, and forward the reply out s1.p4.\n\n 3. SHARED LOCK on a lock already held SHARED (compatible): admit the requester\n    as an additional concurrent\
+  \ reader, set status GRANT, and forward the reply\n    out s1.p4. The earlier readers keep their grants.\n\n 4. LOCK that is NOT immediately grantable \u2014 an EXCLUSIVE request while the lock\n    has\
+  \ any holder, or a SHARED request while the lock is held EXCLUSIVE \u2014 is\n    ENQUEUED at the tail of that lock's waiter FIFO (if the queue has room) and\n    the request is consumed with NO immediate\
+  \ reply (it will be granted later,\n    on a release). The current holder(s) are unchanged. A held lock is never\n    granted to an incompatible requester immediately: that is the mutual-\n    exclusion\
+  \ / reader-writer guarantee.\n\n 5. UNLOCK from a current holder of the lock: that holder relinquishes its grant.\n    - If other (shared) holders remain, the lock stays HELD by them and the\n      UNLOCK\
+  \ is consumed with no reply.\n    - If that was the last holder and the waiter FIFO is non-empty: dequeue the\n      FIFO HEAD (the oldest waiter), grant it the lock \u2014 bind it as the new\n      holder\
+  \ in the mode it requested \u2014 set status GRANT, set the message's\n      client id to the granted (head) client, and forward the reply out s1.p4.\n      The head waiter, never a later-arriving waiter,\
+  \ is the one served \u2014 this\n      is the FIFO-fairness guarantee.\n    - If that was the last holder and the FIFO is empty: the lock returns to\n      FREE and the UNLOCK is consumed with no reply.\n\
+  \n 6. UNLOCK from a client that is NOT a current holder of the lock: rejected \u2014 the\n    message MUST be dropped and the lock and its waiters are unchanged. Only a\n    holder may release.\n\n 7.\
+  \ UNLOCK on a lock that is already FREE: a no-op \u2014 drop the message.\n\nEach lock is independent: holding or queueing on one lock does not affect any\nother lock id. There is no lease or timeout:\
+  \ a lock is released only by an\nexplicit UNLOCK from one of its holders.\n\nOn every GRANT reply delivered to the coordinator port, the IPv4 Hop count is\ndecremented by one as the packet transits the\
+  \ switch (ordinary forwarding).\n"
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: h2
+    to: s1.p2
+  - from: h3
+    to: s1.p3
+  - from: s1.p4
+    to: coord
+hosts:
+  h1:
+    ip: 10.0.0.1
+    mac: 08:00:00:00:00:01
+    port: s1.p1
+  h2:
+    ip: 10.0.0.2
+    mac: 08:00:00:00:00:02
+    port: s1.p2
+  h3:
+    ip: 10.0.0.3
+    mac: 08:00:00:00:00:03
+    port: s1.p3
+  coord:
+    ip: 10.0.0.254
+    mac: 08:00:00:00:00:fe
+    port: s1.p4
+test_cases:
+- name: exclusive_lock_free_grant
+  visibility: public
+  description: Client A sends an EXCLUSIVE LOCK request for lock 0, which is free. The switch binds A as the exclusive holder and forwards a GRANT (status set to GRANT, granted client id A) out the coordinator
+    port s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: shared_locks_coexist
+  visibility: public
+  description: "A takes a SHARED (read) lock on lock 0, then B requests a SHARED lock on the SAME lock 0. Shared locks are compatible: B is also GRANTed (both A and B hold lock 0 concurrently, share count\
+    \ 2). This is the new shared-mode behaviour \u2014 a held lock CAN admit a second concurrent SHARED holder."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 2
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: fifo_head_granted_on_release
+  visibility: public
+  description: "A holds lock 1 (exclusive). B then C each request lock 1 while it is held; both are ENQUEUED in the waiter FIFO (no immediate reply). When A releases lock 1, the FIFO HEAD \u2014 B, the\
+    \ oldest waiter \u2014 is granted and a GRANT (granted client id B) is forwarded out s1.p4. C remains queued. Serving the head, not C, is the FIFO-fairness guarantee."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 2
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: independent_lock_granted
+  visibility: public
+  description: "With A holding lock 0, client C requests a DIFFERENT lock (lock 2). Per-lock state is isolated, so C is GRANTed lock 2 \u2014 holding one lock does not block an unrelated one."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 3
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: contended_lock_enqueued_no_reply
+  visibility: hidden
+  description: A holds lock 0 (exclusive). B requests the same lock 0. The lock is held, so B is ENQUEUED in the waiter FIFO and the request packet is consumed with NO immediate reply (the GRANT to B arrives
+    later, on A's UNLOCK). The immediate observable verdict is therefore a drop.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: drop
+- name: exclusive_blocked_by_shared_holder
+  visibility: hidden
+  description: "A holds a SHARED (read) lock on lock 0. C then requests an EXCLUSIVE lock on lock 0. An exclusive request is incompatible while any shared holder exists, so C cannot be granted immediately\
+    \ \u2014 it is enqueued and the request is consumed (drop). Shared readers exclude a writer."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 3
+  expected:
+    behavior: drop
+- name: relock_after_holder_unlock
+  visibility: hidden
+  description: A holds lock 1 (exclusive) with no waiters, then releases it with an UNLOCK; B's subsequent LOCK on lock 1 is GRANTed because the lock was freed (no FIFO handoff occurs when the queue is
+    empty).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 2
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: holder_unlock_no_waiter_consumed
+  visibility: hidden
+  description: A holds lock 0 (no waiters) then sends an UNLOCK for lock 0. With an empty waiter FIFO the UNLOCK frees the lock and produces NO output of its own (no head to hand off to); the freeing is
+    observable only via a later LOCK.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  expected:
+    behavior: drop
+- name: unlock_free_lock_noop_then_grant
+  visibility: hidden
+  description: "An UNLOCK for lock 3 that was never locked is a no-op (consumed, no GRANT). A following LOCK on lock 3 is still GRANTed \u2014 the spurious unlock did not corrupt the free state."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 2
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: second_waiter_served_after_head_releases
+  visibility: hidden
+  description: 'A holds lock 1; B then C are enqueued. A releases (B, the head, is granted and becomes holder). B then releases lock 1: the remaining FIFO head C is now granted (GRANT, granted client id
+    C). Waiters are served strictly in arrival order across successive releases.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: spoofed_unlock_wrong_holder_rejected
+  visibility: hidden
+  description: A holds lock 0. Client B sends an UNLOCK for lock 0 (B is NOT the holder). Only the holder may release, so B's UNLOCK is rejected (dropped) and lock 0 stays held by A; no waiter is served.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: drop
+- name: non_lock_udp_dropped
+  visibility: hidden
+  description: "A plain IPv4/UDP frame to an ordinary port (no lock-message header) is out of scope for the lock service and is dropped \u2014 and it must not mutate any lock or waiter state."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 53
+  expected:
+    behavior: drop
+- name: non_lock_arp_dropped
+  visibility: hidden
+  description: 'An ARP frame carries no lock-message header and is dropped by the lock service (R0: only lock control messages are handled).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.0.1
+        pdst: 10.0.0.254
+        hwsrc: 08:00:00:00:00:01
+  expected:
+    behavior: drop
+- name: double_lock_same_free_second_not_double_granted
+  visibility: hidden
+  description: "Two clients race for the same free lock 3: A's LOCK arrives first and is granted exclusive; B's LOCK for the same lock is then enqueued (consumed, no reply) \u2014 never a second concurrent\
+    \ GRANT. A correct read-test-write admits exactly ONE exclusive holder; the loser queues."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 2
+  expected:
+    behavior: drop
+- name: shared_release_grants_queued_exclusive
+  visibility: hidden
+  description: "A holds a SHARED lock on lock 2; an EXCLUSIVE request from C is enqueued (blocked by the shared holder). When the shared holder A releases lock 2, the queued exclusive waiter C is granted\
+    \ (GRANT, granted client id C) \u2014 the writer waits behind the reader and is served on release."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 2
+        client_id: 1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 3
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: adversarial_steal_never_granted
+  visibility: hidden
+  description: A holds lock 1 (exclusive). A malicious client C repeatedly LOCKs it. Each attempt is queued, never granted; A stays the sole holder and no second concurrent GRANT is ever emitted (mutual
+    exclusion under adversarial load, even with a waiter FIFO).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  expected:
+    behavior: drop
+- name: shared_coreader_release_keeps_lock_held
+  visibility: hidden
+  description: "A and B both hold lock 0 SHARED (two concurrent readers). A releases its shared lock, but B still holds it, so lock 0 stays SHARED-held \u2014 the release only drops A's grant. An EXCLUSIVE\
+    \ request from C is therefore still incompatible (reader B excludes a writer) and is not granted immediately (consumed/enqueued, drop). A held shared lock survives a partial release."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 2
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 3
+  expected:
+    behavior: drop
+- name: last_reader_release_then_exclusive_granted
+  visibility: hidden
+  description: "A and B hold lock 0 SHARED. A releases (B still holds, lock stays held), then B releases (the last reader leaves, lock returns to FREE). A subsequent EXCLUSIVE LOCK from C is now GRANTed\
+    \ \u2014 the writer is admitted only once every reader has released."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 1
+        status: 0
+        lock_id: 0
+        client_id: 2
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 3
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      LockMsg.client_id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: fifo_full_overflow_denied
+  visibility: hidden
+  description: "A holds lock 1 (exclusive). The bounded waiter FIFO (capacity 4) is then filled by four queued contenders. A fifth LOCK on lock 1 finds the queue FULL: it cannot be enqueued and is denied\
+    \ (drop) \u2014 the capacity boundary between enqueue (R3b) and deny (R3)."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

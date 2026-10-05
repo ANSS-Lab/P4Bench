@@ -1,0 +1,96 @@
+{
+  "oracle_hash": "1c5e05a0ff01c27f08bb7b114323b054d1005dac4bbe1ab90e9a9ee8f2dbebb1",
+  "instance": "stateful_l4_lb_bounded-default",
+  "ran_at": "2026-05-30T00:45:52.219228Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_vip_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_tcp_to_vip_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_first_backend0",
+        "status": "pass"
+      },
+      {
+        "example_id": "established_flow_sticky_backend0",
+        "status": "pass"
+      },
+      {
+        "example_id": "second_distinct_flow_backend1",
+        "status": "pass"
+      },
+      {
+        "example_id": "stickiness_survives_distinct_bucket_interleave",
+        "status": "pass"
+      },
+      {
+        "example_id": "bucket_collision_displaces_resident",
+        "status": "pass"
+      },
+      {
+        "example_id": "displaced_flow_reassigned_as_new",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_vip_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_vip_override",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_assign_capacity_persist_extremes",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "persistence_under_pool_addition": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_flow_state": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "persistence_under_pool_addition",
+      "no_orphan_flow_state"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "silkroad_sigcomm17",
+      "tiara_nsdi22",
+      "cetus_nsdi22"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

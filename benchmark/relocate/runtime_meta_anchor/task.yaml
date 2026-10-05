@@ -1,0 +1,486 @@
+task_name: runtime_meta_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-RuntimeMeta
+pattern_version: '1.0'
+seed:
+  monitored_ports:
+  - 1
+  - 2
+  collector_port: 3
+  mirror_dst: 10.0.0.5
+  count_only_dst: 10.0.0.2
+description: |
+  A switch s1 acts as an in-network traffic-observation function in the
+  style of sFlow / port-mirroring (SPAN), as described in RFC 3176. It
+  forwards traffic normally while delivering copies of selected traffic to
+  a monitoring collector and maintaining per-rule traffic counters that a
+  control plane reads out of band.
+
+  ## Topology
+
+  Switch s1 has five ports:
+
+    - `s1.p1`, `s1.p2` — MONITORED host ports (traffic entering here is
+      observed).
+    - `s1.p3` — the COLLECTOR port (a monitoring station; it is never a
+      monitored port).
+    - `s1.p4`, `s1.p5` — ordinary (unmonitored) host ports.
+
+  Hosts h1..h5 attach to p1..p5's peer side as in the topology block; each
+  host has the MAC and IPv4 address listed under `hosts`.
+
+  ## Base forwarding (applies to every packet that is forwarded)
+
+  Forwarding is plain layer-2 delivery by Ethernet destination address,
+  using this fixed table (control-plane installed):
+
+    | Ethernet destination | egress port |
+    |----------------------|-------------|
+    | 08:00:00:00:01:01    | s1.p1       |
+    | 08:00:00:00:02:02    | s1.p2       |
+    | 08:00:00:00:03:03    | s1.p3       |
+    | 08:00:00:00:04:04    | s1.p4       |
+    | 08:00:00:00:05:05    | s1.p5       |
+
+  Forwarded packets MUST be delivered unchanged — no header field is
+  rewritten, the TTL is NOT decremented. This is a transparent observer,
+  not a router.
+
+  ## Observation rules (the monitor table, control-plane installed)
+
+  Two monitor rules are matched on the packet's IPv4 destination address:
+
+    1. **Mirror rule** — IPv4 destination `10.0.0.5`: traffic to this
+       destination is OBSERVED.
+    2. **Count-only rule** — IPv4 destination `10.0.0.2`: traffic to this
+       destination is observed but NOT copied.
+
+  ## Per-packet behaviour
+
+  Process each packet as follows (first matching case wins):
+
+   1. **Not IPv4** (e.g. ARP) — drop. The observer handles IPv4 only.
+
+   2. **Enters on a monitored port (p1 or p2) AND matches the mirror rule
+      (IPv4 destination 10.0.0.5)** — the switch MUST do BOTH of these:
+        - forward the original packet normally (by the base forwarding
+          table), delivered unchanged; and
+        - deliver a COPY of the packet to the collector on `s1.p3`.
+      The copy is a faithful copy of the observed packet. Observation is
+      non-destructive: the original packet still reaches its normal egress
+      and is byte-for-byte unchanged. (The per-rule packet counter is also
+      incremented; counters are read by the control plane and are not
+      visible on the wire.)
+
+   3. **Enters on a monitored port AND matches the count-only rule (IPv4
+      destination 10.0.0.2)** — forward the original normally; do NOT send
+      any copy to the collector. (The counter is incremented.)
+
+   4. **Matches no monitor rule, OR enters on an unmonitored port (p3, p4,
+      p5)** — forward normally by the base table; no copy, no counter.
+      In particular, a packet to 10.0.0.5 that arrives on an UNMONITORED
+      port is NOT mirrored — observation is gated on the ingress port.
+
+   5. **The Ethernet destination is not in the forwarding table** — flood
+      the packet to all host ports EXCEPT the ingress port and EXCEPT the
+      collector port (i.e. deliver one copy to each of the other host
+      ports p1/p2/p4/p5, never to the collector).
+
+  ## Invariants
+
+   - A copy reaches the collector port `s1.p3` if and only if the packet
+     entered on a monitored port and matched the mirror rule.
+   - A mirrored packet's original copy is delivered to its normal egress
+     unchanged (mirroring never alters or redirects the forwarded packet).
+   - The mirror decision is keyed on the IPv4 destination; the forwarding
+     egress is keyed on the Ethernet destination — the two are independent.
+
+  ## Deliverable
+
+  Produce a P4-16 program for the V1Model architecture (BMv2
+  `simple_switch`) and a control-plane entries file installing the
+  forwarding table, the monitor rules, and whatever is needed to deliver
+  copies to the collector port. Internal table/handle names are yours to
+  choose.
+
+  ## Entries-file format (BMv2 control-plane install contract)
+
+  This task requires more than table entries, so use the OBJECT form for
+  the switch (not a bare list). The per-switch value has three optional
+  lists:
+
+  ```json
+  {
+    "s1": {
+      "entries": [
+        {"table": "<name>", "match": {"<field>": <value>},
+         "action_name": "<name>", "action_params": {"<p>": <v>}}
+      ],
+      "multicast_groups": [
+        {"mgid": <group_id>, "ports": [<port>, <port>, ...]}
+      ],
+      "mirror_sessions": [
+        {"id": <session_id>, "egress_port": <port>}
+      ]
+    }
+  }
+  ```
+
+  - To deliver a copy to the collector, install a `mirror_sessions` entry
+    binding a session id to the collector egress port, and clone to that
+    session id in the data plane.
+  - To flood on a forwarding-table miss, install a `multicast_groups`
+    entry whose `ports` are the flood set, and set the packet's multicast
+    group to that `mgid` in the data plane.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+  links:
+  - from: h1
+    to: s1.p1
+  - from: h2
+    to: s1.p2
+  - from: collector
+    to: s1.p3
+  - from: h4
+    to: s1.p4
+  - from: h5
+    to: s1.p5
+hosts:
+  h1:
+    ip: 10.0.0.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.0.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  collector:
+    ip: 10.0.0.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.0.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+  h5:
+    ip: 10.0.0.5/24
+    mac: 08:00:00:00:05:05
+    port: s1.p5
+test_cases:
+- name: mirror_basic
+  visibility: public
+  description: 'Monitored p1 → dst 10.0.0.5 (mirror rule): forward to p5 AND copy to collector p3.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 4f4253455256455f4d45
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p5
+- name: count_only_no_collector_copy
+  visibility: public
+  description: 'Monitored p1 → dst 10.0.0.2 (count-only rule): forward to p2, NO collector copy.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 434f554e545f4d45
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+- name: forward_unmodified_under_mirror
+  visibility: public
+  description: 'Mirror case: the forwarded original (and the copy) are byte-identical — TTL/MACs unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 554e4348414e474544
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p5
+    transformations:
+      IP.ttl:
+        action: unchanged
+      Ether.dst:
+        action: unchanged
+      Ether.src:
+        action: unchanged
+- name: mirror_from_h2
+  visibility: hidden
+  description: 'Monitored p2 → dst 10.0.0.5 (mirror rule): forward to p5 + copy to collector.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 46524f4d5f4832
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p5
+- name: unruled_forward
+  visibility: hidden
+  description: 'Monitored p1 → dst 10.0.0.4 (no monitor rule): plain forward to p4, no copy.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:04:04
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 554e52554c4544
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p4
+- name: forward_decoupled_from_mirror_key
+  visibility: hidden
+  description: 'Eth dst 04:04 (→p4) but IP dst 10.0.0.5 (mirror rule): forward p4 + copy p3 — forwarding keys on MAC, mirror keys on IP.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:04:04
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 4445434f55504c4544
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p4
+- name: unmonitored_port_not_mirrored
+  visibility: hidden
+  description: 'Unmonitored p4 → dst 10.0.0.5 (mirror rule): forward to p5 only, NO copy (monitoring is gated on ingress port).'
+  input:
+    port: s1.p4
+    layers:
+    - Ether:
+        src: 08:00:00:00:04:04
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.4
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 554e4d4f4e49544f524544
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p5
+- name: fib_miss_flood
+  visibility: hidden
+  description: 'Unknown Ethernet dst on p1 (default_action=forward_flood): flood to p2/p4/p5, never the collector p3.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:ff:ff
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 464c4f4f444d45
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p4
+    - s1.p5
+- name: count_only_no_leak
+  visibility: hidden
+  description: 'Monitored p2 → dst 10.0.0.2 (count-only): forward to p1 only; a leaked collector copy MUST NOT appear.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 4e4f5f4c45414b
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+- name: unmonitored_no_leak
+  visibility: hidden
+  description: 'Unmonitored p5 → dst 10.0.0.5 (mirror rule but unmonitored ingress): forward to p1 only; no collector copy.'
+  input:
+    port: s1.p5
+    layers:
+    - Ether:
+        src: 08:00:00:00:05:05
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.0.5
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 4e4f5f4c45414b32
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+- name: non_ipv4_drop
+  visibility: hidden
+  description: ARP frame on p1 → drop (IPv4-only observer; no copy, no flood).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP: {}
+  expected:
+    behavior: drop
+- name: mirror_preserves_payload
+  visibility: hidden
+  description: 'Mirror case with a large payload: both the forwarded original and the collector copy carry the full payload; TTL unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: '5858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858585858'
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p5
+    transformations:
+      IP.ttl:
+        action: unchanged
+- name: mirror_independent_of_l4
+  visibility: hidden
+  description: 'Mirror rule keys on IP dst only: a different L4 flow to 10.0.0.5 is still mirrored.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:05:05
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load_hex: 4f544845525f464c4f57
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p3
+    - s1.p5

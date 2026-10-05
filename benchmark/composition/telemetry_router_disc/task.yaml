@@ -1,0 +1,774 @@
+task_name: telemetry_router_disc
+task_type: full_program
+complexity: hard
+source: synthesis
+pattern: P-TelemetryRouter
+pattern_version: '1.0'
+seed: telemetry_router_disc-default
+description: |
+  A switch s1 is the telemetry-stamping edge router of a small network: it
+  forwards IPv4 unicast traffic by longest-prefix match AND annotates the
+  traffic it forwards with in-band telemetry that reflects its OWN forwarding
+  decision. The load-bearing requirement is the ORDER of the two jobs — the
+  telemetry record describes where the packet is being sent, so the record is
+  produced only AFTER the forwarding decision is made, and a packet the router
+  decides to discard is never annotated.
+
+  Inspired by In-band Network Telemetry (p4.org INT dataplane specification)
+  layered over RFC 1812 IPv4 forwarding with RFC 2992 equal-cost multipath.
+
+  ## Topology and roles
+
+    - s1.p1 — host h1 (10.0.1.1). Traffic from h1 enters as plain IPv4+TCP
+              with NO telemetry record attached; s1 plays the telemetry
+              SOURCE role for this traffic.
+    - s1.p2..p5 — next-hops of the multipath group for destinations in
+              10.0.2.0/24 (see the FIB below).
+    - s1.p6 — next-hop for 10.0.6.0/24.
+    - s1.p7 — next-hop for the 10.0.0.0/8 cover route.
+    - s1.p8 — upstream device u8 (10.0.8.8). Traffic on this port already
+              carries a telemetry record from an upstream source; s1 plays
+              the telemetry SINK role for this traffic.
+    - s1.p9 — telemetry collector (10.0.9.9). No inbound traffic is expected;
+              it is the egress for the report packets the sink emits.
+
+  ## Forwarding information base (control-plane installed)
+
+  Longest-prefix match on the IPv4 destination address:
+
+    - 10.0.2.0/24 → an equal-cost multipath group of FOUR next-hops on ports
+                    p2, p3, p4, p5.
+    - 10.0.6.0/24 → a single next-hop on port p6.
+    - 10.0.0.0/8  → a single next-hop on port p7 (the less-specific cover).
+
+  There is no default (0.0.0.0/0) route.
+
+  ## Telemetry-record content
+
+  Each per-hop record carries, in order: the hop's switch identifier (a 32-bit
+  control-plane-assigned id — for s1 this is 7); an ingress timestamp; an
+  egress timestamp; the hop latency (egress minus ingress); and the egress
+  queue depth. Timestamps MUST be carried with the full 48-bit precision the
+  data plane natively provides — truncating to a narrower width loses the
+  upper bits. A telemetry-bearing packet is one whose TCP payload begins with
+  a small record header (its first byte is the marker 0x01) followed by a
+  count of how many per-hop records are stacked behind it; the original
+  application payload follows the record stack. The record travels as a prefix
+  of the TCP payload so the IPv4/TCP headers stay in their normal positions.
+
+  ## Routing guards (apply to ALL traffic, before any telemetry action)
+
+  R1. A non-IPv4 frame (ARP, IPv6, raw L2) is dropped.
+  R2. An IPv4 datagram whose header is malformed (version ≠ 4, IHL < 5) is
+      dropped.
+  R3. An IPv4 datagram with TTL ≤ 1 is dropped (forwarding it would leave
+      TTL 0); it MUST NOT be annotated.
+  R4. An IPv4 datagram destined to the limited broadcast 255.255.255.255, or
+      to the directed-broadcast address of a configured subnet, is dropped.
+  R5. An IPv4 datagram whose destination matches NO FIB prefix is dropped; it
+      MUST NOT be annotated. A dropped packet produces NO output on any port —
+      in particular no telemetry record is leaked on a drop path.
+
+  ## Forwarding + next-hop selection (for a packet that passes the guards)
+
+  R6. Select the FIB entry by longest prefix. For a single-next-hop entry, that
+      next-hop is used. For the multipath group, choose ONE member as a
+      function of the packet's 5-tuple (source/destination address, protocol,
+      source/destination L4 ports) such that every packet of the same flow
+      maps to the SAME member, and different flows spread across the group. The
+      choice MUST NOT depend on volatile fields such as TTL.
+  R7. Decrement TTL by exactly one (only once, even though both the forwarding
+      and telemetry steps touch the packet), rewrite Ethernet source to the
+      egress port's MAC and Ethernet destination to the chosen next-hop's MAC,
+      and leave IPv4 source and destination unchanged.
+
+  ## Source role (plain traffic on port 1)
+
+  R8. After the next-hop is chosen, attach a one-hop telemetry record carrying
+      s1's values for the fields above, where the record's egress-related
+      content reflects the SELECTED egress (i.e., the port the packet is
+      actually forwarded on). Then forward on that egress.
+  R9. Because attaching the record grows the packet and the TTL was
+      decremented, the IPv4 total-length field MUST reflect the new size and
+      the IPv4 header checksum MUST be valid over BOTH changes (a single
+      recomputation). Forwarding a stale checksum is a defect.
+
+  ## Sink role (telemetry-bearing traffic on port 8)
+
+  R10. Parse the record stack and compute the maximum hop-latency across all
+       records. IF that maximum is strictly greater than 1 000 000 (in the same
+       unit as the records), emit ONE additional report packet on port 9
+       carrying the harvested record stack to the collector.
+  R11. In ALL cases (whether or not R10 fired), remove the telemetry header and
+       stack so the original packet returns to its pre-telemetry shape, then
+       forward that original on its FIB egress (TTL decremented, Ethernet
+       rewritten). The report (when emitted) and the routed original are TWO
+       separate outputs on DIFFERENT ports.
+
+  ## Sink role, no record present
+
+  R12. Plain IPv4+TCP arriving on port 8 with no telemetry record is forwarded
+       normally on its FIB egress; no record is added or stripped.
+
+  ## Other traffic
+
+  R13. IPv4 that is not TCP is forwarded normally; the telemetry layer here is
+       only carried over TCP.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+      p6: 6
+      p7: 7
+      p8: 8
+      p9: 9
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: nh2
+  - from: s1.p3
+    to: nh3
+  - from: s1.p4
+    to: nh4
+  - from: s1.p5
+    to: nh5
+  - from: s1.p6
+    to: nh6
+  - from: s1.p7
+    to: nh7
+  - from: u8
+    to: s1.p8
+  - from: s1.p9
+    to: collector
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  nh2:
+    ip: 10.0.2.1
+    mac: 08:00:00:00:02:01
+    port: s1.p2
+  nh3:
+    ip: 10.0.3.1
+    mac: 08:00:00:00:03:01
+    port: s1.p3
+  nh4:
+    ip: 10.0.4.1
+    mac: 08:00:00:00:04:01
+    port: s1.p4
+  nh5:
+    ip: 10.0.5.1
+    mac: 08:00:00:00:05:01
+    port: s1.p5
+  nh6:
+    ip: 10.0.6.1
+    mac: 08:00:00:00:06:01
+    port: s1.p6
+  nh7:
+    ip: 10.0.7.1
+    mac: 08:00:00:00:07:01
+    port: s1.p7
+  u8:
+    ip: 10.0.8.8
+    mac: 08:00:00:00:08:08
+    port: s1.p8
+  collector:
+    ip: 10.0.9.9
+    mac: 08:00:00:00:09:09
+    port: s1.p9
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8
+test_cases:
+- name: g1_source_push_route_singleton
+  visibility: public
+  description: 'Plain IPv4+TCP on the source port destined to a singleton route: the switch routes it (longest-prefix /24 over the /8 cover), decrements TTL by one, rewrites Ethernet to the next-hop, AND stamps an INT slot reflecting that egress, then forwards. IP src/dst preserved.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: '44415441'
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:06
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: g1_route_less_specific_cover
+  visibility: hidden
+  description: A destination matching ONLY the /8 cover (not the /24 routes) forwards on the cover's port — longest-prefix correctness through the composed pipeline.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.200.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: '44415441'
+  expected:
+    behavior: forward
+    output_port: s1.p7
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:07:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:07
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_sink_below_threshold_strip_route
+  visibility: public
+  description: 'Pre-stamped INT packet on the upstream port with hop_latency below the report threshold: the sink strips the INT shim+stack and routes the original on its FIB egress, NO telemetry report.'
+  input:
+    port: s1.p8
+    layers:
+    - Ether:
+        src: 08:00:00:00:08:08
+        dst: 08:00:00:00:00:08
+    - IP:
+        src: 10.0.8.8
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f000000070000000005f5e1000000000005f6a4500007a12000000000494e4e4552
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:06
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_sink_above_threshold_report
+  visibility: hidden
+  description: 'Pre-stamped INT packet on the upstream port with hop_latency above the threshold: the sink emits a telemetry report on the collector port.'
+  input:
+    port: s1.p8
+    layers:
+    - Ether:
+        src: 08:00:00:00:08:08
+        dst: 08:00:00:00:00:08
+    - IP:
+        src: 10.0.8.8
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f000000070000000005f5e1000000000005f6a450001e848000000000494e4e4552
+  expected:
+    behavior: forward
+    output_port: s1.p9
+- name: g1_ecmp_flow_consistency
+  visibility: public
+  description: One TCP flow (10.0.1.1:5000 → 10.0.2.50:80) sent as a burst with different TTLs (64, 50, 12) MUST all exit on the SAME ECMP member of the /24 group — the next-hop depends only on the 5-tuple, not on volatile fields. Each is also INT-source-stamped.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 50
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 33
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 12
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: ecmp_consistent
+    output_ports: &id001
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    - s1.p5
+    min_count: 1
+- name: g1_ecmp_distributes
+  visibility: hidden
+  description: 16 distinct TCP flows to 10.0.2.50 spread across ≥2 members of the /24 ECMP group — the next-hop is genuinely hash-distributed, not a constant index.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4007
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4008
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4009
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4010
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4011
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4012
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4013
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4014
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4099
+        dport: 80
+  expected:
+    behavior: ecmp_distributes
+    output_ports: *id001
+    min_distinct_ports: 2
+- name: g2_sink_at_threshold_no_report
+  visibility: hidden
+  description: 'Pre-stamped INT packet with hop_latency EXACTLY at the threshold (predicate is strict >): strip and route, NO report.'
+  input:
+    port: s1.p8
+    layers:
+    - Ether:
+        src: 08:00:00:00:08:08
+        dst: 08:00:00:00:00:08
+    - IP:
+        src: 10.0.8.8
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f000000070000000005f5e1000000000005f6a450000f424000000000494e4e4552
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:06
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g2_sink_no_shim_route
+  visibility: hidden
+  description: 'Plain TCP (no INT shim) arriving on the upstream sink port: routed normally on its FIB egress, no INT shim added (the sink does not stamp).'
+  input:
+    port: s1.p8
+    layers:
+    - Ether:
+        src: 08:00:00:00:08:08
+        dst: 08:00:00:00:00:08
+    - IP:
+        src: 10.0.8.8
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 504c41494e
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:06
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_composed_single_checksum
+  visibility: hidden
+  description: 'Source push path: the IPv4 header changes in TWO places in one pass — TTL decrements AND the INT push grows the packet — so the IPv4 checksum MUST be valid over BOTH (single recompute). The most common silent-failure ''checksum after modification'' trap in composed form.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.6.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 434845434b53554d5f4d45
+  expected:
+    behavior: forward
+    output_port: s1.p6
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:06:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:06
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: g3_no_int_leak_on_no_route_drop
+  visibility: hidden
+  description: A source-port packet whose destination has NO FIB route is dropped at the routing stage and MUST emit NO output at all — no INT shim leaked on the drop path (the composed conditional-deparser leak).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 198.51.100.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 4e4f524f555445
+  expected:
+    behavior: drop
+- name: g3_no_leak_on_ttl_exhausted_drop
+  visibility: hidden
+  description: A routable source-port packet with TTL=1 is TTL-exhausted (forwarding would yield TTL 0) → drop, unstamped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.6.6
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 54544c31
+  expected:
+    behavior: drop
+- name: g3_directed_broadcast_drop
+  visibility: hidden
+  description: The directed-broadcast address of a configured subnet MUST be dropped (RFC 1812 §5.3.5.2), unstamped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.6.255
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: '4243415354'
+  expected:
+    behavior: drop
+- name: g3_non_ipv4_dropped
+  visibility: hidden
+  description: A non-IPv4 (ARP) frame is dropped with no routing and no INT stamping.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP: {}
+  expected:
+    behavior: drop

@@ -1,0 +1,447 @@
+task_name: port_range_classifier_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-PortRangeClassifier
+pattern_version: '1.0'
+seed:
+  classes:
+  - dst_port_range:
+    - 0
+    - 1023
+    egress_port: s1.p2
+  - dst_port_range:
+    - 1024
+    - 49151
+    egress_port: s1.p3
+  default_egress_port: s1.p4
+description: |
+  Implement a multi-field traffic classifier on a single switch s1, in the
+  spirit of the RFC 2475 Differentiated Services multi-field (MF) classifier.
+  The switch classifies each IPv4 TCP/UDP packet by its L4 DESTINATION PORT into
+  one of several service classes and forwards it out the egress port bound to
+  that class. There is no per-flow state — every decision depends only on the
+  current packet and the installed classification policy.
+
+  ## Classification policy (control-plane installed)
+
+  Each service class owns a CLOSED, contiguous interval of destination port
+  numbers and an egress port. For this task:
+
+   - destination port in 0 … 1023      → forward out s1.p2   (well-known band)
+   - destination port in 1024 … 49151  → forward out s1.p3   (registered band)
+   - everything else                   → forward out s1.p4   (the default class)
+
+  The intervals are INCLUSIVE at both ends: a packet whose destination port is
+  exactly 1023 belongs to the first class, and exactly 1024 belongs to the
+  second. A packet whose destination port is 49152 (one past the second band)
+  belongs to the default class, as does a packet to port 49151+1 … 65535.
+
+  ## Per-packet processing
+
+  For each arriving IPv4 packet with a TCP or UDP header:
+
+   1. Read the L4 destination port.
+   2. Find the class whose destination-port interval CONTAINS that port. If the
+      port falls in more than one configured interval, the class installed at
+      the higher priority wins (for this policy the intervals are disjoint, so
+      at most one matches).
+   3. Forward the packet out that class's egress port, UNCHANGED — this is a
+      classifier, not a routing hop or a rewriter: the IPv4 source, destination,
+      TTL, DS/TOS byte, and the Ethernet addresses are all left intact.
+   4. If the destination port falls in no class's interval, forward the packet
+      out the DEFAULT class's egress port (s1.p4).
+
+  A packet that has no L4 port at all — a non-IPv4 frame (e.g. ARP), or an IPv4
+  packet that is neither TCP nor UDP (e.g. ICMP) — has nothing to classify on
+  and is forwarded out the default class's egress port (s1.p4). It MUST NOT be
+  classified on a garbage port value.
+
+  ## Required behaviour / invariants
+
+   - Interval membership is INCLUSIVE: destination port == the low bound and ==
+     the high bound both match the class; low-1 and high+1 do not.
+   - A classified packet leaves on its class's egress port and ITS HEADERS ARE
+     NOT MODIFIED.
+   - Every packet is assigned a class: one whose port matches no configured
+     interval, and one with no L4 port, both take the default class.
+   - The switch must declare an explicit default behaviour for unmatched
+     packets (forward to the default class); it must not silently black-hole
+     them.
+
+  ## Topology
+
+  One switch s1, four ports. Ingress is s1.p1; classified packets leave on
+  s1.p2 (well-known), s1.p3 (registered), or s1.p4 (default / dynamic).
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: well_known_udp_port80
+  visibility: public
+  description: UDP to dst port 80 is in the well-known band [0,1023] → forward out s1.p2, headers unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: registered_udp_port8080
+  visibility: public
+  description: UDP to dst port 8080 is in the registered band [1024,49151] → forward out s1.p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 8080
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_classA_hi_1023
+  visibility: public
+  description: Dst port 1023 is the INCLUSIVE upper bound of the well-known band → still s1.p2.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 1023
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_classB_lo_1024
+  visibility: hidden
+  description: Dst port 1024 is the INCLUSIVE lower bound of the registered band → s1.p3. Straddles the 1023|1024 class transition.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 1024
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_classB_hi_49151
+  visibility: hidden
+  description: Dst port 49151 is the INCLUSIVE upper bound of the registered band → s1.p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 49151
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: lo_bound_zero
+  visibility: hidden
+  description: Dst port 0 is the inclusive lower bound of the well-known band → s1.p2.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: tcp_well_known_443
+  visibility: hidden
+  description: TCP to dst port 443 is in the well-known band → s1.p2. Confirms TCP and UDP take the same range path.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - TCP:
+        sport: 40000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: dynamic_port_to_default
+  visibility: hidden
+  description: UDP to dst port 50000 (dynamic band) matches no configured interval → default class, s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 50000
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: icmp_no_l4_to_default
+  visibility: hidden
+  description: An IPv4 ICMP packet has no L4 port → default class, s1.p4. The switch must NOT classify it on a garbage port.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - ICMP:
+        type: 8
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: arp_no_l4_to_default
+  visibility: hidden
+  description: A non-IPv4 frame (ARP) has no L4 port → default class, s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 10.0.2.2
+        psrc: 10.0.1.1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+- name: off_by_one_just_past_classB
+  visibility: hidden
+  description: Dst port 49152 == registered-band hi + 1 → it MUST fall to the default class (s1.p4), NOT the registered class (s1.p3). Catches an inclusive/exclusive off-by-one or a too-wide range over-cover.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 49152
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: header_preservation_no_rewrite
+  visibility: hidden
+  description: A classified packet (dst port 200 → s1.p2) MUST leave with its IPv4 src/dst/TTL/TOS and Ethernet src UNCHANGED — this is a classifier, not a routing hop. Catches a program that decrements TTL or rewrites MAC.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+    - UDP:
+        sport: 40000
+        dport: 200
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged

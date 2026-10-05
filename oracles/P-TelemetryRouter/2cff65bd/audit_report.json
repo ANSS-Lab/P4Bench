@@ -1,0 +1,282 @@
+{
+  "oracle_hash": "3eb6521150970f579a71b2f9082a954a09efbf50cb426199e1a64650ad530b29",
+  "instance": "telemetry_router_disc-default",
+  "ran_at": "2026-06-17T00:22:47.348130Z",
+  "canonical_examples": {
+    "passed": 26,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_exhausted_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "limited_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "directed_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "martian_src_dormant_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "martian_src_enabled_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_push_singleton_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "longest_prefix_eight_only",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_push_ecmp_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_sample_rate_one_stamps",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_sample_rate_high_still_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_report_fires_above_threshold",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_report_suppressed_below_threshold",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_plain_tcp_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_tcp_ipv4_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_multipath_mode_none",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_role_source_only",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_bit_width_timestamp_32",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_max_hop_count_2",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_report_port_11",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_metadata_fields_minimal",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_routes_alternate_fib",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_routes_alternate_fib_old_dst_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_report_threshold_low_still_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_conditional_emit_always",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "stamp_reflects_routing_decision": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stamp_grows_length_single_checksum": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_decrement_once_across_stages": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "sink_strips_then_routes": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "non_routed_not_stamped": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_hop_count": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "sink_strips_shim": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "timestamp_bit_width_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "hop_count_monotone": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stack_length_matches_metadata_emits": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_traffic_distribution": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "stamp_reflects_routing_decision",
+      "stamp_grows_length_single_checksum",
+      "ttl_decrement_once_across_stages",
+      "sink_strips_then_routes",
+      "non_routed_not_stamped",
+      "no_orphan_hop_count",
+      "sink_strips_shim",
+      "payload_preservation",
+      "timestamp_bit_width_fidelity",
+      "hop_count_monotone",
+      "stack_length_matches_metadata_emits",
+      "lpm_longest_match_correctness",
+      "ip_addr_preservation",
+      "ip_checksum_validity",
+      "ether_rewrite_correctness",
+      "ecmp_flow_consistency",
+      "ecmp_traffic_distribution",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "marple_sigcomm17",
+      "pint_sigcomm20",
+      "contra_nsdi20",
+      "RFC1812",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

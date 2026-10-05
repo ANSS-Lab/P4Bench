@@ -1,0 +1,1348 @@
+# P-DDoSPolicer — Edge: Sketch heavy-hitter detector ∘ stateless policy gate (Composed Pattern)
+#
+# TPL v1.0 task pattern composing
+# P-SketchHeavyHitter (count-min / heavy-hitter rate detection, the
+# D4:telemetry / P9 sketch slice) with P-ACL (stateless wildcard/priority
+# classification, the P4 policy slice) into a single volumetric-DDoS
+# mitigation NF — the ISP-/datacenter-edge deployment where a switch
+# detects high-rate flows in the data plane AND polices them against a
+# control-plane allow/block policy, on the same pass. This is the
+# "P-DDoSPolicer (SketchHeavyHitter ∘ ACL) — sketch-detected heavy hitters
+# drive policy" composite in the pattern catalogue's composite set.
+#
+# The value of this *chained* pattern (versus instantiating
+# P-SketchHeavyHitter and P-ACL independently) is three interactions
+# invisible when the two halves are tested apart:
+#   (a) DETECT-BEFORE-POLICE ORDERING — the sketch update + threshold check
+#       must complete BEFORE the policy verdict on the SAME packet, and the
+#       `mitigation_onset` knob fixes whether the packet that crosses the
+#       threshold is itself policed (post-inc estimate) or merely admits the
+#       flow to the detected set while forwarding (mitigation from the next
+#       packet). This is the common v1model inc-first-then-check trap promoted from a
+#       single-stage hazard to a cross-stage contract — neither half binds
+#       it (standalone P-SketchHeavyHitter is observe-only; standalone P-ACL
+#       has no rate signal to order against);
+#   (b) STATIC↔DYNAMIC POLICY COMBINATION — the verdict fuses a control-plane
+#       static allow/block list (P-ACL) with the data-plane heavy-hitter
+#       signal, under an explicit priority (`policy_trigger` + the
+#       `allowlist_bypass` knob): a static *blocklist* drops a flow
+#       regardless of rate, a static *allowlist* can EXEMPT a heavy flow from
+#       rate mitigation (the legitimate-bulk-sender carve-out), and an
+#       unlisted flow is policed iff the sketch flags it. Which signal wins
+#       on conflict is the composite's load-bearing degree of freedom; the
+#       components alone cannot express the combination;
+#   (c) COMPOUNDED RECOLOR + TTL CHECKSUM — when mitigation recolors rather
+#       than drops, the policer rewrites DSCP AND the base forward decrements
+#       TTL, so the single checksum recompute must cover BOTH mutations on
+#       one pass; a program that recomputes after only one emits a silently-
+#       corrupt packet (the #1 silent failure in the v1model bug catalogue).
+# See `bridging_notes:` for the v1model failure modes this exposes.
+#
+# This composite is the concrete realisation of the
+# `relax_forwarding_independence` augmentation that standalone
+# P-SketchHeavyHitter flags as the "Mantis / Poseidon-lineage DDoS-
+# mitigation NF": here the sketch state legitimately DRIVES the forwarding
+# verdict (the whole point of a policer), so `forwarding_independence` is
+# NOT carried as an enforced invariant — it is structurally relaxed.
+#
+# Instances are produced by binding the parameters below. Reuses the two
+# audited halves' oracles (oracles/P-SketchHeavyHitter/5288c919,
+# oracles/P-ACL/8d7defff) per the oracle content-addressing convention
+# (recorded at instantiation as the composed oracle's provenance) — the same
+# convention the shipped composites P-StatefulFW-NAT44, P-VXLANRouter, and
+# P-NATACL follow. target_capability = composition because
+# the chain's failure modes are cross-cutting and neither pure-scale_up
+# (sketch detection) nor pure-redesign (ACL policy).
+
+pattern_id: P-DDoSPolicer
+version: "1.0"
+
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry, D7:security]          # sketch rate estimation (D4) ∪ policy / threat mitigation (D7)
+  prescriptive: [P4:policy, P8:security, P9:telemetry]   # composite-condition policy (P4) driven by a security-mitigation purpose (P8) over an in-network sketch detector (P9)
+
+target_capability: composition                          # chained composition of a scale_up (P-SketchHeavyHitter) and a redesign (P-ACL) primitive; failure modes are cross-cutting
+
+summary: >
+  Edge volumetric-DDoS policer composing an in-network heavy-hitter sketch
+  (Count-Min / Count-Sketch rate estimation over a bounded register budget,
+  the P-SketchHeavyHitter detector) with a stateless TCAM-style policy gate
+  (RFC 3198 policy / P4Runtime ternary-priority semantics, the P-ACL half)
+  on a single switch. On every IPv4 packet the sketch is updated and a
+  per-flow rate estimate is checked against `heavy_threshold`; the policy
+  stage then renders a verdict that FUSES the data-plane heavy-hitter signal
+  with a control-plane static allow/block list — a static blocklist drops
+  regardless of rate, a static allowlist may exempt a heavy flow from
+  mitigation, and an unlisted flow is mitigated (dropped or recolored) iff
+  the sketch flags it heavy. The composite's load-bearing degrees of freedom
+  are `policy_trigger` (heavy-only vs static-and-heavy combination) and
+  `allowlist_bypass` (whether a static permit exempts a detected heavy flow),
+  which decide the verdict on conflict; `mitigation_onset` fixes the
+  inc-first-then-check boundary semantics across the two stages. Faithfulness
+  ladder: D5.0 Count-Min + heavy-only drop, single-field flowkey (anchor) →
+  D5.1 static-and-heavy combination with allowlist bypass and recolor
+  mitigation → D5.2 Count-Sketch over a tightened sketch budget + scaled
+  rule set with adversarial-collision workload. Reuses the two audited halves
+  P-SketchHeavyHitter and P-ACL as domain-concepts KB entries and chains
+  their audited oracles per the oracle content-addressing convention.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+# The composite inherits its detection-half grounding from P-SketchHeavyHitter
+# (Sonata / SketchLib / Elastic Sketch — the sketch families and the
+# threshold-emit discipline) and its policy-half grounding from P-ACL
+# (RFC 3198 + P4Runtime §9.1 ternary priority + the bug taxonomy), reused
+# verbatim rather than re-derived. The constituents are cited as
+# domain-concepts KB entries — the same convention P-NATACL / P-AQMFairQueue
+# use. The composite-specific grounding is the DDoS-mitigation lineage
+# (Poseidon, Jaqen), drawn from the DDoS-defense part of the data-plane NF survey.
+
+grounding:
+
+  papers:
+    - cite: poseidon_ndss20
+      role: threat_model
+      relevance: |
+        Catalogued in the data-plane NF survey as "the first DDoS-defense
+        policy language for P4" (NDSS 2020, out-of-venue per the
+        SIGCOMM/NSDI/CoNEXT scoping but the canonical reference for the
+        mechanism class). Grounds the composite's central thesis: that a
+        programmable switch expresses DDoS mitigation as a POLICY over a
+        detection signal — the (monitor → classify → mitigate) pipeline this
+        pattern formalises as (sketch update → heavy check → policy verdict).
+        Informs the `policy_trigger` knob (the policy combines a detection
+        signal with operator intent) and the {drop, recolor} mitigation
+        action set as the v1.0-observable subset of Poseidon's mitigation
+        primitives (rate-limit / re-route / scrub are deferred to v2; see
+        bridging_notes). Cited at the catalogue-description granularity
+        actually read in the survey — the deeper policy-compiler internals
+        are recorded as common-knowledge lineage in bridging_notes, not as
+        a section-level citation.
+
+    - cite: jaqen_usenixsec21
+      role: threat_model
+      relevance: |
+        Catalogued in the data-plane NF survey as "switch-native ISP-scale
+        DDoS" defense (USENIX Security 2021). Grounds the SCALE motivation
+        for doing detection in a sketch rather than per-flow registers — at
+        ISP line rate the heavy-hitter set cannot be tracked exactly, so the
+        detector is the bounded-budget sketch the P-SketchHeavyHitter half
+        supplies, and the policer must tolerate the sketch's bounded false-
+        positive rate without over-blocking legitimate traffic. Informs the
+        `no_false_positive_under_collision` invariant (the DDoS-policer
+        safety property: an innocent flow that collides with a heavy flow in
+        one sketch row MUST NOT be policed — the min-across-rows estimator
+        clips the inflated row) and the `allowlist_bypass` carve-out for
+        known-legitimate bulk senders. Cited at the catalogue granularity
+        read in the survey; algorithmic detail in bridging_notes.
+
+  rfcs:
+    - id: RFC3198
+      quote: "It is the binding of a set of actions to a set of conditions - where the conditions are evaluated to determine whether the actions are performed."
+      sections: ["2.3", "2.4", "2.5"]
+      role: domain_concepts
+      relevance: |
+        Inherited from P-ACL. Terminology for Policy-Based Management — the
+        condition-action pair as the unit of a policy rule, and the
+        separation of policy condition (the match predicate) from policy
+        action (the consequence). The composite (like P-ACL) adopts
+        first-match-by-priority for the STATIC rule set because that is what
+        programmable-switch TCAMs realise, and treats `default_action` as a
+        first-class parameter. The composite extends RFC 3198's condition
+        beyond the static header match to include the dynamic heavy-hitter
+        predicate — the policy condition is now "(static match) ∨ (rate over
+        threshold)", which is exactly the combination `policy_trigger` /
+        `allowlist_bypass` parameterise.
+
+  tutorials:
+    - path: tutorials/exercises/basic_forwarding
+      role: baseline_topology
+      relevance: |
+        Inherited from P-SketchHeavyHitter's implementation notes (no sketch
+        exercise exists upstream, but the IPv4-LPM-forward scaffold is shared
+        with this exercise tree). Supplies the underlying L3 forwarding path
+        (egress lookup + TTL decrement + MAC rewrite) that the detect-then-
+        police chain layers on top of, and the control-plane-installed
+        entries convention the static policy table reuses.
+
+
+  posts:
+    - url: https://s3-us-west-2.amazonaws.com/p4runtime/docs/master/P4Runtime-Spec.pdf
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-ACL. P4Runtime Specification v1.3.0 §9.1
+        (TableEntry priority): a non-zero priority MUST be set when the match
+        key includes a ternary field, and a higher priority number wins the
+        lookup. The normative basis for `priority_correctness` on the STATIC
+        rule set and for the `bit<1>` vs `bool` boundary on the permit/deny
+        decision and the heavy bit in the P4 program.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic per-packet identity over hdr.ethernet, hdr.ipv4, hdr.tcp/udp,
+      and std.ingress_port. The flowkey is derived from ${flowkey_fields}
+      (srcAddr in the default seed). All decisions are taken in one ingress
+      pass — there is no per-packet state beyond the sketch / heavy / policy
+      tables below.
+
+  sketch_counters:                           # plays the TPL `bucket` role — aggregate rate state across flows
+    type: bucket
+    keyed_by_tuple:
+      - sketch_row_index                     # 0 .. ${sketch_depth} - 1
+      - sketch_column_index                  # 0 .. ${sketch_width} - 1, derived from h_r(flowkey) mod W
+    attrs:
+      count: int                             # unsigned for count_min, signed for count_sketch
+    capacity: ${sketch_depth} × ${sketch_width}
+    notes: |
+      Reused from P-SketchHeavyHitter. The R×W counter matrix that estimates
+      per-flow arrival rate within the current epoch. Exactly one `inc` per
+      row per IPv4 packet (R1). The min-across-rows (Count-Min) / median-of-
+      signed-rows (Count-Sketch) estimator is the heavy-detection signal the
+      policy stage consults — it MUST be evaluated AFTER the inc on the
+      current packet under ${mitigation_onset} == from_crossing_packet.
+
+  detected_heavy:                            # `flow` — bounded set of flows flagged heavy in the current epoch; from P-SketchHeavyHitter
+    type: flow
+    key:
+      - flowkey                              # ${flowkey_fields}; hdr.ipv4.srcAddr in the default seed
+    attrs:
+      est_count:  int
+      first_seen: timestamp
+    capacity: ${heavy_capacity}
+    notes: |
+      Reused from P-SketchHeavyHitter's heavy `flow` table. A flowkey is
+      admitted on the packet whose (post-inc) estimate first crosses
+      ${heavy_threshold}. Membership is the dynamic half of the policy
+      condition: under ${mitigation_onset} == from_next_packet a flow is
+      policed only AFTER it is a member (admission this packet, mitigation
+      next), so the crossing packet itself forwards; under from_crossing_packet
+      the crossing packet is policed on the same pass. Reset at the epoch
+      boundary (heavy_storage_no_orphan).
+
+  static_policy:                             # `bucket` — control-plane allow/block list; from P-ACL
+    type: bucket
+    keyed_by_tuple: [rule_id]
+    attrs:
+      priority:    int
+      match_spec:  "dict[field, (value, mask)]"   # ternary key over ${match_field_breadth}
+      action:      "enum {permit, deny, mark}"     # permit=allowlist, deny=blocklist, mark=force-recolor
+      action_args: "dict[arg, value]"             # for mark: {dscp}
+    capacity: ${rule_count_capacity}
+    populated_from: ${rules}
+    enforced_when: "${policy_trigger} == static_and_heavy"
+    notes: |
+      Reused from P-ACL (its `bucket`). One bucket holds the entire control-
+      plane-installed static policy. First-match BY PRIORITY: among entries
+      whose match_spec admits the flowkey, the largest `priority` wins; ties
+      are forbidden by no_priority_ambiguity. The `redirect` action of
+      standalone P-ACL is dropped — the base forwarder owns the egress port.
+      Consulted only at ${policy_trigger} == static_and_heavy; at heavy_only
+      this table is absent and the verdict is the pure sketch signal.
+
+  window:                                    # epoch boundary; bounded-history accumulator — from P-SketchHeavyHitter
+    type: window
+    key:
+      - epoch_id
+    attrs:
+      n_packets:  int
+      start_time: timestamp
+    capacity: 1
+    notes: |
+      Reused from P-SketchHeavyHitter. The interval over which the sketch
+      accumulates and the detected-heavy set is valid. Advances when
+      n_packets ≥ ${epoch_packets} or now − start_time ≥ ${epoch_seconds}
+      per ${epoch_trigger}; on advance, sketch_counters and detected_heavy
+      are reset to zero (R6).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  # ── Detection half (reused from P-SketchHeavyHitter) ──
+
+  flowkey_fields:
+    type: list[header_field]
+    constraint: "non-empty; every field parseable on a v1model PISA pipeline"
+    default: [hdr.ipv4.srcAddr]
+    notes: "The identity the sketch and the policy both key on. srcAddr (source-rate policing) at the anchor; lift to 5-tuple to police per-connection."
+
+  sketch_type:
+    type: enum
+    values: [count_min, count_sketch]
+    default: count_min
+    notes: "Restricted to the two single-pass families; the universal / elastic modes of standalone P-SketchHeavyHitter are out of composite scope (see bridging_notes v2 deferrals)."
+
+  sketch_depth:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: "Independent counter rows R. ≥2 so the min-across-rows estimator can clip a single-row adversarial collision (no_false_positive_under_collision)."
+
+  sketch_width:
+    type: int
+    range: "[8, 65536]"
+    default: 256
+    notes: "Columns per row W; MUST be a power of two so the hash output truncates by mod-2^k. Drives the Count-Min false-positive tail (1/W)^R."
+
+  counter_width_bits:
+    type: int
+    range: "[8, 64]"
+    default: 32
+
+  max_register_cells:
+    type: int
+    range: "[8, 1048576]"
+    default: 4096
+    notes: "Memory-budget axis. Hard cap on total register cells across the sketch; shrink_sketch_capacity_4x divides by four, forcing shared sketch storage over per-flow counters."
+
+  hash_polynomial:
+    type: enum
+    values: [crc16, crc32, crc32c, custom_lfsr]
+    default: crc32
+
+  hash_independence:
+    type: enum
+    values: [pairwise, four_wise]
+    default: pairwise
+    notes: "pairwise (CRC-derived) suffices for Count-Min's expected-error bound; four_wise is required by Count-Sketch's variance bound."
+
+  heavy_threshold:
+    type: int
+    range: "[1, 1000000]"
+    default: 1000
+    notes: "Per-epoch arrival count above which a flow is a detected heavy hitter. The rate-policing decision boundary."
+
+  heavy_capacity:
+    type: int
+    range: "[1, 4096]"
+    default: 256
+    notes: "Capacity of the detected_heavy `flow` set. Unlike standalone P-SketchHeavyHitter (which allows 0 = observe-only), the composite always materialises the heavy set because the policy stage consumes it."
+
+  epoch_packets:
+    type: int
+    range: "[1024, 16777216]"
+    default: 1048576
+
+  epoch_seconds:
+    type: int
+    range: "[1, 3600]"
+    default: 60
+
+  epoch_trigger:
+    type: enum
+    values: [packets, time, both]
+    default: both
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision]
+    default: zipfian
+
+  # ── Policy half (reused from P-ACL) ──
+
+  rules:
+    type: list[acl_rule]
+    constraint: |
+      every entry has priority:int ∈ [1, 2^31 - 1], match_spec well-formed
+      over ${match_field_breadth}, action ∈ {permit, deny, mark}; no two
+      entries share both (priority, match_spec); |rules| ≤ ${rule_count_capacity}.
+    notes: "Control-plane-installed static allow/block list populating `static_policy`. Reused from P-ACL (redirect excluded). Empty / unused at ${policy_trigger} == heavy_only."
+
+  rule_count_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: 256
+
+  match_field_breadth:
+    type: enum
+    values: [tuple5, tuple5_vrf, tuple5_vrf_vlan, tuple5_vrf_vlan_dscp]
+    default: tuple5
+    notes: "Width of the ternary static-policy key. Reused from P-ACL."
+
+  priority_depth:
+    type: int
+    range: "[1, 4096]"
+    default: 16
+    notes: "Number of distinct priority levels in ${rules}. Reused from P-ACL."
+
+  default_action:
+    type: enum
+    values: [permit, deny]
+    default: permit
+    notes: |
+      STATIC-policy behaviour on table miss (a flow matching no static rule).
+      `permit` (the anchor — the static list is a small blocklist over an
+      otherwise-permissive default; unlisted flows fall through to the heavy
+      check) or `deny` (zero-trust — unlisted flows drop before the heavy
+      check is even reached). The program MUST declare a `default_action`;
+      omission is the common v1model bug "missing default_action crash". Only meaningful at
+      ${policy_trigger} == static_and_heavy.
+
+  # ── Composite knobs (the load-bearing degrees of freedom) ──
+
+  policy_trigger:
+    type: enum
+    values: [heavy_only, static_and_heavy]
+    default: heavy_only
+    notes: |
+      WHICH signals the policy verdict combines — the composite's primary
+      knob.
+        heavy_only (anchor): the static_policy table is absent; the verdict is
+          the pure sketch signal — mitigate iff the flow is detected heavy,
+          forward otherwise. The minimal "police sources over T" policer.
+        static_and_heavy (harden): the verdict FUSES the control-plane static
+          allow/block list with the heavy signal under the priority blocklist
+          > allowlist-bypass > heavy-mitigate > benign (R1–R5 ordering). The
+          genuinely-composite surface: a flow can be statically blocklisted
+          (drop regardless of rate), statically allowlisted (forwarded; and,
+          under allowlist_bypass, exempt even when heavy), or unlisted
+          (policed iff heavy). The oracle reads this knob from runtime state
+          (parametric-source contract); it never enters the module as a constant.
+
+  allowlist_bypass:
+    type: bool
+    default: false
+    enforced_when: "${policy_trigger} == static_and_heavy"
+    notes: |
+      WHETHER a static permit (allowlist) entry EXEMPTS a flow from heavy-
+      hitter mitigation — the cross-stage priority decision.
+        false (default): a static permit means only "no static drop opinion";
+          a permitted flow that the sketch flags heavy is STILL mitigated
+          (detection wins over a non-exempting allowlist).
+        true (the realistic DDoS-policer carve-out, Jaqen lineage): a static
+          permit makes the flow exempt from rate mitigation — legitimate bulk
+          senders (backups, CDN origins) are allowlisted so they are never
+          policed for being heavy. The sharpest composite distinction: a flow
+          that is BOTH allowlisted AND heavy forwards iff allowlist_bypass.
+
+  mitigation_action:
+    type: enum
+    values: [drop, recolor]
+    default: drop
+    notes: |
+      What the policer does to a mitigated heavy flow.
+        drop (anchor): silent drop (the P-SketchHeavyHitter drop-on-
+          threshold mitigation, the v1.0-observable Poseidon "scrub").
+        recolor: the heavy flow's DSCP is rewritten to a scavenger / low-
+          priority class (reusing the P-ACL `mark` action) and the packet is
+          forwarded — so a downstream AQM / policer degrades it. recolor adds
+          the compound-checksum hazard (DSCP set + TTL decrement, one
+          recompute). Rate-limiting via a v1model meter is a v2 deferral
+          (bridging_notes).
+
+  scavenger_dscp:
+    type: int
+    range: "[0, 63]"
+    default: 8
+    enforced_when: "${mitigation_action} == recolor"
+    notes: |
+      The DSCP code point the recolor mitigation rewrites heavy flows to — a
+      scavenger / low-priority class (CS1 = 8 by default) so a downstream AQM
+      degrades the flow. A seed / control-plane constant (the mark colour),
+      never a per-packet value; reused as the `mark` action_arg of P-ACL.
+
+  mitigation_onset:
+    type: enum
+    values: [from_crossing_packet, from_next_packet]
+    default: from_crossing_packet
+    notes: |
+      The inc-first-then-check boundary across the two stages.
+        from_crossing_packet (anchor): the packet whose post-inc estimate
+          first crosses ${heavy_threshold} is ITSELF policed on the same pass
+          (the natural "police as soon as detected" reading).
+        from_next_packet: the crossing packet admits the flow to
+          detected_heavy and FORWARDS; only subsequent packets of that flow
+          (members of detected_heavy on arrival) are policed. Pins whether the
+          threshold check reads the pre- or post-inc counter — the common v1model
+          inc-first-then-check trap as a composite contract.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_countmin_heavy_only_drop     # anchor — Count-Min, heavy_only, drop, single-field flowkey
+      - D5.1_static_combination_recolor   # static_and_heavy + allowlist_bypass + recolor mitigation
+      - D5.2_countsketch_scaled_adversarial  # Count-Sketch, tightened sketch budget + scaled rule set, adversarial-collision workload
+    default: D5.0_countmin_heavy_only_drop
+    notes: |
+      The composite faithfulness ladder. D5.0 is the minimal happy path:
+      count per-source, drop sources over T, no static policy. D5.1
+      introduces the genuinely-composite static↔dynamic combination with the
+      allowlist carve-out and the recolor compound-checksum. D5.2 adds the
+      signed-counter Count-Sketch detector, capacity pressure on both the
+      sketch and the rule set, and the adversarial-collision workload that
+      stresses no_false_positive_under_collision.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true fires.
+# The rule ORDER R1→R5 IS the composite policy-combination priority:
+#   blocklist (R1) > allowlist-bypass (R2) > heavy-mitigate (R3/R4) > benign (R5).
+# Every IPv4-handling rule's `then` carries the sketch `inc` as its first
+# postcondition (the detect-before-police contract — the rate estimate is
+# updated before the verdict commits, exactly as TTL-decrement appears in
+# every forward rule of P-NATACL). `heavy(flowkey)` denotes the detection
+# predicate evaluated per ${mitigation_onset}: count_exceeds(estimate, T) on
+# the post-inc estimate when from_crossing_packet, or exists(detected_heavy,
+# flowkey) when from_next_packet. `static_verdict` denotes the highest-
+# priority-matching static_policy action over the flowkey (or ${default_action}
+# on a miss), consulted only at ${policy_trigger} == static_and_heavy.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Non-IPv4 frames (ARP, IPv6, raw L2) contribute no counter updates and
+      are outside the policer's match domain. Lifted from P-SketchHeavyHitter
+      R0 / P-ACL R0. No `inc`.
+
+  - id: R1_static_blocklist_drop
+    when: |
+      header_present(ipv4)
+        ∧ ${policy_trigger} == static_and_heavy
+        ∧ value(static_verdict(flowkey), ==, deny)
+    given:
+      packet:        deduce_from_packet
+      sketch_counters: by_hash(flowkey, ${sketch_depth})
+      static_policy: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - "inc(sketch_counters[h(flowkey)])"
+      - drop
+    enforced_when: "${policy_trigger} == static_and_heavy"
+    notes: |
+      Static BLOCKLIST drop — highest policy priority. A statically denied
+      flow is dropped regardless of its rate (a known-bad source is blocked
+      whether or not it is volumetric). The sketch is STILL updated first so
+      the rate estimate reflects true offered load (a blocklisted flow's
+      volume still informs collision analysis). Subsumes P-ACL R2 (deny),
+      ordered ahead of the heavy check.
+
+  - id: R2_static_allowlist_bypass_forward
+    when: |
+      header_present(ipv4)
+        ∧ ${policy_trigger} == static_and_heavy
+        ∧ value(static_verdict(flowkey), ==, permit)
+        ∧ ${allowlist_bypass} == true
+    given:
+      packet:        deduce_from_packet
+      sketch_counters: by_hash(flowkey, ${sketch_depth})
+      static_policy: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - "inc(sketch_counters[h(flowkey)])"
+      - "bind(detected_heavy, flowkey, {est_count: aggregate(sketch_counters[h(flowkey)], min), first_seen: now}) IF heavy(flowkey)"
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+      - dec(hdr.ipv4.ttl, 1)
+    enforced_when: "${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass}"
+    notes: |
+      Static ALLOWLIST exemption — the legitimate-bulk-sender carve-out
+      (Jaqen lineage). When allowlist_bypass is on, a statically permitted
+      flow is forwarded EVEN IF the sketch flags it heavy — detection does
+      NOT override an explicit allow. The sketch still updates and the flow is
+      still ADMITTED to detected_heavy (so telemetry / counters are accurate),
+      but no mitigation is applied. This is the rule that makes the
+      both-allowlisted-and-heavy flow forward; with allowlist_bypass == false
+      this rule does not fire and such a flow falls through to R3/R4.
+
+  - id: R3_heavy_mitigate_drop
+    when: |
+      header_present(ipv4)
+        ∧ heavy(flowkey)
+        ∧ ${mitigation_action} == drop
+        ∧ ¬(${policy_trigger} == static_and_heavy ∧ value(static_verdict(flowkey), ==, deny))
+        ∧ ¬(${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass} ∧ value(static_verdict(flowkey), ==, permit))
+    given:
+      packet:        deduce_from_packet
+      sketch_counters: by_hash(flowkey, ${sketch_depth})
+      detected_heavy: by_key(flowkey)
+    then:
+      - "inc(sketch_counters[h(flowkey)])"
+      - "bind(detected_heavy, flowkey, {est_count: aggregate(sketch_counters[h(flowkey)], min), first_seen: now}) IF ¬exists(detected_heavy, flowkey)"
+      - drop
+    enforced_when: "${mitigation_action} == drop"
+    notes: |
+      Heavy-hitter DROP mitigation. A flow the sketch flags heavy — and that
+      is neither blocklisted (handled by R1) nor allowlist-exempt (R2) — is
+      dropped. Under ${mitigation_onset} == from_crossing_packet the crossing
+      packet is dropped on the pass that admits it; under from_next_packet the
+      crossing packet forwarded via R5 (admission only) and this rule fires on
+      its successors (already members of detected_heavy). Realises the
+      P-SketchHeavyHitter relax_forwarding_independence augmentation.
+
+  - id: R4_heavy_mitigate_recolor
+    when: |
+      header_present(ipv4)
+        ∧ heavy(flowkey)
+        ∧ ${mitigation_action} == recolor
+        ∧ ¬(${policy_trigger} == static_and_heavy ∧ value(static_verdict(flowkey), ==, deny))
+        ∧ ¬(${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass} ∧ value(static_verdict(flowkey), ==, permit))
+    given:
+      packet:        deduce_from_packet
+      sketch_counters: by_hash(flowkey, ${sketch_depth})
+      detected_heavy: by_key(flowkey)
+    then:
+      - "inc(sketch_counters[h(flowkey)])"
+      - "bind(detected_heavy, flowkey, {est_count: aggregate(sketch_counters[h(flowkey)], min), first_seen: now}) IF ¬exists(detected_heavy, flowkey)"
+      - "set(hdr.ipv4.diffserv, ${scavenger_dscp})"
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+    enforced_when: "${mitigation_action} == recolor"
+    notes: |
+      Heavy-hitter RECOLOR mitigation. The heavy flow's DSCP is rewritten to
+      a scavenger / low-priority class and the packet is forwarded for a
+      downstream AQM to degrade. The SINGLE checksum recompute covers BOTH the
+      DSCP set AND the TTL decrement (compound_recolor_checksum_validity) — the
+      composite's sharpest checksum hazard. ${scavenger_dscp} is a control-
+      plane / seed constant (the mark colour), not a per-packet value.
+
+  - id: R5_benign_forward
+    when: |
+      header_present(ipv4)
+        ∧ ¬(${policy_trigger} == static_and_heavy ∧ value(static_verdict(flowkey), ==, deny))
+        ∧ ¬(heavy(flowkey)
+              ∧ ¬(${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass}
+                    ∧ value(static_verdict(flowkey), ==, permit)))
+    given:
+      packet:        deduce_from_packet
+      sketch_counters: by_hash(flowkey, ${sketch_depth})
+    then:
+      - "inc(sketch_counters[h(flowkey)])"
+      - "bind(detected_heavy, flowkey, {est_count: aggregate(sketch_counters[h(flowkey)], min), first_seen: now}) IF heavy(flowkey) ∧ ${mitigation_onset} == from_next_packet"
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+      - dec(hdr.ipv4.ttl, 1)
+    notes: |
+      Benign FORWARD — the catch-all. A flow that is not blocklisted and is
+      either below threshold or allowlist-exempt is forwarded with the base
+      L3 transform (egress lookup + TTL decrement + checksum recompute). Under
+      ${mitigation_onset} == from_next_packet a flow whose estimate crosses on
+      THIS packet is admitted to detected_heavy here (so R3/R4 police it on
+      the next packet) while the crossing packet itself forwards — the precise
+      inc-first-then-check boundary the detect_before_police invariant binds.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  # ── Composite-specific (the chain's load-bearing properties) ──
+
+  - id: detect_before_police
+    clause: stability
+    target: "(sketch_counters[h(flowkey)], verdict)"
+    while: "header_present(ipv4) ∧ (R1 ∨ R2 ∨ R3 ∨ R4 ∨ R5 fires)"
+    notes: |
+      On every IPv4 packet the sketch `inc` precedes the policy verdict, and
+      the heavy check reads the counter consistently with ${mitigation_onset}:
+      the post-inc estimate when from_crossing_packet (so the crossing packet
+      is policed), the pre-inc membership when from_next_packet (so the
+      crossing packet forwards and admits, successors are policed). The common v1model
+      inc-first-then-check trap promoted to a cross-stage contract. Implementation bug
+      it catches: checking the OLD counter value before the increment under
+      from_crossing_packet (the crossing packet escapes mitigation by exactly
+      one packet), or policing the crossing packet itself under from_next_packet
+      (an off-by-one in the other direction).
+
+  - id: policy_combination_consistency
+    clause: stability
+    target: verdict
+    while: "header_present(ipv4) ∧ ${policy_trigger} == static_and_heavy"
+    notes: |
+      The verdict is the documented combination of the static signal and the
+      heavy signal, applied in the fixed priority blocklist > allowlist-bypass
+      > heavy-mitigate > benign (R1 > R2 > R3/R4 > R5). The `allowlist_bypass`
+      knob decides exactly one cell of the truth table: a flow that is BOTH
+      statically permitted AND sketch-heavy forwards iff allowlist_bypass,
+      else it is mitigated. No standalone analogue — P-ACL has no heavy signal
+      to combine, P-SketchHeavyHitter has no static list. Implementation anti-pattern:
+      letting the static ACL's permit issue a `forward` that races / overrides
+      the heavy-drop, or vice versa, without the explicit priority — a verdict
+      that depends on stage execution order rather than the declared policy.
+
+  - id: compound_recolor_checksum_validity
+    clause: stability
+    target: "(hdr.ipv4.header_checksum, hdr.ipv4.diffserv, hdr.ipv4.ttl)"
+    while: "egress(packet) ∧ R4 fires"
+    enforced_when: "${mitigation_action} == recolor"
+    notes: |
+      On a recolored+forwarded packet the IPv4 header checksum MUST be valid
+      on egress AFTER both the DSCP rewrite and the TTL decrement. The hazard:
+      two header mutations from two conceptual stages (the policer's mark + the
+      base forwarder's TTL) on one pass, so a program that recomputes after only
+      one emits a silently-corrupt header. The v1model bug catalogue's #1 silent failure,
+      sharpened by the compounding (reused from P-NATACL / P-ACL).
+
+  - id: no_false_positive_under_collision
+    clause: stability
+    target: verdict
+    while: "header_present(ipv4) ∧ ${sketch_depth} ≥ 2"
+    notes: |
+      The DDoS-policer SAFETY property (Jaqen lineage): an innocent low-rate
+      flow that collides with a heavy flow in ONE sketch row MUST NOT be
+      policed. The min-across-rows (Count-Min) / median-of-signed-rows
+      (Count-Sketch) estimator clips the inflated row against the unaffected
+      rows, so heavy(flowkey) is false for the innocent flow. Implementation bug it
+      catches: deriving all R row hashes from one seed (every row collides
+      identically, so the estimator cannot clip) or reading a single row as
+      the estimate. Over-blocking legitimate traffic is the worst failure of a
+      policer; this invariant is its guard.
+
+  # ── Detection-half invariants (reused from P-SketchHeavyHitter) ──
+
+  - id: counter_persistence_within_epoch
+    clause: persistence
+    target: "sketch_counters[*].count"
+    while: "within a single epoch"
+    free_under: ["evict(sketch_counters, all) at R6"]
+    notes: |
+      Each cell's count is monotonically non-decreasing across `inc` firings
+      within an epoch (for count_sketch this weakens to ±1 per inc). The only
+      free_under is the epoch-boundary reset. Reused from P-SketchHeavyHitter.
+
+  - id: heavy_storage_no_orphan
+    clause: no_orphan
+    target: detected_heavy
+    while: "true"
+    notes: |
+      Every detected_heavy entry is removed at the next epoch boundary; no
+      flagged flow persists across epochs (a flow that was heavy in epoch k
+      must re-cross the threshold in epoch k+1 to be policed again). Reused
+      from P-SketchHeavyHitter; the policer-specific consequence is that
+      mitigation MUST lapse when the rate subsides, not persist as a
+      permanent block.
+
+  # ── Policy-half invariants (reused from P-ACL) ──
+
+  - id: priority_correctness
+    clause: stability
+    target: chosen_static_rule
+    while: "${policy_trigger} == static_and_heavy ∧ (R1 ∨ R2 fires, or static_verdict consulted)"
+    notes: |
+      P4Runtime §9.1 — among static_policy entries whose match_spec admits the
+      flowkey, the largest priority wins. Reused from P-ACL; catches treating
+      priority as install/list order.
+
+  - id: no_priority_ambiguity
+    clause: stability
+    target: chosen_static_rule
+    while: "${policy_trigger} == static_and_heavy"
+    notes: |
+      No two same-priority static rules match the same packet (P4Runtime §9.1
+      ties are non-deterministic). The seed validator rejects overlapping
+      same-priority masks. Reused from P-ACL.
+
+  - id: default_action_correctness
+    clause: stability
+    target: static_verdict
+    while: "${policy_trigger} == static_and_heavy ∧ no static rule matches the flowkey"
+    notes: |
+      On a static-table miss the static_verdict MUST equal ${default_action}
+      (permit ⇒ fall through to the heavy check, deny ⇒ drop before it). Reused
+      from P-ACL; catches an ACL table left at NoAction when the seed declares
+      deny (a silent default-permit that lets unlisted flows skip the block).
+
+  - id: mark_only_modifies_dscp
+    clause: persistence
+    target: "(hdr.ipv4.srcAddr, hdr.ipv4.dstAddr, hdr.ipv4.totalLen)"
+    while: "R4 fires (recolor branch)"
+    enforced_when: "${mitigation_action} == recolor"
+    free_under: ["hdr.ipv4.diffserv", "hdr.ipv4.ttl"]
+    notes: |
+      The recolor action modifies ONLY hdr.ipv4.diffserv beyond the standard
+      TTL decrement — addresses, length, ports preserved. Reused from P-ACL;
+      catches an implementation that folds the DSCP write into a generic rewrite that
+      dirties unrelated fields.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Single ingress pass: the sketch update, heavy check, and policy verdict
+      all complete without recirculation (one optional recirculation only if a
+      multi-stage hash forces it, per P-SketchHeavyHitter). A mitigated packet
+      MUST NOT re-enter the detector stage.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-goal rules and the v1model bug taxonomy. Entries marked
+# [composite] probe the chain interactions.
+
+test_scaffolding:
+
+  G1:
+    - id: heavy_flow_mitigated
+      generate: |
+        Warm-up (prior_inputs, TTL=64): ${heavy_threshold} - 1 packets for one
+        flowkey f_hot. Test packet (TTL=64 so the egress TTL is observable): one
+        more for f_hot that crosses the threshold. Assert the policer mitigates:
+        DROP (no egress) when ${mitigation_action} == drop, or RECOLOR (egress on
+        the forwarding port with hdr.ipv4.diffserv == scavenger DSCP, TTL−1,
+        checksum valid) when recolor. The composite golden path (R3/R4). Under
+        ${mitigation_onset} == from_next_packet, expect the crossing packet to
+        FORWARD and the FOLLOWING f_hot packet to be mitigated.
+
+    - id: below_threshold_forwarded
+      generate: |
+        Send a single IPv4 packet (TTL=64) for a flowkey that has received far
+        fewer than ${heavy_threshold} packets in the epoch, to a destination with
+        a control-plane forwarding entry. Assert forward on the expected egress
+        port with TTL−1, headers otherwise unchanged, checksum valid. Probes R5
+        (benign path) — the policer must not police low-rate traffic.
+
+    - id: detection_onset_boundary
+      generate: |
+        [composite] prior_inputs bring f_hot to exactly ${heavy_threshold} - 1.
+        Send the crossing packet, then a second f_hot packet. Assert the verdicts
+        match ${mitigation_onset} EXACTLY: from_crossing_packet ⇒ crossing packet
+        mitigated AND next mitigated; from_next_packet ⇒ crossing packet forwarded
+        AND next mitigated. Probes detect_before_police; bug it catches: reading
+        the pre-inc counter (off-by-one in the threshold check).
+
+    - id: blocklist_drops_regardless_of_rate
+      requires: "${policy_trigger} == static_and_heavy"
+      generate: |
+        [composite] Install a static deny (blocklist) rule matching a flowkey g.
+        Send a SINGLE low-rate packet for g (well below ${heavy_threshold}).
+        Assert drop (R1) — a blocklisted flow is dropped whether or not it is
+        heavy. Then send a permitted low-rate flow and assert it forwards. Probes
+        the blocklist > heavy priority and policy_combination_consistency.
+
+    - id: allowlist_exempts_heavy
+      requires: "${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass} == true"
+      generate: |
+        [composite] Install a static permit (allowlist) rule matching f_legit.
+        prior_inputs: drive f_legit ABOVE ${heavy_threshold}. Send the crossing +
+        a following packet. Assert BOTH forward unmitigated (no drop, no recolor)
+        even though the sketch flags f_legit heavy — the allowlist bypass exempts
+        it. Re-run with allowlist_bypass == false and assert the same flow IS
+        mitigated. The sharpest composite test: neither half expresses the
+        permit-vs-detection priority. Anchors policy_combination_consistency.
+
+  G2:
+    - id: sketch_capacity_pressure_estimate_within_error
+      generate: |
+        Under a tightened ${max_register_cells}, drive one flowkey to N =
+        10·${sketch_width} packets via prior_inputs (TTL=64), interleaved with
+        background flows. Test the (N+1)-th packet. Assert the heavy decision is
+        correct (mitigated) and the estimate is in [true, true + N/${sketch_width}]
+        — shared sketch storage must still detect the heavy flow at budget. Maps
+        to the capacity axis.
+
+    - id: epoch_reset_clears_mitigation
+      generate: |
+        Drive f_hot heavy in epoch k (prior_inputs), force an epoch boundary
+        (via ${epoch_packets} or simulated time advance), then send ONE f_hot
+        packet (TTL=64) in epoch k+1. Assert it FORWARDS (not mitigated) — the
+        detected_heavy set was reset, so mitigation lapses with the rate.
+        Anchors heavy_storage_no_orphan; bug it catches: stale detected_heavy
+        carry-over permanently blocking a flow whose burst ended.
+
+  G3:
+    - id: adversarial_collision_no_false_drop
+      requires: "${sketch_depth} >= 2"
+      generate: |
+        [composite] Workload ${workload_skew} == adversarial_collision. The
+        attacker crafts N flowkeys that all hash to the SAME column in row 0,
+        each sent ${heavy_threshold} - 1 times via prior_inputs (row-0 estimate
+        inflated past T, true per-flow rate below T). Test packet: one packet
+        from an INNOCENT flow colliding in row 0 only. Assert it is NOT mitigated
+        (forwarded) — the min/median across the other rows clips the inflated
+        row. Probes no_false_positive_under_collision — the policer's #1 safety
+        property. The common v1model bug "hash extern misuse" (row hashes from one seed) is the bug.
+
+    - id: recolor_or_drop_deparser_well_formed
+      generate: |
+        [composite] Common v1model bug "conditional deparser". On the mitigation branch assert
+        the packet is well-formed: for drop, no malformed egress on any port; for
+        recolor, the egress packet has a bit-exact header layout with only DSCP +
+        TTL + checksum changed (no emitted-garbage / dropped-header on the
+        non-standard branch). Stage exactly one threshold crossing; assert the
+        mitigation branch and the benign branch both deparse correctly.
+
+    - id: combination_priority_inversion
+      requires: "${policy_trigger} == static_and_heavy ∧ |${rules}| >= 4"
+      generate: |
+        [composite] Install ≥4 static rules with overlapping ternary masks at
+        non-equal priorities (e.g. priority 10 deny on src /16, priority 100
+        permit on the exact /32), constructed so a naive list-order program fires
+        the WRONG rule; arrange the flow to ALSO be sketch-heavy. Assert the
+        verdict follows highest-priority-static THEN the heavy combination
+        exactly (the /32 permit wins the static verdict, then allowlist_bypass
+        decides). The common v1model bug "priority inversion (ternary)" combined with the dynamic
+        signal. Probes priority_correctness + policy_combination_consistency.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease on the same axis so difficulty
+# recalibration by parameter rebinding can move in either direction.
+
+mutation_operators:
+
+  # === Composite combination axis (the load-bearing knobs) ==================
+  - id: enable_static_policy_combination
+    applicable_when: "${policy_trigger} == heavy_only"
+    effect: "${policy_trigger} ← static_and_heavy ∧ ${faithfulness} ← max(${faithfulness}, D5.1_static_combination_recolor)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "|${rules}| ≥ 1 ∧ every entry in ${rules} has action ∈ {permit, deny, mark}"
+    notes: |
+      Lift heavy_only → static_and_heavy: the verdict now fuses a control-plane
+      allow/block list with the heavy signal, adding priority_correctness,
+      default_action_correctness, and policy_combination_consistency to the
+      program's burden. Pairs with `disable_static_policy_combination`.
+
+  - id: disable_static_policy_combination
+    applicable_when: "${policy_trigger} == static_and_heavy"
+    effect: "${policy_trigger} ← heavy_only"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Drop the static policy table; the verdict reverts to the pure sketch signal. Pairs with `enable_static_policy_combination`."
+
+  - id: enable_allowlist_bypass
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ${allowlist_bypass} == false"
+    effect: "${allowlist_bypass} ← true"
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "${rules} contains ≥ 1 permit entry"
+    notes: |
+      Turn on the allowlist carve-out — a static permit now EXEMPTS a heavy
+      flow from mitigation, changing one cell of the combination truth table
+      (both-permitted-and-heavy ⇒ forward). Changes the chain's order of
+      operations (the permit must be checked before the heavy mitigation), not
+      a parameter magnitude — hence algebra-breadth. The single strongest
+      composite-axis harden. Pairs with `disable_allowlist_bypass`.
+
+  - id: disable_allowlist_bypass
+    applicable_when: "${allowlist_bypass} == true"
+    effect: "${allowlist_bypass} ← false"
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "A static permit no longer exempts a heavy flow (detection wins over a non-exempting allowlist). Pairs with `enable_allowlist_bypass`."
+
+  - id: switch_mitigation_to_recolor
+    applicable_when: "${mitigation_action} == drop"
+    effect: "${mitigation_action} ← recolor"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Change the mitigation from a clean drop to a DSCP recolor + forward,
+      adding the compound_recolor_checksum_validity hazard (DSCP set + TTL
+      decrement, one recompute) and mark_only_modifies_dscp. Pairs with
+      `switch_mitigation_to_drop`.
+
+  - id: switch_mitigation_to_drop
+    applicable_when: "${mitigation_action} == recolor"
+    effect: "${mitigation_action} ← drop"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to a clean drop (no header rewrite, no compound checksum). Pairs with `switch_mitigation_to_recolor`."
+
+  - id: shift_onset_to_next_packet
+    applicable_when: "${mitigation_onset} == from_crossing_packet"
+    effect: "${mitigation_onset} ← from_next_packet"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Move the inc-first-then-check boundary so the crossing packet forwards
+      and admits, and mitigation begins on the next packet — the SUT must read
+      the pre-inc membership rather than the post-inc estimate, the harder of
+      the two off-by-one readings to get right. Pairs with
+      `shift_onset_to_crossing_packet`.
+
+  - id: shift_onset_to_crossing_packet
+    applicable_when: "${mitigation_onset} == from_next_packet"
+    effect: "${mitigation_onset} ← from_crossing_packet"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Police the crossing packet itself on the same pass. Pairs with `shift_onset_to_next_packet`."
+
+  # === Detection capacity axis (reused from P-SketchHeavyHitter) ============
+  - id: shrink_sketch_capacity_4x
+    applicable_when: "${max_register_cells} >= 32"
+    effect: "${max_register_cells} ← ${max_register_cells} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${max_register_cells} >= 8"
+    notes: "Tighten the sketch memory budget so per-flow counters no longer fit — forces shared sketch storage. Pairs with `enlarge_sketch_capacity_2x`. Reused from P-SketchHeavyHitter."
+
+  - id: enlarge_sketch_capacity_2x
+    applicable_when: "${max_register_cells} <= 524288"
+    effect: "${max_register_cells} ← ${max_register_cells} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${max_register_cells} <= 1048576"
+    notes: "Loosen the sketch memory budget. Pairs with `shrink_sketch_capacity_4x`. Reused from P-SketchHeavyHitter."
+
+  # === Detection threshold axis (reused from P-SketchHeavyHitter) ===========
+  - id: tighten_heavy_threshold_4x
+    applicable_when: "${heavy_threshold} >= 100"
+    effect: "${heavy_threshold} ← ${heavy_threshold} / 4"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${heavy_threshold} >= ${sketch_width} / 100"
+    notes: "Lower the rate-policing boundary — more flows are flagged, more boundary cases. Pairs with `relax_heavy_threshold_2x`. Reused from P-SketchHeavyHitter."
+
+  - id: relax_heavy_threshold_2x
+    applicable_when: "${heavy_threshold} <= 500000"
+    effect: "${heavy_threshold} ← ${heavy_threshold} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Raise the rate-policing boundary. Pairs with `tighten_heavy_threshold_4x`. Reused from P-SketchHeavyHitter."
+
+  # === Detection faithfulness ladder (reused from P-SketchHeavyHitter) ======
+  - id: lift_to_count_sketch
+    applicable_when: "${sketch_type} == count_min"
+    effect: |
+      ${sketch_type}  ← count_sketch ∧
+      ${faithfulness} ← max(${faithfulness}, D5.2_countsketch_scaled_adversarial)
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${hash_independence} ∈ {pairwise, four_wise}"
+    notes: |
+      Switch the detector to signed-counter Count-Sketch (median-of-rows
+      estimator) — the program must implement the per-row sign hash and the
+      median, a sharper v1model bug surface than Count-Min's min. Pairs with
+      `revert_to_count_min`. Reused from P-SketchHeavyHitter.
+
+  - id: revert_to_count_min
+    applicable_when: "${sketch_type} == count_sketch"
+    effect: "${sketch_type} ← count_min"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to unsigned Count-Min (min-of-rows). Pairs with `lift_to_count_sketch`. Reused from P-SketchHeavyHitter."
+
+  # === Hash-family axis (reused from P-SketchHeavyHitter) ===================
+  - id: tighten_hash_independence
+    applicable_when: "${hash_independence} == pairwise"
+    effect: "${hash_independence} ← four_wise"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Require four-wise-independent row hashes (needed for the Count-Sketch variance bound; stresses no_false_positive_under_collision). Pairs with `relax_hash_independence`. Reused from P-SketchHeavyHitter."
+
+  - id: relax_hash_independence
+    applicable_when: "${hash_independence} == four_wise ∧ ${sketch_type} == count_min"
+    effect: "${hash_independence} ← pairwise"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax to pairwise (sufficient for Count-Min). Pairs with `tighten_hash_independence`. Reused from P-SketchHeavyHitter."
+
+  - id: switch_hash_polynomial
+    applicable_when: "${hash_polynomial} ∈ {crc16, crc32, crc32c}"
+    effect: "${hash_polynomial} ← custom_lfsr"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_polynomial} ∈ {crc16, crc32, crc32c, custom_lfsr}"
+    notes: "Force a custom per-row LFSR polynomial rather than a stock CRC, exposing cross-row hash-independence assumptions (no_false_positive_under_collision). Pairs with `revert_hash_polynomial_to_crc32`. Reused from P-SketchHeavyHitter."
+
+  - id: revert_hash_polynomial_to_crc32
+    applicable_when: "${hash_polynomial} ≠ crc32"
+    effect: "${hash_polynomial} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to stock crc32. Pairs with `switch_hash_polynomial`. Reused from P-SketchHeavyHitter."
+
+  # === Workload axis (reused from P-SketchHeavyHitter) ======================
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← adversarial_collision"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${sketch_depth} >= 2"
+    notes: "Adversarial collisions stress the estimator's clip and no_false_positive_under_collision. Pairs with `lower_workload_skew`. Reused from P-SketchHeavyHitter."
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} == adversarial_collision"
+    effect: "${workload_skew} ← zipfian"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to a benign skew. Pairs with `raise_workload_skew`. Reused from P-SketchHeavyHitter."
+
+  # === Static-policy capacity axis (reused from P-ACL) ======================
+  - id: shrink_rule_capacity_4x
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} > 64"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16 ∧ |${rules}| ≤ ${rule_count_capacity}"
+    notes: "Tighten the static rule-count budget (no TCAM-of-everything). Pairs with `enlarge_rule_capacity_2x`. Reused from P-ACL."
+
+  - id: enlarge_rule_capacity_2x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} < 32768"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${rule_count_capacity} ≤ 65536"
+    notes: "Loosen the static rule-count budget. Pairs with `shrink_rule_capacity_4x`. Reused from P-ACL."
+
+  # === Static-policy strictness axis (reused from P-ACL) ====================
+  - id: flip_default_to_deny
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ${default_action} == permit"
+    effect: "${default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${rules} contains ≥ 1 permit entry"
+    notes: |
+      Flip the static policy from a permissive blocklist (unlisted flows fall
+      through to the heavy check) to a zero-trust allowlist (unlisted flows
+      drop before the heavy check). Requires a non-NoAction default on the
+      static table. Pairs with `flip_default_to_permit`. Reused from P-ACL.
+
+  - id: flip_default_to_permit
+    applicable_when: "${default_action} == deny"
+    effect: "${default_action} ← permit"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${rules} contains ≥ 1 deny entry"
+    notes: "Flip the static default back to permissive. Pairs with `flip_default_to_deny`. Reused from P-ACL."
+
+  # === Static-policy feature-breadth axis (reused from P-ACL) ===============
+  - id: expand_match_field_breadth
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ${match_field_breadth} ≠ tuple5_vrf_vlan_dscp"
+    effect: "${match_field_breadth} ← next of {tuple5 → tuple5_vrf → tuple5_vrf_vlan → tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: "Widen the ternary static-policy key (more fields to parse + key on). Pairs with `shrink_match_field_breadth`. Reused from P-ACL."
+
+  - id: shrink_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5"
+    effect: "${match_field_breadth} ← previous of {tuple5 ← tuple5_vrf ← tuple5_vrf_vlan ← tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: "Narrow the ternary static-policy key. Pairs with `expand_match_field_breadth`. Reused from P-ACL."
+
+  - id: inflate_priority_depth
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ${priority_depth} < 1024"
+    effect: "${priority_depth} ← min(${priority_depth} * 4, 4096)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${priority_depth} ≥ 1 ∧ ${priority_depth} ≤ 4096"
+    notes: "Lift static-policy priority depth (TCAM priority-encoder cost; one-rule-per-priority implementations overflow). Pairs with `flatten_priority_depth`. Reused from P-ACL."
+
+  - id: flatten_priority_depth
+    applicable_when: "${priority_depth} > 2"
+    effect: "${priority_depth} ← max(${priority_depth} / 4, 1)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${priority_depth} ≥ 1"
+    notes: "Collapse static-policy priority depth. Pairs with `inflate_priority_depth`. Reused from P-ACL."
+
+  # === Test-rigor workload axis (reused from P-ACL) =========================
+  - id: inject_overlapping_priority_rules
+    applicable_when: "${policy_trigger} == static_and_heavy ∧ ('combination_priority_inversion' ∉ test_scaffolding.G3 ∨ |${rules}| < 4)"
+    effect: |
+      Generate ≥4 static rules whose ternary masks overlap pairwise at
+      non-equal priorities, confusable for an out-of-order install; add the G3
+      `combination_priority_inversion` test if absent.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16"
+    notes: "Test-rigor harden on static priority correctness, combined with the heavy signal. Pairs with `simplify_to_disjoint_rules`. Reused from P-ACL."
+
+  - id: simplify_to_disjoint_rules
+    applicable_when: "|${rules}| > 4"
+    effect: |
+      Regenerate ${rules} so no two ternary masks overlap (priority becomes
+      irrelevant); remove G3 `combination_priority_inversion` if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${rules}| ≥ 1"
+    notes: "Test-rigor ease. Pairs with `inject_overlapping_priority_rules`. Reused from P-ACL."
+
+  # === Presentation-noise axis (input-form; shared protocol) ================
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the shared noisify_spec_low protocol (also in P-NATACL / P-StatefulFW-NAT44):
+        • 1 distractor clause about deployment / environment / out-of-scope
+          behaviour that is true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, subnet,
+          DSCP value) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this composed pattern in v1model P4:
+
+    D5.0 (faithfulness=D5.0_countmin_heavy_only_drop, heavy_only, drop,
+          mitigation_onset=from_crossing_packet, single-field flowkey):
+      - Pipeline stages in order: (1) parse + extract meta.l4_* (only if the
+        flowkey extends past srcAddr); (2) the sketch update + heavy check;
+        (3) the verdict. NO static policy table at heavy_only.
+      - sketch: ${sketch_depth} register<bit<${counter_width_bits}>>(
+        ${sketch_width}), one per row; ${sketch_depth} hash() calls with a
+        DISTINCT crc variant per row (deriving all rows from one seed is the
+        no_false_positive_under_collision bug). INCREMENT first, THEN read the
+        per-row cells and take the min — `est = min(c0, c1, ...)`. Compare
+        `est >= heavy_threshold` AFTER the inc (detect_before_police /
+        from_crossing_packet). A program that reads the cell, compares, then
+        increments policies the crossing packet one packet late.
+      - detected_heavy: a register-backed set (hash-indexed slot per flowkey or
+        a small assoc array) recording membership; admit on first crossing.
+      - verdict: `if (est >= heavy_threshold) mark_to_drop(std);` else the base
+        ipv4_lpm forward. The sketch DRIVES the drop — this is the relaxed-
+        forwarding-independence specialisation, expected and correct here.
+      - epoch: a register holding (epoch_id, n_packets, start_time); on
+        rollover, zero the sketch + detected_heavy (R6). In the v1.0 harness
+        without time injection, epoch advance is driven by the packet counter
+        (epoch_trigger=packets) — the time arm is a v2 surface.
+
+    D5.1 (static_and_heavy, allowlist_bypass=true, recolor):
+      - static_policy: a ternary table on the configured key; actions =
+        { permit; deny; mark; @defaultonly permit_to_heavy_check; }; size =
+        ${rule_count_capacity}; default_action per ${default_action}. Entries
+        carry an explicit P4Runtime priority (priority_correctness).
+      - Combination as a metadata cascade (the R1>R2>R3/R4>R5 priority):
+          static_policy.apply();         // sets meta.static = {deny|permit|mark|miss}
+          // (sketch already updated + meta.heavy set in stage 2)
+          if      (meta.static == deny)                          mark_to_drop(std);
+          else if (meta.static == permit && allowlist_bypass)    ipv4_lpm.apply();   // exempt
+          else if (meta.heavy)                                   <mitigate>;          // drop or recolor
+          else                                                    ipv4_lpm.apply();
+        The ORDER of these branches IS policy_combination_consistency — a
+        program that lets the static permit issue its own forward inside the
+        table action races the heavy mitigation.
+      - recolor: `hdr.ipv4.diffserv = scavenger_dscp;` then the base TTL
+        decrement; the SINGLE MyComputeChecksum recompute covers BOTH
+        (compound_recolor_checksum_validity). Recomputing after only one is
+        the #1 silent failure.
+
+    D5.2 (count_sketch, tightened budget, scaled rules, adversarial workload):
+      - count_sketch: each row also has a 1-bit sign hash; the per-row update
+        is `cell += (sign ? +1 : -1)` and the estimate is the MEDIAN of the
+        per-row signed reads (a 3-stage compare network for R ≤ 5). four_wise
+        hash independence is required for the variance bound.
+      - tightened ${max_register_cells} forces a genuinely shared sketch (no
+        per-flow counter fallback); scaled ${rules} forces real priority
+        encoding.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Reading the sketch cell BEFORE the increment under from_crossing_packet —
+      the crossing packet escapes mitigation by exactly one packet
+      (detect_before_police). The inverse (policing the crossing packet under
+      from_next_packet) is the other off-by-one.
+    * Deriving all R sketch row hashes from one seed / reading a single row as
+      the estimate — an innocent flow that collides in that row is falsely
+      policed. The worst policer failure; no_false_positive_under_collision and
+      the adversarial-collision G3 test catch it.
+    * Letting a static `permit` action issue `forward`/`egress_spec` directly
+      inside the table action instead of setting a metadata flag that the
+      combination cascade reads — the permit then races the heavy mitigation
+      and the verdict depends on apply() order, not the declared priority
+      (policy_combination_consistency).
+    * Forgetting the allowlist exemption (mitigating an allowlisted heavy flow
+      when allowlist_bypass is on), or applying the exemption when it is off —
+      the both-permitted-and-heavy truth-table cell.
+    * Recomputing the checksum after only the DSCP recolor OR only the TTL
+      decrement — a recolored packet egresses corrupt
+      (compound_recolor_checksum_validity).
+    * Persisting detected_heavy across the epoch boundary — a flow whose burst
+      ended stays permanently blocked (heavy_storage_no_orphan).
+    * Treating the heavy bit / permit decision as a bit<1> read back later on a
+      path where it was never written (the default / non-IPv4 path) — the common v1model
+      bit<1> vs bool boundary bug; an uninitialised read returns an unspecified
+      value.
+    * Counting on a `meter`/policer extern for rate-limiting — v1model BMv2's
+      meter semantics are not cleanly observable in the single-pass
+      use-files harness; the v1.0 mitigation surface is drop / recolor only
+      (see v2 deferrals).
+
+  v2 deferrals (out of scope for this v1.0 pattern):
+    * True rate-limiting via a v1model meter / token bucket (the literal
+      "policer") — not cleanly observable per-packet in the packet-test harness; the
+      observable mitigations are drop and DSCP recolor.
+    * Time-driven epochs / sliding windows — the v1.0 harness injects no
+      time_tick, so epoch advance is packet-count-driven.
+    * Universal / Elastic sketch detectors (carried by standalone
+      P-SketchHeavyHitter) — out of composite scope; the composite restricts
+      to the two single-pass families.
+    * Multi-action Poseidon mitigation primitives beyond drop/recolor
+      (re-route to a scrubber, SYN-cookie challenge — the latter is
+      P-SYNCookieGuard's surface).
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    * The R1>R2>R3/R4>R5 combination priority (blocklist > allowlist-bypass >
+      heavy-mitigate > benign) is the conventional DDoS-policer ordering
+      (block known-bad, exempt known-good, then police by rate); it is
+      synthesised from the Poseidon/Jaqen lineage rather than quoted from a
+      read section.
+    * mitigation_onset's two readings encode the common v1model inc-first-then-check
+      ambiguity as an explicit knob so the same audited oracle grades both
+      boundary semantics — a pattern-design choice, not a source claim.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and the (chained) oracle
+       audit must all pass.
+
+    2. Composite oracle reuse: the instance's oracle chains
+       the two audited halves — oracles/P-SketchHeavyHitter/5288c919 (the
+       sketch update + heavy detection signal) feeding
+       oracles/P-ACL/8d7defff (the static verdict over the flowkey) into the
+       combination cascade — recorded as the composed oracle's
+       provenance, the same convention P-StatefulFW-NAT44, P-VXLANRouter, and
+       P-NATACL follow. The composite GLUE (the R1>R2>R3/R4>R5 combination
+       priority, the detect-before-police / mitigation_onset boundary, the
+       allowlist_bypass exemption cell, and the compound recolor checksum) is
+       the only new code to audit; the two halves are inherited. The oracle
+       audit MUST exercise the mitigation_onset and allowlist_bypass knobs at
+       their extremes (parametric-source invariant — seed values never enter
+       the module as constants).
+
+    3. For anchor-band instances (D5.0_countmin_heavy_only_drop, heavy_only,
+       drop, from_crossing_packet, single-field flowkey), the task SHOULD be
+       behaviourally equivalent to "count per-source within an epoch and drop
+       sources whose estimate crosses T": cross-check by hand-running the
+       public test set through the chained oracle and comparing the by-flow
+       drop/forward verdicts.
+
+    4. Its constituents P-SketchHeavyHitter and P-ACL are calibrated
+       across difficulty levels before this composite's harder siblings are
+       produced; the anchor instance may come first (as for P-VXLANRouter /
+       P-RouterACL).
+       Per the corpus pattern of composite compile-gate cliffs
+       (lb_failover_anchor, natacl_anchor), expect the sketch + ternary +
+       combination-cascade compile surface to be the first risk — budget a
+       compile-surface ease (power-of-two sketch_width, generous max_retries)
+       for a reachable anchor.

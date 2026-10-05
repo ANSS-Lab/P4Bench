@@ -1,0 +1,134 @@
+{
+  "oracle_hash": "524d84362794db9fbb55f056ffaa440d1378b55a03a8a7673b79da20b5141f08",
+  "instance": "acl_dmz_allow_list-default",
+  "ran_at": "2026-05-29T23:41:54.265377Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "deny_explicit_rule",
+        "status": "pass"
+      },
+      {
+        "example_id": "permit_explicit_rule",
+        "status": "pass"
+      },
+      {
+        "example_id": "priority_wins_over_overlap",
+        "status": "pass"
+      },
+      {
+        "example_id": "priority_inversion_deny_wins",
+        "status": "pass"
+      },
+      {
+        "example_id": "table_miss_default_deny",
+        "status": "pass"
+      },
+      {
+        "example_id": "table_miss_default_permit",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_permit_unmappable_dst_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_default_deny",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_default_permit",
+        "status": "pass"
+      },
+      {
+        "example_id": "mark_action_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "redirect_overrides_routing",
+        "status": "pass"
+      },
+      {
+        "example_id": "extended_field_match_miss",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "priority_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_priority_ambiguity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "default_action_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "permit_header_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mark_only_modifies_dscp": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "redirect_routes_to_named_port": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "priority_correctness",
+      "no_priority_ambiguity",
+      "default_action_correctness",
+      "permit_header_preservation",
+      "mark_only_modifies_dscp",
+      "redirect_routes_to_named_port",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

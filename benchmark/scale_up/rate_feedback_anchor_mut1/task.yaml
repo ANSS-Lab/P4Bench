@@ -1,0 +1,834 @@
+task_name: rate_feedback_anchor_mut1
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-RateFeedback
+pattern_version: '1.0'
+seed:
+  feedback_header: xcp_cwnd_header
+  feedback_semantics: xcp_feedback
+  faithfulness: D5.2_xcp_feedback_split
+  signal_keying: per_dscp_class
+  n_signal_classes: 8
+  aggregation_mode: packet_count
+  aggregation_window: 16
+  aggregate_lower_better: true
+  path_min_strict: true
+  target_rate: 1000000
+  default_action: forward
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: host
+    to: s1.p1
+  - from: s1.p2
+    to: link2
+  - from: s1.p3
+    to: link3
+hosts:
+  host:
+    note: feedback senders + ordinary traffic; ingress on s1.p1
+  link2:
+    note: outgoing link for 10.0.2.0/24; egress port s1.p2
+  link3:
+    note: outgoing link for 10.0.3.0/24; egress port s1.p3
+description: |-
+  Implement an explicit congestion-feedback stamper for BMv2 (v1model). The
+  switch tracks how much feedback-carrying traffic it has handled for each
+  traffic class, turns that into a locally computed SIGNED congestion-feedback
+  value for the class, and folds that value into a feedback field carried by
+  passing packets — but only ever to make the field MORE RESTRICTIVE (more
+  negative), never less, so the most-congested switch along a path is the one
+  whose feedback the receiver ends up seeing.
+
+  Topology: traffic arrives on port 1. The destination IPv4 address selects an
+  outgoing port: 10.0.1.0/24 leaves on port 1, 10.0.2.0/24 on port 2,
+  10.0.3.0/24 on port 3. A packet whose destination matches no route is dropped.
+
+  Feedback packets are identified by a small shim carried on UDP destination
+  port 9999: its first four bytes are a 32-bit feedback value (field name
+  RCPFeedback.value), interpreted as a SIGNED two's-complement integer. A packet
+  that is not UDP, or is UDP on any other destination port, carries no feedback
+  field.
+
+  Required behaviour, per packet:
+
+  - Ordinary traffic. A packet with no feedback shim is forwarded on its normal
+    forwarding decision, completely unmodified. Non-IPv4 frames are dropped.
+
+  - Congestion accounting, per traffic class. For a feedback-carrying packet, the
+    switch counts it against the load of its TRAFFIC CLASS and from that
+    accumulated load derives the class's currently advertised signed feedback. A
+    packet's traffic class is its DiffServ code point (the high six bits of the
+    IPv4 type-of-service byte), NOT its outgoing port: two packets on the SAME
+    outgoing link but with DIFFERENT DiffServ code points belong to DIFFERENT
+    classes and accumulate load independently. The signed feedback must be a
+    deterministic function of the traffic the switch has seen for that class (so
+    the same packet train always yields the same feedback, run to run) and must
+    get MORE NEGATIVE as the class accumulates more load — a busier class
+    advertises more congestion. Each class's load is maintained over a bounded
+    window of the most recent feedback packets of that class and is reset at the
+    window boundary, counted in packets (there is no wall-clock timer); the value
+    must never wrap or overflow.
+
+  - Exact feedback law. Number the feedback packets of each class 1, 2, 3, …
+    within a window of the 16 most recent feedback packets of that class (the
+    per-class counter resets after every 16 feedback packets of that class,
+    counted independently per DiffServ class); call this per-class count the
+    load, so a class's first feedback packet in a window has load 1. Before
+    folding, the class's advertised signed feedback for the packet is computed
+    as
+
+        feedback(load) = target_rate / (1 + load) − target_rate / 2
+
+    using integer (floor) division, with target_rate = 1000000 (so the constant
+    offset is target_rate / 2 = 500000). The result is written into the 32-bit
+    field as a two's-complement signed value — a negative value v is stored as
+    2^32 + v — and never wraps beyond 32 bits. Worked examples: load 1 gives
+    1000000 / 2 − 500000 = 0; load 2 gives 1000000 / 3 − 500000 = −166667;
+    load 4 gives 1000000 / 5 − 500000 = −300000.
+
+  - Signed feedback folding. The switch compares the signed feedback the packet
+    already carries with its own signed feedback for the packet's class. If the
+    switch's value is more restrictive (more negative) than the value in the
+    field, it overwrites the field with its own value. If the field already
+    carries a value at least as restrictive (equal or more negative) — i.e. some
+    earlier, busier hop already wrote it — the switch leaves the field untouched.
+    The switch must never make the feedback less negative. Either way the packet
+    is forwarded on its normal forwarding decision; the accounting and folding
+    never change which port a packet leaves on and never drop it.
+
+  Both the P4 program and any table entries are yours to author. The observable
+  behaviour the switch must get right is the signed value left in the feedback
+  field after each packet, the choice never to raise that value, that each
+  DiffServ traffic class is accounted independently, and the bounded packet-count
+  window over which a class's load is maintained.
+test_cases:
+- name: stamp_signed_feedback_on_underutilised_field
+  visibility: public
+  goal_class: G1
+  description: A feedback packet arrives on a cold congestion class carrying a large POSITIVE (under-utilised / least-restrictive) signed feedback value. The switch computes its own signed feedback for the class (which at a cold class is more restrictive — smaller, toward zero or negative) and overwrites the field with that more-restrictive signed value, then forwards on the normal outgoing port. The feedback field is read and written as a signed two's-complement value.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 0
+- name: preserve_more_negative_upstream_feedback
+  visibility: public
+  goal_class: G1
+  description: A feedback packet arrives carrying a value that is ALREADY more restrictive (more NEGATIVE) than this switch's signed feedback — a more-congested upstream hop wrote it. The switch leaves the field UNCHANGED (it never makes the feedback less negative) and forwards the packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 4294167296
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: ordinary_packet_forwarded_unmodified
+  visibility: public
+  goal_class: G1
+  description: An ordinary packet (no feedback shim) to a routable destination is forwarded on its normal outgoing port with no field modified.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: {}
+- name: signal_grows_makes_feedback_more_negative
+  visibility: hidden
+  goal_class: G1
+  description: After the switch handles several feedback packets for one congestion class, a further feedback packet of that class with a least-restrictive (large positive) field is stamped with a MORE NEGATIVE signed value than a cold class would stamp — the signed feedback tracks accumulated load downward (more congested => more negative).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.77
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 4294667296
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+- name: per_dscp_signal_isolation
+  visibility: hidden
+  goal_class: G2
+  description: The congestion signal is keyed on the DiffServ class, NOT the egress port. After warming DSCP class A (on egress port 2) with feedback traffic, a feedback packet of a DIFFERENT DSCP class B (also on egress port 2) with a least-restrictive field is stamped with class B's own near-cold signed feedback — one DSCP class's load does not bleed into another, even on the same egress link.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.77
+        ttl: 64
+        proto: 17
+        tos: 80
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 0
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+- name: window_resets_signal_after_16_packets
+  visibility: hidden
+  goal_class: G2
+  description: The per-class load is maintained over a 16-packet window and resets at the boundary (by packet count, not wall clock). After 16 feedback packets of one DSCP class drive the signed feedback well negative, the 17th packet of that class is stamped with the post-reset (near-cold, back toward zero) signed feedback — the window boundary reset happened.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 0
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+- name: equal_feedback_preserved
+  visibility: hidden
+  goal_class: G2
+  description: A feedback packet whose signed value exactly equals the switch's cold-class signed feedback (zero) is left UNCHANGED — the fold overwrites only when STRICTLY more restrictive (more negative). Forwarded normally.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: no_route_drop
+  visibility: hidden
+  goal_class: G2
+  description: A feedback packet whose destination matches no route is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: drop
+- name: adversary_cannot_make_feedback_less_negative
+  visibility: hidden
+  goal_class: G3
+  description: An adversarial sender presents a feedback packet whose field is ALREADY far more restrictive (much MORE NEGATIVE) than the switch's signed feedback, trying to coerce the switch into raising it toward a less-congested (more positive) value. The switch PRESERVES the more-negative value — it never makes the signed feedback less negative — even against a crafted value.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 4292967296
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: unchanged
+- name: deterministic_signed_stamp_not_qdepth
+  visibility: hidden
+  goal_class: G3
+  description: The same single feedback packet on a cold class is stamped to a fixed deterministic signed value derived from the packet-count signal, not from a queue-depth read (which would be ~0 and run-varying). The expected stamp is bit-identical run to run.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40001
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 0
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) carries no forwarding class and is dropped before any signal update.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.9.9
+        pdst: 10.0.2.50
+  expected:
+    behavior: drop
+- name: udp_non_feedback_port_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A UDP packet on a non-feedback destination port (53, not the feedback demux port) carries no feedback field and is forwarded unmodified — the feedback path is keyed on the specific demux port, not on UDP in general.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: {}
+- name: preserve_branch_then_stamp_branch_consistent
+  visibility: hidden
+  goal_class: G3
+  description: Following a preserve (no-rewrite) packet whose feedback is already more negative, a subsequent feedback packet of the same DSCP class whose field is less negative than the switch's value is still correctly stamped — the no-rewrite branch does not corrupt the deparsed signed feedback header for the later rewrite branch.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 500000
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      RCPFeedback.value:
+        action: change_to
+        value: 4294800629
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.3.50
+        ttl: 64
+        proto: 17
+        tos: 40
+    - UDP:
+        sport: 40000
+        dport: 9999
+    - RCPFeedback:
+        value: 4294067296

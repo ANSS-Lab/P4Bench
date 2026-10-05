@@ -1,0 +1,182 @@
+# P-VLANBridge — 802.1Q VLAN bridge (access/trunk, tag push/pop, per-VLAN fwd)
+#
+# TPL v1.0 task pattern. An IEEE 802.1Q VLAN-aware bridge:
+# access ports impose a PVID tag on ingress and strip it on egress; trunk ports
+# carry tagged frames; forwarding is per-VLAN (a frame in VLAN V only reaches
+# ports in V's member set). The corpus's first L2 task and first 802.1Q tag
+# push/pop. Grounded in IEEE 802.1Q.
+
+pattern_id: P-VLANBridge
+version: "1.0"
+nf_categories:
+  descriptive:  [D9:bridging]
+  prescriptive: [P1:forwarding]
+target_capability: redesign
+summary: >
+  802.1Q VLAN bridge. Access ports are untagged members of one VLAN (their
+  PVID); trunk ports carry 802.1Q-tagged frames for multiple VLANs. On ingress
+  an untagged frame on an access port is associated with the port PVID; a
+  tagged frame on a trunk takes its VLAN from the tag. Forwarding is per-VLAN
+  via an L2 FIB; on egress the tag is PUSHED (to a trunk) or POPPED (to an
+  access port). VLANs are isolated: a frame never egresses a port that is not
+  a member of its VLAN.
+
+grounding:
+  rfcs: []
+  papers: []
+  tutorials:
+    - path: ieee_8021q
+      cite: "IEEE Std 802.1Q-2018, §9.5 / §6.9"
+      role: canonical_spec
+      quote: >-
+        A VLAN tag is inserted following the Source Address field, comprising a
+        Tag Protocol Identifier (TPID) of 0x8100 and Tag Control Information
+        carrying the VLAN Identifier (VID). On reception, a Port classifies each
+        frame to exactly one VLAN: tagged frames by their VID, untagged frames by
+        the Port VLAN Identifier (PVID). A frame is forwarded only through Ports
+        in the member set of its VLAN; the tag is removed on egress through an
+        untagged member Port.
+      grounds: [R0_access_tagged, R0b_trunk_untagged, R1_pvid, R2_vlan_membership, R3_fib_forward]
+      relevance: |
+        IEEE 802.1Q — VLAN tagging. The 4-byte tag (TPID 0x8100, PCP 3b, DEI
+        1b, VID 12b) sits between the Ethernet source and the EtherType. Access
+        (untagged) vs trunk (tagged) port roles, PVID ingress association,
+        per-VLAN member sets, and the ingress-push / egress-pop rules are the
+        normative behaviour R1–R4 realise.
+
+entities:
+  packet:
+    notes: "VLAN derived from the 802.1Q tag (trunk) or the ingress port PVID (access)."
+  port_role:
+    keyed_by_tuple: [port]
+    attrs:
+      role: "enum(access, trunk)"
+      pvid: int                             # for access ports
+      vlans: "list[int]"                    # for trunk ports
+  vlan_fib:                                 # the TPL `bucket` role
+    keyed_by_tuple: [vlan, dst_mac]
+    attrs: {egress_port: port}
+    notes: "Per-VLAN MAC→port table. A miss is an unknown unicast → drop (canonical)."
+
+parameters:
+  port_roles:
+    type: dict[port, role_spec]
+    constraint: "each port is access(pvid) or trunk(vlans)"
+  vlan_fib:
+    type: list[fib_entry]
+    constraint: "each has vlan, dst_mac, egress_port; egress_port is a member of vlan"
+  unknown_unicast_policy:
+    type: enum
+    values: [drop, flood]
+    default: drop
+    notes: "Canonical drops unknown unicast; flood is a mutation."
+  faithfulness:
+    type: enum
+    values: [D9.0_static_fib, D9.1_flood, D9.2_learning]
+    default: D9.0_static_fib
+
+rules:
+  - id: R0_access_tagged_drop
+    when: "ingress_role == access ∧ header_present(dot1q)"
+    then: [drop]
+    notes: "An access port expects untagged frames; a tagged frame is dropped."
+  - id: R0b_trunk_untagged_drop
+    when: "ingress_role == trunk ∧ ¬header_present(dot1q)"
+    then: [drop]
+    notes: "No native VLAN — a trunk expects tagged frames; untagged dropped."
+  - id: R1_resolve_vlan
+    when: "true"
+    then:
+      - "vlan ← (ingress_role == access) ? pvid(ingress_port) : dot1q.vid"
+    notes: "Determine the frame's VLAN from the PVID (access) or the tag (trunk)."
+  - id: R2_vlan_membership_drop
+    when: "ingress_role == trunk ∧ dot1q.vid ∉ vlans(ingress_port)"
+    then: [drop]
+    notes: "A trunk drops VLANs not in its allowed set; an unconfigured VLAN drops."
+  - id: R3_forward_per_vlan
+    when: "exists(vlan_fib, by_key(vlan, hdr.ethernet.dst))"
+    given:
+      entry: by_key(vlan, hdr.ethernet.dst, ${vlan_fib})
+    then:
+      - "if egress_role(entry.egress_port) == trunk: ensure_tag(vlan)   # push if ingress was access"
+      - "if egress_role(entry.egress_port) == access: pop_tag()         # strip the 802.1Q tag"
+      - forward(entry.egress_port)
+    notes: |
+      Per-VLAN L2 forward. The egress port's role decides the tag: trunk egress
+      carries the tag (push it if the frame arrived untagged on an access port);
+      access egress strips it. The Ethernet src/dst MACs are NOT rewritten (this
+      is a bridge, not a router).
+  - id: R4_unknown_unicast
+    when: "¬exists(vlan_fib, by_key(vlan, hdr.ethernet.dst))"
+    then: ["${unknown_unicast_policy}"]
+    notes: "Unknown destination within the VLAN → drop (canonical) or flood to VLAN members."
+
+invariants:
+  - id: vlan_isolation
+    clause: stability
+    target: egress_port
+    while: "rule R3 fires"
+    notes: "A frame only egresses a port in its VLAN's member set (the FIB enforces this)."
+  - id: tag_push_correctness
+    clause: stability
+    target: dot1q.vid
+    while: "egress_role == trunk"
+    notes: "An egress trunk frame carries an 802.1Q tag with the frame's VLAN."
+  - id: tag_pop_correctness
+    clause: stability
+    target: ethernet.etherType
+    while: "egress_role == access"
+    notes: "An egress access frame is untagged — the EtherType is the inner type (e.g. 0x0800)."
+  - id: mac_preservation
+    clause: persistence
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "rule R3 fires"
+    notes: "A bridge does not rewrite MAC addresses."
+
+test_scaffolding:
+  G1:
+    - id: access_ingress_push_to_trunk
+      generate: "Untagged on an access port, dst MAC reachable via a trunk → push PVID tag, forward tagged."
+    - id: trunk_to_access_pop
+      generate: "Tagged on a trunk, dst MAC on an access port → pop tag, forward untagged."
+    - id: trunk_to_trunk_keep_tag
+      generate: "Tagged on a trunk, dst MAC via another trunk → forward with the tag preserved."
+  G2:
+    - id: vlan_isolation_unknown_drop
+      generate: "A dst MAC that exists only in another VLAN is unknown in this VLAN → drop."
+    - id: trunk_unconfigured_vlan_drop
+      generate: "Tagged frame whose VID is not in the trunk's allowed set → drop."
+  G3:
+    - id: access_port_tagged_drop
+      generate: "A tagged frame arriving on an access port → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_flood_unknown
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${unknown_unicast_policy} == drop"
+    effect: "${unknown_unicast_policy} ← flood ∧ ${faithfulness} ← D9.1_flood"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    notes: "Unknown unicast floods to all OTHER member ports of the VLAN (multicast)."
+  - id: enable_mac_learning
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} != D9.2_learning"
+    effect: "${faithfulness} ← D9.2_learning"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    notes: "Learn src MAC→(vlan,port) on ingress instead of a static FIB."
+
+bridging_notes: |
+  Canonical implementation:
+    - Parser: Ether; select(etherType): 0x8100 → parse dot1q then inner; else inner.
+    - ingress_meta.vlan = is_access(port) ? pvid_table(port) : dot1q.vid.
+    - Drop access-tagged and trunk-untagged frames up front.
+    - vlan_fib keyed (vlan, ethernet.dst) → egress_port.
+    - On egress: if the egress port is a trunk, ensure a dot1q tag with vlan
+      (set TPID 0x8100, vid); if access, remove the dot1q tag (set ether.type
+      to the inner type). Do not rewrite MACs.
+  Anti-patterns:
+    * Forwarding across VLANs (ignoring the vlan key).
+    * Leaving the tag on an access-egress frame, or stripping it on a trunk.
+    * Rewriting MAC addresses (router behaviour, not bridging).

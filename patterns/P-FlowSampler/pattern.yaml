@@ -1,0 +1,577 @@
+# P-FlowSampler — sFlow-style 1-in-N Packet Sampling to a Telemetry Collector
+#
+# TPL v1.0 task pattern. A non-destructive packet sampler:
+# a register-backed counter advances on every packet; on every Nth packet the
+# switch clones a copy to a telemetry collector port (the "sample") while the
+# ORIGINAL is forwarded normally to its real egress. This is the data-plane
+# core of sFlow agent sampling (RFC 3176) under the Flow-Selection framework of
+# RFC 7014. Real sFlow randomises the sampling decision; this pattern uses a
+# DETERMINISTIC count-based 1-in-N selector so the sampled subset is gradable
+# in BMv2 `--use-files` (see bridging_notes). Closes the basic-layer sampling
+# gap on the scale_up axis. Instances bind the parameters below.
+
+pattern_id: P-FlowSampler
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry]                          # sampling / measurement export
+  prescriptive: [P9:telemetry]                          # sketches, INT, heavy-hitter, sampling
+target_capability: scale_up                             # scales measurement off the control plane into a per-packet data-plane sampler
+summary: >
+  Non-destructive 1-in-N packet sampling to a telemetry collector: a counter in
+  a register advances on every packet, and when the counter reaches a multiple
+  of the sampling interval ${sample_rate} the switch clones (mirrors) a copy of
+  the packet to the collector port while still forwarding the original to its
+  normal egress. The clone may carry a small sample header recording the
+  sampling rate and a sequence number (RFC 3176 sample datagram fields). The
+  canonical instance is a single global counter sampling every packet stream
+  uniformly; mutation lifts to per-ingress-port / per-flow independent samplers,
+  tightens or loosens the sampling interval, and widens or narrows the
+  sample-header field breadth. Unlike production sFlow the selector is
+  DETERMINISTIC count-based (every Nth) rather than randomised, so the sampled
+  subset is reproducible and gradable in a packet train (RFC 7014 §2.2 calls
+  systematic count-based sampling a valid Selection Process).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC3176
+      sections: ["1", "2", "4", "5.1"]
+      role: normative_behaviour
+      relevance: |
+        InMon Corporation's sFlow: A Method for Monitoring Traffic in Switched
+        and Routed Networks — the canonical sampling agent semantics every
+        rule realises:
+          - §2 / §4  Packet Flow Sampling: the agent maintains a per-instance
+                 packet counter; sampling fires "based on a defined sampling
+                 rate ... an average of 1 in N packets" — basis for R2's
+                 `count_exceeds`-gated mirror and the inc-every-packet counter.
+          - §2   The sampled packet is COPIED to the sFlow agent for export;
+                 the original packet's forwarding is UNAFFECTED — basis for the
+                 sample-is-non-destructive contract (R1 forward always fires,
+                 R2 mirror is additive) and the forward_always invariant.
+          - §5.1 Flow sample datagram carries the sampling_rate and a
+                 sample sequence number (`sample_pool` / sequence) — basis for
+                 the optional sample-header `set` in R2 and the
+                 ${sample_header} feature-breadth parameter.
+        Caveat: §2 specifies RANDOM sampling ("avoids synchronisation");
+        this pattern substitutes a deterministic 1-in-N selector so the
+        sampled subset is reproducible across a packet train (see
+        bridging_notes). RFC 7014 §2.2 admits the count-based variant.
+    - id: RFC7014
+      sections: ["2", "2.2", "3", "6.2.1"]
+      role: normative_behaviour
+      quote: >-
+        Systematic sampling is a deterministic selection function.  It may be
+        a periodic selection of the N-th Flow Record that arrives at the
+        Intermediate Flow Selection Process.
+      quote_source: patterns/P-FlowSampler/grounding/RFC7014.txt
+      relevance: |
+        Flow Selection Techniques — the selection-process framework that names
+        the sampling primitive this pattern implements:
+          - §2   Selection Process: a packet enters the Observation at most
+                 once and the Selector decides Select / not-Select; selected
+                 packets are reported, non-selected packets are otherwise
+                 unaffected — basis for the per-packet inc + select-on-Nth
+                 structure and the non-destructive forward.
+          - §2.2 Property Match / Sampling: "Systematic count-based" Sampling
+                 selects every Nth packet — the deterministic selector this
+                 pattern uses (vs probabilistic, §2.2's "Random" variant),
+                 making the selected subset deterministic and gradable.
+          - §3   Composite techniques: count-based selection composes per
+                 Observation Point (per ingress interface) — basis for the
+                 ${sampler_scope} per-port / per-flow independent-counter
+                 mutation axis.
+
+  papers: []
+  tutorials: []
+  posts: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    type: packet
+    notes: |
+      Atomic; the forwarding decision derives from the control-plane FIB /
+      static egress map. Every packet both advances the sampler counter and is
+      forwarded; a subset is additionally cloned to the collector.
+
+  flow:
+    type: flow
+    key:
+      - hdr.ipv4.srcAddr
+      - hdr.ipv4.dstAddr
+      - hdr.ipv4.protocol
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    enforced_when: "${sampler_scope} == per_flow"
+    notes: |
+      Flow tuple used ONLY when ${sampler_scope} == per_flow to select which
+      independent counter cell advances (RFC 7014 §3 per-Observation-Point
+      selection). Not materialised as forwarding state.
+
+  sampler:                                # the TPL `bucket` role
+    type: bucket
+    keyed_by: "${sampler_scope}"          # global → 1 cell; per_port → indexed by ingress_port; per_flow → indexed by hash(flow)
+    attrs:
+      counter:       int                  # monotone packet count since last reset; reg cell
+      sample_seq:    int                  # number of samples emitted (sample sequence number, RFC 3176 §5.1)
+    capacity: ${sampler_cells}
+    notes: |
+      The packet counter(s). Global scope is a single cell; per_port indexes
+      the cell by std.ingress_port; per_flow indexes by a hash of the flow
+      tuple into ${sampler_cells} cells. inc on every packet (R1); the
+      count_exceeds-style modulo test gates the mirror (R2).
+
+  collector:                              # a `link`-keyed export target
+    type: link
+    keyed_by_tuple: [collector_port]
+    attrs:
+      collector_port: port                # the telemetry egress the clone is sent to
+    notes: |
+      Where the cloned sample is delivered. A single static collector port in
+      the canonical instance; observable in --use-files as the port carrying
+      the duplicate packet.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  egress_map:
+    type: list[fwd_entry]
+    constraint: |
+      every entry maps a destination key (e.g. hdr.ipv4.dstAddr exact/LPM) to
+      an egress port; covers the normal forwarding path the sample is taken
+      alongside. A default/static egress is permitted.
+    notes: "Control-plane forwarding table. The sampler is orthogonal to it."
+
+  sample_rate:
+    type: int
+    range: "[2, 65536]"
+    default: 4
+    notes: |
+      The sampling interval N: the switch samples 1-in-N packets, i.e. fires a
+      clone when (counter mod N) == 0. Smaller N = more samples = easier to
+      observe; larger N stresses the modulo arithmetic over a longer train.
+      RFC 3176 §2 "1 in N". Must be ≥ 2 (N==1 would sample every packet).
+
+  collector_port:
+    type: port
+    constraint: "a valid egress port distinct from any forwarding egress in normal tests"
+    notes: "Telemetry collector egress; the clone's destination (RFC 3176 §2)."
+
+  sampler_scope:
+    type: enum
+    values: [global, per_port, per_flow]
+    default: global
+    notes: |
+      global   → one shared counter for all packets (canonical instance).
+      per_port → independent counter per std.ingress_port (RFC 7014 §3
+                 per-Observation-Point selection).
+      per_flow → independent counter per flow tuple, hashed into ${sampler_cells}.
+
+  sampler_cells:
+    type: int
+    range: "[1, 65536]"
+    default: 1
+    constraint: "global ⇒ 1; per_port ⇒ ≥ #ingress_ports; per_flow ⇒ ≥ 2"
+    notes: "Number of independent counter cells. shrink/enlarge operators move this."
+
+  sample_header:
+    type: enum
+    values: [none, rate_only, rate_seq]
+    default: none
+    notes: |
+      Feature breadth of the cloned sample's tag (RFC 3176 §5.1 datagram
+      fields):
+        none     → clone is a verbatim copy of the original packet.
+        rate_only→ clone prepends a sample tag carrying the sampling_rate N.
+        rate_seq → clone's tag carries sampling_rate N AND the sample sequence
+                   number (sample_seq), incremented per emitted sample.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32]
+    default: crc16
+    enforced_when: "${sampler_scope} == per_flow"
+    notes: "Hash family for the per-flow cell index (RFC 7014 §3)."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_count_based, D5.1_per_scope, D5.2_scaled_cells]
+    default: D5.0_count_based
+    notes: |
+      Sampling-selector fidelity ladder. D5.0 is the deterministic global
+      count-based selector (the gradable substitute for RFC 3176's random
+      selector). D5.1 partitions the selector per scope; D5.2 scales the cell
+      array. The selector is NEVER probabilistic in any band (ungradable).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics, but R1 and R2 are ADDITIVE on the same packet: R1
+# always advances the counter and forwards the original; R2 additionally clones
+# when the count hits the interval. The original is never suppressed by R2.
+
+rules:
+
+  - id: R1_count_and_forward
+    when: "header_present(ipv4)"
+    given:
+      sampler: by_key(${sampler_scope}, std.ingress_port, flow, ${hash_algo})
+      egress:  by_lookup(hdr.ipv4.dstAddr, ${egress_map})
+    then:
+      - inc(sampler.counter)
+      - forward(egress)
+    notes: |
+      Every IPv4 packet advances its sampler counter (RFC 7014 §2 — each packet
+      enters the Selection Process exactly once) and is forwarded normally
+      (RFC 3176 §2 — sampling does not affect the original's forwarding). For
+      sampler_scope==global the cell is the single shared counter; per_port
+      uses std.ingress_port as the index; per_flow uses hash(flow). The forward
+      target is the normal data-plane egress, independent of the sampler.
+
+  - id: R2_sample_clone
+    when: |
+      header_present(ipv4)
+        ∧ count_exceeds(sampler.counter mod ${sample_rate}, 0)¬
+    given:
+      sampler:   by_key(${sampler_scope}, std.ingress_port, flow, ${hash_algo})
+      collector: by_key(${collector_port})
+    then:
+      - "set(meta.sample_rate, ${sample_rate})            IF ${sample_header} != none"
+      - "inc(sampler.sample_seq)                          IF ${sample_header} == rate_seq"
+      - "set(meta.sample_seq, sampler.sample_seq)         IF ${sample_header} == rate_seq"
+      - mirror(${collector_port})
+    notes: |
+      The sampling fire. After R1 has advanced the counter, if the counter is
+      an exact multiple of N (counter mod N == 0) the switch mirrors/clones a
+      COPY of the packet to the collector port (RFC 3176 §2 — 1 in N copied to
+      the agent). The `count_exceeds(... mod N, 0)¬` form reads "the modulo
+      residue is NOT greater than 0", i.e. residue == 0 — the deterministic
+      every-Nth selector (RFC 7014 §2.2 systematic count-based). The clone is
+      ADDITIVE: the original packet from R1 is still forwarded on its egress.
+      Optionally the clone carries a sample tag (sampling_rate, sample_seq) per
+      ${sample_header} (RFC 3176 §5.1). The selector is deterministic, never
+      random (gradability; see bridging_notes).
+
+  - id: R3_non_ipv4_forward
+    when: "¬header_present(ipv4)"
+    given:
+      egress: by_lookup_l2(${egress_map})
+    then:
+      - forward(egress)
+    notes: |
+      Non-IPv4 frames are forwarded but NOT sampled (the sampler keys on the
+      IPv4 flow / packet stream). Keeps the counter from advancing on traffic
+      outside the sampled Observation (RFC 7014 §2 Observation scope).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: forward_always
+    clause: persistence
+    target: original_packet_forwarded
+    while: "rule R1 fires"
+    free_under: []
+    notes: |
+      RFC 3176 §2 — sampling is NON-DESTRUCTIVE: the original packet is always
+      forwarded on its normal egress regardless of whether it was also sampled.
+      Anti-pattern: cloning to the collector INSTEAD of forwarding (drops the
+      original), or routing the original to the collector port.
+
+  - id: counter_quantum_one
+    clause: stability
+    target: sampler.counter_increment
+    while: "rule R1 fires"
+    notes: |
+      The counter advances by EXACTLY one per packet (RFC 7014 §2 — each packet
+      enters the Selection Process once). Double-inc (ingress + egress, or
+      counting the clone as a separate packet) corrupts the 1-in-N spacing.
+
+  - id: sample_spacing_correctness
+    clause: stability
+    target: sample_emission_decision
+    while: "rule R2 evaluated"
+    notes: |
+      Across a packet train, a clone is emitted on EXACTLY the packets whose
+      post-increment counter is a multiple of ${sample_rate} (every Nth), and
+      on no others. Sampling on counter>threshold, off-by-one (Nth±1), or a
+      non-modulo comparison splits the spacing — the core gradable property.
+
+  - id: sample_is_copy_not_move
+    clause: persistence
+    target: "(hdr.ipv4.srcAddr, hdr.ipv4.dstAddr, payload)"
+    while: "rule R2 fires"
+    free_under: [sample_header_prepend]
+    notes: |
+      The cloned sample preserves the original packet's headers/payload (it is
+      a copy), except for an optional prepended sample tag under
+      ${sample_header}. The clone MUST NOT mutate the in-flight original.
+
+  - id: per_scope_independence
+    clause: stability
+    target: chosen_sampler_cell
+    while: "rule R1 fires ∧ ${sampler_scope} != global"
+    enforced_when: "${sampler_scope} != global"
+    notes: |
+      RFC 7014 §3 — when scoped, each ingress port (per_port) or flow
+      (per_flow) advances ONLY its own counter; cross-scope packets must not
+      share a cell. Using one global counter under a scoped seed mis-spaces
+      every scope's samples.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_original_always
+      generate: |
+        Send a single IPv4 packet matching an egress entry. Assert: the
+        original is forwarded on its normal egress with headers unchanged
+        (sampling is non-destructive; RFC 3176 §2). At N≥2 a single packet is
+        NOT sampled — assert NO clone appears on the collector port.
+    - id: sample_on_nth_packet
+      generate: |
+        Send a train of exactly ${sample_rate} identical IPv4 packets. Assert:
+        all N are forwarded on the normal egress, AND exactly ONE clone appears
+        on the collector port (on the Nth packet, counter mod N == 0).
+    - id: sample_spacing_two_periods
+      generate: |
+        Send a train of 2*${sample_rate} packets. Assert: exactly TWO clones on
+        the collector port, on the Nth and 2Nth packets (deterministic
+        every-Nth spacing; RFC 7014 §2.2). No clone on any other packet.
+    - id: sample_header_fields
+      requires: "${sample_header} != none"
+      generate: |
+        With ${sample_header} != none, send a train of ${sample_rate} packets;
+        on the emitted clone assert the sample tag carries sampling_rate ==
+        ${sample_rate} (and, for rate_seq, sample_seq == 1 on the first
+        clone, 2 on the second). RFC 3176 §5.1.
+    - id: per_scope_independent_counters
+      requires: "${sampler_scope} != global"
+      generate: |
+        Send ${sample_rate}-1 packets into scope A and ${sample_rate} packets
+        into scope B (distinct ingress port or flow). Assert: scope B emits one
+        clone (its counter hit N) and scope A emits none (its counter is N-1);
+        the counters did not bleed across scopes (RFC 7014 §3).
+
+  G2:
+    - id: sample_rate_one_below_period
+      generate: |
+        Send a train of ${sample_rate}-1 packets. Assert: all forwarded, ZERO
+        clones (counter never reaches a multiple of N) — the off-by-one
+        boundary of the modulo selector.
+    - id: long_train_modulo_wrap
+      generate: |
+        Send a long train (e.g. 4*${sample_rate}+1 packets). Assert: exactly 4
+        clones, on packets N,2N,3N,4N, and none on the trailing +1 — the
+        modulo arithmetic holds across multiple periods and is not a one-shot.
+    - id: non_ipv4_not_sampled
+      generate: |
+        Interleave a non-IPv4 frame (ARP / raw) into the train. Assert: it is
+        forwarded but does NOT advance the sampler counter and is never cloned
+        (R3); the IPv4 sample spacing is unaffected by it.
+
+  G3:
+    - id: collector_not_a_forwarding_sink
+      generate: |
+        Send a normal IPv4 packet NOT on a sampled boundary. Assert: nothing
+        appears on the collector port (the collector receives ONLY sampled
+        clones, never mis-routed originals — guards forward_always /
+        sample-is-copy bypass).
+    - id: deparser_conditional_clone_bug
+      generate: |
+        On a sampled packet with ${sample_header} != none, assert the clone is
+        emitted WITH its sample header AND the original (un-tagged) is still
+        forwarded. Probes the v1model conditional-deparser bug (emitting a
+        header on one copy but corrupting/duplicating it on the other) and the
+        clone/recirculation metadata bug (clone3 session not carrying the
+        sample fields). Bug-driven: deparser-conditional + clone-extern misuse.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  # ── axis: faithfulness (sampling interval / selector fidelity) ───────────
+  - id: tighten_sample_rate_4x
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${sample_rate} <= 16384"
+    effect: "${sample_rate} ← ${sample_rate} * 4"
+    feasibility_postcondition: "${sample_rate} ≤ 65536"
+    notes: |
+      Rarer sampling: a longer train must pass before a clone fires, stressing
+      the modulo selector and counter width over many periods. Harden on the
+      sampling-interval (selector-fidelity) axis.
+
+  - id: loosen_sample_rate_4x
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${sample_rate} >= 8"
+    effect: "${sample_rate} ← ${sample_rate} / 4"
+    feasibility_postcondition: "${sample_rate} ≥ 2"
+    notes: |
+      Denser sampling: clones fire more often in a short train, easier to
+      observe. Ease counterpart of tighten_sample_rate_4x on the same axis.
+
+  # ── axis: feature-breadth (sample-header surface) ────────────────────────
+  - id: widen_sample_header
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${sample_header} != rate_seq"
+    effect: |
+      ${sample_header} ← (none → rate_only, rate_only → rate_seq).
+      rate_seq adds the per-sample sequence-number state (sampler.sample_seq)
+      to the clone, activating the sample_header_fields G1 case at rate_seq.
+    feasibility_postcondition: "${sample_header} ∈ {rate_only, rate_seq}"
+    notes: |
+      Adds sample-datagram fields to the clone (RFC 3176 §5.1). rate_seq forces
+      a second piece of register state (the sample sequence) and exercises the
+      clone metadata-carry path. Harden on the feature-breadth axis.
+
+  - id: narrow_sample_header
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${sample_header} != none"
+    effect: "${sample_header} ← (rate_seq → rate_only, rate_only → none)"
+    feasibility_postcondition: "${sample_header} ∈ {none, rate_only}"
+    notes: |
+      Drops sample-tag fields; `none` makes the clone a verbatim copy (no
+      deparser/clone-metadata work). Ease counterpart of widen_sample_header.
+
+  # ── axis: feature-breadth (sampler scope: global vs per-scope) ───────────
+  - id: scope_per_observation_point
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${sampler_scope} == global"
+    effect: |
+      ${sampler_scope} ← per_port ∧
+      ${sampler_cells} ← max(${sampler_cells}, #ingress_ports) ∧
+      ${faithfulness} ← D5.1_per_scope.
+      Activates per_scope_independence and the per_scope_independent_counters
+      G1 case (independent counter per ingress port; RFC 7014 §3).
+    feasibility_postcondition: "${sampler_cells} ≥ 2"
+    notes: |
+      Lifts from one global counter to independent per-ingress-port counters —
+      a register array indexed by std.ingress_port. Harden on feature-breadth
+      (the per-Observation-Point selection surface of RFC 7014 §3).
+
+  - id: unscope_to_global
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${sampler_scope} != global"
+    effect: |
+      ${sampler_scope} ← global ∧ ${sampler_cells} ← 1 ∧
+      ${faithfulness} ← D5.0_count_based.
+      Removes per_scope_independence and the per-scope G1 case.
+    feasibility_postcondition: "${sampler_cells} == 1"
+    notes: |
+      Collapses to a single shared counter (canonical instance). Ease
+      counterpart of scope_per_observation_point on the same axis.
+
+  # ── axis: faithfulness (per-flow hashed cells) ───────────────────────────
+  - id: scope_per_flow_hashed
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${sampler_scope} == per_port"
+    effect: |
+      ${sampler_scope} ← per_flow ∧ ${faithfulness} ← D5.2_scaled_cells ∧
+      ${sampler_cells} ← max(${sampler_cells}, 16).
+      Counter cell indexed by hash(flow tuple) into ${sampler_cells}; sampling
+      is now per-flow (RFC 7014 §3 composite per-flow selection).
+    feasibility_postcondition: "${sampler_cells} ≥ 2 ∧ ${hash_algo} ∈ {crc16, crc32}"
+    notes: |
+      Hash-indexed per-flow counters: introduces hash-collision aliasing of the
+      counter, the hardest faithfulness rung. Harden on faithfulness (selector
+      partitioning / cell fidelity).
+
+  - id: coarsen_per_flow_to_per_port
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${sampler_scope} == per_flow"
+    effect: "${sampler_scope} ← per_port ∧ ${faithfulness} ← D5.1_per_scope"
+    feasibility_postcondition: "${sampler_scope} == per_port"
+    notes: |
+      Drops the per-flow hash indexing back to a direct per-port index (no
+      collision aliasing). Ease counterpart of scope_per_flow_hashed.
+
+  # ── axis: capacity (counter-cell array depth) ────────────────────────────
+  - id: shrink_sampler_cells_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${sampler_scope} == per_flow ∧ ${sampler_cells} > 8"
+    effect: "${sampler_cells} ← ${sampler_cells} / 4"
+    feasibility_postcondition: "${sampler_cells} ≥ 2"
+    notes: |
+      Fewer per-flow cells ⇒ more hash collisions ⇒ flows alias onto a shared
+      counter, stressing per_scope_independence. Harden on capacity.
+
+  - id: enlarge_sampler_cells_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${sampler_scope} == per_flow ∧ ${sampler_cells} < 32768"
+    effect: "${sampler_cells} ← ${sampler_cells} * 2"
+    feasibility_postcondition: "${sampler_cells} ≤ 65536"
+    notes: |
+      More cells ⇒ fewer collisions ⇒ cleaner per-flow independence. Ease
+      counterpart of shrink_sampler_cells_4x on the capacity axis.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common v1model P4 implementations:
+
+    Canonical (sampler_scope: global, sample_header: none, sample_rate: 4):
+      - One register<bit<W>>(${sampler_cells}) counter array. On every IPv4
+        packet (R1): counter[idx] = counter[idx] + 1, then write back; idx is
+        0 for global, std.ingress_port for per_port, hash(flow) for per_flow.
+      - The 1-in-N test: if (counter[idx] % N == 0) clone to the collector.
+        In BMv2, modulo by a NON-power-of-two N is legal only against a
+        compile-time-known N; non-const `%` is a known p4c slip — prefer a
+        register that resets at N (counter = (counter+1==N) ? 0 : counter+1)
+        and clone when the reset fires, which avoids `%` entirely.
+      - The clone uses clone3 / clone_preserving_field_list (CloneType.I2E or
+        E2E) with a clone session id mapped (via simple_switch_CLI
+        `mirroring_add <sid> <collector_port>`) to the collector egress. The
+        ORIGINAL continues on its normal egress_spec — the clone is additive.
+      - Normal forwarding (R1 forward / R3) is a standard exact/LPM egress map;
+        the sampler is orthogonal to it.
+      - sample_header rate_only/rate_seq: a custom sample header set on the
+        CLONED copy only (guard the deparser emit on a "is_clone" / instance_type
+        metadata flag); sample_seq is a second register cell inc'd per emit.
+
+  Gradability contract (BMv2 --use-files):
+    * The harness feeds a TRAIN of packets and observes two ports: the normal
+      egress (every original) and the collector port (one clone per N packets).
+    * The selector MUST be deterministic count-based (every Nth). RFC 3176 §2
+      specifies RANDOM sampling; a probabilistic selector is UNGRADABLE here
+      because the sampled subset would vary run-to-run. The pattern uses 1-in-N
+      systematic count-based sampling (RFC 7014 §2.2), which fixes exactly which
+      packets are sampled given the input train — the gradable substitute.
+    * NO time_tick: the counter advances on received packets only; there is no
+      periodic/timed sampling (the v1.0 harness injects no time ticks).
+
+  Anti-pattern implementations to reject:
+    * Cloning the packet to the collector INSTEAD of forwarding the original
+      (sampling must be non-destructive — RFC 3176 §2).
+    * A probabilistic / random()-gated sample decision (ungradable).
+    * Counting the clone as a separate packet (double-inc) — breaks 1-in-N.
+    * Sampling on counter > N (one-shot) instead of counter % N == 0 (periodic).
+    * Conditional deparser that emits the sample header on the original too,
+      or fails to carry the sample fields onto the clone (clone metadata bug).
+    * A single global counter under a per_port / per_flow seed (cross-scope
+      counter bleed — RFC 7014 §3).
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance and hand-run
+  the public tests through the oracle for the seed; confirm the collector port
+  carries exactly ceil(train_len / N) clones and the normal egress carries
+  every original.

@@ -1,0 +1,107 @@
+{
+  "oracle_hash": "f2644b3f81ba3294c2bd664271bffaf06fc7bb14a04d5bfaaf519f36528de980",
+  "instance": "three_color_marker_anchor-default",
+  "ran_at": "2026-05-30T21:18:23.259722Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "green_cold_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_remark_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_drop_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "pbs_shrunk_reds",
+        "status": "pass"
+      },
+      {
+        "example_id": "cbs_rebind_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "color_aware_precolor_red_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "per_flow_isolation_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "aggregate_shared_reds",
+        "status": "pass"
+      },
+      {
+        "example_id": "exact_token_boundary_not_red",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_consumes_nothing",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "bucket_saturation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "red_consumes_nothing": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "peak_dominates_committed": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "color_downgrade_only": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "bucket_saturation",
+      "red_consumes_nothing",
+      "peak_dominates_committed",
+      "color_downgrade_only"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2698",
+      "RFC2697"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

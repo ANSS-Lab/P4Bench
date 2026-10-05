@@ -1,0 +1,603 @@
+# P-InNetworkSequencer — In-Network Sequencer (NOPaxos / Eris)
+#
+# TPL v1.0 task pattern, extracted from the cited sources. This pattern
+# occupies the (D10:distributed-systems-primitives, P10:in-network-compute)
+# cell of the NF design-space map and is a `relocate`-frontier pattern: the global
+# sequencing point of a replicated state-machine protocol — classically a
+# dedicated coordinator/sequencer host — is relocated INTO the switch. On the
+# ordered multicast path the switch stamps a globally-monotonic sequence
+# number onto each request so every replica applies requests in one identical
+# order (NOPaxos's Ordered Unreliable Multicast, OUM), turning ordering from a
+# round of agreement into a single read-modify-write of a register.
+
+pattern_id:        P-InNetworkSequencer
+version:           "1.0"
+nf_categories:                                            # NF-category tags (ID:name pairs)
+  descriptive:  [D10:distributed-systems-primitives]      # in-network consensus, lock service, coordination
+  prescriptive: [P10:in-network-compute]                  # aggregation, reduction; SwitchML-style — `relocate` row
+target_capability: relocate                               # relocates the coordinator-side sequencer down into the switch
+
+summary: >
+  In-network ordered multicast: the switch keeps a globally-monotonic
+  sequence counter per sequencing group (identified by a destination
+  multicast group / session id), and on every packet of the sequenced
+  traffic class it read-increments that counter and stamps the new value
+  into a dedicated sequence-number header field before multicasting the
+  packet to the replica group — so all replicas observe one identical
+  request order (NOPaxos OUM). Non-sequenced traffic forwards untouched and
+  must NOT consume a sequence number. The canonical instance is a single
+  sequencing group with a strictly-monotonic counter and a session-epoch
+  stamp; mutation lifts to multiple independent per-group counters, a
+  drop-on-non-sequenced strictness policy, wider sequence-space / epoch
+  semantics, and a faithfulness ladder from exact monotonic counting to
+  windowed / approximate ordering. Every decision is observable on emitted
+  packets — drop / forward / egress (multicast) / the stamped sequence and
+  session fields across a packet train — so the monotone counter is graded
+  packet-driven, with no reliance on wall-clock timers.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+
+    - cite: nopaxos_osdi16
+      role: canonical_implementation
+      quote: "Ordered Multicast: The network supports a multicast operation such that if two messages, m and m′, are multicast to a set of processes, R, then all processes in R that receive m and m′ receive them in the same order."
+      quote_source: "NOPaxos §3 Ordered Unreliable Multicast (verbatim; cached at patterns/P-InNetworkSequencer/grounding/nopaxos_osdi16.txt). Grounds the per-group monotonic sequence-stamp (R2) and the seq_monotonicity / per_group_isolation ordering invariants."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        NOPaxos — "Just Say NO to Paxos Overhead: Replacing Consensus with
+        Network Ordering" (Li et al., OSDI '16) — is the textbook in-network
+        sequencer. It splits consensus into Ordered Unreliable Multicast
+        (OUM): a single sequencer on the path to a replica group stamps a
+        strictly-increasing sequence number onto every multicast message,
+        and the replicas then run a lightweight ordered-but-unreliable
+        protocol on top. Li et al. realise the sequencer in the network
+        device itself (a programmable switch / middlebox) as a counter that
+        is read-incremented and written into a sequence-number header field
+        on the multicast path. This is the source of: the per-group
+        monotonic counter (the `bucket` entity), the read-increment-stamp
+        rule (R2 — `inc` then `set` the seqno field), the multicast forward
+        to the replica group (`forward(group)`), the session/epoch stamp
+        that lets replicas detect a sequencer reset, and the core
+        monotonicity + per-group-isolation invariants. NOPaxos's "the
+        sequencer only orders the OUM traffic class" is the source of R0
+        (non-sequenced traffic forwards without consuming a number).
+
+    - cite: eris_sosp17
+      role: scaling_approach
+      relevance: |
+        Eris — "Fast Distributed Transactions and Strongly Consistent
+        Replication for OLTP Database Systems" (Li et al., SOSP '17) —
+        generalises the single-sequencer idea to MULTIPLE independent
+        sequencing groups: an in-network "sequencer" assigns a multi-stamp,
+        one monotone counter PER shard/group, so independent groups order in
+        parallel without a global bottleneck, and a transaction touching
+        several groups carries one stamp per group. This is the source of
+        the multi-group lift (the `n_groups` capacity axis and the
+        `enable_multi_group` operator), the per-group counter isolation
+        invariant (`per_group_isolation`), and the epoch/session component
+        of the stamp used to recover after a sequencer failover. It also
+        motivates the `sequencing_class` selectivity: only the designated
+        ordered traffic is stamped; everything else is forwarded untouched.
+
+  # No IETF RFC defines an in-network sequencer / ordered unreliable
+  # multicast, and the upstream p4lang/tutorials repository ships no
+  # sequencer exercise — both lists are intentionally empty: nothing is
+  # cited that was not read. The concrete header-field layout and BMv2
+  # register/mcast mapping are common-knowledge gap-fills recorded in `bridging_notes`.
+  rfcs:                  []
+  tutorials:             []
+  posts:                 []
+
+# ─── Entities (pick from the 8 entity types) ────────────────────────────────
+
+entities:
+
+  packet:                       # per-packet, stateless — the request to be ordered
+    key:
+      - hdr.seq.group_id        # which sequencing group / replica set this request targets
+    attrs:
+      seq_no:  int              # the sequence-number field the switch STAMPS (output)
+      session: int              # session/epoch id the switch stamps alongside seq_no
+    notes: |
+      The on-the-wire request. The sequencing header is modelled as
+      `hdr.seq`; the implementation chooses the concrete wire encoding (custom
+      ethertype, or UDP-encapsulated, with a dedicated seq_no + session
+      field). group_id selects WHICH counter to read-increment; seq_no and
+      session are write-only outputs the switch overwrites on the sequenced
+      path. A request matches the sequenced class via ${sequencing_class}.
+
+  bucket:                       # aggregate state across the class: the monotone counter, one per group
+    key:
+      - hdr.seq.group_id
+    attrs:
+      counter:  int             # last sequence number handed out for this group (monotone, never decreases)
+      session:  int             # current session/epoch for this group (stamped into every ordered packet)
+    capacity: ${n_groups}
+    notes: |
+      The sequencer state. There is ONE counter per sequencing group; a
+      request's group_id indexes it. The contract is read-increment-stamp:
+      counter ← counter + 1, then stamp that value into hdr.seq.seq_no.
+      The implementation realises this as a register array indexed by group_id
+      (a register `counter[n_groups]` plus a `session[n_groups]`), with the
+      cold-start convention that an untouched counter reads 0 and the first
+      stamped value is 1. seq_no values are per-group; two groups advance
+      independently (Eris multi-stamp).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  sequencing_class:
+    type: function
+    constraint: |
+      a predicate over header fields selecting the ordered traffic class
+      (e.g. header_present(seq) ∧ match(hdr.seq.type, REQUEST)). Only
+      packets satisfying it are stamped + ordered.
+    notes: "Defines WHICH packets the sequencer orders (NOPaxos OUM class)."
+
+  replica_group:
+    type: int
+    notes: |
+      The multicast group id the sequenced request is replicated to (the
+      replica set). The canonical instance maps every sequencing group to
+      one replica multicast group; the implementation installs the mcast_grp
+      member set.
+
+  group_id_map:
+    type: dict[int, int]
+    constraint: "maps each hdr.seq.group_id to its replica multicast group id"
+    notes: |
+      Control-plane binding of sequencing-group → replica multicast group.
+      With ${n_groups}==1 this is the single {0: ${replica_group}} entry.
+
+  n_groups:
+    type: int
+    range: "[1, 4096]"
+    default: 1
+    notes: |
+      Number of independent monotone counters / sequencing groups (Eris
+      multi-stamp). 1 → single global sequencer (canonical, NOPaxos);
+      >1 → per-group isolated counters. enlarge/shrink operators move this.
+
+  seq_width_bits:
+    type: int
+    range: "[8, 64]"
+    default: 32
+    notes: |
+      Width of the sequence-number space. A narrow space exercises the
+      counter-wrap boundary (seq_no rolls 2^width-1 → next); 32 is the
+      no-wrap-in-test canonical value.
+
+  non_sequenced_policy:
+    type: enum
+    values: [forward, drop]
+    default: forward
+    notes: |
+      Behaviour on a packet OUTSIDE ${sequencing_class}. forward → pass
+      untouched without consuming a sequence number (NOPaxos: only OUM
+      traffic is ordered). drop → strict sequencer that admits only the
+      ordered class. The non-sequenced packet MUST NOT advance any counter
+      under either policy.
+
+  stamp_session:
+    type: bool
+    default: true
+    notes: |
+      When true, R2 also stamps hdr.seq.session from the group's session
+      attribute so replicas can detect a sequencer reset/failover
+      (NOPaxos session, Eris epoch). When false, only seq_no is stamped.
+
+  reset_session_on_request:
+    type: enum
+    values: [REQUEST]            # the control-message type that bumps the session/epoch
+    notes: |
+      Message type that, when ${stamp_session}, increments the group's
+      session and restarts its counter (a sequencer failover / view change).
+      Modelled as a distinguished hdr.seq.type value; gated by
+      ${enable_session_reset}.
+
+  enable_session_reset:
+    type: bool
+    default: false
+    notes: |
+      When true, R-Reset fires on a session-reset control message: bump the
+      group's session and zero its counter (NOPaxos view change / Eris
+      epoch advance). When false, the session is static.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_exact_monotone, D5.1_windowed, D5.2_approximate]
+    default: D5.0_exact_monotone
+    notes: |
+      D5.0_exact_monotone → seq_no strictly increases by EXACTLY 1 per
+        ordered packet, no gaps, no reuse (canonical).
+      D5.1_windowed       → ordering correct within a bounded reorder
+        window (gaps tolerated, monotone non-decreasing).
+      D5.2_approximate    → best-effort counting; monotone only, magnitude
+        of increment unconstrained. Relaxes the stamp-exactness invariant.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R_malformed_drop
+    when: "¬header_present(seq)"
+    then:
+      - drop
+    notes: |
+      The pattern orders the sequencing header's traffic only. A frame with
+      no parsed sequencing header is malformed for this NF and dropped. (A
+      deployment that tunnels non-sequenced traffic past the switch would
+      model it as a separate ether-type forwarded by R0; here the harness
+      sees only seq-bearing frames, so absence is malformed.)
+
+  - id: R_session_reset
+    when: |
+      header_present(seq) ∧ match(hdr.seq.type, ${reset_session_on_request})
+    enforced_when: "${enable_session_reset} ∧ ${stamp_session}"
+    given:
+      bucket: by_key(hdr.seq.group_id)
+    then:
+      - inc(bucket.session)
+      - set(bucket.counter, 0)
+      - rewrite(hdr.seq.session, bucket.session)
+      - rewrite(hdr.seq.seq_no, bucket.counter)
+      - forward(group_id_map[hdr.seq.group_id])
+    notes: |
+      NOPaxos view change / Eris epoch advance: a session-reset control
+      message bumps the group's session/epoch and restarts its counter at
+      0, so replicas discard the previous session's order. The reset
+      message is itself multicast to the replica group carrying the new
+      session and seq_no==0.
+
+  - id: R0_non_sequenced_forward
+    when: |
+      header_present(seq) ∧ ¬${sequencing_class}
+    enforced_when: "${non_sequenced_policy} == forward"
+    then:
+      - forward(group_id_map[hdr.seq.group_id])
+    notes: |
+      NOPaxos: only the OUM traffic class is ordered. Traffic outside
+      ${sequencing_class} is forwarded UNTOUCHED — crucially it MUST NOT
+      read-increment any counter or alter seq_no. Active only when
+      ${non_sequenced_policy}==forward; under the drop policy R_non_seq_drop
+      below supersedes it.
+
+  - id: R_non_sequenced_drop
+    when: |
+      header_present(seq) ∧ ¬${sequencing_class}
+    enforced_when: "${non_sequenced_policy} == drop"
+    then:
+      - drop
+    notes: |
+      Strict-sequencer policy: a packet outside the ordered class is
+      dropped (admission control). Still MUST NOT advance any counter.
+
+  - id: R2_sequence_stamp_multicast
+    when: |
+      header_present(seq) ∧ ${sequencing_class}
+    given:
+      bucket: by_key(hdr.seq.group_id)
+    then:
+      - inc(bucket.counter)
+      - rewrite(hdr.seq.seq_no, bucket.counter)
+      - set(hdr.seq.session, bucket.session)
+      - forward(group_id_map[hdr.seq.group_id])
+    notes: |
+      The canonical sequencing step (NOPaxos OUM). Read-increment the
+      group's monotone counter, stamp the NEW value into hdr.seq.seq_no,
+      stamp the group's session (when ${stamp_session}), and multicast the
+      request to the replica group so every replica observes the same
+      ordered stream. Cold start: an untouched counter is 0, so the first
+      stamped seq_no for a group is 1. The increment is by EXACTLY one under
+      D5.0_exact_monotone. seq_no/session are the only header fields written;
+      the request payload is preserved.
+
+# ─── Invariants (pick from the 6 invariant clauses) ─────────────────────────
+
+invariants:
+
+  - id: seq_monotonicity
+    clause: stability
+    target: hdr.seq.seq_no
+    while: "rule R2_sequence_stamp_multicast fires"
+    notes: |
+      Within one sequencing group, the stamped seq_no STRICTLY increases
+      across the ordered packet train (NOPaxos: a globally-monotonic
+      sequence). Under D5.0_exact_monotone the increment is exactly +1 with
+      no gaps and no reuse; under D5.1_windowed it is non-decreasing within
+      the reorder window. Graded packet-driven across a train, no timer.
+
+  - id: counter_persistence_off_class
+    clause: persistence
+    target: bucket.counter
+    while: "rule R0_non_sequenced_forward fires ∨ rule R_non_sequenced_drop fires"
+    free_under: []
+    notes: |
+      A non-sequenced packet MUST NOT change any group's counter. The
+      classic implementation bug is incrementing the register on the common path
+      (before the class test) so non-ordered traffic burns sequence
+      numbers; the off-class-then-sequenced interleaving test pins it.
+
+  - id: per_group_isolation
+    clause: persistence
+    target: bucket.counter
+    while: "rule R2_sequence_stamp_multicast fires ∧ ${n_groups} > 1"
+    enforced_when: "${n_groups} > 1"
+    free_under: ["the addressed group's own counter"]
+    notes: |
+      Eris multi-stamp: stamping group g advances ONLY g's counter; every
+      other group's counter is unchanged. A single shared counter across
+      groups (one register cell, group_id ignored as index) violates this —
+      the interleaved-two-group test pins it.
+
+  - id: session_stamp_stability
+    clause: stability
+    target: hdr.seq.session
+    while: "rule R2_sequence_stamp_multicast fires ∧ ${stamp_session}"
+    enforced_when: "${stamp_session}"
+    notes: |
+      Every ordered packet of a group carries that group's current session;
+      the session is constant between resets (NOPaxos session id). After
+      R_session_reset it advances by one and the counter restarts at 0.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Each request is stamped once and multicast once; no recirculation.
+      Bounds the path on the v1model pipeline.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: stamp_first_packet_cold_start
+      generate: |
+        Send one in-class request to a fresh group (cold-start, counter==0);
+        assert it is multicast to the replica group AND egress seq_no==1
+        (first handed-out number), session stamped when ${stamp_session}.
+    - id: stamp_monotone_train
+      generate: |
+        Send N≥4 in-class requests to one group in sequence; assert the
+        emitted seq_no values are 1,2,3,…,N strictly increasing by 1 (no
+        gaps, no reuse) under D5.0; assert each is multicast to the replica
+        group. Pins seq_monotonicity.
+    - id: non_sequenced_untouched
+      requires: "${non_sequenced_policy} == forward"
+      generate: |
+        Send an OUT-of-class packet (header present but ¬${sequencing_class});
+        assert it is forwarded with seq_no UNCHANGED (no stamp). Pins
+        R0_non_sequenced_forward.
+    - id: counter_not_burned_by_off_class
+      generate: |
+        Interleave: in-class (expect seq_no==1) → out-of-class (forward or
+        drop per policy) → in-class (expect seq_no==2, NOT 3). Asserts the
+        off-class packet did not consume a sequence number. Pins
+        counter_persistence_off_class.
+    - id: session_stamp_and_reset
+      requires: "${enable_session_reset} ∧ ${stamp_session}"
+      generate: |
+        Stamp two in-class requests (session==s, seq_no 1,2) → send a
+        session-reset control message → stamp again; assert post-reset
+        session==s+1 and seq_no restarts at 0 then 1. Pins
+        session_stamp_stability + R_session_reset.
+
+  G2:
+    - id: per_group_independent_counters
+      requires: "${n_groups} > 1"
+      generate: |
+        Interleave in-class requests across TWO group_ids: A,B,A,B; assert
+        group A sees seq_no 1,2 and group B sees seq_no 1,2 independently
+        (NOT a shared 1,2,3,4 sequence). Pins per_group_isolation.
+    - id: seq_space_wrap_boundary
+      requires: "${seq_width_bits} <= 16"
+      generate: |
+        Preload / drive the counter to 2^${seq_width_bits}-1, send one more
+        in-class request; assert seq_no wraps to the defined next value
+        (0 then continue) rather than saturating or trapping. Edge-of-spec
+        capacity probe on the sequence space.
+
+  G3:
+    - id: drop_malformed_no_seq_header
+      generate: |
+        Send a frame with no parsed sequencing header; assert DROP
+        (R_malformed_drop) and that no counter advanced (a following in-class
+        request still gets the expected next seq_no). Probes the
+        register-cold-start / uninitialised-read bug pattern (bug taxonomy
+        Rule 3): the malformed packet must not touch the register.
+    - id: forged_class_no_bypass
+      requires: "${non_sequenced_policy} == drop"
+      generate: |
+        Adversarial out-of-class packet attempting to reach replicas under
+        the strict policy; assert DROP — an attacker cannot inject an
+        unordered request into the replica stream. Default-deny under the
+        drop policy.
+    - id: multicast_replication_correct
+      generate: |
+        Send one in-class request; assert it is REPLICATED to every member
+        port of the replica multicast group (not just one egress), each copy
+        carrying the same stamped seq_no/session. Probes the v1model
+        multicast-group (mcast_grp / replication-list) bug pattern — a SUT
+        that unicasts to a single port instead of replicating fails here.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Every harden is paired with an ease on the SAME axis (single-axis displacement).
+
+mutation_operators:
+
+  # ── axis: capacity (n_groups) ──────────────────────────────────────────
+  - id: enable_multi_group
+    axis: capacity
+    direction: harden
+    applicable_when: "${n_groups} == 1"
+    effect: |
+      ${n_groups} ← max(${n_groups} * 8, 8) ∧
+      extend ${group_id_map} with a replica multicast group per new
+      sequencing group. Activates the per_group_isolation invariant and the
+      per_group_independent_counters G2 test.
+    feasibility_postcondition: "${n_groups} > 1 ∧ ${n_groups} ≤ 4096"
+    notes: |
+      Eris multi-stamp lift: many independent counters indexed by group_id.
+      Bridge: a register ARRAY indexed by group_id, not a single cell —
+      the common single-counter bug now fails per_group_isolation.
+
+  - id: collapse_to_single_group
+    axis: capacity
+    direction: ease
+    applicable_when: "${n_groups} > 1"
+    effect: |
+      ${n_groups} ← 1 ∧ collapse ${group_id_map} to the single
+      {0: ${replica_group}} binding. Deactivates per_group_isolation and the
+      per_group_independent_counters G2 test (single NOPaxos sequencer).
+    feasibility_postcondition: "${n_groups} == 1"
+
+  # ── axis: strictness (non_sequenced_policy + session reset) ─────────────
+  - id: tighten_to_strict_sequencer
+    axis: strictness
+    direction: harden
+    applicable_when: "${non_sequenced_policy} == forward ∨ ¬${enable_session_reset}"
+    effect: |
+      ${non_sequenced_policy} ← drop ∧ ${enable_session_reset} ← true.
+      Activates R_non_sequenced_drop (admission control), R_session_reset
+      (view change), the forged_class_no_bypass G3 case and the
+      session_stamp_and_reset G1 case.
+    feasibility_postcondition: "${non_sequenced_policy} == drop ∧ ${stamp_session}"
+    notes: |
+      Strict admission + failover semantics: only the ordered class reaches
+      replicas, and a reset message bumps the session and restarts the
+      counter. Couples two strictness knobs that move the same difficulty
+      axis (admission + epoch handling); feasibility requires the session
+      stamp so the reset is observable.
+
+  - id: relax_to_permissive_sequencer
+    axis: strictness
+    direction: ease
+    applicable_when: "${non_sequenced_policy} == drop ∨ ${enable_session_reset}"
+    effect: |
+      ${non_sequenced_policy} ← forward ∧ ${enable_session_reset} ← false.
+      Drops the admission and view-change machinery, leaving a plain
+      stamp-and-multicast sequencer over a static session.
+    feasibility_postcondition: "${non_sequenced_policy} == forward ∧ ¬${enable_session_reset}"
+
+  # ── axis: faithfulness (exact ↔ approximate ordering) ───────────────────
+  - id: relax_ordering_faithfulness
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${faithfulness} == D5.0_exact_monotone"
+    effect: |
+      ${faithfulness} ← D5.1_windowed. seq_monotonicity weakens from
+      strictly-+1 to non-decreasing within a bounded reorder window — gaps
+      become acceptable, so a SUT that loses exact counting still scores.
+    feasibility_postcondition: "${faithfulness} != D5.0_exact_monotone"
+    notes: |
+      Faithfulness ladder (exact monotone counting → windowed). Lowers the
+      bar on the COMPUTATION fidelity of the counter, distinct from the
+      feature-breadth strictness axis above.
+
+  - id: restore_exact_monotone
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${faithfulness} != D5.0_exact_monotone"
+    effect: |
+      ${faithfulness} ← D5.0_exact_monotone. Restores the strictly-+1, no-gap,
+      no-reuse contract; seq_monotonicity becomes the exact-counting check.
+    feasibility_postcondition: "${faithfulness} == D5.0_exact_monotone"
+
+  # ── axis: feature-breadth (session/epoch stamping surface) ──────────────
+  - id: add_session_epoch_stamp
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "¬${stamp_session}"
+    effect: |
+      ${stamp_session} ← true. R2 now stamps BOTH seq_no and the group
+      session; activates session_stamp_stability and widens the output
+      surface the SUT must produce (two stamped fields, per-group session
+      register).
+    feasibility_postcondition: "${stamp_session}"
+    notes: |
+      Feature-breadth (how much of the protocol surface the task implements:
+      session/epoch stamping), as distinct from faithfulness (counter
+      computation fidelity). Paired with drop_session_stamp.
+
+  - id: drop_session_stamp
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${stamp_session}"
+    effect: |
+      ${stamp_session} ← false ∧ ${enable_session_reset} ← false. R2 stamps
+      only seq_no; deactivates session_stamp_stability, the session reset
+      rule, and the session G1 case — a bare monotone sequencer.
+    feasibility_postcondition: "¬${stamp_session} ∧ ¬${enable_session_reset}"
+
+  # ── axis: capacity (sequence-number space width) ────────────────────────
+  - id: shrink_seq_space
+    axis: capacity
+    direction: harden
+    applicable_when: "${seq_width_bits} > 8"
+    effect: "${seq_width_bits} ← ${seq_width_bits} / 2"
+    feasibility_postcondition: "${seq_width_bits} >= 8"
+    notes: |
+      Narrows the sequence space so the counter-wrap boundary becomes
+      reachable in-test (activates seq_space_wrap_boundary G2). A SUT that
+      assumes an effectively-infinite seq space mishandles the wrap.
+
+  - id: widen_seq_space
+    axis: capacity
+    direction: ease
+    applicable_when: "${seq_width_bits} < 64"
+    effect: "${seq_width_bits} ← min(${seq_width_bits} * 2, 64)"
+    feasibility_postcondition: "${seq_width_bits} <= 64"
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations in v1model P4 (common-knowledge gap-fills — NOPaxos/Eris
+  describe the mechanism, not a BMv2 layout):
+
+    Canonical (n_groups: 1, non_sequenced_policy: forward, stamp_session: true):
+      - Custom `hdr.seq` header (group_id, type, session, seq_no) over a
+        chosen ether-type or UDP encap; the implementation picks the wire encoding.
+      - State: register<bit<W>>(n_groups) counter; register<bit<W>>(n_groups)
+        session, indexed by hdr.seq.group_id. Cold start: counter cell reads
+        0, so the first stamped value is read-then-write → 1. Use the
+        read-modify-write idiom: read into a temp, +1, write back, stamp temp+1
+        (or write-back-then-stamp), being careful the stamp equals the NEW
+        value, not the OLD.
+      - Class test: ${sequencing_class} (e.g. hdr.seq.type == REQUEST) gates
+        the increment. The increment MUST sit INSIDE the in-class branch —
+        not on the common path — or non-sequenced traffic burns numbers
+        (counter_persistence_off_class).
+      - Multicast: set standard_metadata.mcast_grp = replica group; install
+        the mcast group's replication list in the entries so the request is
+        copied to every replica port (multicast_replication_correct).
+      - Session reset (when enabled): on the reset message type, session ← session
+        + 1 and counter ← 0 for that group, then stamp seq_no==0.
+
+  Anti-pattern implementations to reject:
+    * Incrementing the counter on the common path / before the class test —
+      non-sequenced traffic then consumes sequence numbers.
+    * Stamping the OLD counter value instead of the post-increment value
+      (off-by-one; first packet stamps 0 instead of 1).
+    * A single shared counter cell when n_groups>1 (group_id not used as the
+      register index) — violates per_group_isolation.
+    * Unicasting to one replica port instead of setting mcast_grp +
+      replication list — replicas diverge.
+    * Decrementing / resetting the counter on ordinary ordered traffic
+      (only a session-reset message resets it).
+
+post_instantiation_hooks: |
+  For each instance, the public tests run through the oracle for the seed
+  must yield the expected outputs. Note the
+  harness feeds only packets (no time_tick): drive the monotone counter and
+  any session reset via received packets, never wall-clock timers.

@@ -1,0 +1,278 @@
+task_name: ipv6_router_anchor
+task_type: full_program
+complexity: low
+source: rfc
+pattern: P-IPv6Router
+pattern_version: '1.0'
+
+seed:
+  fib_capacity: unbounded
+  max_nexthop_group_size: 1
+  multipath_mode: none
+  hash_algo: crc16
+  filter_link_local: true
+  filter_multicast: true
+  default_action: drop
+  faithfulness: D5.0_static_fib
+
+description: |
+  Implement standard IPv6 unicast forwarding on a single switch s1
+  (RFC 8200 / RFC 4291). The switch forwards IPv6 packets according to the
+  destination-prefix policy below and drops everything outside it.
+
+  ## Forwarding policy (destination prefix → egress)
+
+  The control plane installs these as table entries; a destination is forwarded
+  by its longest matching prefix. Each entry names the egress port, the next-hop
+  MAC (new Ethernet destination), and the egress port's own MAC (new Ethernet
+  source).
+
+    | destination prefix    | egress port | next-hop MAC      | egress-port MAC   |
+    |-----------------------|-------------|-------------------|-------------------|
+    | 2001:db8:1::/64       | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 2001:db8:2::/64       | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 2001:db8:3::/64       | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+    | 2001:db8:2::7/128     | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+   - A frame that is not IPv6 is dropped.
+   - The IPv6 Hop Limit is decremented by one on egress; a packet arriving with
+     Hop Limit 0 or 1 is dropped rather than forwarded.
+   - An eligible packet is forwarded by the longest prefix matching its
+     destination: out the bound egress port, with the Ethernet source set to the
+     egress port's own MAC and the destination to the next-hop MAC. The IPv6
+     source and destination addresses are left unchanged.
+   - An eligible packet whose destination matches no prefix is dropped (there is
+     no default route).
+   - A packet whose destination is a link-local (fe80::/10) or multicast
+     (ff00::/8) address is dropped by this unicast forwarder.
+
+  ## Topology
+
+  One switch s1 with three hosts:
+    - h1 at s1.p1. IPv6 2001:db8:1::1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv6 2001:db8:2::2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv6 2001:db8:3::3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "2001:db8:1::1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "2001:db8:2::2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "2001:db8:3::3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: fwd_h1_to_h2
+    visibility: public
+    description: |
+      An IPv6 packet to 2001:db8:2::2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::2", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IPv6.hlim: {action: decremented_by, delta: 1}
+        IPv6.src:  {action: unchanged}
+        IPv6.dst:  {action: unchanged}
+
+  - name: fwd_h1_to_h3
+    visibility: public
+    description: |
+      An IPv6 packet to 2001:db8:3::3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:3::3", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IPv6.hlim: {action: decremented_by, delta: 1}
+        IPv6.src:  {action: unchanged}
+        IPv6.dst:  {action: unchanged}
+
+  - name: drop_hoplimit_one
+    visibility: public
+    description: |
+      An IPv6 packet to 2001:db8:2::2 arriving with Hop Limit 1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::2", hlim: 1}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: fwd_longest_prefix_priority
+    visibility: hidden
+    description: |
+      Longest-prefix-match on 128-bit keys. 2001:db8:2::7 is covered by both
+      2001:db8:2::/64 (→ p2) and 2001:db8:2::7/128 (→ p3). The /128 wins, so
+      the packet forwards out s1.p3 with the h3 MAC rewrite.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::7", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IPv6.hlim: {action: decremented_by, delta: 1}
+
+  - name: fwd_within_subnet_other_host
+    visibility: hidden
+    description: |
+      The /64 prefix covers the whole subnet. 2001:db8:2::8 matches
+      2001:db8:2::/64 (NOT the /128 override for ::7) → forwards out s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::8", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IPv6.hlim: {action: decremented_by, delta: 1}
+
+  - name: fwd_nextheader_independence_udp
+    visibility: hidden
+    description: |
+      Forwarding is Next-Header-agnostic. A UDP packet to 2001:db8:2::2
+      forwards out s1.p2 exactly like the TCP golden path.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::2", hlim: 64}
+        - UDP:   {sport: 5353, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IPv6.hlim: {action: decremented_by, delta: 1}
+
+  - name: fwd_hoplimit_two_egress_one
+    visibility: hidden
+    description: |
+      Hop Limit 2 is forwarded (not dropped) with egress Hop Limit 1 — pins
+      the decrement-then-egress ordering and the "drop at ≤1" boundary.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::2", hlim: 2}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IPv6.hlim: {action: change_to, value: 1}
+
+# --- G2: robustness / boundary ---
+
+  - name: drop_hoplimit_zero
+    visibility: hidden
+    description: |
+      Hop Limit 0 to a routable destination MUST be dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:2::2", hlim: 0}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_no_route
+    visibility: hidden
+    description: |
+      No matching prefix (no ::/0 default). 2001:db8:9::9 matches no entry
+      and MUST be dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "2001:db8:9::9", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+# --- G3: security / scope ---
+
+  - name: drop_non_ipv6_arp
+    visibility: hidden
+    description: |
+      A non-IPv6 frame (ARP) MUST NOT be forwarded — implicit drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.2", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop
+
+  - name: drop_link_local_dst
+    visibility: hidden
+    description: |
+      Destination fe80::1 (link-local) MUST be dropped, not routed off-link
+      (RFC 4291 §2.5.6).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "fe80::1", hlim: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_multicast_dst
+    visibility: hidden
+    description: |
+      Destination ff02::1 (multicast) MUST be dropped by a unicast forwarder
+      (RFC 4291 §2.7).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "33:33:00:00:00:01"}
+        - IPv6:  {src: "2001:db8:1::1", dst: "ff02::1", hlim: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop

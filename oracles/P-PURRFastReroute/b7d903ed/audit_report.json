@@ -1,0 +1,138 @@
+{
+  "oracle_hash": "71ad585ad1118e8aa4bebbbb7aeab26c00bd399656637c8cfa7150d014badef3",
+  "instance": "purr_frr_anchor-default",
+  "ran_at": "2026-05-30T01:59:13.522902Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_frr_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_primary_up_forward_exact",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_primary_down_forward_backup",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_both_down_noncascaded_blackhole_backup",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_both_down_cascaded_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_cascaded_primary_down_backup_up_forward_backup",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_primary_up_ttl_relaxed",
+        "status": "pass"
+      },
+      {
+        "example_id": "lpm_longest_prefix_wins",
+        "status": "pass"
+      },
+      {
+        "example_id": "lpm_shorter_prefix_when_long_misses",
+        "status": "pass"
+      },
+      {
+        "example_id": "simultaneous_multi_port_down",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_primary": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_backup": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "failover_decision_per_packet": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_links": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "failover_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "ttl_quantum_one",
+      "ip_addr_preservation",
+      "ether_rewrite_correctness_on_primary",
+      "ether_rewrite_correctness_on_backup",
+      "failover_decision_per_packet",
+      "no_orphan_links",
+      "failover_bounded_latency"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "purr_conext19"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,506 @@
+task_name: stateful_fw_tpl
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-StatefulFW
+pattern_version: '1.0'
+seed:
+  internal_subnet: 10.0.1.0/24
+  external_subnet: 10.0.2.0/24
+  default_policy: permit_out_deny_in
+  state_capacity: unbounded
+  eviction_policy: none
+  faithfulness: D5.0_stateless_acl
+  reflexive_strict: false
+failure_modes:
+- inbound_acl_keyed_on_3tuple_subset_only
+- non_tcp_inbound_admitted
+- non_ipv4_admitted
+- lpm_miss_silently_forwarded_to_default_port
+- outbound_protocol_filtered_against_acl
+- ttl_not_decremented_on_admit
+- ether_src_mac_left_unchanged
+description: |
+  A switch s1 separates an internal zone from an external zone and
+  enforces a zone-asymmetric access-control policy on the traffic that
+  crosses between them.
+
+  ## Topology and roles
+
+    - s1.p1 — connection point facing the internal zone, where host h1
+              lives (address 10.0.1.1, hardware address
+              08:00:00:00:01:01).
+    - s1.p2 — connection point facing the external zone, where host h2
+              lives (address 10.0.2.2, hardware address
+              08:00:00:00:02:02).
+
+  ## Eligibility
+
+  A frame received on either port is eligible for further inspection only
+  if it carries an IPv4 datagram. Frames that are not IPv4 (e.g. ARP, or
+  any unknown EtherType) MUST be discarded; they MUST NOT alter any
+  internal state, MUST NOT be forwarded, and MUST NOT produce a response.
+
+  ## Internal zone (frame received on s1.p1)
+
+  An IPv4 datagram received on the internal-zone port is unconditionally
+  admitted, regardless of its IPv4 protocol — TCP, UDP, ICMP, and any
+  other IPv4 payload all proceed to the forwarding step. There is no
+  per-flow eligibility test on this side.
+
+  ## External zone (frame received on s1.p2)
+
+  An IPv4 datagram received on the external-zone port is admitted only
+  when ALL of the following hold; the checks short-circuit in the order
+  listed, and a packet that fails an earlier check is never inspected
+  against later checks:
+
+    1. The IPv4 payload is TCP. Any other IPv4 protocol MUST be discarded.
+    2. The 4-tuple (IPv4 source address, IPv4 destination address, TCP
+       source port, TCP destination port) of the received packet equals
+       one of the pre-authorised 4-tuples that your control plane
+       installs. The pre-authorised set is exactly:
+         - (src 10.0.2.2, dst 10.0.1.1, srcPort 80,  dstPort 1000)
+         - (src 10.0.2.2, dst 10.0.1.1, srcPort 443, dstPort 2000)
+       This set is fixed for the lifetime of the switch; the data plane
+       has no other admission criterion. Any 4-tuple not in the set MUST
+       be discarded — even if only one component differs from a permitted
+       entry.
+
+  ## Forwarding step (applies to admitted IPv4 datagrams)
+
+  Admitted IPv4 datagrams (whether from the internal or the external
+  zone) are routed by longest-prefix match on the IPv4 destination
+  address. The control plane supplies the routing table; each entry
+  identifies an egress port and a pair of next-hop hardware addresses.
+  The packet observed at the egress port MUST satisfy ALL of:
+
+    - The egress port is the port specified by the matching routing
+      entry. An IPv4 datagram whose destination matches no routing entry
+      MUST be discarded.
+    - The Ethernet source address has been replaced by the matching
+      routing entry's "outgoing-side" hardware address.
+    - The Ethernet destination address has been replaced by the matching
+      routing entry's next-hop hardware address.
+    - The IPv4 hop count is exactly one less than on ingress, and the
+      datagram remains structurally well-formed (in particular its IPv4
+      header checksum is recomputed). At this tier the firewall imposes
+      no TTL-zero check: a packet that ingresses with a hop count of 1 is
+      still forwarded, egressing with a hop count of 0.
+    - All other fields of the packet are byte-identical to the received
+      packet (in particular, the IPv4 source address, the IPv4
+      destination address, all TCP/UDP/ICMP fields, and any payload).
+
+  Discarded packets produce NO output and MUST NOT alter any of the
+  switch's internal state.
+
+  ## Control plane
+
+  Your submission MUST author the control-plane entries and emit them in
+  entries.json. The evaluation harness installs exactly the entries you
+  provide and pre-installs nothing. Install:
+
+    - Routing entries — longest-prefix match on the IPv4 destination
+      address, one per zone subnet, each naming an egress port and the
+      outgoing-side and next-hop hardware addresses:
+        - 10.0.1.0/24 → egress port 1 (internal zone); rewrite Ether.src
+          to 08:00:00:00:00:01 and Ether.dst to 08:00:00:00:01:01.
+        - 10.0.2.0/24 → egress port 2 (external zone); rewrite Ether.src
+          to 08:00:00:00:00:02 and Ether.dst to 08:00:00:00:02:02.
+    - The exact-match list of pre-authorised inbound 4-tuples
+      (external → internal) enumerated under "External zone" above.
+
+  No per-flow state, connection tracking, or reflexive admission is
+  expected at this tier — the policy is a pure function of the per-packet
+  4-tuple and the control-plane-installed lists.
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+test_cases:
+- name: outbound_tcp_forward
+  visibility: public
+  description: TCP from internal host h1 (10.0.1.1) to external host h2 (10.0.2.2) is forwarded out the external port; the next-hop Ether.dst becomes h2's MAC, Ether.src becomes the switch's external MAC, and TTL decrements by one.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: outbound_udp_forward
+  visibility: public
+  description: UDP from the internal zone is forwarded — the zone-asymmetric default policy admits any IPv4 protocol outbound (RFC 2979 §4 transparent-firewall behaviour). Same TTL/MAC rewrites apply.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: inbound_tcp_with_acl_match
+  visibility: public
+  description: Inbound TCP from h2:80 to h1:1000 matches the first ACL entry (srcIP=10.0.2.2, dstIP=10.0.1.1, srcPort=80, dstPort=1000) and is admitted; LPM forwards to the internal port with TTL−1 and the internal-side next-hop MACs.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: inbound_tcp_no_acl_match_drop
+  visibility: public
+  description: 'Inbound TCP whose 4-tuple is NOT in the pre-authorised ACL set is dropped. RFC 2979 §3 default-deny: external traffic with no explicit permit must be discarded.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9999
+        dport: 55555
+        flags: S
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_drop
+  visibility: public
+  description: 'Non-IPv4 traffic (ARP) is dropped unconditionally regardless of ingress port (R1: ¬header_present(ipv4) → drop).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+- name: inbound_tcp_second_acl_match
+  visibility: hidden
+  description: The second ACL entry (h2:443 → h1:2000) admits inbound traffic independently of the first; an implementation that only honours a single hard-coded 4-tuple fails this case.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 443
+        dport: 2000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+- name: inbound_tcp_wrong_srcport_drop
+  visibility: hidden
+  description: Inbound TCP whose srcAddr/dstAddr/dstPort match an ACL entry but whose srcPort differs (9999 vs 80) MUST drop. Anchors the exact-match-on-4-tuple discipline.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9999
+        dport: 1000
+        flags: S
+  expected:
+    behavior: drop
+- name: inbound_tcp_wrong_dport_drop
+  visibility: hidden
+  description: Inbound TCP whose srcPort is in the ACL but dstPort differs (9999 vs 1000) MUST drop. Same exact-match invariant — both endpoints of the 4-tuple are load-bearing.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 9999
+        flags: S
+  expected:
+    behavior: drop
+- name: inbound_tcp_wrong_srcaddr_drop
+  visibility: hidden
+  description: Inbound TCP from a srcAddr other than the ACL'd 10.0.2.2 (here 10.0.2.99) MUST drop, even when ports match. An implementation that keys on (srcPort, dstPort) only fails this case.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.99
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 1000
+        flags: A
+  expected:
+    behavior: drop
+- name: inbound_udp_drop
+  visibility: hidden
+  description: UDP arriving on the external port is dropped — the firewall only inspects TCP inbound; all other IPv4 protocols are denied without consulting the ACL.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 5000
+  expected:
+    behavior: drop
+- name: inbound_icmp_drop
+  visibility: hidden
+  description: ICMP arriving on the external port is dropped — same rationale as inbound UDP. Default-deny means no implicit ICMP echo.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_arp_drop
+  visibility: hidden
+  description: ARP from the external port is dropped by R1 (¬IPv4) before the zone-policy is consulted. This is distinct from case 5 only in ingress port — the rule fires on either side.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.2.2
+        pdst: 10.0.1.1
+        hwsrc: 08:00:00:00:02:02
+  expected:
+    behavior: drop
+- name: outbound_ttl_one_decrements_to_zero
+  visibility: hidden
+  description: An outbound packet ingressing with TTL=1 is admitted and forwarded; the TTL is decremented to 0 in egress (the firewall does NOT impose an implicit TTL-zero drop — that is a router concern not a firewall concern, and the reference matches).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 2000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+- name: outbound_no_lpm_match_drop
+  visibility: hidden
+  description: An outbound IPv4 packet whose destination falls outside both subnets installed in the LPM table (here 192.168.99.99) is dropped. The default-action of the LPM table is drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 192.168.99.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: outbound_non_ipv4_unknown_ethertype_drop
+  visibility: hidden
+  description: A frame with an unknown EtherType (0x88B5, IEEE Std 802 — local experimental) MUST be dropped. R1 catches all non-IPv4 frames, not just ARP.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 34997
+  expected:
+    behavior: drop
+- name: outbound_second_distinct_flow_forwarded
+  visibility: hidden
+  description: A second outbound TCP flow (different sport/dport from case 1) is admitted; the firewall imposes no per-flow eligibility on the trusted side at this tier (the policy is stateless).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 2000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

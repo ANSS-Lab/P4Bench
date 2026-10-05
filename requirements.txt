@@ -1,0 +1,13 @@
+# P4Bench release — runtime dependencies.
+# Core (always needed to build packets, parse tasks, parse P4Info):
+scapy==2.7.0
+PyYAML==6.0.3
+protobuf<4
+p4runtime>=1.5.0
+
+# Optional LLM adapters — install only the one(s) you use:
+#   pip install openai        # adapters/gpt_adapter.py        (OPENAI_API_KEY)
+#   pip install google-genai  # adapters/gemini_adapter.py     (GEMINI_API_KEY)
+#   pip install openai        # adapters/deepseek_adapter.py   (DEEPSEEK_API_KEY)
+#   pip install openai        # adapters/qwen_adapter.py       (DASHSCOPE_API_KEY)
+#   adapters/claude_code_adapter.py shells out to the `claude` CLI (no SDK)

@@ -1,0 +1,1195 @@
+# P-NATACL — Edge: IPv4 NAPT ∘ stateless TCAM ACL (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-NAT44 (IPv4
+# NAPT, RFC 3022) with P-ACL (stateless wildcard/priority classification)
+# into a single edge NF — the cloud-/enterprise-gateway deployment where a
+# switch both hides an internal subnet behind a public address AND enforces
+# a stateless policy ACL on the traffic crossing it. This is the
+# "P-NATACL (NAT44 ∘ ACL) — stateful-rewrite then policy" composite.
+#
+# The value of this *chained* pattern (versus instantiating P-NAT44 and
+# P-ACL independently) is three interactions invisible when the two halves
+# are tested apart:
+#   (a) the NAT/ACL ORDER OF OPERATIONS — at which point in the pipeline
+#       does the ACL classify, and on WHICH addresses? The composite makes
+#       this an explicit knob (`acl_match_stage`): the ACL can match on the
+#       internal-side (pre-NAT outbound / de-NAT-ed inbound) 5-tuple, or on
+#       the wire-side (post-NAT outbound / pre-NAT inbound) 5-tuple. The
+#       two orderings give DIFFERENT verdicts for the same flow, and the
+#       components alone cannot express the choice;
+#   (b) deny-before-allocate — a denied outbound flow MUST be dropped by
+#       the ACL BEFORE NAT allocates a binding, else a denied (possibly
+#       adversarial) source still drains the port pool / mapping table. A
+#       resource-pollution failure mode neither half exhibits in isolation;
+#   (c) compounded header rewrite + checksum — on a permitted+marked
+#       outbound packet the IPv4 header is dirtied TWICE (the ACL `mark`
+#       sets DSCP and the NAT `rewrite` sets src+sport), so the single
+#       checksum recompute must cover both; an implementation that recomputes after
+#       only one mutation emits a silently-corrupt packet.
+# See `bridging_notes:` for the v1model failure modes this exposes.
+#
+# Reuses the two audited halves' oracles (P-NAT44 and P-ACL) under the
+# content-addressed oracle convention (recorded at instantiation as the
+# composed oracle's provenance) — the same convention the shipped
+# composites P-StatefulFW-NAT44 and P-VXLANRouter follow. target_capability
+# = composition because the chain's failure modes are cross-cutting and
+# neither pure-scale_up (NAT44) nor pure-redesign (ACL).
+
+pattern_id: P-NATACL
+version: "1.0"
+
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking, D7:security]   # NAT mapping state ∪ ACL policy classification
+  prescriptive: [P2:address-translation, P4:policy]        # NAPT (P2) gated by composite-condition match-action policy (P4)
+
+target_capability: composition                          # chained composition of a scale_up (P-NAT44) and a redesign (P-ACL) primitive; failure modes are cross-cutting
+
+summary: >
+  Edge-gateway composition of IPv4 NAPT (RFC 3022) with a stateless
+  TCAM-style ACL (RFC 3198 policy / P4Runtime ternary-priority semantics)
+  on a single switch. On the outbound path (internal → external) the ACL
+  classifies the flow first; a denied flow is dropped before any NAT
+  binding is allocated, a permitted/marked flow is SNAT-ed (src+sport →
+  public_ip+ext_port) and forwarded, and a marked flow additionally has its
+  DSCP rewritten — the single checksum recompute covering both the mark
+  and the NAT rewrite. On the inbound path (external → internal) only
+  return packets matching an established mapping are DNAT-ed; the ACL then
+  re-classifies on the de-NAT-ed internal address before delivery; all
+  other inbound traffic falls to default-deny. The composite's load-bearing
+  degree of freedom is `acl_match_stage` — whether the ACL sees the
+  internal-side or wire-side 5-tuple — which decides the verdict and, under
+  dynamic NAT, whether deny-before-allocate is even achievable. Faithfulness
+  ladder: D5.0 static NAT mapping + small permit/deny ACL (default permit,
+  internal_side) → D5.1 dynamic port allocation gated by a default-deny
+  ACL → D5.2 +mark action over a bounded mapping table + scaled rule set
+  with the wire-side ordering hazard.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+# The composite inherits its normative grounding from the two audited
+# halves; the RFC / paper clauses below are reused verbatim from the
+# constituent patterns (P-NAT44 for RFC 3022 / 4787 + Sailfish / Sirius,
+# P-ACL for RFC 3198 + P4Runtime §9.1 + the bug taxonomy) rather than
+# re-derived. The constituents are cited as domain-concepts entries —
+# the same convention P-StatefulFW-NAT44 and P-VXLANRouter use.
+
+grounding:
+
+  papers:
+    - cite: sailfish_sigcomm21
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-NAT44. Sailfish documents SNAT composed
+        side-by-side with ACL and VPC as the cloud-gateway NF chain on
+        Tofino at Alibaba scale — i.e. the EXACT composition this pattern
+        formalises. It is the canonical reference that NAT and ACL coexist
+        in one programmable edge pipeline, and that the order in which the
+        policy filter and the address rewrite are applied is a deliberate
+        design choice (not an accident of how the two were written
+        separately). Grounds the `acl_match_stage` knob and the
+        deny-before-allocate ordering rule.
+
+    - cite: sirius_nsdi24
+      role: scaling_approach
+      relevance: |
+        Inherited from P-NAT44. Sirius composes ~10 business NFs (SNAT and
+        ACL among them) into a single P4 edge-gateway program with explicit
+        per-stage ordering and ASIC↔CPU partitioning when the chain does
+        not fit on chip. Informs the bridging guidance for the chained
+        pipeline: the ACL stage MUST precede the NAT-allocation stage on
+        the outbound path so a denied flow never reaches the port-pool
+        allocator, and how to ladder rule-count vs mapping-capacity
+        pressure independently.
+
+  rfcs:
+    - id: RFC3022
+      sections: ["2", "3", "4"]
+      role: canonical_spec
+      quote: "Basic Network Address Translation or Basic NAT is a method by which IP addresses are mapped from one group to another, transparent to end users."
+      relevance: |
+        Inherited from P-NAT44. Traditional NAT (Basic NAT and NAPT) — the
+        binding specification the NAT half realises: (a) static-vs-dynamic
+        mapping (D5.0 vs D5.1+); (b) the address-pool / port-pool model
+        bounded by `port_pool_range`; (c) NAPT scope restricted to TCP/UDP
+        and drop on non-L4 / non-IPv4 (R1/R2); (d) the bidirectional-mapping
+        symmetry invariant (`pair_symmetry`); and (e) the choice to drop
+        (rather than ICMP-respond) on inbound-with-no-mapping, fixed
+        deterministically here.
+
+    - id: RFC4787
+      sections: ["4", "5"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-NAT44. UDP NAT behavioural requirements — pins
+        endpoint-independent mapping (REQ-1 / REQ-2: same internal
+        `(ip, port, proto)` MUST map to the same `ext_port` regardless of
+        destination) and the address-pooling constraint. Drives the
+        `endpoint_independent_mapping` parameter and its invariant.
+
+    - id: RFC3198
+      sections: ["2.3", "2.4", "2.5"]
+      role: domain_concepts
+      relevance: |
+        Inherited from P-ACL. Terminology for Policy-Based Management — the
+        condition-action pair as the basic unit of a policy rule, and the
+        separation of policy condition (the match predicate) from policy
+        action (the consequence). RFC 3198 does NOT mandate first-match vs
+        all-matches nor a default-action; the composite (like P-ACL) adopts
+        first-match-by-priority because that is what programmable-switch
+        TCAMs realise, and treats `default_action` as a first-class
+        parameter.
+
+  tutorials:
+    - path: tutorials/exercises/basic_routing
+      role: baseline_topology
+      relevance: |
+        Inherited from P-NAT44. Two-host single-switch topology (one
+        internal port + one external port) and the IPv4 forwarding / TTL
+        conventions reused here for the L3 path the NAT + ACL chain layers
+        on top of. The composite adds a ternary ACL table before (outbound)
+        and after (inbound) the NAT translation tables.
+
+
+  posts:
+    - url: https://s3-us-west-2.amazonaws.com/p4runtime/docs/master/P4Runtime-Spec.pdf
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-ACL. P4Runtime Specification v1.3.0 §9.1
+        (TableEntry priority): a non-zero priority MUST be set when the
+        match key includes a ternary field, and a higher priority number
+        wins the lookup. The normative basis for `priority_correctness` and
+        for the `bit<1>` vs `bool` boundary on the permit/deny decision in
+        the implementation.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    notes: |
+      Per-packet 5-tuple identity. As in P-NAT44, `meta.l4_srcPort` /
+      `meta.l4_dstPort` are extracted into metadata after the L4 parser so
+      downstream rules are protocol-agnostic between TCP and UDP. The ACL
+      verdict is computed over a VIEW of this flow chosen by
+      `${acl_match_stage}` — the original (internal) tuple or the
+      translated (wire) tuple — see `acl_verdict` below.
+
+  acl_rules:                                 # plays the TPL `bucket` role — aggregate policy state across a class
+    type: bucket
+    keyed_by_tuple: [rule_id]
+    attrs:
+      priority:    int
+      match_spec:  "dict[field, (value, mask)]"   # ternary key over ${match_field_breadth}
+      action:      "enum {permit, deny, mark}"     # redirect omitted — NAT owns the egress decision
+      action_args: "dict[arg, value]"             # for mark: {dscp}
+    capacity: ${rule_count_capacity}
+    populated_from: ${rules}
+    notes: |
+      Reused from P-ACL (its `bucket`). One bucket holds the entire
+      control-plane-installed ACL. First-match semantics is BY PRIORITY:
+      among all entries whose match_spec admits the (stage-selected) tuple,
+      the largest `priority` wins; ties are forbidden by
+      `no_priority_ambiguity`. The `redirect` action of standalone P-ACL is
+      dropped from the composite action set because the NAT path determines
+      the egress port — a redirect would race the NAT forward decision.
+
+  nat_mapping_outbound:                      # `bucket` — internal (ip, port, proto) → public (ip, ext_port); from P-NAT44
+    type: bucket
+    keyed_by_tuple:
+      - hdr.ipv4.src        # internal IP
+      - meta.l4_srcPort     # internal L4 port
+      - hdr.ipv4.proto
+    attrs:
+      public_ip: address
+      ext_port:  port
+    capacity: ${mapping_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Reused from P-NAT44. Drives the outbound SNAT (R4/R5). Created only
+      after the ACL permits (R5); under static mode the control plane
+      preinstalls symmetric pairs via reference entries (not a seed param).
+
+  nat_mapping_inbound:                       # `bucket` — public (ip, ext_port, proto) → internal (ip, port); from P-NAT44
+    type: bucket
+    keyed_by_tuple:
+      - hdr.ipv4.dst        # public IP
+      - meta.l4_dstPort     # external L4 port
+      - hdr.ipv4.proto
+    attrs:
+      internal_ip:   address
+      internal_port: port
+    capacity: ${mapping_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Reused from P-NAT44. Mirror of nat_mapping_outbound; `pair_symmetry`
+      ties the two. Drives the inbound DNAT (R9/R10).
+
+  port_pool:
+    attrs:
+      free_ports: list[port]
+      range:      "[${port_pool_range}.low, ${port_pool_range}.high]"
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      Reused from P-NAT44. Free-list of external L4 ports used by R5
+      (dynamic allocation). The deny-before-allocate ordering guarantees
+      only ACL-permitted flows ever draw from this pool. Static mode does
+      not materialise it.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  # ── NAT half (reused from P-NAT44) ──
+
+  public_ip:
+    type: address
+    constraint: ipv4
+
+  internal_subnet:
+    type: address
+    constraint: ipv4_cidr
+
+  mapping_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+
+  port_pool_range:
+    type: tuple[int, int]
+    constraint: "low ≥ 1024 ∧ high ≤ 65535 ∧ low < high"
+    default: [10000, 65535]
+
+  mode:
+    type: enum
+    values: [static, dynamic]
+    default: static
+    notes: |
+      static  → control plane installs both directions of every mapping
+                (D5.0). dynamic → data plane allocates ext_port from
+                port_pool on the first PERMITTED outbound packet (D5.1+).
+
+  eviction_policy:
+    type: enum
+    values: [none, LRU, timeout]
+    default: none
+
+  idle_timeout_s:
+    type: int
+    range: "[1, 3600]"
+    default: 60
+    enforced_when: "${eviction_policy} == timeout"
+
+  endpoint_independent_mapping:
+    type: bool
+    default: true
+    notes: "RFC 4787 REQ-1: ext_port a function of (internal_ip, internal_port, proto) only. Reused from P-NAT44."
+
+  # ── ACL half (reused from P-ACL) ──
+
+  rules:
+    type: list[acl_rule]
+    constraint: |
+      every entry has priority:int ∈ [1, 2^31 - 1], match_spec well-formed
+      over ${match_field_breadth}, action ∈ allowed-by-${action_breadth};
+      no two entries share both (priority, match_spec); |rules| ≤
+      ${rule_count_capacity}.
+    notes: "Control-plane-installed ACL entries populating `acl_rules`. Reused from P-ACL (redirect excluded)."
+
+  rule_count_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: 256
+
+  match_field_breadth:
+    type: enum
+    values: [tuple5, tuple5_vrf, tuple5_vrf_vlan, tuple5_vrf_vlan_dscp]
+    default: tuple5
+    notes: "Width of the ternary ACL key. Reused from P-ACL."
+
+  priority_depth:
+    type: int
+    range: "[1, 4096]"
+    default: 16
+    notes: "Number of distinct priority levels in ${rules}. Reused from P-ACL."
+
+  action_breadth:
+    type: enum
+    values: [permit_deny, permit_deny_mark]
+    default: permit_deny
+    notes: |
+      The ACL action set. permit_deny is the pure-firewall gate over NAT.
+      permit_deny_mark adds DSCP colouring on permit — which in the
+      composite compounds with the NAT rewrite into a single checksum
+      recompute (the load-bearing composite checksum interaction). The
+      permit_deny_mark_redirect tier of standalone P-ACL is NOT offered:
+      NAT owns the egress port.
+
+  default_action:
+    type: enum
+    values: [permit, deny]
+    default: permit
+    notes: |
+      ACL behaviour on table miss. `permit` (edge ACL — deny-list over a
+      permissive default) at the anchor; `deny` (zero-trust / DMZ ACL —
+      allow-list) hardens. The implementation MUST declare a `default_action` on the
+      table; omission is the common v1model "missing default_action crash" bug.
+
+  # ── Composite knob (the load-bearing degree of freedom) ──
+
+  acl_match_stage:
+    type: enum
+    values: [internal_side, wire_side]
+    default: internal_side
+    notes: |
+      WHICH 5-tuple the ACL classifies on — the composite's defining knob.
+        internal_side (anchor): the ACL sees the INTERNAL-side addresses on
+          both directions — the original src tuple on outbound (pre-NAT)
+          and the de-NAT-ed dst tuple on inbound (post-NAT). Policies are
+          written in terms of internal hosts; deny-before-allocate is
+          achievable because the verdict needs no allocated ext_port.
+        wire_side (harden): the ACL sees the WIRE-side (public-facing)
+          addresses — the translated (public_ip, ext_port) on outbound
+          (post-NAT) and the raw public dst on inbound (pre-NAT). Under
+          dynamic NAT this introduces an ORDERING HAZARD: the outbound
+          verdict depends on the ext_port, which only exists after
+          allocation, so deny-before-allocate cannot hold and a denied flow
+          must be rolled back (or the allocation must be speculative). The
+          oracle reads this knob from runtime state (parametric-source
+          contract); it never enters the module as a constant.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_static_nat_permit_acl       # anchor — static mapping + small permit/deny ACL, default permit, internal_side
+      - D5.1_dynamic_nat_filtered        # dynamic port allocation gated by a default-deny ACL
+      - D5.2_marked_scaled_wire          # +mark action, bounded mapping + scaled rule set, wire_side ordering hazard
+    default: D5.0_static_nat_permit_acl
+    notes: |
+      The composite faithfulness ladder. D5.0 is the minimal happy path: a
+      handful of static NAT pairs behind a permissive deny-list ACL on the
+      internal tuple. D5.1 introduces the genuinely-composite
+      deny-before-allocate path under a default-deny ACL with dynamic port
+      allocation. D5.2 adds the mark↔checksum compounding, capacity
+      pressure on both tables, and the wire_side ordering hazard.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true fires.
+# `acl_verdict(stage)` denotes the highest-priority-matching ACL entry's
+# action over the tuple selected by ${acl_match_stage} (the original src
+# tuple or, on wire_side outbound, the translated tuple; the de-NAT-ed dst
+# tuple or, on wire_side inbound, the raw public tuple), or ${default_action}
+# on a table miss. Outbound rules (R3–R6) precede inbound rules (R7–R10).
+
+rules:
+
+  - id: R1_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP — anything not IPv4 is dropped on both zones. Outside
+      both the NAPT scope (RFC 3022 §4) and the canonical IPv4 5-tuple ACL
+      match domain. Lifted from P-NAT44 R6 (non-IPv4 half) / P-ACL R0.
+
+  - id: R2_non_tcp_udp_drop
+    when: |
+      header_present(ipv4)
+        ∧ ¬header_present(tcp) ∧ ¬header_present(udp)
+    then:
+      - drop
+    notes: |
+      NAPT scope is TCP/UDP only (RFC 3022 §4) — ICMP and other L4s are
+      dropped before the ACL or NAT consult, so every classified/translated
+      packet has L4 ports. Lifted from P-NAT44 R6 (non-L4 half).
+
+  - id: R3_outbound_acl_deny
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ value(acl_verdict(${acl_match_stage}), ==, deny)
+    given:
+      flow:      deduce_from_packet
+      acl_rules: by_highest_priority(rules, internal_view(packet), ${match_field_breadth})
+    then:
+      - drop
+    notes: |
+      Outbound DENY — the load-bearing composite security rule. A denied
+      outbound flow is dropped HERE, before any NAT lookup or allocation,
+      so a denied (possibly adversarial) source never draws an ext_port or
+      installs a mapping. Anchors `acl_precedes_nat_state`. On internal_side
+      the verdict is computed on the original (pre-NAT) tuple; on wire_side
+      (dynamic) the verdict needs the would-be ext_port — see the ordering
+      hazard in `bridging_notes`.
+
+  - id: R4_outbound_permit_or_mark_hit
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ value(acl_verdict(${acl_match_stage}), ∈, {permit, mark})
+        ∧ exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+    given:
+      flow:                 deduce_from_packet
+      acl_rules:            by_highest_priority(rules, internal_view(packet), ${match_field_breadth})
+      nat_mapping_outbound: by_key((hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+    then:
+      - "set(hdr.ipv4.diffserv, acl_rules[*].action_args.dscp) IF acl_verdict(${acl_match_stage}) == mark"
+      - rewrite(hdr.ipv4.src, nat_mapping_outbound[*].public_ip)
+      - rewrite(meta.l4_srcPort, nat_mapping_outbound[*].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external_port)
+    notes: |
+      Outbound HIT on a permitted/marked flow with an existing mapping —
+      apply the (optional) DSCP mark AND the SNAT rewrite, then a SINGLE
+      checksum recompute covers both header mutations
+      (`compound_rewrite_checksum_validity`). Subsumes P-NAT44 R1, gated by
+      the ACL. The mark side-effect fires only at ${action_breadth} ==
+      permit_deny_mark.
+
+  - id: R5_outbound_permit_or_mark_miss_dynamic
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ value(acl_verdict(${acl_match_stage}), ∈, {permit, mark})
+        ∧ ¬exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+        ∧ ${mode} == dynamic
+        ∧ ¬empty(port_pool.free_ports)
+    given:
+      flow:      deduce_from_packet
+      acl_rules: by_highest_priority(rules, internal_view(packet), ${match_field_breadth})
+      port_pool: singleton
+    then:
+      - "bind(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto), {public_ip: ${public_ip}, ext_port: alloc(port_pool)})"
+      - "bind(nat_mapping_inbound, (${public_ip}, nat_mapping_outbound[*].ext_port, hdr.ipv4.proto), {internal_ip: hdr.ipv4.src, internal_port: meta.l4_srcPort})"
+      - "set(hdr.ipv4.diffserv, acl_rules[*].action_args.dscp) IF acl_verdict(${acl_match_stage}) == mark"
+      - rewrite(hdr.ipv4.src, ${public_ip})
+      - rewrite(meta.l4_srcPort, nat_mapping_outbound[*].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external_port)
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      First packet of a new PERMITTED outbound flow under dynamic mode:
+      allocate ext_port and install BOTH mapping halves atomically
+      (`pair_symmetry`), then mark+SNAT+forward. Reached only after the ACL
+      permits — so the port pool is drawn down only by permitted flows
+      (`acl_precedes_nat_state`). Subsumes P-NAT44 R2.
+
+  - id: R6_outbound_permit_miss_drop
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ value(acl_verdict(${acl_match_stage}), ∈, {permit, mark})
+        ∧ ¬exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+        ∧ (${mode} == static ∨ empty(port_pool.free_ports))
+    then:
+      - drop
+    notes: |
+      Permitted outbound flow with no mapping and no way to make one (static
+      mode without a preinstalled pair, or dynamic with an exhausted pool).
+      Deterministic drop (RFC 3022 §4.1). Subsumes P-NAT44 R3.
+
+  - id: R7_inbound_wrong_dst_drop
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ ¬match(hdr.ipv4.dst, ${public_ip})
+    then:
+      - drop
+    notes: |
+      Inbound packet not destined for the public IP — drop. Confirms the
+      public-IP gate sits before the conntrack/ACL consult. Subsumes the
+      `dst ≠ public_ip` half of P-NAT44 R5.
+
+  - id: R8_inbound_no_mapping_drop
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.dst, ${public_ip})
+        ∧ ¬exists(nat_mapping_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+    then:
+      - drop
+    notes: |
+      Default-deny on the external side: an inbound packet to the public IP
+      with no established mapping is unsolicited and dropped — BEFORE the
+      ACL, because there is no internal tuple to classify yet. Subsumes the
+      no-mapping half of P-NAT44 R5.
+
+  - id: R9_inbound_dnat_acl_deny
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.dst, ${public_ip})
+        ∧ exists(nat_mapping_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+        ∧ value(acl_verdict(${acl_match_stage}), ==, deny)
+    given:
+      nat_mapping_inbound: by_key((hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+      acl_rules:           by_highest_priority(rules, denatted_view(packet, nat_mapping_inbound), ${match_field_breadth})
+    then:
+      - drop
+    notes: |
+      Inbound return matching a live mapping, but the ACL DENIES it. The
+      verdict is computed on the de-NAT-ed internal tuple (internal_side) or
+      the raw public tuple (wire_side). Drops even though a mapping exists —
+      policy overrides reachability. No standalone analogue: P-NAT44 always
+      forwards an inbound hit; P-ACL never sees the de-NAT-ed address.
+
+  - id: R10_inbound_dnat_permit_or_mark
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.dst, ${public_ip})
+        ∧ exists(nat_mapping_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+        ∧ value(acl_verdict(${acl_match_stage}), ∈, {permit, mark})
+    given:
+      nat_mapping_inbound: by_key((hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+      acl_rules:           by_highest_priority(rules, denatted_view(packet, nat_mapping_inbound), ${match_field_breadth})
+    then:
+      - rewrite(hdr.ipv4.dst, nat_mapping_inbound[*].internal_ip)
+      - rewrite(meta.l4_dstPort, nat_mapping_inbound[*].internal_port)
+      - "set(hdr.ipv4.diffserv, acl_rules[*].action_args.dscp) IF acl_verdict(${acl_match_stage}) == mark"
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(internal_port)
+    notes: |
+      Inbound RETURN admitted: DNAT the dst back to the stored internal
+      (ip, port), apply the optional mark, single checksum recompute over
+      both, decrement TTL, forward to the internal zone. Fuses P-NAT44 R4
+      with the ACL permit. R4/R10 are inverse transforms
+      (`bidirectional_translation`).
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  # ── Composite-specific (the chain's load-bearing properties) ──
+
+  - id: acl_precedes_nat_state
+    clause: no_orphan
+    target: "membership(nat_mapping_outbound)"
+    while: "ingress(internal_port) ∧ value(acl_verdict(${acl_match_stage}), ==, deny)"
+    free_under: ["paired_bind(_)", "paired_evict(_)"]
+    enforced_when: "${acl_match_stage} == internal_side ∨ ${mode} == static"
+    notes: |
+      The composite's #1 security invariant: a DENIED outbound flow MUST NOT
+      cause a NAT binding to be allocated (no port drawn from the pool, no
+      mapping pair installed). Structurally realised by R3 firing (and
+      dropping) before R5 (the only allocating rule). Defends against a
+      denied/adversarial source draining the port pool to starve legitimate
+      flows. NOT enforceable under wire_side+dynamic (the verdict needs the
+      ext_port that allocation produces) — hence the `enforced_when` guard
+      and the ordering hazard documented in `bridging_notes`.
+
+  - id: acl_match_stage_consistency
+    clause: stability
+    target: acl_verdict
+    while: "R3 ∨ R4 ∨ R5 ∨ R9 ∨ R10 fires"
+    notes: |
+      The ACL verdict for a given flow is computed over exactly the tuple
+      named by ${acl_match_stage} — the internal-side view (original src on
+      outbound, de-NAT-ed dst on inbound) or the wire-side view (translated
+      tuple on outbound, raw public dst on inbound) — and the SAME stage is
+      applied in both directions. Implementation anti-pattern: classifying outbound
+      on the original tuple but inbound on the still-public (not de-NAT-ed)
+      tuple — an inconsistent stage that lets a flow be permitted one way
+      and silently denied the other.
+
+  - id: compound_rewrite_checksum_validity
+    clause: stability
+    target: "(hdr.ipv4.header_checksum, hdr.tcp.checksum, hdr.udp.checksum)"
+    while: "egress(packet) ∧ (R4 ∨ R5 ∨ R10 fires)"
+    notes: |
+      On every forwarded packet the IPv4 (and TCP/UDP, since the L4 pseudo-
+      header covers the rewritten addr/port) checksums MUST be valid on
+      egress AFTER all header mutations of that pass. The composite hazard:
+      a marked+SNAT-ed packet is mutated TWICE in one pass (DSCP set + src
+      rewrite), so an implementation that recomputes after only the NAT rewrite (or
+      only the mark) emits a silently-corrupt header. The #1 silent failure,
+      sharpened by the compounding.
+
+  # ── NAT-half invariants (reused from P-NAT44) ──
+
+  - id: pair_symmetry
+    clause: no_orphan
+    target: nat_mapping_outbound
+    while: "true"
+    free_under: ["paired_bind(_)", "paired_evict(_)"]
+    notes: |
+      Every outbound mapping has a complementary inbound entry installed in
+      the SAME firing (R5), and every eviction is paired. Reused from
+      P-NAT44.
+
+  - id: port_uniqueness
+    clause: stability
+    target: "(public_ip, ext_port, proto) → flow"
+    while: "true"
+    notes: "No two distinct outbound flows share (public_ip, ext_port, proto). Reused from P-NAT44; without it R10 cannot uniquely reverse the mapping."
+
+  - id: bidirectional_translation
+    clause: stability
+    target: "rewrite-pair-of(flow)"
+    while: "flow ∈ live_mappings"
+    notes: "R4/R5 (outbound SNAT) and R10 (inbound DNAT) are inverse transforms for every live mapping. Reused from P-NAT44."
+
+  - id: endpoint_independent_mapping
+    clause: persistence
+    target: nat_mapping_outbound[*].ext_port
+    while: "flow.internal_ip ∧ flow.internal_port ∧ flow.proto fixed"
+    free_under: ["evict(nat_mapping_outbound, _)"]
+    enforced_when: "${endpoint_independent_mapping}"
+    notes: "RFC 4787 REQ-1: ext_port a function of (internal_ip, internal_port, proto) only. Reused from P-NAT44."
+
+  - id: no_orphan_mapping
+    clause: no_orphan
+    target: nat_mapping_outbound
+    enforced_when: "${mapping_capacity} ≠ unbounded ∧ ${mode} == dynamic"
+    notes: "Bounded mapping under dynamic allocation MUST evict stale entries, else the pool drains and permitted flows are blackholed (R6). Reused from P-NAT44."
+
+  # ── ACL-half invariants (reused from P-ACL) ──
+
+  - id: priority_correctness
+    clause: stability
+    target: chosen_rule
+    while: "R3 ∨ R4 ∨ R5 ∨ R9 ∨ R10 fires"
+    notes: |
+      P4Runtime §9.1 — among all ACL entries whose match_spec admits the
+      stage-selected tuple, the largest priority wins. Reused from P-ACL;
+      implementation bug it catches is treating priority as list/installation order.
+
+  - id: no_priority_ambiguity
+    clause: stability
+    target: chosen_rule
+    while: "R3 ∨ R4 ∨ R5 ∨ R9 ∨ R10 fires"
+    notes: "No two same-priority ACL rules match the same packet (P4Runtime §9.1 ties are non-deterministic). The seed validator rejects overlapping same-priority masks. Reused from P-ACL."
+
+  - id: default_action_correctness
+    clause: stability
+    target: decision
+    while: "no ACL rule matches the stage-selected tuple"
+    notes: |
+      On an ACL table miss the verdict MUST equal ${default_action} (permit
+      ⇒ proceed to NAT, deny ⇒ drop). Reused from P-ACL; catches an implementation
+      that leaves the ACL table's default at NoAction when the seed declares
+      deny — a silent default-permit that lets unclassified flows through
+      NAT.
+
+  - id: mark_only_modifies_dscp
+    clause: persistence
+    target: "(hdr.ipv4.ttl_before_decrement, hdr.ipv4.totalLen)"
+    while: "(R4 ∨ R5 ∨ R10 fires) ∧ acl_verdict == mark"
+    enforced_when: "${action_breadth} == permit_deny_mark"
+    free_under: ["hdr.ipv4.diffserv", "the NAT-rewritten addr/port fields"]
+    notes: |
+      The ACL `mark` action contributes ONLY a DSCP change beyond the NAT
+      rewrite — it MUST NOT touch TTL (beyond the standard decrement),
+      totalLen, or any field other than diffserv and the NAT-owned
+      addr/port. Reused from P-ACL, scoped around the NAT rewrite. Catches a
+      implementation that folds the DSCP write into a generic "rewrite_header"
+      action shared with NAT that also dirties unrelated fields.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: "No recirculation; every packet forwards or drops in one ingress pass. The ACL gate and NAT translation are a single pipeline traversal."
+
+  - id: bounded_latency
+    clause: bounded_latency
+    target: packet
+    while: "header_present(ipv4)"
+    enforced_when: "true"
+    notes: "Per-packet latency bounded by pipeline depth — both directions (ACL→SNAT outbound, DNAT→ACL inbound) complete in one ingress pass; no recirculation."
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Entries
+# marked [composite] probe the chain interactions.
+
+test_scaffolding:
+
+  G1:
+    - id: outbound_permit_snat
+      generate: |
+        Install a permit ACL rule matching an internal flow (and, for
+        D5.0/static, the symmetric NAT pair). Send the matching outbound
+        TCP/UDP packet (src ∈ ${internal_subnet}, TTL=64). Assert: ACL
+        permits, IP.src ← ${public_ip}, L4 sport ← ext_port (∈
+        ${port_pool_range} under dynamic), IP.ttl decremented by 1, output
+        = external_port, and IP/L4 checksums valid. The composite golden
+        path (R4/R5). Anchors `bidirectional_translation` (outbound half).
+
+    - id: inbound_dnat_permit_return
+      generate: |
+        Warm-up: outbound packet installs (or preinstalls) a mapping with
+        ext_port=X. Test: inbound packet dst=${public_ip}, dport=X, TTL=64,
+        whose de-NAT-ed internal tuple is ACL-permitted. Assert: IP.dst ←
+        internal_ip, L4 dport ← internal_port, ACL permits, TTL−1, output =
+        internal_port, checksums valid. Anchors `bidirectional_translation`
+        (inbound half) + the post-NAT ACL classify (R10).
+
+    - id: outbound_deny_dropped
+      generate: |
+        [composite] Install a deny ACL rule matching an internal flow. Send
+        the matching outbound packet. Assert drop (R3). Then send a second,
+        DIFFERENT, permitted outbound flow and assert it still gets a valid
+        ext_port — i.e. the denied flow consumed no port-pool slot. Probes
+        `acl_precedes_nat_state` + R3-before-R5 ordering.
+
+    - id: priority_wins_over_overlap
+      generate: |
+        Install two ACL rules with non-equal priorities whose match_specs
+        both admit one outbound flow (e.g. low-priority deny on src /24 +
+        high-priority permit on the exact /32). Send the packet; assert it
+        is permitted and SNAT-ed (high priority wins). Tests
+        `priority_correctness`; catches a ternary table installed without
+        @priority.
+
+    - id: marked_outbound_dscp_and_snat
+      requires: "${action_breadth} == permit_deny_mark"
+      generate: |
+        [composite] Install a mark ACL rule (dscp=C) matching an internal
+        flow with a NAT mapping. Send the matching outbound packet. Assert:
+        hdr.ipv4.diffserv ← C AND IP.src/sport SNAT-ed AND IP.ttl−1 AND the
+        IPv4 + L4 checksums VALID on egress (both mutations covered by one
+        recompute). Anchors `compound_rewrite_checksum_validity` +
+        `mark_only_modifies_dscp`.
+
+  G2:
+    - id: default_action_on_acl_miss
+      generate: |
+        Send an outbound flow whose tuple matches NO ACL rule. Assert the
+        outcome equals ${default_action}: permit ⇒ SNAT+forward (mapping
+        permitting), deny ⇒ drop with no allocation. Tests
+        `default_action_correctness`; catches an ACL table left at NoAction
+        when the seed declares deny.
+
+    - id: port_pool_exhaustion_permitted_only
+      requires: "${mode} == dynamic"
+      generate: |
+        [composite] Open enough PERMITTED outbound flows to drain
+        port_pool.free_ports; interleave a stream of DENIED outbound flows.
+        Assert: the denied flows never allocate (the pool depletes at the
+        rate of permitted flows only), then one more permitted flow under
+        ${eviction_policy}=none drops (R6), while under LRU/timeout it
+        forwards after a stale-mapping eviction. Probes
+        `acl_precedes_nat_state` under capacity pressure +
+        `no_orphan_mapping`.
+
+    - id: mapping_capacity_eviction
+      requires: "${mapping_capacity} != unbounded ∧ ${eviction_policy} != none ∧ ${mode} == dynamic"
+      generate: |
+        Open ${mapping_capacity} permitted outbound flows, then one more.
+        Send the return packet for the oldest. Under FIFO/LRU/timeout that
+        mapping was evicted (paired) so the inbound has no match and drops
+        (R8). Anchors `pair_symmetry` (eviction is paired).
+
+  G3:
+    - id: deny_before_allocate_dos_resilience
+      requires: "${mode} == dynamic ∧ ${acl_match_stage} == internal_side"
+      generate: |
+        [composite] Send 2 × |port_pool| DENIED outbound flows (distinct
+        internal sports) with no warm-up; concurrently warm one legitimate
+        permitted flow. Assert: every denied flow is dropped with NO ext_port
+        drawn, AND the legitimate flow allocates and forwards normally.
+        Anchors `acl_precedes_nat_state` as a DoS-resilience property — the
+        Sailfish/Sirius motivation for ordering the ACL before the allocator.
+
+    - id: inbound_unsolicited_drop
+      generate: |
+        Send an inbound TCP/UDP packet to ${public_ip}:dport whose
+        (public_ip, dport, proto) is NOT in nat_mapping_inbound. Assert drop
+        (R8). Default-deny on the external side; the ACL is never consulted
+        because there is no de-NAT-ed tuple.
+
+    - id: acl_match_stage_pre_vs_post
+      generate: |
+        [composite] Construct a flow whose INTERNAL-side tuple is permitted
+        by the ACL but whose WIRE-side (translated) tuple would be denied
+        (or vice versa) — e.g. a deny rule on the public_ip's translated
+        port range. Run the suite once per ${acl_match_stage}. Assert the
+        verdict (forward vs drop) follows the configured stage exactly. The
+        sharpest composite test — neither half can express it. Anchors
+        `acl_match_stage_consistency`.
+
+    - id: snat_mark_checksum_correctness
+      generate: |
+        Send an outbound packet that R4/R5 forwards (marked if
+        ${action_breadth} == permit_deny_mark). Assert the egress IPv4
+        checksum AND the TCP/UDP checksum recompute over the rewritten
+        (src, sport) and the rewritten DSCP. Common v1model bug "checksum after
+        modification", compounded. Mirror on the inbound DNAT side (R10).
+
+    - id: icmp_and_non_ipv4_dropped
+      generate: |
+        Send (a) an ICMP echo from the internal subnet and (b) an ARP frame
+        from either zone. Assert both drop (R2 / R1). Parser-edge anchor;
+        also targets the v1model conditional-deparser bug pattern — a SUT
+        that emits a degenerate header on the drop path breaks the
+        parser/deparser boundary.
+
+    - id: overlapping_mask_priority_inversion
+      requires: "|${rules}| >= 4"
+      generate: |
+        Install ≥4 ACL rules with overlapping ternary masks at non-equal
+        priorities, constructed so a naive list-order-wins implementation fires the
+        WRONG rule (e.g. priority 10 deny on src /16, priority 100 permit on
+        the exact /32 + dport). Send a packet matching both; assert the
+        higher-priority permit wins and the flow is SNAT-ed. Common v1model bug "priority
+        inversion (ternary)". Reused from P-ACL.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease on the same axis so the
+# parameter rebinding can move difficulty in either direction.
+
+mutation_operators:
+
+  - id: enable_dynamic_nat
+    applicable_when: "${faithfulness} == D5.0_static_nat_permit_acl ∧ ${mode} == static"
+    effect: "${mode} ← dynamic ∧ ${faithfulness} ← D5.1_dynamic_nat_filtered"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "width(${port_pool_range}) ≥ max(${mapping_capacity}, 16)"
+    notes: |
+      Lift D5.0 → D5.1: the data plane now allocates ext_port on each new
+      PERMITTED outbound flow, and the deny-before-allocate ordering becomes
+      load-bearing. Pairs with `disable_dynamic_nat`.
+
+  - id: disable_dynamic_nat
+    applicable_when: "${faithfulness} == D5.1_dynamic_nat_filtered ∧ ${mode} == dynamic"
+    effect: "${mode} ← static ∧ ${faithfulness} ← D5.0_static_nat_permit_acl"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Revert to control-plane-installed static mappings. Pairs with `enable_dynamic_nat`."
+
+  - id: expand_action_breadth_to_mark
+    applicable_when: "${action_breadth} == permit_deny"
+    effect: "${action_breadth} ← permit_deny_mark"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${rules} has action ∈ {permit, deny, mark}"
+    notes: |
+      Add the DSCP `mark` action — which compounds with the NAT rewrite into
+      a single checksum recompute (`compound_rewrite_checksum_validity`), the
+      composite's sharpest checksum hazard. Pairs with `contract_action_breadth`.
+
+  - id: contract_action_breadth
+    applicable_when: "${action_breadth} == permit_deny_mark"
+    effect: "${action_breadth} ← permit_deny"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${rules} has action ∈ {permit, deny}"
+    notes: "Drop the mark action back to a pure permit/deny gate. Pairs with `expand_action_breadth_to_mark`."
+
+  - id: swap_acl_match_stage_to_wire
+    applicable_when: "${acl_match_stage} == internal_side"
+    effect: "${acl_match_stage} ← wire_side ∧ ${faithfulness} ← max(${faithfulness}, D5.2_marked_scaled_wire)"
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Move the ACL match-stage to the wire-side (public-facing) tuple. Under
+      dynamic NAT this introduces the ORDERING HAZARD: the outbound verdict
+      depends on the ext_port produced by allocation, so deny-before-allocate
+      no longer holds and the SUT must classify after a speculative
+      allocation (rolling back on deny). The single strongest composite-axis
+      harden — it changes the chain's order of operations, not a parameter
+      magnitude. Pairs with `swap_acl_match_stage_to_internal`.
+
+  - id: swap_acl_match_stage_to_internal
+    applicable_when: "${acl_match_stage} == wire_side"
+    effect: "${acl_match_stage} ← internal_side"
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Restore internal-side classification, re-enabling deny-before-allocate. Pairs with `swap_acl_match_stage_to_wire`."
+
+  - id: flip_default_to_deny
+    applicable_when: "${default_action} == permit"
+    effect: "${default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${rules} contains ≥ 1 permit entry"
+    notes: |
+      Flip the ACL from a permissive deny-list (edge ACL) to a zero-trust
+      allow-list — unclassified flows now drop before NAT. Requires the
+      implementation to declare a non-NoAction default on the ACL table. Pairs with
+      `flip_default_to_permit`.
+
+  - id: flip_default_to_permit
+    applicable_when: "${default_action} == deny"
+    effect: "${default_action} ← permit"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${rules} contains ≥ 1 deny entry"
+    notes: "Flip the ACL back to a permissive default. Pairs with `flip_default_to_deny`."
+
+  - id: shrink_mapping_capacity_4x
+    applicable_when: "${mapping_capacity} ≠ unbounded ∧ ${mapping_capacity} > 256 ∧ ${mode} == dynamic"
+    effect: "${mapping_capacity} ← ${mapping_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${mapping_capacity} ≥ 64"
+    notes: "Tighten the NAT mapping-table capacity, forcing real eviction. Pairs with `enlarge_mapping_capacity_2x`."
+
+  - id: enlarge_mapping_capacity_2x
+    applicable_when: "${mapping_capacity} ≠ unbounded ∧ ${mapping_capacity} < 524288"
+    effect: "${mapping_capacity} ← ${mapping_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${mapping_capacity} ≤ 1048576"
+    notes: "Loosen the NAT mapping capacity. Pairs with `shrink_mapping_capacity_4x`."
+
+  - id: shrink_port_pool_4x
+    applicable_when: "${mode} == dynamic ∧ width(${port_pool_range}) > 256"
+    effect: "${port_pool_range} ← shrink_to_quarter_around_midpoint(${port_pool_range})"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "width(${port_pool_range}) ≥ max(${mapping_capacity}, 16) ∧ ${port_pool_range}.low ≥ 1024 ∧ ${port_pool_range}.high ≤ 65535"
+    notes: "Tighten the port pool so the allocator needs a real free-list. Pairs with `enlarge_port_pool_2x`."
+
+  - id: enlarge_port_pool_2x
+    applicable_when: "${mode} == dynamic ∧ width(${port_pool_range}) < 32768"
+    effect: "${port_pool_range} ← enlarge_to_double_around_midpoint(${port_pool_range})"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${port_pool_range}.low ≥ 1024 ∧ ${port_pool_range}.high ≤ 65535"
+    notes: "Loosen the port pool. Pairs with `shrink_port_pool_4x`."
+
+  - id: shrink_rule_capacity_4x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} > 64"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16 ∧ |${rules}| ≤ ${rule_count_capacity}"
+    notes: "Tighten the ACL rule-count budget (no TCAM-of-everything). Pairs with `enlarge_rule_capacity_2x`. Reused from P-ACL."
+
+  - id: enlarge_rule_capacity_2x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} < 32768"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${rule_count_capacity} ≤ 65536"
+    notes: "Loosen the ACL rule-count budget. Pairs with `shrink_rule_capacity_4x`. Reused from P-ACL."
+
+  - id: expand_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5_vrf_vlan_dscp"
+    effect: "${match_field_breadth} ← next of {tuple5 → tuple5_vrf → tuple5_vrf_vlan → tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: "Widen the ternary ACL key (more fields to parse + key on). Pairs with `shrink_match_field_breadth`. Reused from P-ACL."
+
+  - id: shrink_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5"
+    effect: "${match_field_breadth} ← previous of {tuple5 ← tuple5_vrf ← tuple5_vrf_vlan ← tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: "Narrow the ternary ACL key. Pairs with `expand_match_field_breadth`. Reused from P-ACL."
+
+  - id: inflate_priority_depth
+    applicable_when: "${priority_depth} < 1024"
+    effect: "${priority_depth} ← min(${priority_depth} * 4, 4096)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${priority_depth} ≥ 1 ∧ ${priority_depth} ≤ 4096"
+    notes: "Lift ACL priority depth (TCAM priority-encoder cost). Pairs with `flatten_priority_depth`. Reused from P-ACL."
+
+  - id: flatten_priority_depth
+    applicable_when: "${priority_depth} > 2"
+    effect: "${priority_depth} ← max(${priority_depth} / 4, 1)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${priority_depth} ≥ 1"
+    notes: "Collapse ACL priority depth. Pairs with `inflate_priority_depth`. Reused from P-ACL."
+
+  - id: add_timeout_eviction
+    applicable_when: "${mode} == dynamic ∧ ${eviction_policy} ≠ timeout"
+    effect: "${eviction_policy} ← timeout"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${idle_timeout_s} ≥ 1"
+    notes: "Add idle-timeout eviction over dynamic NAT mappings (timestamp arithmetic on registers). Pairs with `disable_timeout_eviction`. Reused from P-NAT44."
+
+  - id: disable_timeout_eviction
+    applicable_when: "${eviction_policy} == timeout"
+    effect: "${eviction_policy} ← none"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${mapping_capacity} == unbounded"
+    notes: "Remove idle-timeout eviction. Pairs with `add_timeout_eviction`."
+
+  - id: enforce_endpoint_independent_mapping
+    applicable_when: "${endpoint_independent_mapping} == false"
+    effect: "${endpoint_independent_mapping} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Require RFC 4787 REQ-1 (ext_port independent of destination). Pairs with `relax_endpoint_independent_mapping`. Reused from P-NAT44."
+
+  - id: relax_endpoint_independent_mapping
+    applicable_when: "${endpoint_independent_mapping} == true"
+    effect: "${endpoint_independent_mapping} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Drop the EIM requirement. Pairs with `enforce_endpoint_independent_mapping`. Reused from P-NAT44."
+
+  - id: inject_overlapping_priority_rules
+    applicable_when: "'overlapping_mask_priority_inversion' ∉ test_scaffolding.G3 ∨ |${rules}| < 4"
+    effect: |
+      Generate ≥4 ACL rules whose ternary masks overlap pairwise at
+      non-equal priorities, confusable for an out-of-order install; add the
+      G3 `overlapping_mask_priority_inversion` test if absent.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16"
+    notes: "Test-rigor harden on ACL priority correctness. Pairs with `simplify_to_disjoint_rules`. Reused from P-ACL."
+
+  - id: simplify_to_disjoint_rules
+    applicable_when: "|${rules}| > 4"
+    effect: |
+      Regenerate ${rules} so no two ternary masks overlap (priority becomes
+      irrelevant); remove G3 `overlapping_mask_priority_inversion` if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${rules}| ≥ 1"
+    notes: "Test-rigor ease. Pairs with `inject_overlapping_priority_rules`. Reused from P-ACL."
+
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the shared noisify_spec_low protocol (also in P-StatefulFW-NAT44):
+        • 1 distractor clause about deployment / environment / out-of-scope
+          behaviour that is true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, subnet,
+          table) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4:
+
+    D5.0 (faithfulness=D5.0_static_nat_permit_acl, mode=static,
+          internal_side, default permit):
+      - Pipeline stages in order: (1) parse + extract meta.l4_*; (2) the
+        ACL ternary table on the INTERNAL-side 5-tuple; (3) the NAT tables.
+      - acl table: key = { internal 5-tuple : ternary }; actions =
+        { permit; deny; @defaultonly permit_to_nat; }; size =
+        ${rule_count_capacity}; default_action = permit_to_nat (or deny →
+        mark_to_drop per ${default_action}). The permit action sets a
+        metadata flag meta.acl_ok = 1 (NOT a forward — NAT decides egress);
+        deny does mark_to_drop. Entries carry an explicit P4Runtime priority.
+      - snat table: key = { src_ip, src_port, proto : exact }; action =
+        do_snat(public_ip, ext_port). dnat table: key = { dst_ip, dst_port,
+        proto : exact }; action = do_dnat(internal_ip, internal_port).
+        default_action = drop on both (R6 / R8).
+      - Gate the NAT apply on meta.acl_ok: `if (meta.acl_ok == 1) {
+        snat.apply(); }` outbound, `dnat.apply()` then `acl.apply()` inbound
+        (so the de-NAT-ed addr is what the ACL keys on — internal_side).
+      - Re-compute IPv4 + TCP/UDP checksums in MyComputeChecksum AFTER the
+        rewrite — the most common silent NAT failure.
+
+    D5.1 (dynamic NAT gated by a default-deny ACL):
+      - register<bit<W>>(N) for the mapping pair, indexed by hash(outbound
+        5-tuple) and hash(public_ip, ext_port, proto); a 16-bit port-pool
+        register (next-free + in-use bitmap or free-list).
+      - Ordering implementation: the ACL table MUST apply BEFORE the allocator on the
+        outbound path so a denied flow never reaches `alloc()`
+        (acl_precedes_nat_state). An implementation that allocates first then checks
+        the ACL leaks port-pool slots to denied flows — the DoS failure the
+        G3 deny_before_allocate test catches.
+      - default-deny ACL: the acl table's default_action MUST be
+        mark_to_drop, NOT NoAction (default_action_correctness).
+
+    D5.2 (+mark, scaled, wire_side):
+      - mark action: `hdr.ipv4.diffserv = dscp;` set on the permit path; the
+        SINGLE MyComputeChecksum recompute then covers BOTH the DSCP write
+        and the SNAT addr/port rewrite (compound_rewrite_checksum_validity).
+      - wire_side ordering hazard: the outbound ACL now keys on the
+        TRANSLATED (public_ip, ext_port). Under dynamic NAT the ext_port
+        does not exist until allocation, so the SUT must either allocate
+        speculatively then roll back on deny (freeing the port + un-binding
+        the pair), or restructure the pipeline so the ACL runs post-NAT and
+        the deny path explicitly releases state. A naive "ACL-after-NAT"
+        implementation that forgets the rollback leaks one mapping per denied flow.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Allocating the NAT mapping BEFORE consulting the ACL on the outbound
+      path — denied flows drain the port pool. The single most insidious
+      composite failure; acl_precedes_nat_state / the DoS G3 test catch it.
+    * Classifying outbound on the original tuple but inbound on the still-
+      PUBLIC (not de-NAT-ed) dst — an inconsistent acl_match_stage that
+      permits a flow one way and denies it the other
+      (acl_match_stage_consistency).
+    * Recomputing the checksum after only the NAT rewrite OR only the DSCP
+      mark, not both — a marked+SNAT-ed packet egresses with a corrupt
+      header. compound_rewrite_checksum_validity catches it.
+    * Treating the permit/deny decision as a bit<1> read back later on the
+      default-action path — the common v1model bit<1> vs bool boundary bug; an
+      uninitialised read on the miss path returns an unspecified value.
+    * Installing the ternary ACL via an ordered-list CLI without @priority —
+      breaks the moment the control plane inserts an out-of-order high-
+      priority rule (priority_correctness).
+    * Decrementing TTL twice (once in an inherited router library, once in
+      the chain) — caught at the TTL=2 → TTL=1 boundary.
+    * Keying the port allocator on the destination — violates
+      endpoint_independent_mapping (RFC 4787 REQ-1).
+    * Offering a `redirect` ACL action — it races the NAT forward decision;
+      the composite deliberately drops redirect from the action set.
+
+  v2 deferrals (out of scope for this v1.0 pattern):
+    * Multi-public-IP pools.
+    * Hairpinning (RFC 4787 REQ-9) — internal→internal via the public IP.
+    * ICMP echo / error tracking through the chain.
+    * TCP state-machine enforcement (that surface lives in P-StatefulFW-NAT44).
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and the (chained) oracle
+       audit must all pass validation.
+
+    2. Composite oracle reuse: the instance's oracle chains
+       the two audited halves — the P-ACL oracle (the verdict over the
+       stage-selected tuple) feeding the P-NAT44 oracle (the gated
+       translation) — recorded as the composed oracle's provenance, the same convention P-StatefulFW-NAT44 and P-VXLANRouter
+       follow. The composite glue (deny-before-allocate ordering, the
+       acl_match_stage tuple selection, the compound checksum) is the only
+       new code to audit; the two halves are inherited.
+
+    3. For anchor instances (D5.0_static_nat_permit_acl, internal_side,
+       default permit, permit_deny), the task SHOULD be behaviourally
+       equivalent to "a static NAPT behind a small internal-side deny-list":
+       cross-check by hand-running the public test set through the chained
+       oracle and comparing the expected by-port mappings.

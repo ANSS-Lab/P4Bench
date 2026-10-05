@@ -1,0 +1,925 @@
+# P-ApproxFairQueueing — Approximate Per-Flow Fair-Queueing Admission
+#
+# TPL v1.0 task pattern, grounded in Sharma et al. NSDI '18 (AFQ).
+#
+# Design-space cell: (D6:scheduling, P5:queueing).
+# Target capability `scale_up`: programmability replaces the ~24-queue
+# strict-priority hardware scheduler with a byte-accurate per-flow-budget
+# admission filter, so any commodity switch can approximate ideal fair
+# queueing within bounded error.
+
+pattern_id:        P-ApproxFairQueueing
+version:           "1.0"
+nf_categories:                          # NF-category tags (ID:name pairs)
+  descriptive:  [D6:scheduling]         # PIFO / fair queueing / rank-based egress
+  prescriptive: [P5:queueing]           # rank-based scheduling under `scale_up`
+target_capability: scale_up             # commodity switches cannot run ideal FQ; AFQ scales the NF via sketch + rotating-strata (P5:queueing category)
+
+summary: >
+  Per-packet byte-accurate admission filter that approximates ideal
+  fair queueing on a fixed-queue PISA pipeline. The pattern keeps a
+  count-min-style per-flow byte sketch and a single-cell global "bytes
+  admitted" counter; derives flow_round = sketch_estimate / quantum and
+  current_round = global_bytes / (quantum * fair_share_k); drops the
+  packet when round_shift = max(0, flow_round - current_round) ≥ window
+  (the strict drop boundary), otherwise admits, updates state, and
+  encodes round_shift into IPv4.identification so a downstream rotating
+  strict-priority scheduler can serve it from the right strata. The
+  parameter axes control sketch geometry, the window strictness, the
+  faithfulness ladder (exact per-flow ↔ count-min ↔ lossy quantum), the
+  hash family, the workload skew, and the eligibility short-circuit.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+grounding:
+
+  papers:
+
+    - cite: afq_nsdi18
+      role: canonical_implementation
+      relevance: |
+        Sharma et al.'s AFQ paper is the primary algorithm source. §3
+        defines the per-flow byte estimator + rotating-strata strict-
+        priority dequeue; the §3.2 ingress filter is exactly this
+        pattern's R3 / R4: flow_round = bytes_per_flow / QUANTUM,
+        current_round = global_bytes / (QUANTUM * K), round_shift =
+        max(0, flow_round - current_round), drop if shift ≥ WINDOW,
+        else assign rank = round_shift and admit. The paper's §3.4
+        sketch-of-counters discussion (Count-Min row hash + MIN
+        aggregation) is the source of the `bucket` entity's row /
+        column layout and the `min`-of-rows estimator in `notes:` on R3
+        and R4. The paper's fairness theorem (Theorem 1, §3.5) bounds
+        the gap between an admitted flow's flow_round and the current
+        round at WINDOW - 1; this is the source of the `fair_round_gap`
+        invariant.
+
+    - cite: calendarq_nsdi20
+      role: scaling_approach
+      relevance: |
+        Sharma et al.'s follow-on PCQ paper, which extends AFQ's
+        rotating-strata dequeue from a fixed-priority scheduler to a
+        general calendar queue. Relevant because PCQ adopts the same
+        ingress admission filter as AFQ — the ingress side this pattern
+        models is unchanged — but it loosens the egress-strata
+        assumption. Cited so that difficulty-recalibrated seeds can
+        retarget the `${window}` parameter without changing the
+        ingress contract: the strata are an implementation surface
+        controlled by the scheduling NF that consumes round_shift, not
+        a part of this pattern's spec.
+
+    - cite: sppifo_nsdi20
+      role: scaling_approach
+      relevance: |
+        SP-PIFO is the alternative line of attack on the same scaling
+        gap — approximating PIFO with strict-priority queues. SP-PIFO
+        and AFQ are siblings in the P5:queueing category: same target capability
+        (scale_up scheduling), same fixed-queue hardware constraint,
+        different state-economy choice (SP-PIFO uses adaptive
+        rank-to-queue mapping with O(1) per-stage state; AFQ uses a
+        per-flow byte sketch). Cited as a comparison point for the
+        `faithfulness` ladder — D5.0_exact_per_flow recovers ideal FQ
+        with O(|flows|) state, D5.1_count_min recovers Sharma's AFQ
+        with O(sketch_rows * sketch_width) state, and D5.2_lossy_quantum
+        recovers an SP-PIFO-flavoured strata-coarsening regime.
+
+    - cite: sketchlib_nsdi22
+      role: domain_concepts
+      relevance: |
+        SketchLib's §3 enumerates the four switch-resource bottlenecks
+        that bound any sketch-based NF on PISA: hash calls per packet
+        (caps `${sketch_rows}` at ~8 on Tofino-class targets), memory
+        accesses per packet (drives the byte-vs-packet accounting
+        choice — bytes need a 32-bit-wide register, packets fit in
+        16-bit), pipeline stages (caps `${sketch_rows}` again because
+        each row writes one stage), and per-row hash independence (the
+        guarantee Count-Min's expected-error bound relies on). Informs
+        the `${sketch_rows}` / `${sketch_width}` ranges and the
+        `${hash_polynomial}` / `${hash_independence}` parameter axes.
+
+  rfcs: []          # no IETF RFC defines AFQ semantics normatively.
+  tutorials: []     # the upstream p4lang/tutorials repository ships no AFQ exercise.
+  posts: []
+
+# ─── Entities (pick from the 8 entity types) ───────────────────────────────
+entities:
+
+  packet:                       # per-packet, stateless
+    notes: |
+      Eligibility checks and per-packet field rewrites operate on this
+      entity. R0–R2 evaluate ingress port and parser outcomes; R3 / R4
+      derive round_shift per-packet from the bucket state; R4 rewrites
+      IPv4.identification (← round_shift), IPv4.ttl (--), and
+      Ether.dst (← ${core_mac}).
+
+  bucket:                       # sketch counter matrix + 1-cell global counter
+    key:
+      - sketch_row_index        # 0 .. ${sketch_rows} - 1
+      - sketch_column_index     # 0 .. ${sketch_width} - 1, derived from h_r(flowkey) mod W
+    attrs:
+      bytes_count: int          # cumulative on-wire bytes admitted for any flow that maps to (row, column)
+      global_bytes: int         # single-cell aggregate; addressed via the reserved (row=GLOBAL, column=0) slot
+    capacity: "${sketch_rows} × ${sketch_width} cells + 1 global cell"
+    notes: |
+      Two distinct accumulators co-live on this entity: the count-min
+      sketch (R × W cells, addressed by per-row hash of the flowkey)
+      and a single-cell global "total bytes admitted" counter. The
+      sketch is read with the `min`-across-rows aggregator (R3's
+      `aggregate(bucket, min, flowkey)` notation); the global cell is
+      read directly (`bucket.global_bytes`). Updates happen ONLY on
+      R4 — eligibility-failed and out-of-window packets MUST leave
+      both sets of cells untouched (this is what makes the
+      `state_unchanged_on_reject` invariant testable).
+
+# ─── Parameters (mutation axes) ─────────────────────────────────────────────
+parameters:
+
+  window:
+    type: int
+    range: "[2, 64]"
+    default: 8
+    notes: |
+      Strict drop boundary. A packet's round_shift must be strictly
+      less than ${window} to be admitted; round_shift == ${window} is
+      already a drop (the off-by-one trap from R3's `≥` predicate).
+      Smaller values are stricter per-flow rate limits.
+
+  quantum:
+    type: int
+    range: "[64, 4096]"
+    default: 256
+    notes: |
+      Bytes per per-flow round. flow_round = sketch_estimate /
+      ${quantum}, integer division. AFQ §3.2 picks 256 because it
+      matches the L2-MTU / 6 quotient for 1500-byte Ethernet frames
+      — small enough that one MTU-class packet advances by ~6 rounds,
+      large enough that the round counter fits 16 bits at 10G line
+      rate.
+
+  fair_share_k:
+    type: int
+    range: "[1, 64]"
+    default: 4
+    notes: |
+      Fair-share denominator. current_round = global_bytes /
+      (${quantum} * ${fair_share_k}). Larger K means slower
+      advancement of current_round, which equalises throughput across
+      more flows but allows greater short-term unfairness within the
+      ${window} budget. Picked to 4 in the default seed because the
+      AFQ paper's evaluation uses K = 4 on 24-queue hardware.
+
+  sketch_rows:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: |
+      Count-min depth R. Each row is one independent hash; the `min`
+      aggregator across rows is what bounds positive bias (Count-Min's
+      one-sided error guarantee). At R = 1 there is no MIN protection
+      and any adversarial collision inflates the estimate; this is
+      the harden direction for `shrink_sketch_rows_to_1`. SketchLib
+      §3 caps R at 8 because each row consumes one ALU stage on
+      Tofino-class targets.
+
+  sketch_width:
+    type: int
+    range: "[16, 65536]"
+    default: 256
+    notes: |
+      Columns per row W. Drives the false-positive tail
+      P(estimate > true + ε·N) ≤ (1/W)^R for Count-Min. Default 256
+      matches the canonical task; should be a power of two so the
+      hash output can be truncated by mod-2^k rather than a divider.
+
+  hash_polynomial:
+    type: enum
+    values: [crc16, crc32, crc32c, custom_lfsr]
+    default: crc32
+    notes: |
+      Per-row hash family. The implementation's choice of polynomial
+      controls collision distribution; `custom_lfsr` is the
+      harden direction because it forces the implementation to implement its
+      own per-row polynomial rather than reusing a stock CRC variant.
+
+  hash_independence:
+    type: enum
+    values: [pairwise, four_wise]
+    default: pairwise
+    notes: |
+      Hash-family independence axis (SketchLib §3). Count-Min's
+      expected-error bound holds under pairwise independence; tighter
+      `four_wise` is required when adversarial collisions are the
+      threat model (`${workload_skew} == adversarial_collision`).
+
+  flowkey_fields:
+    type: list[header_field]
+    constraint: "non-empty; every field is parseable on a v1model PISA pipeline"
+    default: [hdr.ipv4.srcAddr]
+    notes: |
+      Flowkey breadth. The default seed is per-source-IP fair sharing,
+      matching the AFQ paper's evaluation. Extending to the 5-tuple
+      (srcAddr, dstAddr, proto, sport, dport) makes the pattern a
+      per-connection fair-sharing filter, which is more expensive
+      because the hash domain is larger and the L4 ports must be
+      parsed before the sketch index is computed.
+
+  eligibility_protocol:
+    type: enum
+    values: [tcp, udp, any_l4]
+    default: tcp
+    notes: |
+      L4 short-circuit. `tcp` (default) drops non-TCP packets before
+      they consume any sketch state. `any_l4` admits all L4 traffic;
+      the eligibility short-circuit is weaker but the drop predicate
+      is the same. Acts as both a state-leak guard (R0–R2) and a
+      faithfulness lever (broader admission = harder fair-sharing).
+
+  byte_accounting:
+    type: enum
+    values: [on_wire_length, payload_length, unit_per_packet]
+    default: on_wire_length
+    notes: |
+      The accounting source that drives the sketch and global counter
+      increments on R4. `on_wire_length` (default) increments by the
+      full Ethernet frame length; this is what AFQ §3.2 specifies and
+      what the byte-accuracy invariant binds. `payload_length` is a
+      common LLM bug — counts only the L4 payload, misses TCP/UDP
+      headers, breaks the byte-accuracy invariant. `unit_per_packet`
+      is the packet-count regression mode (faithfulness regression).
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_exact_per_flow     # one register slot per distinct flowkey; exact fair-queueing
+      - D5.1_count_min          # count-min sketch over flowkeys (Sharma AFQ default)
+      - D5.2_lossy_quantum      # coarsened quantum (e.g., 8× wider) — SP-PIFO-flavoured
+    default: D5.1_count_min
+    notes: |
+      Faithfulness ladder for the per-flow accounting
+      (pattern-specific `D5.x_<descriptor>` codes). D5.0 collapses the
+      sketch into an exact per-flow register table (no false
+      positives, but O(|flows|) state); D5.1 is the canonical Sharma
+      AFQ design with Count-Min approximation; D5.2 coarsens the
+      quantum so per-flow rounds advance more slowly and inter-flow
+      drift accumulates — the SP-PIFO-flavoured strata-coarsening
+      regime.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision]
+    default: zipfian
+    notes: |
+      Assumed traffic-distribution axis. `uniform` is the easy case
+      (all flowkeys equally likely). `zipfian` matches measured
+      internet traffic. `adversarial_collision` crafts flowkeys that
+      maximise sketch-row collisions, exposing single-row sketch
+      designs and weak hash polynomials.
+
+  access_port:
+    type: int
+    range: "[1, 511]"
+    default: 1
+    notes: Topology binding — the ingress port at which the admission filter applies.
+
+  core_port:
+    type: int
+    range: "[1, 511]"
+    default: 2
+    notes: Topology binding — the egress port admitted packets are forwarded to.
+
+  core_mac:
+    type: string
+    constraint: "valid IEEE 802 colon-separated unicast MAC address (e.g., 08:00:00:00:02:01)"
+    default: "08:00:00:00:02:01"
+    notes: Topology binding — the next-hop MAC overwritten into Ether.dst on admit.
+
+# ─── Rules (TPL vocabulary; first-match priority) ─────────────────────────
+# State writes inside `then` are visible to subsequent rules on subsequent
+# packets only.
+
+rules:
+
+  - id: R0_wrong_port_drop
+    when: "¬ingress(${access_port})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      First eligibility short-circuit. Frames arriving on any port
+      other than ${access_port} are discarded BEFORE the parser
+      outcome is inspected and BEFORE any sketch read. This rule
+      MUST NOT update any bucket cell — that is what the
+      `state_unchanged_on_reject` invariant binds.
+
+  - id: R1_non_ipv4_drop
+    when: "ingress(${access_port}) ∧ ¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Second eligibility short-circuit. ARP, IPv6, MPLS, and other
+      non-IPv4 EtherTypes are dropped without sketch updates.
+
+  - id: R2_non_l4_drop
+    when: "ingress(${access_port}) ∧ header_present(ipv4) ∧ ¬header_present(${eligibility_protocol})"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Third eligibility short-circuit. With the default
+      ${eligibility_protocol} = tcp, IPv4/UDP and IPv4/ICMP are
+      dropped. With ${eligibility_protocol} = any_l4 this rule is
+      vacuous (header_present is true for every IPv4 packet) and the
+      pipeline collapses into R3 / R4 directly.
+
+  - id: R3_out_of_window_drop
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      count_exceeds(round_shift(bucket, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1)
+    given:
+      packet: deduce_from_packet
+      bucket: by_hash(flowkey, ${sketch_rows})
+    then:
+      - drop
+    notes: |
+      Out-of-window drop. `round_shift(bucket, flowkey, quantum, K)`
+      is the derived quantity
+        max(0, aggregate(bucket, min, flowkey) / ${quantum}
+                 − bucket.global_bytes / (${quantum} * ${fair_share_k}))
+      i.e., the difference between this flow's per-flow round and the
+      current global round, clamped at zero to prevent
+      unsigned-subtraction underflow. The predicate `count_exceeds(...,
+      ${window} - 1)` is semantically `round_shift ≥ ${window}` — the
+      drop boundary is strict (`≥`, not `>`); the off-by-one trap is
+      what the `boundary_drop_strict_ge_window` G2 scaffold probes.
+      No state mutation on this rule.
+
+  - id: R4_admit_and_forward
+    when: |
+      ingress(${access_port}) ∧
+      header_present(ipv4) ∧
+      header_present(${eligibility_protocol}) ∧
+      ¬count_exceeds(round_shift(bucket, flowkey, ${quantum}, ${fair_share_k}), ${window} - 1)
+    given:
+      packet: deduce_from_packet
+      bucket: by_hash(flowkey, ${sketch_rows})
+    then:
+      - "inc(bucket[h_r(flowkey)] for r in 0..${sketch_rows}-1, by ${byte_accounting})"
+      - "inc(bucket.global_bytes, by ${byte_accounting})"
+      - "set(hdr.ipv4.identification, round_shift(bucket, flowkey, ${quantum}, ${fair_share_k}))"
+      - "dec(hdr.ipv4.ttl, 1)"
+      - "set(hdr.ethernet.dstAddr, ${core_mac})"
+      - "forward(${core_port})"
+    notes: |
+      Admission. The order of postconditions matters: round_shift
+      MUST be derived against the bucket state read BEFORE the
+      `inc` writes (otherwise the packet's own bytes shift its own
+      assigned round downward), and the IPv4 header checksum MUST be
+      recomputed by the implementation to cover the new `ttl` and
+      `identification` values. ${byte_accounting} controls what is
+      added: `on_wire_length` (default) uses
+      `standard_metadata.packet_length` — the AFQ paper's contract;
+      `payload_length` is a faithfulness regression and breaks the
+      byte-accuracy invariant.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: state_unchanged_on_reject
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      For every packet whose firing rule is R0, R1, R2, or R3
+      (wrong-port, non-IPv4, non-L4, or out-of-window), no bucket
+      cell — neither any (row, column) sketch slot nor the global
+      cell — changes. `free_under: {R4 only}`. This is what makes
+      eligibility short-circuits and out-of-window drops cost-free in
+      state terms; an implementation that "inc-first, then check
+      window" violates this invariant and the
+      `eligibility_priors_do_not_consume_bytes` G3 scaffold catches
+      it.
+    enforced_when: "true"
+
+  - id: counter_persistence_within_lifetime
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      The sketch cells and the global cell are monotonically
+      non-decreasing across R4 firings — there is no eviction or
+      decay rule in v1.0 of this pattern. (A future v2 may add an
+      epoch-rotation rule paired with `evict(bucket, all)` at a
+      `time_tick`.)
+    enforced_when: "true"
+
+  - id: fair_round_gap_bounded
+    clause: fairness
+    binds: [bucket, packet]
+    statement: |
+      For every admitted packet (the firing rule is R4): the
+      packet's stamped `hdr.ipv4.identification` value (=
+      round_shift at admit time) lies in [0, ${window} - 1]. This
+      is the AFQ paper's Theorem 1 (§3.5) made testable: every
+      admitted flow's per-flow round trails the current round by at
+      most ${window} - 1 quanta. Captures both the underflow clamp
+      (the lower bound 0) and the strict drop boundary (the upper
+      bound ${window} - 1).
+    enforced_when: "true"
+
+  - id: byte_accuracy_under_default_accounting
+    clause: stability
+    binds: [bucket, packet]
+    statement: |
+      Under `${byte_accounting} == on_wire_length`: each R4 firing
+      increments the sketch row cells (one per row) and the global
+      cell by exactly `standard_metadata.packet_length` — the
+      bytes-on-the-wire Ethernet-frame length, including the
+      Ethernet header. Packet-count accounting (`unit_per_packet`)
+      and L4-payload accounting (`payload_length`) violate this
+      invariant and break the AFQ fairness theorem on
+      heterogeneous-packet-size workloads.
+    enforced_when: "${byte_accounting} == on_wire_length"
+
+  - id: no_pipeline_loop
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every packet traverses the ingress pipeline exactly once.
+      There is no recirculation: round_shift is computed in a single
+      pass over the sketch rows and a single read of the global cell.
+    enforced_when: "true"
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Probes are drawn from the test-case conventions and the v1model bug
+# taxonomy.
+
+test_scaffolding:
+
+  G1:                                   # functional correctness
+
+    - id: first_packet_admit_round_shift_zero
+      generate: |
+        Fresh switch (no prior_inputs). A single eligible packet
+        (matching ${eligibility_protocol}, on ${access_port}) is sent.
+        Assert: admitted via R4, IPv4.identification = 0, TTL
+        decremented by 1, Ether.dst rewritten to ${core_mac}, egress
+        port = ${core_port}. Probes G1-P2-T1 (cold-start) +
+        G1-P1-T5 (explicit transformation assertion).
+
+    - id: state_accumulation_round_shift_grows_with_bytes
+      generate: |
+        Prior_inputs: one large eligible packet (~800 B payload, so
+        on-wire length crosses ${quantum} by a 3× margin). Probe: a
+        second eligible packet for the same flowkey. Assert: admitted
+        via R4, IPv4.identification > 0 (exact value: prior_bytes /
+        ${quantum} − prior_bytes / (${quantum} * ${fair_share_k})).
+        A packet-count implementation gives IPv4.identification = 0
+        here, so this discriminates `${byte_accounting}` choices.
+        Probes G1-P2-T2 (state accumulation) + G1-P2-T7 (read-then-
+        write ordering: round_shift derives from BEFORE-write state).
+
+    - id: cross_flow_isolation_sketch_rows_protect
+      generate: |
+        Prior_inputs: burst K eligible packets for flowkey f_A so
+        that round_shift(f_A) climbs close to ${window} - 1. Probe:
+        one eligible packet for flowkey f_B chosen so that f_B
+        shares row 0's hash with f_A but row 1's hash is fresh.
+        Assert: f_B's first packet admits with
+        IPv4.identification = 0 — the `min`-across-rows estimator
+        clips the inflated row 0 against row 1's fresh 0. Probes
+        G1-P2-T3 (cross-flow independence) + the
+        `fair_round_gap_bounded` invariant.
+
+    - id: underflow_clamp_idle_flow_admits_at_zero
+      generate: |
+        Prior_inputs: enough eligible packets for f_A to push
+        bucket.global_bytes high enough that current_round > 0,
+        while keeping f_A's per-flow round even higher. Probe:
+        one eligible packet for previously-silent flowkey f_B.
+        Assert: f_B's first packet admits with
+        IPv4.identification = 0 — because flow_round(f_B) = 0 <
+        current_round, the max(0, ...) clamp prevents underflow.
+        Without the clamp, the unsigned subtraction wraps to a huge
+        positive value and the packet would be dropped by R3.
+        Probes the `fair_round_gap_bounded` invariant's lower
+        bound + G1-P2-T7 (signed-vs-unsigned arithmetic).
+
+  G2:                                   # robustness / boundary
+
+    - id: boundary_admit_at_window_minus_one
+      generate: |
+        Stage prior_inputs so that the probe's round_shift comes
+        out exactly equal to ${window} - 1. Assert: admitted with
+        IPv4.identification = ${window} - 1. Probes G2-P1-T1
+        (exact-threshold boundary; admit side of the `≥` predicate).
+
+    - id: boundary_drop_at_window_exactly
+      generate: |
+        Stage prior_inputs one quantum further than the admit
+        boundary so the probe's round_shift = ${window} exactly.
+        Assert: dropped. An off-by-one implementation that uses `>`
+        instead of `≥` admits this packet incorrectly. Probes
+        G2-P1-T1 (drop side of the strict boundary) + the
+        `state_unchanged_on_reject` invariant (the dropped probe
+        MUST NOT consume sketch bytes).
+
+    - id: ttl_one_admitted_packet_egresses_with_ttl_zero
+      generate: |
+        Eligible probe with TTL = 1. Assert: admitted with TTL = 0
+        on egress, IPv4 checksum recomputed to cover the new TTL
+        and the round_shift-bearing IPv4.identification. This pattern
+        has no TTL-expiry rule (the AFQ spec does not require
+        one), so TTL = 1 admits cleanly. Probes G2-P1-T2 (TTL
+        decrement) + G1-P4-T1 (checksum after multi-field rewrite).
+
+  G3:                                   # security / bypass
+
+    - id: eligibility_priors_do_not_consume_bytes
+      generate: |
+        Prior_inputs: a long mixed sequence — UDP packets, ARP
+        frames, wrong-port packets, IPv6 frames — all matching the
+        flowkey of probe target f_A. Probe: one eligible packet for
+        f_A. Assert: admitted with IPv4.identification = 0, exactly
+        the same outcome as if no priors had been sent. Probes
+        G3-P1-T1 / G3-P1-T3 (fail-closed on non-IPv4 / non-L4) +
+        the `state_unchanged_on_reject` invariant.
+
+    - id: sketch_min_full_collision_inherits_state
+      requires: "${faithfulness} == D5.1_count_min ∧ ${sketch_rows} >= 2"
+      generate: |
+        Prior_inputs: burst flowkey f_A heavily so that both row 0
+        and row 1 cells climb past the drop boundary. Probe: one
+        eligible packet for flowkey f_D crafted to collide with
+        f_A on EVERY sketch row (full-collision adversarial). Assert:
+        f_D's first packet is dropped — the min-across-rows
+        estimator inherits f_A's accumulated bytes, not f_D's fresh
+        zero. Probes G3-P2-T2 (adversarial hash collision) + the
+        Count-Min one-sided-error guarantee.
+
+    - id: conditional_admit_deparser_well_formed
+      generate: |
+        Probes the common v1model bug "conditional deparser".
+        Stage prior_inputs so that the probe is dropped (R3 fires).
+        Then send a separate same-flowkey probe immediately after,
+        engineered to be admitted (R4). Assert: the admitted
+        probe's output packet is bit-exact-equal to the input
+        modulo the four declared transformations (IPv4.id,
+        IPv4.ttl, Ether.dst, IPv4 checksum). A conditional
+        deparser that drops a packet header on the R3 branch must
+        not corrupt the deparser state for the R4 branch on the
+        next packet. Probes bug-pattern "conditional deparser" +
+        G1-P4-T2 (output structure correctness).
+
+    - id: hash_over_unguarded_l4_under_eligibility_relaxation
+      requires: "${eligibility_protocol} == any_l4 ∧ len(${flowkey_fields}) > 1"
+      generate: |
+        With eligibility relaxed to any_l4 and the flowkey
+        extending to L4 ports, send an ICMP probe (proto = 1) where
+        the TCP/UDP headers are NOT extracted. Assert: the implementation
+        either guards the hash with `isValid(hdr.tcp)` /
+        `isValid(hdr.udp)` checks, or maps ICMP to a deterministic
+        non-garbage flowkey — but does NOT use unspecified L4 port
+        fields (P4 §8.25 uninitialised-value hazard). Otherwise the
+        sketch index is non-deterministic and admission becomes
+        flaky. Probes G1-P2-T9 (hash over uninitialised fields).
+
+  coverage_floor:
+    G1: 4
+    G2: 3
+    G3: 4
+
+# ─── Mutation operators (4 required fields each) ───────────────────────────
+
+mutation_operators:
+
+  # === Capacity axis: window strictness ====================================
+  - id: shrink_window_2x
+    applicable_when: "${window} >= 4"
+    effect: "${window} ← ${window} / 2"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${window} >= 2"
+
+  - id: enlarge_window_2x
+    applicable_when: "${window} <= 32"
+    effect: "${window} ← ${window} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${window} <= 64"
+
+  # === Capacity axis: sketch rows (min-protection budget) ==================
+  - id: shrink_sketch_rows_to_1
+    applicable_when: "${sketch_rows} >= 2 ∧ ${faithfulness} == D5.1_count_min"
+    effect: "${sketch_rows} ← 1"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${sketch_rows} >= 1"
+    notes: |
+      Single-row sketch — no `min` protection. Any
+      adversarial-collision workload directly inflates the
+      single-row estimate; the `sketch_min_full_collision_inherits_state`
+      G3 scaffold becomes vacuous (collision is the default), and the
+      `cross_flow_isolation_sketch_rows_protect` G1 scaffold breaks
+      because there is no second row to clip against.
+
+  - id: enlarge_sketch_rows
+    applicable_when: "${sketch_rows} < 4"
+    effect: "${sketch_rows} ← ${sketch_rows} + 1"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${sketch_rows} <= 8"
+
+  # === Capacity axis: sketch width ========================================
+  - id: shrink_sketch_width_4x
+    applicable_when: "${sketch_width} >= 64"
+    effect: "${sketch_width} ← ${sketch_width} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${sketch_width} >= 16"
+
+  - id: enlarge_sketch_width_2x
+    applicable_when: "${sketch_width} <= 32768"
+    effect: "${sketch_width} ← ${sketch_width} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${sketch_width} <= 65536"
+
+  # === Faithfulness ladder: D5.0 ↔ D5.1 ↔ D5.2 ============================
+  - id: lift_to_count_min
+    applicable_when: "${faithfulness} == D5.0_exact_per_flow"
+    effect: |
+      ${faithfulness}   ← D5.1_count_min
+      ${sketch_rows}    ← max(${sketch_rows}, 2)
+      ${sketch_width}   ← max(${sketch_width}, 256)
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${sketch_rows} >= 1 ∧ ${sketch_width} >= 16"
+    notes: |
+      Adds sketch collisions as a failure mode. The implementation must now
+      use a hash-indexed per-row register layout and the min-across-
+      rows aggregator, rather than an exact per-flow table.
+
+  - id: revert_to_exact_per_flow
+    applicable_when: "${faithfulness} == D5.1_count_min"
+    effect: |
+      ${faithfulness}   ← D5.0_exact_per_flow
+      ${sketch_rows}    ← 1
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Collapses the sketch into an exact per-flowkey register table.
+      Removes the min-across-rows discipline and the hash-independence
+      requirement.
+
+  - id: lift_to_lossy_quantum
+    applicable_when: "${faithfulness} == D5.1_count_min ∧ ${quantum} <= 1024"
+    effect: |
+      ${faithfulness}   ← D5.2_lossy_quantum
+      ${quantum}        ← ${quantum} * 4
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${quantum} <= 4096"
+
+  - id: revert_lossy_quantum
+    applicable_when: "${faithfulness} == D5.2_lossy_quantum ∧ ${quantum} >= 64"
+    effect: |
+      ${faithfulness}   ← D5.1_count_min
+      ${quantum}        ← ${quantum} / 4
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${quantum} >= 64"
+
+  # === Strictness axis: byte vs packet accounting ========================
+  - id: enable_byte_accurate_accounting
+    applicable_when: "${byte_accounting} ≠ on_wire_length"
+    effect: "${byte_accounting} ← on_wire_length"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Switches accounting to the on-wire frame length. Forces the
+      implementation to read `standard_metadata.packet_length` rather than
+      an explicit byte counter, and to handle the byte-accuracy
+      invariant on heterogeneous packet-size workloads. This is the
+      harden direction because LLMs default to packet-count
+      accounting, which is simpler but breaks the AFQ fairness
+      theorem.
+
+  - id: disable_byte_accurate_accounting
+    applicable_when: "${byte_accounting} == on_wire_length"
+    effect: "${byte_accounting} ← unit_per_packet"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Hash-family axis ===================================================
+  - id: switch_hash_polynomial_to_custom_lfsr
+    applicable_when: "${hash_polynomial} ∈ {crc16, crc32, crc32c}"
+    effect: "${hash_polynomial} ← custom_lfsr"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: revert_hash_polynomial_to_crc32
+    applicable_when: "${hash_polynomial} ≠ crc32"
+    effect: "${hash_polynomial} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: tighten_hash_independence
+    applicable_when: "${hash_independence} == pairwise ∧ ${faithfulness} == D5.1_count_min"
+    effect: "${hash_independence} ← four_wise"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: relax_hash_independence
+    applicable_when: "${hash_independence} == four_wise"
+    effect: "${hash_independence} ← pairwise"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Workload axis ======================================================
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← adversarial_collision"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} == adversarial_collision"
+    effect: "${workload_skew} ← zipfian"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Eligibility-breadth axis ===========================================
+  - id: restrict_eligibility_to_tcp
+    applicable_when: "${eligibility_protocol} ∈ {udp, any_l4}"
+    effect: "${eligibility_protocol} ← tcp"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Tightens the eligibility short-circuit. Forces the implementation to
+      add an explicit `isValid(hdr.tcp)` guard before the sketch
+      index path, which is a common conditional-deparser bug
+      surface in v1model.
+
+  - id: broaden_eligibility_to_any_l4
+    applicable_when: "${eligibility_protocol} ∈ {tcp, udp}"
+    effect: "${eligibility_protocol} ← any_l4"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Flowkey-breadth axis ===============================================
+  - id: extend_flowkey_to_5tuple
+    applicable_when: "len(${flowkey_fields}) == 1"
+    effect: |
+      ${flowkey_fields} ← [hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                           hdr.ipv4.protocol, hdr.${eligibility_protocol}.sport,
+                           hdr.${eligibility_protocol}.dport]
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${eligibility_protocol} ∈ {tcp, udp}"
+    notes: |
+      Lifts the flowkey from per-source-IP to per-connection. The
+      implementation must now parse the L4 ports before computing the
+      sketch index, and must guard the hash against ICMP / non-L4
+      packets if `${eligibility_protocol} == any_l4` is also set
+      (which `feasibility_postcondition` forbids).
+
+  - id: shrink_flowkey_to_src_only
+    applicable_when: "len(${flowkey_fields}) > 1"
+    effect: "${flowkey_fields} ← [hdr.ipv4.srcAddr]"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+# ─── Implementation notes (advisory; not visible to the SUT) ───────────────
+bridging_notes: |
+  Common implementations of this pattern in v1model P4:
+
+    Default seed (faithfulness=D5.1_count_min, sketch_rows=2,
+                  sketch_width=256, byte_accounting=on_wire_length,
+                  eligibility_protocol=tcp, window=8, quantum=256,
+                  fair_share_k=4):
+      - bucket realised as
+          register<bit<32>>(${sketch_width}) sketch_row_r;  // for r in 0..R-1
+          register<bit<32>>(1) global_bytes;
+      - Per-row hash:
+          hash(meta.h_r, HashAlgorithm.crc32_<variant>, 0,
+               {${flowkey_fields}}, ${sketch_width});
+        with a distinct CRC variant per row so the
+        hash_independence assumption holds.
+      - round_shift derivation in match-action:
+          b_r = sketch_row_r.read(meta.h_r);   // R reads, one per row
+          flow_bytes_estimate = min(b_0, b_1, ..., b_{R-1});
+          total = global_bytes.read(0);
+          current_round = total >> log2(${quantum} * ${fair_share_k});
+          flow_round    = flow_bytes_estimate >> log2(${quantum});
+          round_shift   = (flow_round > current_round)
+                             ? (flow_round - current_round) : 0;
+      - Drop predicate:
+          if (round_shift >= ${window}) mark_to_drop(standard_metadata);
+        — strict `>=`, not `>`.
+      - Admission updates (only on the admit branch):
+          sketch_row_r.write(meta.h_r, b_r + standard_metadata.packet_length);
+          global_bytes.write(0, total + standard_metadata.packet_length);
+          hdr.ipv4.identification = (bit<16>) round_shift;
+          hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+          hdr.ethernet.dstAddr = ${core_mac};
+          standard_metadata.egress_spec = ${core_port};
+      - Checksum recomputation in MyComputeChecksum MUST cover both
+        the modified ttl and the new identification field.
+
+    faithfulness = D5.0_exact_per_flow:
+      - sketch_row_0 becomes a per-flowkey exact table; the hash is
+        replaced by an exact-match table lookup keyed on
+        ${flowkey_fields}, action body re-uses the byte-update logic.
+        No min-across-rows aggregator; the byte-accuracy invariant is
+        the only one still binding.
+
+    faithfulness = D5.2_lossy_quantum:
+      - sketch layout is unchanged but ${quantum} is large enough
+        that per-flow rounds advance very slowly; current_round
+        also advances slowly proportionally. Fairness drift becomes
+        observable at smaller traffic volumes; the
+        `boundary_admit_at_window_minus_one` and
+        `boundary_drop_at_window_exactly` G2 scaffolds need
+        proportionally larger prior_inputs to set up.
+
+    eligibility_protocol = any_l4:
+      - R2 collapses to a tautology and the parser does not need to
+        extract a specific L4 header before sketch indexing. The
+        `hash_over_unguarded_l4_under_eligibility_relaxation` G3
+        scaffold becomes the canonical failure surface — ICMP probes
+        crash the hash if the implementation re-uses L4-port fields in
+        flowkey_fields without an isValid guard.
+
+  Common implementation bugs (anchors for G2 / G3 test design):
+    - "inc-first, then check window": violates the
+      `state_unchanged_on_reject` invariant. Caught by
+      `eligibility_priors_do_not_consume_bytes`.
+    - Unsigned subtraction without clamp:
+      `flow_round - current_round` wraps to a huge bit<32>; caught by
+      `underflow_clamp_idle_flow_admits_at_zero`.
+    - Off-by-one drop predicate (`>` instead of `>=`): caught by
+      `boundary_drop_at_window_exactly`.
+    - Single-row sketch (`shrink_sketch_rows_to_1` operator's intent):
+      caught by `sketch_min_full_collision_inherits_state` going
+      vacuous (collision always inherits) — the operator deliberately
+      removes the min protection so the harden direction is to lose
+      the cross-flow-isolation property.
+    - Packet-count accounting under byte-accuracy invariant: caught by
+      `state_accumulation_round_shift_grows_with_bytes` — a packet-count
+      implementation gives shift = 0 where a byte-accurate one gives
+      shift = 3.
+    - global_bytes incremented BEFORE round_shift is derived: the
+      packet's own bytes shift its own round downward, breaking the
+      `fair_round_gap_bounded` invariant on the upper bound.
+    - Conditional deparser drops headers on the R3 branch and
+      corrupts the R4 branch: caught by
+      `conditional_admit_deparser_well_formed`.
+
+  v2 deferral notes (not enforceable at v1.0):
+    - Epoch rotation with `evict(bucket, all)` at a `time_tick` —
+      the current invariant set does not include `no_orphan`, so
+      sketch cells grow unboundedly within a process lifetime. The
+      Sharma AFQ paper recommends a periodic rotation; in TPL v1.0
+      this lives in the host-side `state` dict outside the pattern's
+      formal entity set.
+    - Cross-switch fairness (the AFQ paper's §5 multi-hop discussion)
+      requires a coordinated `current_round` across switches, which
+      needs a primitive not in the TPL v1.0 vocabulary.
+    - The egress-side rotating strict-priority scheduler that
+      consumes `IPv4.identification` is intentionally out of scope —
+      this pattern's contract ends at the ingress stamp. See
+      `calendarq_nsdi20` for the egress-side counterpart.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - The eligibility short-circuit ordering (port → IPv4 → L4) is
+      a pipeline convention borrowed from the upstream
+      p4lang/tutorials basic_forwarding exercise structure; the AFQ
+      paper does not specify it explicitly because its evaluation
+      treats the switch as IPv4/TCP-only.
+    - The choice to encode round_shift into IPv4.identification (R4's
+      `set(hdr.ipv4.identification, ...)`) is the implementation convention
+      used in the canonical task, which lifts the
+      AFQ paper's "tag the packet with its assigned rank" requirement
+      onto an existing 16-bit IPv4 header field. The paper itself
+      uses a separate metadata field that does not appear on the
+      wire; the IPv4.identification re-use makes the rank observable
+      to the verifier without adding a new header.
+    - The `state_unchanged_on_reject` invariant is implicit in the
+      AFQ paper (its §3.2 algorithm only updates state on admit) but
+      is not stated as a property; flagging it lets the
+      `inc-first-then-check` implementation bug be caught by an oracle audit.

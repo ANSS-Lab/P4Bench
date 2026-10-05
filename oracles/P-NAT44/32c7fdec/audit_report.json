@@ -1,0 +1,141 @@
+{
+  "oracle_hash": "9f37967e95ba78af9d921e42029d10980a245aa230765f55914cc9b0fadf1478",
+  "instance": "nat44_tpl-default",
+  "ran_at": "2026-05-29T19:03:03.814908Z",
+  "canonical_examples": {
+    "passed": 15,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_l4_icmp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_udp_snat_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_tcp_snat_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_unmapped_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_not_internal_subnet_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_udp_dnat_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_then_inbound_return",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_unsolicited_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_wrong_dst_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_public_ip_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_public_ip_override",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_internal_subnet_override",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_mode_dynamic_new_flow",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_dynamic_knob_extremes",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "pair_symmetry": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "port_uniqueness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "bidirectional_translation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "endpoint_independent_mapping": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_mapping": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "pair_symmetry",
+      "port_uniqueness",
+      "bidirectional_translation",
+      "endpoint_independent_mapping",
+      "no_orphan_mapping",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "sailfish_sigcomm21",
+      "sirius_nsdi24",
+      "RFC3022",
+      "RFC4787"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

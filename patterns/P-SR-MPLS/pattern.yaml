@@ -1,0 +1,652 @@
+# P-SR-MPLS — Segment Routing over the MPLS data plane (SR-MPLS SID processing)
+#
+# TPL v1.0 task pattern. An SR-MPLS node forwarding on a
+# stack of MPLS labels that are Segment IDs (SIDs). Unlike a plain LSR
+# (P-MPLSLabelSwitch) that does a generic top-label SWAP keyed on an arbitrary
+# LFIB mapping, this node keys on the SEMANTICS of the top SID:
+#   - the top label == THIS node's Node-SID (Prefix-SID for a local prefix) →
+#     POP the completed segment and CONTINUE processing the next segment
+#     (forward toward the next SID's next-hop). Adjacent completed Node-SIDs
+#     are multi-popped.
+#   - an Adjacency-SID owned by this node → POP and forward out the bound
+#     adjacency (the SID names the egress link directly, bypassing any FIB).
+#   - Penultimate-Hop-Popping (PHP): when the segment just completed is the
+#     next-to-last on the path (after the pop the remaining stack is empty /
+#     bottom-of-stack), expose the inner packet.
+#   - a remote SID (top label is some other node's SID) → continuing transit:
+#     forward on that SID's next-hop WITHOUT a pop (global SRGB SID) or SWAP it
+#     to the downstream label (local/per-node SID), per ${sid_block}.
+# MPLS TTL is decremented on every hop. RFC 8660 (SR-MPLS data plane),
+# RFC 8402 (SR architecture / SID + segment-list semantics).
+#
+# Reuses the MPLS shim header already defined for P-MPLSLabelSwitch
+# (custom_headers.py: scapy.contrib.mpls.MPLS, Ether 0x8847 binding) — an
+# instance does NOT introduce a new header type.
+
+pattern_id: P-SR-MPLS
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                            # SID/segment-list-based forwarding (a routing discipline)
+  prescriptive: [P1:forwarding]                         # match-action on the top SID + variable-depth stack edit
+target_capability: redesign                             # programmability redesigns the fixed-function SR-MPLS SID engine
+summary: >
+  Segment Routing over the MPLS data plane (SR-MPLS). The node forwards a stack
+  of MPLS labels that are Segment IDs, acting on the TOP label per its SID TYPE
+  rather than via a generic label→label LFIB swap. A top label equal to this
+  node's Node-SID is a COMPLETED segment: POP it and continue toward the next
+  SID's next-hop (multi-popping consecutive local Node-SIDs); an Adjacency-SID
+  owned by this node is POPped and forwarded out the bound adjacency directly;
+  Penultimate-Hop-Popping exposes the inner packet when the completed segment
+  is next-to-last; a remote SID is continuing transit, forwarded on its
+  next-hop without a pop (global SRGB SID) or swapped to the downstream label
+  (per-node SID). The MPLS TTL is decremented on every hop and the label stack
+  below the acted-upon segments is preserved. This is DISTINCT from
+  P-MPLSLabelSwitch, which performs the generic top-label SWAP of a plain
+  transit LSR keyed on an opaque LFIB entry: here forwarding is driven by SID
+  semantics (local-Node-SID pop-and-continue, Adjacency-SID, PHP, multi-pop of
+  completed segments), not a single swap mapping. Mutation widens the SID-type
+  surface (node-SID-only → +adjacency-SID → +PHP) and the stack depth.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC8660
+      cite: "RFC 8660 §2.5 / §2.6 / §2.10"
+      sections: ["2.1", "2.4", "2.5", "2.6", "2.10", "4.1", "4.2"]
+      role: normative_behaviour
+      quote: >-
+        A Prefix-SID is an instruction to forward the packet along the
+        shortest path to the prefix; the node whose prefix the SID represents
+        pops the label and continues toward the next segment. An Adjacency-SID
+        is a local segment that the node pops and forwards out the associated
+        adjacency. When Penultimate Hop Popping is used, the penultimate node
+        removes the top label so the ultimate node receives the exposed packet.
+        Standard MPLS TTL processing applies: the top label TTL is decremented
+        at each hop and the packet is discarded when it reaches zero.
+      grounds: [R1_decrement_ttl, R3_node_sid_pop_and_continue, R4_adjacency_sid, R5_php_expose_inner]
+      relevance: |
+        Segment Routing with the MPLS Data Plane (SR-MPLS) — the canonical
+        forwarding behaviour every rule realises:
+          - §2.1 / §2.4  A SID is an MPLS label; the SR Global Block (SRGB) is
+                 a domain-wide label range so a global Prefix/Node-SID maps to
+                 the SAME label on every node — basis for the ${sid_block}
+                 global-vs-local distinction (global SRGB SID forwarded without
+                 swap; per-node SID swapped).
+          - §2.5  Prefix-SID / Node-SID: a node that owns the SID (the segment
+                 endpoint, i.e. the prefix is local) POPs the label and
+                 continues to the next segment — basis for R3 (node-SID
+                 pop-and-continue) and the multi-pop of consecutive local SIDs.
+          - §2.6  Adjacency-SID: a locally-significant SID bound to a specific
+                 outgoing link/adjacency; the owning node POPs it and forwards
+                 out that adjacency, bypassing the FIB — basis for R4.
+          - §2.10 / §4.1  Penultimate-Hop-Popping (PHP): the penultimate node of
+                 a segment removes the label so the ultimate node receives the
+                 exposed packet — basis for R5 (PHP on the next-to-last
+                 segment) gated by ${enable_php}.
+          - §4.2  TTL: SR-MPLS uses standard MPLS TTL processing — decrement
+                 the top label TTL each hop, discard on zero — basis for R1 and
+                 the mpls_ttl_quantum_one invariant.
+    - id: RFC8402
+      cite: "RFC 8402 §3.1 / §3.4 / §5.1"
+      sections: ["3.1", "3.4", "3.5", "5.1"]
+      role: normative_behaviour
+      quote: >-
+        A segment is identified by a Segment Identifier (SID). A segment list
+        is an ordered list of segments; the active segment is the one being
+        executed, encoded as the top label of the MPLS stack. A Prefix-SID is a
+        global segment drawn from the SR Global Block (SRGB) and so maps to the
+        same label on every node, whereas an Adjacency-SID is local to the node
+        that originates it. Completing the active segment advances processing to
+        the next segment in the list.
+      grounds: [R2_remote_sid_transit, R3_node_sid_pop_and_continue, stack_below_acted_segments_preserved]
+      relevance: |
+        Segment Routing Architecture — the SID / segment-list semantics that
+        distinguish SR forwarding from a plain LSR swap:
+          - §3.1  A segment list is an ordered list of instructions; the ACTIVE
+                  segment is the one currently executed (the top of the MPLS
+                  stack). Completing a segment advances to the next — basis for
+                  the pop-and-continue model and the "completed segments are
+                  popped" persistence of the stack below.
+          - §3.4  Prefix-SID / Node-SID is a GLOBAL segment (SRGB-indexed,
+                  reaches the prefix via shortest path) — basis for the global
+                  SID continuing-transit forward without swap.
+          - §3.5  Adjacency-SID is a LOCAL segment (an instruction to steer onto
+                  a specific adjacency) — basis for R4's bypass-FIB forward.
+          - §5.1  SR-MPLS instantiates segments as MPLS labels and the segment
+                  list as a label stack; this is what lets the node key on SID
+                  TYPE rather than an opaque label mapping — the core
+                  differentiation from P-MPLSLabelSwitch.
+
+  papers: []
+  tutorials: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Decisions derive from the TOP MPLS label
+      (interpreted as a SID), the node's SID tables, and the next-hop FIB.
+
+  local_node_sid:                           # the TPL `bucket` role
+    keyed_by_tuple: [label]
+    attrs:
+      is_last_in_srgb: bool                  # advisory; for PHP boundary reasoning
+    capacity: ${sid_table_capacity}
+    notes: |
+      A label this node OWNS as a Node/Prefix-SID (the prefix is local). When
+      the top label matches one of these, the segment is COMPLETED → pop and
+      continue. Multiple consecutive local Node-SIDs are popped in turn.
+
+  local_adj_sid:                            # also a `bucket` (class)
+    keyed_by_tuple: [label]
+    attrs:
+      egress_port:  port
+      next_hop_mac: address
+      port_mac:     address
+    enforced_when: "${enable_adj_sid}"
+    notes: |
+      A locally-significant Adjacency-SID: the label directly names an outgoing
+      adjacency (egress link + L2 rewrite), bypassing the next-hop FIB.
+
+  sid_fib:                                  # also a `bucket` (class)
+    keyed_by_tuple: [label]
+    attrs:
+      egress_port:  port
+      next_hop_mac: address
+      port_mac:     address
+      out_label:    int                      # downstream label for per-node (swap) SIDs
+    notes: |
+      Forwarding state keyed on the ACTIVE SID label, used both for (a)
+      continuing transit on a remote SID and (b) the next-hop toward the SID
+      newly exposed after a node-SID pop.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  local_node_sids:
+    type: list[int]
+    constraint: "each label ∈ [16, 2^20); the SIDs this node owns as Node/Prefix-SIDs"
+    notes: "Drives R3 (pop-and-continue) and the multi-pop of consecutive local SIDs."
+
+  local_adj_sids:
+    type: dict[int, adj_sid_t]
+    constraint: |
+      each value has egress_port:port, next_hop_mac:address, port_mac:address;
+      key label ∈ [16, 2^20). Empty unless ${enable_adj_sid}.
+    default: {}
+
+  sid_fib:
+    type: list[sid_fib_entry]
+    constraint: |
+      each entry has label ∈ [16, 2^20), egress_port:port, next_hop_mac:address,
+      port_mac:address; per-node entries also carry out_label.
+
+  sid_table_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Max owned-SID / FIB entries. shrink_sid_capacity_4x exercises this axis."
+
+  enable_adj_sid:
+    type: bool
+    default: false
+    notes: |
+      When true, R4 (Adjacency-SID pop-and-forward-out-adjacency) is active.
+      Canonical instance: false (Node-SID-only).
+
+  enable_php:
+    type: bool
+    default: false
+    notes: |
+      When true, R5 Penultimate-Hop-Popping is active: a completed segment that
+      is next-to-last (after the pop the remaining stack is at bottom-of-stack)
+      exposes the inner packet rather than forwarding it still-labelled.
+      Canonical instance: false.
+
+  sid_block:
+    type: enum
+    values: [global_srgb, per_node]
+    default: global_srgb
+    notes: |
+      Continuing-transit (remote-SID) discipline (RFC 8660 §2.4, RFC 8402
+      §3.4). global_srgb → the remote SID is forwarded on its next-hop WITHOUT
+      a swap (domain-wide label). per_node → the SID is SWAPped to its
+      downstream out_label before forwarding.
+
+  max_stack_depth:
+    type: int
+    range: "[1, 8]"
+    default: 3
+    notes: "Maximum SID-stack depth the parser must handle. deepen_segment_stack raises it."
+
+  reserved_label_policy:
+    type: enum
+    values: [drop, process]
+    default: drop
+    notes: "Labels 0..15 are reserved (RFC 3032 §2.1); canonical drops them as unmatched."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_node_sid, D5.1_adj_sid, D5.2_php]
+    default: D5.0_node_sid
+    notes: "SID-type feature-breadth ladder (NOT state/computation fidelity)."
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters: TTL gate, then SID-type dispatch
+# (owned-adjacency, owned-node, remote), then miss.
+
+rules:
+
+  - id: R0_non_mpls_drop
+    when: "¬header_present(mpls)"
+    then:
+      - drop
+    notes: |
+      The pattern is SR-MPLS forwarding only. Non-MPLS ether-types (0x0800
+      IPv4, ARP, …) are out of scope → drop.
+
+  - id: R1_mpls_ttl_exhausted
+    when: "header_present(mpls) ∧ value(mpls.top.ttl, ≤, 1)"
+    then:
+      - drop
+    notes: |
+      RFC 8660 §4.2 / RFC 3032 §2.4 — decrement the top-label TTL each hop;
+      discard if it would reach 0. A packet arriving with top TTL ∈ {0,1} is
+      dropped (it cannot be forwarded).
+
+  - id: R4_adjacency_sid
+    when: |
+      header_present(mpls) ∧ value(mpls.top.ttl, >, 1)
+        ∧ exists(local_adj_sid, by_key(mpls.top.label))
+    enforced_when: "${enable_adj_sid}"
+    given:
+      adj: by_key(mpls.top.label, ${local_adj_sids})
+    then:
+      - "pop(mpls.top)"
+      - dec(mpls.top.ttl, 1)
+      - set(hdr.ethernet.src, adj.port_mac)
+      - set(hdr.ethernet.dst, adj.next_hop_mac)
+      - forward(adj.egress_port)
+    notes: |
+      RFC 8660 §2.6 / RFC 8402 §3.5 — the top label is THIS node's
+      Adjacency-SID: POP it and forward out the bound adjacency DIRECTLY,
+      bypassing the sid_fib. The TTL decrement is applied to the now-exposed
+      top label (the next SID, or the inner network layer if this was the last
+      label). Mutation-gated (enable_adj_sid).
+
+  - id: R3_node_sid_pop_and_continue
+    when: |
+      header_present(mpls) ∧ value(mpls.top.ttl, >, 1)
+        ∧ match(mpls.top.label, ${local_node_sids})
+        ∧ ¬(exists(local_adj_sid, by_key(mpls.top.label)) ∧ ${enable_adj_sid})
+    given:
+      n_completed: count_prefix_local_sids(mpls, ${local_node_sids})   # # of consecutive top SIDs this node owns
+      next_sid:    first_non_local_top(mpls, ${local_node_sids})       # the first SID NOT owned (exposed after the pops)
+      entry:       by_key(next_sid, ${sid_fib})                        # next-hop toward the next segment
+    then:
+      - "pop(mpls.top, n_completed)                 # pop the completed local-SID segment(s); multi-pop consecutive owned SIDs"
+      - dec(mpls.top.ttl, 1)
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: |
+      RFC 8660 §2.5 / RFC 8402 §3.1, §3.4 — the top label is this node's
+      Node/Prefix-SID: the segment is COMPLETED. POP it and continue toward the
+      NEXT segment (the SID now on top), forwarding via the sid_fib keyed on
+      that next SID. Consecutive labels that are ALSO this node's local SIDs are
+      multi-popped (the path passed several local prefixes). The TTL decrement
+      is applied to the newly exposed top label. This is the SR distinction
+      from a plain LSR swap: forwarding is driven by ownership of the SID, not
+      by an opaque label→label LFIB mapping.
+
+  - id: R5_php_expose_inner
+    when: |
+      header_present(mpls) ∧ value(mpls.top.ttl, >, 1)
+        ∧ match(mpls.top.label, ${local_node_sids})
+        ∧ next_segment_is_bottom_of_stack(mpls)
+    enforced_when: "${enable_php}"
+    given:
+      entry: by_key(mpls.top.label, ${sid_fib})    # next-hop for the penultimate segment
+    then:
+      - "pop(mpls.top)                              # PHP: remove the completed (penultimate) segment"
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: |
+      RFC 8660 §2.10 / §4.1 — Penultimate-Hop-Popping. When the completed
+      segment is the NEXT-TO-LAST (after popping it the stack is at
+      bottom-of-stack, i.e. the inner network-layer packet is exposed), forward
+      the EXPOSED packet so the ultimate node receives it unlabelled. Ordered
+      BEFORE R3 when ${enable_php}: this rule supersedes plain pop-and-continue
+      precisely at the penultimate-segment boundary. The inner packet's own TTL
+      is preserved (only the MPLS shim is removed). Mutation-gated (enable_php).
+
+  - id: R2_remote_sid_transit
+    when: |
+      header_present(mpls) ∧ value(mpls.top.ttl, >, 1)
+        ∧ ¬match(mpls.top.label, ${local_node_sids})
+        ∧ ¬(exists(local_adj_sid, by_key(mpls.top.label)) ∧ ${enable_adj_sid})
+        ∧ exists(sid_fib, by_key(mpls.top.label))
+    given:
+      entry: by_key(mpls.top.label, ${sid_fib})
+    then:
+      - "rewrite(mpls.top.label, (${sid_block} == per_node) ? entry.out_label : mpls.top.label)"
+      - dec(mpls.top.ttl, 1)
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: |
+      RFC 8660 §2.4 / RFC 8402 §3.4 — continuing transit: the top label is a
+      REMOTE node's SID (not owned here). Forward on the SID's next-hop. Under
+      global_srgb the label is unchanged (domain-wide SID); under per_node the
+      label is SWAPped to the downstream out_label. Only the TOP label is
+      touched; the stack below and the encapsulated payload are preserved. This
+      is the ONLY rule that resembles the plain-LSR step, and only when
+      sid_block == per_node — the canonical pattern's distinction lives in
+      R3/R4/R5.
+
+  - id: R6_sid_miss_drop
+    when: |
+      header_present(mpls) ∧ value(mpls.top.ttl, >, 1)
+        ∧ ¬match(mpls.top.label, ${local_node_sids})
+        ∧ ¬(exists(local_adj_sid, by_key(mpls.top.label)) ∧ ${enable_adj_sid})
+        ∧ ¬exists(sid_fib, by_key(mpls.top.label))
+    then:
+      - drop
+    notes: |
+      Unknown top SID (incl. reserved labels 0..15 under the drop policy) and
+      no FIB entry → drop. No SID instruction can be executed.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: mpls_ttl_quantum_one
+    clause: stability
+    target: mpls.top.ttl_decrement
+    while: "rule R2_remote_sid_transit ∨ R3_node_sid_pop_and_continue ∨ R4_adjacency_sid fires"
+    notes: |
+      RFC 8660 §4.2 — the exposed top-label TTL is decremented by EXACTLY one
+      per hop. Double-decrement (ingress + egress) is the classic implementation bug.
+      (PHP / R5 removes the shim entirely so no MPLS TTL survives to decrement.)
+
+  - id: completed_segments_popped
+    clause: stability
+    target: forward_decision
+    while: "rule R3_node_sid_pop_and_continue fires"
+    notes: |
+      RFC 8402 §3.1 — a top label that is a LOCAL Node-SID is a completed
+      segment and MUST be popped, advancing to the next segment; the node MUST
+      NOT forward it still on top, and MUST NOT key the next-hop on the
+      completed SID. Consecutive local SIDs are all popped before forwarding.
+
+  - id: stack_below_acted_segments_preserved
+    clause: persistence
+    target: "mpls.labels[below_acted_segments]"
+    while: "rule R2_remote_sid_transit ∨ R3_node_sid_pop_and_continue ∨ R4_adjacency_sid fires"
+    notes: |
+      Only the acted-upon top segment(s) are modified/removed; the remaining
+      SID stack and the encapsulated network-layer payload (including its own
+      TTL) are preserved.
+
+  - id: adj_sid_bypasses_fib
+    clause: stability
+    target: egress_adjacency
+    while: "rule R4_adjacency_sid fires"
+    enforced_when: "${enable_adj_sid}"
+    notes: |
+      RFC 8660 §2.6 — an Adjacency-SID names the egress link directly; the
+      egress port and L2 rewrite come from the adjacency binding, NOT from a
+      sid_fib lookup on the exposed next SID.
+
+  - id: php_exposes_inner
+    clause: stability
+    target: egress_header_stack
+    while: "rule R5_php_expose_inner fires"
+    enforced_when: "${enable_php}"
+    notes: |
+      RFC 8660 §2.10 — after PHP the egress packet carries NO MPLS shim for the
+      popped segment; the inner network-layer packet is exposed and its own TTL
+      is unchanged.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ (rule R2 ∨ R3 ∨ R4 ∨ R5 fires)"
+    notes: "Egress Ether.src ← egress port MAC; Ether.dst ← next-hop MAC."
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: node_sid_pop_and_continue
+      generate: |
+        MPLS stack [own_node_sid(s=0), next_sid(s=1)] / IP to a node-SID this
+        node owns. Assert: the completed top SID is POPPED, the next SID is now
+        on top, forwarded on the sid_fib next-hop for that next SID, top TTL
+        decremented by 1, L2 rewrite, correct egress; the inner SID/payload
+        preserved.
+    - id: remote_sid_transit_global
+      requires: "${sid_block} == global_srgb"
+      generate: |
+        Top label is a REMOTE SID (not owned), present in sid_fib. Assert it is
+        forwarded on its next-hop with the label UNCHANGED (global SRGB), TTL-1,
+        L2 rewrite, correct egress.
+    - id: remote_sid_transit_swap
+      requires: "${sid_block} == per_node"
+      generate: |
+        Top label is a remote per-node SID; assert it is SWAPPED to out_label,
+        TTL-1, forwarded — the plain-LSR-like case.
+    - id: multi_pop_consecutive_local_sids
+      generate: |
+        Stack [own_sid_A(s=0), own_sid_B(s=0), next_sid(s=1)] where A and B are
+        BOTH owned by this node; assert BOTH are popped and forwarding keys on
+        next_sid (multi-pop of completed segments).
+    - id: adj_sid_forward_out_adjacency
+      requires: "${enable_adj_sid}"
+      generate: |
+        Top label is this node's Adjacency-SID; assert POP and forward out the
+        BOUND adjacency port/MACs, bypassing the sid_fib, TTL-1.
+    - id: php_expose_inner_packet
+      requires: "${enable_php}"
+      generate: |
+        Stack [own_penultimate_sid(s=1)] / IP (next segment is bottom-of-stack);
+        assert the shim is POPPED and the bare IP packet is forwarded (no MPLS
+        header on egress), inner IP TTL unchanged.
+
+  G2:
+    - id: drop_ttl_one
+      generate: "MPLS top TTL==1 → drop (would decrement to 0). RFC 8660 §4.2."
+    - id: drop_ttl_zero
+      generate: "MPLS top TTL==0 → drop."
+    - id: deep_stack_node_sid
+      generate: |
+        A max-depth stack (${max_stack_depth} labels) with a top owned Node-SID;
+        assert correct pop-and-continue and stack-below preservation on the deep
+        stack (variable-depth parsing).
+    - id: ttl_two_egress_one
+      generate: "Top TTL==2 on a remote-SID transit → forwarded with egress top TTL==1."
+
+  G3:
+    - id: drop_unknown_sid
+      generate: |
+        Top label is neither an owned Node-SID nor an Adjacency-SID nor in the
+        sid_fib → drop (R6). Adversarial: an attacker-chosen label must not leak
+        a forward.
+    - id: drop_non_mpls
+      generate: "A plain IPv4 frame (etherType 0x0800) → drop (out of scope, R0)."
+    - id: drop_reserved_label
+      requires: "${reserved_label_policy} == drop"
+      generate: |
+        A reserved label (e.g. 0 explicit-null) not installed as a SID → drop.
+    - id: no_double_decrement
+      generate: |
+        Bug-driven (mpls.top.ttl arithmetic): assert the exposed top TTL is
+        decremented by EXACTLY one across a node-SID pop-and-continue — guards
+        the double-decrement (ingress+egress) v1model arithmetic bug and the
+        conditional-deparser bug when a header is conditionally popped.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden paired with an ease on the SAME axis.
+# Axes used: feature-breadth (SID-type surface), capacity, workload (stack depth).
+
+mutation_operators:
+
+  # ── feature-breadth axis: Adjacency-SID surface ──
+  - id: enable_adjacency_sid
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${enable_adj_sid} == false"
+    effect: |
+      ${enable_adj_sid} ← true ∧
+      populate ${local_adj_sids} with ≥1 Adjacency-SID (egress + L2 rewrite) ∧
+      ${faithfulness} ← D5.1_adj_sid ∧
+      add the adj_sid_forward_out_adjacency G1 test.
+    feasibility_postcondition: "|${local_adj_sids}| ≥ 1 ∧ ${faithfulness} == D5.1_adj_sid"
+    notes: |
+      Widens the SID-type surface from Node-SID-only to +Adjacency-SID
+      (pop-and-forward-out-adjacency, bypassing the FIB). Activates R4 and the
+      adj_sid_bypasses_fib invariant.
+
+  - id: disable_adjacency_sid
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${enable_adj_sid} == true"
+    effect: |
+      ${enable_adj_sid} ← false ∧ ${local_adj_sids} ← {} ∧
+      ${faithfulness} ← D5.0_node_sid ∧
+      remove the adj_sid_forward_out_adjacency G1 test.
+    feasibility_postcondition: "${enable_adj_sid} == false"
+    notes: "Ease counterpart of enable_adjacency_sid on the same SID-type feature-breadth axis."
+
+  # ── feature-breadth axis: PHP surface ──
+  - id: enable_php
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${enable_php} == false"
+    effect: |
+      ${enable_php} ← true ∧ ${faithfulness} ← D5.2_php ∧
+      add the php_expose_inner_packet G1 test.
+    feasibility_postcondition: "${enable_php} == true ∧ ${faithfulness} == D5.2_php"
+    notes: |
+      Adds Penultimate-Hop-Popping: the node must remove the shim at the
+      next-to-last segment and forward the exposed inner packet. Activates R5
+      (ordered before R3) and the php_exposes_inner invariant. The conditional
+      header pop is the high-value implementation bug (conditional deparser).
+
+  - id: disable_php
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${enable_php} == true"
+    effect: |
+      ${enable_php} ← false ∧
+      (if ${enable_adj_sid}: ${faithfulness} ← D5.1_adj_sid else ${faithfulness} ← D5.0_node_sid) ∧
+      remove the php_expose_inner_packet G1 test.
+    feasibility_postcondition: "${enable_php} == false"
+    notes: "Ease counterpart of enable_php on the same SID-type feature-breadth axis."
+
+  # ── workload axis: SID-stack depth ──
+  - id: deepen_segment_stack
+    axis: workload
+    direction: harden
+    applicable_when: "${max_stack_depth} < 8"
+    effect: |
+      ${max_stack_depth} ← min(${max_stack_depth} + 2, 8) ∧
+      add deep-stack G2 tests (multi-pop and stack-below preservation at depth).
+    feasibility_postcondition: "${max_stack_depth} ≤ 8"
+    notes: "Stresses variable-depth SID-stack parsing and the multi-pop loop."
+
+  - id: shallow_segment_stack
+    axis: workload
+    direction: ease
+    applicable_when: "${max_stack_depth} > 1"
+    effect: "${max_stack_depth} ← max(${max_stack_depth} - 2, 1)"
+    feasibility_postcondition: "${max_stack_depth} ≥ 1"
+    notes: "Ease counterpart of deepen_segment_stack on the workload (stack-depth capacity) axis."
+
+  # ── capacity axis: SID-table size ──
+  - id: shrink_sid_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${sid_table_capacity} ≠ unbounded ∧ ${sid_table_capacity} > 64"
+    effect: "${sid_table_capacity} ← ${sid_table_capacity} / 4"
+    feasibility_postcondition: "${sid_table_capacity} ≥ 16"
+    notes: "Tightens owned-SID / FIB table capacity."
+
+  - id: enlarge_sid_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${sid_table_capacity} ≠ unbounded"
+    effect: "${sid_table_capacity} ← ${sid_table_capacity} * 2"
+    feasibility_postcondition: "${sid_table_capacity} ≤ 1048576"
+    notes: "Ease counterpart of shrink_sid_capacity_4x on the capacity axis."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  DIFFERENTIATION vs P-MPLSLabelSwitch (the most important review point):
+    - P-MPLSLabelSwitch is a plain transit LSR: ONE LFIB table keyed on the top
+      label → a generic op (swap/pop/push) with an opaque out_label. The pattern
+      identity is the top-label SWAP; pop is a mutation-only extra.
+    - P-SR-MPLS keys on SID SEMANTICS. The dispatch is by SID TYPE:
+        * top label ∈ local_node_sids  → POP and continue (R3), multi-popping
+          consecutive local SIDs, forwarding on the FIB keyed on the NEXT SID;
+        * top label ∈ local_adj_sids   → POP and forward out the bound adjacency
+          (R4), bypassing the FIB;
+        * penultimate completed segment → PHP, expose inner (R5);
+        * remote SID                    → continuing transit (R2): no swap under
+          global SRGB, swap under per-node.
+      The plain-swap behaviour appears ONLY as R2's per_node sub-case; the
+      pattern's canonical (global_srgb, node-SID) form does NO swap at all.
+      Do NOT collapse this into P-MPLSLabelSwitch.
+
+  Reuse the MPLS shim header from P-MPLSLabelSwitch:
+    - custom_headers.py re-exports scapy.contrib.mpls.MPLS; instances import it
+      rather than defining a new header. Ether 0x8847 → parse mpls[0]; while
+      S==0 parse the next shim; on S==1 the next header is the payload (IP).
+
+  Canonical (Node-SID-only, global_srgb) implementation to v1model P4:
+    - A `my_node_sid` exact table keyed on mpls[0].label → hit ⇒ owned Node-SID;
+      action: setValid/setInvalid to pop the top shim, then look up the EXPOSED
+      mpls[0].label in `sid_fib` for the next-hop + L2 rewrite; mpls[0].ttl =
+      mpls[0].ttl - 1 on the exposed top.
+    - Multi-pop: a small bounded loop / staged tables popping while the exposed
+      top is still an owned SID (max ${max_stack_depth} stages).
+    - sid_fib exact table keyed on the active label → egress + MACs (+ out_label
+      only under per_node).
+    - Gate: if (mpls[0].isValid() && mpls[0].ttl > 1).
+    - default = drop (R6 miss + reserved labels).
+
+  Gradability in BMv2 --use-files: observable as the output label stack
+  (post-pop top label, S-bit, stack depth), the egress port, and the top MPLS
+  TTL across the SID sequence. NO time_tick is used — all behaviour is driven by
+  the received packet's SID stack.
+
+  Anti-pattern implementations to reject:
+    * Treating a local Node-SID like a generic swap (rewriting it to an
+      out_label) instead of popping and continuing.
+    * Keying the next-hop on the COMPLETED (just-popped) SID instead of the
+      exposed next SID.
+    * Forgetting to multi-pop consecutive local SIDs.
+    * Adj-SID via the FIB instead of the direct adjacency binding.
+    * Swapping under global_srgb (the global SID label is domain-wide,
+      unchanged on transit).
+    * Decrementing the INNER IP TTL (only the MPLS top TTL changes; PHP leaves
+      the inner TTL intact).
+    * Double-decrementing the MPLS TTL (ingress + egress).
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance and hand-run
+  the public tests through the oracle for the seed. Reuse the MPLS
+  custom_headers.py from a P-MPLSLabelSwitch instance.

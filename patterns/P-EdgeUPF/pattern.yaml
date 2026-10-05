@@ -1,0 +1,262 @@
+# P-EdgeUPF — 5G edge UPF data plane: stateless ACL ∘ GTP-U decap/encap ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass User Plane Function (UPF) every 5G N3/N6 boundary
+# runs: a stateless ternary ACL on the INNER user 5-tuple (P-ACL, P4), a
+# direction-keyed GTP-U tunnel endpoint that decaps on the uplink and encaps on
+# the downlink (P-GTPUEncap, P13), and an LPM unicast forwarder
+# (P-IPv4Routing, P1). The value of the *chained* pattern over instantiating
+# the three apart is the cross-stage ORDERING and the data dependence between
+# stages — invisible when each half is tested alone:
+#   (a) DECAP-BEFORE-ROUTE — the uplink LPM lookup keys on the INNER
+#       destination, which only exists after the outer IP/UDP/GTP-U is
+#       stripped. Routing the outer header would send user traffic to the gNB
+#       underlay, not toward the internet. Standalone P-IPv4Routing never sees
+#       a tunnelled packet; standalone P-GTPUEncap has no forwarding stage.
+#   (b) ACL-ON-INNER — the access policy keys on the user (inner) 5-tuple in
+#       BOTH directions. On the uplink the inner tuple is buried under the
+#       tunnel; on the downlink it is the bare packet. The ACL verdict is
+#       therefore computed at different stack depths depending on direction,
+#       yet must reference the same logical tuple. Standalone P-ACL has no
+#       tunnel to peer through.
+#   (c) BEARER DEPENDENCE — downlink encap requires a control-plane-installed
+#       bearer binding (UE IP -> TEID + gNB address). A packet to a UE with no
+#       bearer is dropped (no tunnel to build); the encap TEID is data-dependent
+#       on that binding. Neither half binds this cross-stage state lookup.
+#   (d) COMPOUND CHECKSUM — a routed inner header has its TTL decremented and a
+#       fresh checksum; an encapped packet carries a wholly NEW outer IPv4/UDP
+#       header whose checksums must be valid. The v1model multi-rewrite trap
+#       promoted across the encap/decap boundary.
+
+pattern_id: P-EdgeUPF
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D9:tunnel-encapsulation"
+    - "D2:header-rewriting"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P4:stateless-classification"
+    - "P13:gtp-tunnel-endpoint"
+
+target_capability: composition   # chains a relocate (P-GTPUEncap), a redesign (P-ACL/P-IPv4Routing) primitive; failure modes are cross-cutting
+
+summary: >
+  Single-pass 5G edge UPF straddling the N3 (access/gNB) and N6 (core/internet)
+  boundary. Every packet is (1) classified by a stateless ternary ACL on its
+  INNER user 5-tuple — a deny drops it before any tunnel work; (2) processed by
+  direction: an uplink packet (ingress access port) arrives GTP-U-tunnelled and
+  is decapsulated to expose the inner user IP datagram, while a downlink packet
+  (ingress core port) is plain IPv4 toward a UE and is encapsulated in GTP-U
+  using the UE's control-plane bearer binding (TEID + gNB address), dropping if
+  no bearer exists; (3) forwarded by LPM — the uplink routes on the decapsulated
+  inner destination toward the core, the downlink routes the new outer header
+  toward the gNB. The pipeline order ACL → decap/encap → route, the ACL-on-inner
+  contract, and the bearer-dependent encap are the load-bearing composite
+  contracts.
+
+grounding:
+  rfcs:
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute on the routed header
+    - id: RFC3198
+      quote: "It is the binding of a set of actions to a set of conditions - where the conditions are evaluated to determine whether the actions are performed."
+      title: "Terminology for Policy-Based Management"
+      role: ACL classification vocabulary (permit/deny)
+  specs:
+    - cite: "3GPP TS 29.281 — General Packet Radio System (GPRS) Tunnelling Protocol User Plane (GTPv1-U)"
+      role: GTP-U G-PDU encap/decap, TEID semantics, outer UDP port 2152
+  papers:
+    - cite: "Jeyakumar et al., Millions of Little Minions, SIGCOMM 2014"
+      role: ordering rationale for classify→tunnel→forward in a single pass
+
+entities:
+  acl_table:
+    type: bucket
+    key: [inner_ipv4_src, inner_ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {action: "permit|deny", priority: int}
+    capacity: ${rule_count_capacity}
+    eviction: none
+    notes: stateless ternary first-match-by-priority; evaluated on the INNER user 5-tuple in both directions.
+  bearer_table:
+    type: session
+    key: [ue_ipv4]
+    attrs: {egress_teid: int, gnb_ip: ipv4}
+    capacity: ${bearer_capacity}
+    eviction: none
+    notes: control-plane PDU-session bearer bindings; consulted on the downlink to build the GTP-U tunnel. A miss drops (no bearer).
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table; consulted on the inner dst (uplink) or the new outer dst (downlink).
+
+parameters:
+  access_subnet:        {type: cidr,   default: "10.0.1.0/24"}
+  core_subnet:          {type: cidr,   default: "198.51.100.0/24"}
+  ue_subnet:            {type: cidr,   default: "10.0.9.0/24"}
+  upf_n3_ip:            {type: ipv4,   default: "10.0.1.1"}
+  gtpu_udp_port:        {type: int,    default: 2152, constraint: "gtpu_udp_port == 2152"}
+  bearer_table:         {type: list,   default: []}
+  bearer_capacity:      {type: int,    default: 256, constraint: "bearer_capacity >= 1"}
+  acl_rules:            {type: list,   default: []}
+  rule_count_capacity:  {type: int,    default: 256}
+  match_field_breadth:  {type: enum,   values: [dst_only, tuple3, tuple5], default: tuple5}
+  priority_depth:       {type: int,    default: 16}
+  default_acl_action:   {type: enum,   values: [permit, deny], default: permit}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [acl_tunnel_route], default: acl_tunnel_route}
+  access_port:          {type: int,    default: 1}
+  core_port:            {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable/tunnellable header.
+
+  - id: R1_acl_classify
+    when: "header_present(IPv4)"
+    given: {match: "acl_table on the INNER user 5-tuple by descending priority"}
+    then: ["drop(pkt) if matched action == deny or (miss and default_acl_action == deny)"]
+    notes: >
+      stateless classification on the inner (user) tuple. On the uplink the
+      inner tuple is the inner IP datagram beneath the tunnel; on the downlink
+      it is the bare packet. The deny path leaves no tunnel/forwarding work
+      (acl_on_inner).
+
+  - id: R2_uplink_decap
+    when: "ingress on access_port and not denied"
+    given: {header_present: "UDP(gtpu_udp_port)/GTP-U/inner IPv4"}
+    then:
+      - "drop(pkt) if outer UDP dport != gtpu_udp_port or no GTP-U header (non-tunnelled access traffic)"
+      - "strip(outer Ether/IP/UDP/GTP-U)"
+      - "expose(inner IPv4 datagram as the packet)"
+      - "route_dst := inner IP.dst"
+    notes: decap before route; the inner destination is only visible after the tunnel is stripped (decap_before_route).
+
+  - id: R3_downlink_encap
+    when: "ingress on core_port and not denied"
+    given: {match: "bearer_table by (IP.dst == UE IP)"}
+    then:
+      - "drop(pkt) if no bearer binding for IP.dst (unsolicited / no PDU session)"
+      - "encap: push outer IPv4(src=upf_n3_ip, dst=bearer.gnb_ip)/UDP(sport=gtpu_udp_port,dport=gtpu_udp_port)/GTP-U(teid=bearer.egress_teid) over the original packet"
+      - "route_dst := bearer.gnb_ip"
+    notes: bearer dependence; the encap TEID + outer dst come from the control-plane bearer binding (bearer_dependence).
+
+  - id: R4_route_forward
+    when: "not dropped by R0-R3"
+    given: {match: "fib LPM on route_dst (inner dst uplink / outer dst downlink)"}
+    then:
+      - "drop(pkt) if no LPM match or ttl == 0 on the routed header"
+      - "dec(ttl, 1) on the routed header"
+      - "rewrite(outermost Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: >
+      LPM forward on the direction-specific destination. Uplink decrements the
+      INNER (now outermost) IPv4 TTL; downlink carries a fresh outer header (the
+      inner TTL is preserved end-to-end). One checksum recompute covers the
+      mutated/new header.
+
+invariants:
+  - id: decap_before_route
+    clause: stability
+    target: "the uplink LPM lookup keys on the INNER IP.dst exposed by decap, never the outer dst"
+  - id: acl_on_inner
+    clause: stability
+    target: "the ACL verdict keys on the inner user 5-tuple in both directions"
+    notes: the deny path short-circuits before R2/R3.
+  - id: bearer_dependence
+    clause: persistence
+    target: "a downlink packet is encapsulated iff a bearer binding exists for IP.dst; a miss drops"
+    free_under: [bearer_capacity]
+  - id: encap_outer_header_completeness
+    clause: stability
+    target: "the downlink outer IPv4/UDP/GTP-U carries upf_n3_ip src, bearer gnb_ip dst, gtpu_udp_port, and the bearer egress_teid"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "the routed header's IPv4 (and, for encap, outer UDP) checksums are valid over the TTL decrement / new-header construction"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases on the routed header; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: uplink_decap_forward
+      generate: "uplink GTP-U packet on access_port: decapped, inner dst routed out core_port, inner TTL-1"
+    - id: downlink_encap_forward
+      generate: "downlink plain IPv4 to a UE with a bearer: encapped in GTP-U (bearer TEID, gNB outer dst), routed out access_port"
+    - id: acl_deny_drop
+      generate: "a packet whose inner 5-tuple matches an ACL deny rule is dropped before tunnel/route"
+  G2:
+    - id: downlink_no_bearer_drop
+      generate: "downlink packet to a UE with NO bearer binding is dropped (no tunnel)"
+    - id: uplink_inner_dst_routing
+      generate: "uplink packet routes on the INNER dst (a different inner dst goes to a different/next-hop), proving decap-before-route"
+    - id: ttl_one_forwards_zero
+      generate: "uplink packet with inner ttl==1 forwards with egress inner ttl==0 (decrement once); inner ttl==0 drops"
+  G3:
+    - id: acl_deny_on_inner_uplink
+      generate: "an uplink tunnelled packet whose INNER tuple matches a deny rule is dropped — the ACL peers through the tunnel"
+    - id: uplink_non_gtpu_drop
+      generate: "a non-GTP-U IPv4 packet on the access port (no UDP/2152 tunnel) is dropped"
+    - id: non_ipv4_drop
+      generate: "ARP frame dropped before classification"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: flip_default_to_deny
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "${default_acl_action}: permit -> deny (unlisted inner flows dropped; only explicit permits pass)"
+    feasibility_postcondition: "at least one explicit permit rule exists"
+  - id: expand_match_field_breadth
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "match_field_breadth: dst_only -> tuple5 (full inner 5-tuple ACL matching)"
+  - id: shrink_bearer_capacity_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "bearer_capacity /= 4 (binding pressure on the downlink bearer table)"
+  - id: disable_acl
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "acl_rules: [] and default_acl_action: permit (decap/encap+route only; the ACL stage is a pass-through)"
+  - id: uplink_only
+    direction: ease
+    kind: rule
+    axis: pipeline_scope
+    effect: "drop the downlink encap stage (core_port traffic dropped); only the uplink decap+route path is graded; oracle regenerated"
+    feasibility_postcondition: "the FIB has a core-facing route for inner destinations"
+
+bridging_notes: |
+  - The ACL is stateless first-match by descending priority on the INNER user
+    5-tuple. A miss falls through to default_acl_action. On the uplink the
+    inner tuple is the GTP-U-encapsulated inner IP datagram; on the downlink it
+    is the bare incoming packet.
+  - Direction is decided by ingress port: access_port packets are GTP-U
+    uplink (decap), core_port packets are downlink (encap toward a UE).
+  - Uplink decap: the input is Ether/IP/UDP(2152)/GTP_U_Header/IP(inner)/L4.
+    A non-GTP-U IPv4 packet on the access port (no UDP/2152) drops. Strip the
+    outer Ether/IP/UDP/GTP-U; the inner IPv4 datagram becomes the packet; the
+    LPM key is the inner IP.dst; TTL is decremented once on the inner header.
+  - Downlink encap: the input is plain Ether/IP(dst==UE). Look up the bearer
+    by IP.dst; a miss drops. Build a NEW outer header
+    Ether/IP(src=upf_n3_ip, dst=gnb_ip)/UDP(2152)/GTP_U_Header(teid=egress_teid)
+    over the original packet; the LPM key is the outer dst (gnb_ip); the outer
+    TTL is set fresh and the inner TTL is preserved.
+  - LPM forwards on the direction-specific destination. ttl==0 on the routed
+    header drops. One checksum recompute covers the routed/new header.
+  - The cross-stage contracts: (a) decap-before-route — uplink routes on the
+    inner dst; (b) ACL-on-inner — both directions key the policy on the user
+    tuple; (c) bearer dependence — downlink encap needs a bearer binding.

@@ -1,0 +1,1278 @@
+# P-BFDLiveness — Bidirectional Forwarding Detection (RFC 5880/5881/5883)
+#
+# TPL v1.0 task pattern. Fills the previously empty
+# (D5:routing × P16:packet-origination) cell of the NF design-space map and
+# pairs with P-PURRFastReroute as the upstream liveness signal — see the
+# `liveness_export` parameter and the `enable_liveness_register_export`
+# operator, which together produce a register-array view that the FRR
+# pattern's `swap_liveness_to_dataplane_register` op consumes. This is the
+# first pattern in the corpus where the switch *originates* packets;
+# diagnostically it probes the v1model `clone3` / `recirculate` /
+# generator-table surface that the v1model bug catalogue notes is commonly
+# conflated with adjacent-target abstractions. target_capability = redesign:
+# BFD is a fixed-function ASIC primitive being moved into programmable
+# logic-level iteration. Instances are produced by binding the parameters below.
+
+pattern_id: P-BFDLiveness
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                                  # routing-family liveness signalling
+  prescriptive: [P16:packet-origination]                      # the canonical switch-originated-probe cell — previously unfilled
+
+target_capability: redesign                                   # BFD moves an ASIC fixed-function probe primitive into programmable logic
+
+summary: >
+  Sub-second bidirectional liveness detection per RFC 5880 with the
+  single-hop (RFC 5881) and multi-hop (RFC 5883) encapsulations. The
+  switch terminates BFD control sessions: each ingress BFD packet
+  validates against the §6.8.6 reception cascade, looks up its session
+  (Your Discriminator after init; source-IP + local-discriminator on
+  the first packet per RFC 5880 §6.3), advances the three-way handshake state
+  machine (Down → Init → Up) and stamps a `last_rx_timestamp` into the
+  session entry. On a periodic `time_tick`, two side rules fire: a
+  detection check that transitions any session whose
+  `now − last_rx > detect_mult × negotiated_rx_interval` to Down, and a
+  periodic-origination rule that emits a fresh probe at the negotiated
+  TX cadence carrying the local state. The pattern's headline
+  capability is *packet origination* — this is the first corpus
+  pattern that exercises the v1model `recirculate` / generator-entry
+  surface for switch-originated probes (`time_tick` entity). Anchor faithfulness (D5.0) is an 8-byte
+  minimal-state model with a single hop, control-plane-managed
+  origination, and ABI-level session lookup; higher bands ladder to
+  the full RFC 5880 mandatory section (D5.1), multi-hop RFC 5883
+  encapsulation (D5.2), and the optional Echo function plus
+  data-plane origination via `recirculate` (D5.3). The pattern's
+  `liveness_export` parameter exposes a port-keyed register view that
+  P-PURRFastReroute consumes at its D5.3 band — promoting the
+  two-pattern composition the P7 design-space row needs for end-to-end
+  coverage of the failover loop.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # BFD has no top-venue paper grounding in the literature survey; the protocol's reference is its RFC family
+
+  rfcs:
+    - cite: rfc5880
+      id: RFC5880                                             # canonical BFD spec; `cite` lacked a machine-checkable id before GS1 grounding
+      title: "Bidirectional Forwarding Detection (BFD)"
+      sections: ["§4.1 packet format", "§6.2 state machine", "§6.8.1 state variables", "§6.8.4 detection time", "§6.8.5 the Poll Sequence", "§6.8.6 reception of BFD Control packets", "§6.8.7 transmission", "§6.8.9 Echo function"]
+      role: normative_behaviour
+      grounding_cache: grounding/RFC5880.txt                  # verbatim RFC 5880 text fetched from https://www.rfc-editor.org/rfc/rfc5880.txt
+      quote: |                                                # RFC 5880 §6.5 — grounds R2 effect #4 (Poll→Final reply) + the `poll_final_handshake` test
+        packets with the Poll (P) bit set.  When the other system receives a
+        Poll, it immediately transmits a BFD Control packet with the Final
+        (F) bit set, independent of any periodic BFD Control packets it may
+        be sending (see section 6.8.7).
+      relevance: |
+        The protocol's authoritative source. The pattern's rule
+        sequence preserves the MUST-clauses that bind data-plane
+        behaviour, drawn verbatim from §6.8.6 and §6.8.7:
+          - §4.1 packet format — Vers, Diag, Sta, P/F/C/A/D/M flags,
+            Detect Mult, Length, My/Your Discriminator, Desired Min
+            TX Interval, Required Min RX Interval, Required Min Echo
+            RX Interval. The pattern's faithfulness ladder D5.0 →
+            D5.1 lifts the on-wire format from an 8-byte minimal
+            stand-in to the full 24-byte RFC 5880 mandatory section.
+          - §6.8.6 reception cascade — version != 1, length < 24,
+            length > UDP payload, Detect Mult == 0, M bit set, My
+            Discriminator == 0, Your Discriminator != 0 with no
+            session, A-bit mismatch with bfd.AuthType — every one
+            MUST drop. The R1 invalid-BFD-drop rule below is the
+            conjunction of these MUST-clauses.
+          - §6.2 / §6.8.6 state machine — Down → Init → Up advance on
+            ingress, and the reverse transition on detection timeout
+            with bfd.LocalDiag = 1 (Control Detection Time Expired).
+            The pattern's R3 implements the §6.8.4 detection-time
+            formula: detection_time = Detect Mult ×
+            max(RequiredMinRxInterval, RemoteDesiredMinTxInterval).
+          - §6.8.7 transmission — periodic emit at no less than the
+            larger of bfd.DesiredMinTxInterval and
+            bfd.RemoteMinRxInterval, 25% jitter applied. The R4
+            periodic-origination rule mirrors this exactly; the
+            `origination_mode` parameter selects whether the emit
+            originates from a packet-driven recirculation path
+            (data-plane origination, D5.3 ladder) or from a
+            generator-entry table populated by the control plane
+            (D5.0 anchor).
+          - §6.8.9 Echo function — gated on R5 by the
+            `echo_enabled` parameter (D5.3 ladder); single-packet
+            looback to the source.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model implementation — `recirculate()` vs
+        `clone3()` vs a generator-entry table for emit, register-
+        backed session-state layout, hash-keyed session lookup —
+        is widely-known P4-on-v1model practice rather than
+        RFC-cited. These implementation notes are flagged
+        `[common-knowledge baseline]` in `bridging_notes:` rather
+        than re-attributed to the RFC.
+
+    - cite: rfc5881
+      title: "Bidirectional Forwarding Detection (BFD) for IPv4 and IPv6 (Single Hop)"
+      sections: ["§4 encapsulation", "§5 TTL/Hop Limit", "§6 demultiplexing"]
+      role: normative_behaviour
+      relevance: |
+        Single-hop encapsulation rules the pattern's D5.0/D5.1
+        instances honour:
+          - UDP destination port 3784 for control packets, 3785 for
+            echo, source port in [49152, 65535].
+          - "all BFD Control packets for the session MUST be sent
+            with a Time to Live (TTL) or Hop Limit value of 255";
+            on receive, "MUST be discarded if the received TTL or
+            Hop Limit is not equal to 255". The pattern's
+            `ttl_strictness == strict_255` parameter binding turns
+            this into R1's first sub-clause; the implementation bug it
+            catches is omitting the TTL check entirely (so any
+            off-link spoof packet that happens to match a session's
+            5-tuple is accepted).
+          - Initial-packet demultiplexing rule for Your
+            Discriminator = 0 (per §3): bind to (remote system,
+            interface, protocol). The pattern's
+            `session_lookup_key == source_ip_and_remote_discr`
+            parameter exposes this initial-packet path; the strict
+            `your_discr_only` setting drops every Your Disc == 0
+            packet and is the harder variant.
+
+    - cite: rfc5883
+      title: "Bidirectional Forwarding Detection (BFD) for Multihop Paths"
+      sections: ["§5 encapsulation", "§6 authentication"]
+      role: normative_behaviour
+      relevance: |
+        Multi-hop encapsulation rules the pattern's D5.2 band
+        honours:
+          - UDP destination port 4784 for multi-hop control
+            packets.
+          - §3: "[BFD-1HOP] describes a lightweight method of
+            avoiding spoofing by requiring a Time to Live
+            (TTL)/Hop Limit of 255 on both transmit and receive,
+            but this obviously does not work across multiple
+            hops" — so the pattern's `ttl_strictness == relaxed`
+            (or `per_session`) is the multi-hop-compatible
+            setting and disables R1's TTL-255 sub-clause for
+            5883-keyed sessions.
+          - Initial demultiplexing uses (src IP, dst IP) when Your
+            Discriminator is zero, since the (interface, source)
+            tuple of 5881 does not constrain a multi-hop path.
+
+  tutorials: []                                               # no p4lang/tutorials BFD exercise
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; non-BFD packets traverse the pattern as a pass-through
+      (R0 forwards them to the downstream pipeline; the BFD module
+      neither consumes nor modifies them).
+
+  session:                                                    # the BFD session — the richest per-conversation state in the pattern
+    name: bfd_session
+    keyed_by: bfd.LocalDiscr                                  # primary lookup once Your Discriminator is nonzero (§6.8.6)
+    aux_key: "(peer_ip, ingress_port) — used at Your Discriminator == 0 per §6.3 / RFC 5881 §3 / RFC 5883 §4"
+    attrs:
+      local_discr:           int                              # bfd.LocalDiscr — nonzero, unique per system
+      remote_discr:          int                              # bfd.RemoteDiscr — echoed back, 0 on init
+      local_state:           enum                             # bfd.SessionState ∈ {AdminDown, Down, Init, Up}
+      remote_state:          enum                             # bfd.RemoteSessionState ∈ same
+      last_rx_timestamp:     int                              # microsecond timestamp of last valid RX
+      last_tx_timestamp:     int                              # microsecond timestamp of last TX
+      negotiated_tx_interval: int                             # max(bfd.DesiredMinTxInterval, bfd.RemoteMinRxInterval) (µs)
+      negotiated_rx_interval: int                             # max(bfd.RequiredMinRxInterval, bfd.RemoteDesiredMinTxInterval) (µs)
+      detect_mult:           int                              # nonzero; per §6.8.4
+      peer_ip:               address                          # remote endpoint
+      local_ip:              address                          # local endpoint (for multi-session disambiguation)
+      port_binding:          port                             # ingress port for the session; binds to link.is_down at R4's tail
+      hop_type:              enum                             # single_hop (RFC 5881) | multi_hop (RFC 5883)
+    capacity: ${session_capacity}
+    notes: |
+      A control-plane-installed BFD session plus a few data-plane-
+      mutated fields. Most of bfd.* lives in static seed bindings;
+      `local_state`, `remote_state`, `last_rx_timestamp`, and
+      `last_tx_timestamp` are the only fields R2/R3/R4 write.
+
+  link:                                                       # port-keyed liveness output — the consumer interface for P-PURRFastReroute
+    keyed_by: egress_port
+    attrs:
+      is_down: bool
+    capacity: ${liveness_register_capacity}
+    enforced_when: "${liveness_export} ∈ {link_register, both}"
+    notes: |
+      The cross-pattern composition surface. When
+      ${liveness_export} = link_register, every session whose
+      local_state transitions to Down (via R3) flips the bit at
+      `link[session.port_binding].is_down ← 1`; transitions to Up
+      (via R2) clear it. This is the exact data-plane register
+      P-PURRFastReroute's D5.3 `swap_liveness_to_dataplane_
+      register` operator reads — the cross-pattern composition
+      between P-BFDLiveness and P-PURRFastReroute.
+
+  time_tick:                                                  # periodic event source — R3 and R4 fire on tick events
+    period: ${tick_period_us}
+    notes: |
+      A periodic event the harness injects at ${tick_period_us}-
+      microsecond cadence. R3 (detection-time check) and R4
+      (periodic emit) fire on tick events, not on packets. The
+      `time_tick` entity is the v1.0 vocabulary's mechanism for
+      modelling switch-originated periodic behaviour.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  sessions:
+    type: list[bfd_session_entry]
+    constraint: |
+      every entry has local_discr ∈ [1, 2^32-1] unique across the
+      list, remote_discr ∈ [0, 2^32-1] (0 on init), peer_ip:ipv4 or
+      ipv6, local_ip:ipv4 or ipv6 same family as peer_ip, port_binding
+      ∈ valid port ids, detect_mult ∈ [1, 255], desired_min_tx_interval
+      ∈ [1000, 1e9] microseconds, required_min_rx_interval ∈ [1, 1e9]
+      microseconds, hop_type ∈ {single_hop, multi_hop}, role ∈
+      {active, passive}.
+    notes: |
+      Control-plane-installed BFD session descriptors. Anchor seeds
+      typically install 1–2 sessions for a topology with 2–3 hosts;
+      D5.2 (multi-hop) seeds install one cross-router session.
+
+  session_capacity:
+    type: int | unbounded
+    range: "[4, 65536]"
+    default: unbounded
+    notes: |
+      Maximum number of BFD sessions the data-plane session table
+      holds. Realistic single-pipeline ASIC BFD scales to 10²–10³
+      sessions (vendor docs); the `shrink_session_capacity_4x`
+      mutation walks the pattern down toward that regime.
+
+  detect_mult:
+    type: int
+    range: "[1, 32]"
+    default: 3
+    notes: |
+      Default detection multiplier for new sessions whose seed
+      entry does not override. Per §6.8.4 the detection time is
+      detect_mult × negotiated_rx_interval. RFC 5880 recommends 3
+      as the canonical default; lowering this to 1 is the
+      `lower_detect_mult` harden — it forces tighter timing and
+      catches implementations that have any per-tick slack in their
+      detection check.
+
+  packet_format_faithfulness:
+    type: enum
+    values: [D5.0_minimal_8byte, D5.1_rfc5880_mandatory, D5.2_multihop_rfc5883, D5.3_echo_rfc5880]
+    default: D5.0_minimal_8byte
+    notes: |
+      Packet-format faithfulness ladder. D5.0 is an
+      anchor-only stand-in: an 8-byte BFD payload carrying just
+      My Discriminator (4 bytes) + Your Discriminator (4 bytes),
+      Length is fixed, Diag/Sta/flags are absent. D5.1 lifts to
+      the full RFC 5880 24-byte mandatory section with the
+      complete reception cascade. D5.2 adds the multi-hop UDP-port-
+      4784 + relaxed-TTL encapsulation of RFC 5883. D5.3 adds the
+      §6.8.9 Echo function and switches the origination path from
+      a generator-entry table to data-plane `recirculate`-driven
+      emit. Seed-only parameter; not an nf_categories design-space tag.
+
+  origination_mode:
+    type: enum
+    values: [no_origination_sink_only, generator_entry_table, packet_driven_recirculate]
+    default: generator_entry_table
+    notes: |
+      How the periodic BFD probe is emitted on R4:
+        no_origination_sink_only → the switch consumes incoming
+            BFD packets and advances its session state but does
+            NOT originate probes. R4 is disabled; the peer must
+            do all the emitting. Used for sink-only nodes in
+            asymmetric topologies; degenerate ease setting that
+            shrinks the rule set.
+        generator_entry_table  → the control plane installs a
+            generator entry that fires every ${tick_period_us}
+            and triggers a static "emit one probe per active
+            session" action. Anchor; the v1.0 default.
+        packet_driven_recirculate → the data plane drives its own
+            origination via `recirculate()` — a stub-payload
+            packet is recirculated and on its second pass
+            triggers the emit. D5.3 harden; first-corpus probe
+            of the v1model recirculation surface.
+
+  transit_role:
+    type: enum
+    values: [sink_only, source_and_sink, passthrough_transit]
+    default: source_and_sink
+    notes: |
+      What role the switch plays for BFD sessions:
+        sink_only → terminates RX only; never originates (forces
+            ${origination_mode} = no_origination_sink_only).
+        source_and_sink → terminates both directions of one or
+            more sessions; the anchor / default.
+        passthrough_transit → the switch is on the BFD path but
+            does not terminate; BFD packets transit unmodified
+            (R0 passes them) and the pattern's state-machine
+            rules are dormant. Used for transit-router instances
+            of a wider topology.
+
+  failure_action_breadth:
+    type: enum
+    values: [link_down_only, link_down_plus_diag_log, link_down_plus_mirror_to_cpu]
+    default: link_down_only
+    notes: |
+      What happens at R3 when the detection timer fires beyond
+      writing local_state ← Down:
+        link_down_only → R3 only flips local_state and the
+            link.is_down register slot (default).
+        link_down_plus_diag_log → R3 additionally writes
+            bfd.LocalDiag ← 1 (Control Detection Time Expired,
+            §6.8.6) into the session entry. Implementations sometimes
+            forget to update the diagnostic field, causing the
+            next emitted probe to carry stale Diag.
+        link_down_plus_mirror_to_cpu → R3 additionally mirrors a
+            session-down digest to the CPU port for control-plane
+            notification (a cross-pattern hook).
+
+  ttl_strictness:
+    type: enum
+    values: [strict_255, relaxed, per_session_by_hop_type]
+    default: strict_255
+    notes: |
+      How R1 enforces RFC 5881 §5's TTL=255 requirement:
+        strict_255 → every BFD packet with TTL ≠ 255 is dropped;
+            this is the RFC 5881 anchor. Catches off-link spoof
+            attempts. Incompatible with D5.2 multi-hop.
+        relaxed → no TTL check; permits any TTL. The RFC 5883
+            multi-hop default.
+        per_session_by_hop_type → the check is gated per session
+            on the session's hop_type — strict for single_hop,
+            relaxed for multi_hop. Correct generalisation when
+            ${packet_format_faithfulness} = D5.2 (mixed hop
+            types) but a frequent implementation oversight.
+
+  session_lookup_key:
+    type: enum
+    values: [your_discr_only, source_ip_and_remote_discr, both]
+    default: both
+    notes: |
+      Per §6.8.6, the demux rule depends on Your Discriminator:
+        your_discr_only → reject every packet with Your Discr == 0
+            (no initial packet ever advances; sessions must be
+            pre-bound by the control plane). Stricter than RFC.
+        source_ip_and_remote_discr → use (source_ip, ingress_port)
+            keys for Your Discr == 0 packets per §6.3 / RFC 5881
+            §3. Required to handle the first packet of a new
+            session.
+        both → primary key is Your Discriminator; fallback to
+            source-IP / ingress-port when Your Discr == 0. The
+            RFC-compliant default.
+
+  echo_enabled:
+    type: bool
+    default: false
+    notes: |
+      When true, R5 (echo reflection on UDP dst port 3785) is
+      active. Per §6.8.9, the switch receives the echo packet and
+      loops it back unmodified to the source; the sender's own
+      detection loop uses round-trip arrival to confirm liveness.
+      Gated on by ${packet_format_faithfulness} = D5.3.
+
+  liveness_export:
+    type: enum
+    values: [none, link_register, digest_to_cp, both]
+    default: none
+    notes: |
+      How the session's Up/Down state is exposed to downstream
+      consumers:
+        none → no export; sessions are observed only on their
+            own probe traffic. Anchor.
+        link_register → flip a port-keyed register bit
+            (link[port_binding].is_down). This is the consumer
+            interface for P-PURRFastReroute's
+            `swap_liveness_to_dataplane_register` operator at
+            its D5.3 band — the cross-pattern composition.
+        digest_to_cp → emit a digest packet to the control
+            plane on every state change.
+        both → both link_register and digest_to_cp.
+
+  liveness_register_capacity:
+    type: int
+    range: "[8, 512]"
+    default: 64
+    notes: |
+      Number of slots in the link.is_down register array.
+      ${liveness_export} = link_register requires at least one
+      slot per port the harness's topology uses; the constraint
+      `|sessions.port_binding| ≤ liveness_register_capacity` is
+      checked at instantiation.
+
+  tick_period_us:
+    type: int
+    range: "[100, 1000000]"
+    default: 10000
+    notes: |
+      How often the harness fires a time_tick event into the
+      oracle. Should evenly divide the smallest negotiated TX
+      interval across all sessions. 10 ms is the v1.0 anchor;
+      smaller values stress R3/R4 ordering.
+
+  faithfulness:                                               # mirror-alias for packet_format_faithfulness; kept so seeds can opt for the conventional TPL key
+    type: enum
+    values: [D5.0_minimal_8byte, D5.1_rfc5880_mandatory, D5.2_multihop_rfc5883, D5.3_echo_rfc5880]
+    default: D5.0_minimal_8byte
+    notes: |
+      Convenience alias for ${packet_format_faithfulness} so seeds
+      can use the conventional TPL `faithfulness` key. Bound
+      identically; mutations that move one move the other.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. R0–R2 fire on packet ingress;
+# R3 and R4 fire on time_tick ingress; R5 (echo) fires on packet ingress
+# at UDP dst 3785 and is gated by ${echo_enabled}.
+
+rules:
+
+  - id: R0_non_bfd_passthrough
+    when: |
+      ¬(
+        header_present(udp)
+          ∧ (match(udp.dst_port, 3784) ∨ match(udp.dst_port, 4784) ∨ (${echo_enabled} ∧ match(udp.dst_port, 3785)))
+      )
+    then:
+      - forward(downstream_pipeline)
+    notes: |
+      Any frame that is not a BFD control packet (dst port 3784 or
+      4784) and, when ${echo_enabled}, not an echo packet (dst
+      port 3785), bypasses the pattern's state-machine rules and
+      continues through the downstream pipeline (typically the
+      forwarding pattern composed with this one). The pattern is
+      transparent to non-BFD traffic; R0 exists explicitly so the
+      first-match cascade does not consume regular forwarding-path
+      packets.
+
+  - id: R1_invalid_bfd_drop
+    when: |
+      (
+        header_present(udp)
+          ∧ (match(udp.dst_port, 3784) ∨ match(udp.dst_port, 4784))
+      )
+      ∧ (
+          ¬match(bfd.version, 1)
+        ∨ value(bfd.length, <, 24)                               # RFC 5880 §6.8.6 — A bit clear minimum; D5.0 only uses 8 bytes and waives this sub-check via packet_format_faithfulness
+        ∨ value(bfd.length, >, udp_payload_length)
+        ∨ match(bfd.detect_mult, 0)
+        ∨ match(bfd.flag_M, 1)
+        ∨ match(bfd.my_discr, 0)
+        ∨ (
+            value(bfd.your_discr, !=, 0)
+            ∧ ¬exists(session, by_local_discr(bfd.your_discr))
+          )
+        ∨ (
+            ${ttl_strictness} == strict_255
+            ∧ match(udp.dst_port, 3784)
+            ∧ value(ipv4.ttl, !=, 255)                            # RFC 5881 §5
+          )
+        ∨ (
+            ${ttl_strictness} == per_session_by_hop_type
+            ∧ match(udp.dst_port, 3784)
+            ∧ value(ipv4.ttl, !=, 255)
+          )
+      )
+    enforced_when: "${packet_format_faithfulness} != D5.0_minimal_8byte ∨ match(bfd.my_discr, 0) ∨ match(bfd.detect_mult, 0)"
+    then:
+      - drop
+    notes: |
+      The §6.8.6 reception cascade collapsed into one rule. Every
+      sub-clause is a MUST in RFC 5880; the implementation bug this rule
+      catches is omitting the cascade entirely (so any malformed
+      BFD frame is silently accepted and trashes session state).
+      At ${packet_format_faithfulness} = D5.0 the length and
+      version sub-checks are relaxed because the wire format is
+      an 8-byte stand-in, but the structural checks (my_discr,
+      detect_mult, your_discr-vs-session) still apply.
+
+  - id: R2_valid_bfd_rx_session_advance
+    when: |
+      header_present(udp)
+        ∧ (match(udp.dst_port, 3784) ∨ match(udp.dst_port, 4784))
+        ∧ ¬(R1_invalid_bfd_drop.fires)
+        ∧ (
+            exists(session, by_local_discr(bfd.your_discr))
+            ∨ (
+                ${session_lookup_key} ∈ {source_ip_and_remote_discr, both}
+                ∧ match(bfd.your_discr, 0)
+                ∧ exists(session, by_peer_ip_and_port(ipv4.src, std.ingress_port))
+              )
+          )
+    given:
+      session: by_local_discr(bfd.your_discr) if value(bfd.your_discr, !=, 0)
+               else by_peer_ip_and_port(ipv4.src, std.ingress_port)
+    then:
+      - "bind(session, session.key, attrs: {
+            remote_discr: bfd.my_discr,
+            remote_state: bfd.state,
+            last_rx_timestamp: now_us,
+            negotiated_rx_interval: max(session.required_min_rx_interval, bfd.desired_min_tx_interval)
+          })"
+      - "transition(session, advance_per_§6.8.6_state_table(session.local_state, bfd.state))"
+      - "bind(link, session.port_binding, attrs: {is_down: (session.local_state == Down ? 1 : 0)})
+            IF ${liveness_export} ∈ {link_register, both}"
+      - "emit(bfd_response_packet with flag_F=1, flag_P=0, your_discr=bfd.my_discr,
+              my_discr=session.local_discr, state=session.local_state)
+            IF match(bfd.flag_P, 1)"
+      - drop                                                  # the ingress BFD packet itself does not leave the switch (it is consumed)
+    notes: |
+      The §6.8.6 receive-path state machine collapsed into one
+      rule. Note four ordered effects:
+        1. bind session attrs from the packet's BFD fields;
+        2. transition local_state per the §6.8.6 state table
+           (Down/Init/Up advance; transition to Down if remote
+           sends AdminDown);
+        3. flip the link.is_down register slot if liveness export
+           is enabled — this is the consumer interface for
+           P-PURRFastReroute;
+        4. if the Poll bit was set, emit a Final-bit-set response
+           (§6.5 P/F handshake).
+      The ingress BFD packet is then dropped — the pattern
+      consumes the packet (the switch is its destination).
+
+  - id: R3_detection_timeout_to_down
+    when: |
+      header_present(time_tick)
+        ∧ exists(session, by_local_discr(any))
+        ∧ value(session.local_state, ∈, {Init, Up})
+        ∧ elapsed(now_us - session.last_rx_timestamp, >, session.detect_mult * session.negotiated_rx_interval)
+    given:
+      session: by_local_discr(any_eligible_session)
+    then:
+      - "transition(session, Down)"
+      - "set(session.local_diag, 1)
+            IF ${failure_action_breadth} ∈ {link_down_plus_diag_log, link_down_plus_mirror_to_cpu}"
+      - "bind(link, session.port_binding, attrs: {is_down: 1})
+            IF ${liveness_export} ∈ {link_register, both}"
+      - "mirror(cpu_port_for_session_down_digest)
+            IF ${failure_action_breadth} == link_down_plus_mirror_to_cpu
+            ∨ ${liveness_export} ∈ {digest_to_cp, both}"
+    notes: |
+      §6.8.4 detection-time check. Fires once per tick per
+      session whose `last_rx_timestamp` is beyond the detection
+      window. The transition to Down also flips
+      link[port_binding].is_down = 1 (cross-pattern signal to
+      P-PURRFastReroute). The diag-write and digest-mirror
+      effects are ${failure_action_breadth}- and
+      ${liveness_export}-gated.
+
+  - id: R4_periodic_origination
+    when: |
+      header_present(time_tick)
+        ∧ exists(session, by_local_discr(any))
+        ∧ value(session.local_state, ∈, {Down, Init, Up})       # AdminDown ⇒ no emit; passive Down with remote_discr == 0 also ⇒ no emit (handled below)
+        ∧ ¬(value(session.local_state, ==, Down) ∧ value(session.remote_discr, ==, 0) ∧ value(session.role, ==, passive))
+        ∧ elapsed(now_us - session.last_tx_timestamp, ≥, session.negotiated_tx_interval)
+        ∧ ${origination_mode} != no_origination_sink_only
+    given:
+      session: by_local_discr(any_eligible_session)
+    then:
+      - "emit(bfd_packet with version=1, diag=session.local_diag, state=session.local_state,
+              flag_P=session.poll_pending, flag_F=0,
+              detect_mult=session.detect_mult, length=24,
+              my_discr=session.local_discr, your_discr=session.remote_discr,
+              desired_min_tx_interval=session.desired_min_tx_interval,
+              required_min_rx_interval=session.required_min_rx_interval,
+              required_min_echo_rx_interval=session.required_min_echo_rx_interval,
+              encapsulated_in: ipv4_udp(src=session.local_ip, dst=session.peer_ip,
+                                       udp_dst_port=(session.hop_type == single_hop ? 3784 : 4784),
+                                       udp_src_port=session.local_udp_src_port,
+                                       ipv4_ttl=255))
+              applying_jitter_up_to_25_percent_per_§6.8.7"
+      - "set(session.last_tx_timestamp, now_us)"
+    enforced_when: "${origination_mode} ∈ {generator_entry_table, packet_driven_recirculate}"
+    notes: |
+      §6.8.7 transmission. Periodic emit at the negotiated TX
+      rate. The §6.8.7 MUST-NOT clauses:
+        - MUST NOT transmit BFD Control packets at an interval
+          less than negotiated_tx_interval less 25% jitter;
+        - MUST NOT transmit if Passive role and
+          bfd.RemoteDiscr == 0 (handled in the rule's negated
+          when-clause);
+        - MUST NOT periodically transmit if remote is in Demand
+          mode (not modelled in v1.0; flagged in
+          bridging_notes for a v1.1 extension).
+      The `${origination_mode}` parameter selects between a
+      control-plane-installed generator entry (anchor; D5.0–D5.2)
+      and a data-plane `recirculate()`-driven path (D5.3 harden,
+      first-corpus probe of the v1model recirculation surface).
+
+  - id: R5_echo_reflection
+    when: |
+      header_present(udp)
+        ∧ match(udp.dst_port, 3785)                             # RFC 5881 §4 echo port
+        ∧ ${echo_enabled}
+        ∧ ¬(R1_invalid_bfd_drop.fires)
+    enforced_when: "${echo_enabled}"
+    then:
+      - set(ipv4.dst, ipv4.src)
+      - set(ipv4.src, ipv4.dst)
+      - forward(std.ingress_port)                                # bounce out the port we received on, unmodified payload
+    notes: |
+      §6.8.9 echo reflection. The switch is the *receiver* of an
+      echo packet the sender (peer) emitted to verify the
+      forward path; the only requirement is to loop it back
+      unmodified. R5 swaps src/dst at the IP layer and forwards
+      out the ingress port so the packet retraces the link.
+      Gated on ${echo_enabled} so D5.0–D5.2 instances do not
+      ship a dormant rule.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_orphan_sessions
+    clause: no_orphan
+    target: session
+    notes: |
+      Every session entry has a defined population mechanism —
+      it is installed by the control plane via the ${sessions}
+      seed parameter and removed only on explicit teardown. The
+      pattern declares no eviction policy on the session table
+      (sessions live as long as the operator installs them);
+      capacity overflow is rejected at the control plane rather
+      than evicting a live session.
+
+  - id: detection_bounded_latency
+    clause: bounded_latency
+    target: session_down_declaration
+    bound: "session.detect_mult * session.negotiated_rx_interval + ${tick_period_us}"
+    notes: |
+      The §6.8.4 detection-time bound, extended by one tick to
+      account for the discrete-time R3 check. The first packet-
+      misses-the-window event MUST trigger a Down transition
+      within one tick of the deadline; implementations that defer the
+      check to a control-plane scrape fail this invariant.
+
+  - id: local_discriminator_persistence
+    clause: persistence
+    target: session.local_discr
+    while: "session is bound"
+    free_under: []
+    notes: |
+      §6.8.6: bfd.LocalDiscr is chosen once per session and MUST
+      NOT change for the session's lifetime. Implementation bug:
+      regenerating local_discr at each emit ("randomise per
+      probe") — peers reject the session as a new one and
+      detection thrashes.
+
+  - id: session_state_advance_monotonic_in_normal_path
+    clause: stability
+    target: session.local_state
+    while: "no detection timeout AND no AdminDown received"
+    notes: |
+      Under steady-state RX, session.local_state advances
+      Down → Init → Up and does NOT bounce backwards. An implementation
+      that resets local_state to Down on every incoming Up
+      packet (mis-implementing the §6.8.6 table) fails this
+      invariant.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. R5 echo reflection
+      forwards the packet exactly once out the ingress port; R4
+      origination emits a fresh packet that is not a recirculated
+      copy. The `packet_driven_recirculate` origination mode
+      recirculates one stub packet per emit *exactly once* (the
+      second pass triggers the actual emit and consumes the
+      stub); implementations that fail to consume the stub on its second
+      pass produce an infinite recirculation loop and trip this
+      invariant.
+
+  - id: emit_packet_structure_completeness
+    clause: stability
+    target: emitted_bfd_packet_layers
+    while: "rule R4 fires"
+    notes: |
+      Every packet emitted by R4 MUST contain a full Eth + IPv4 +
+      UDP + BFD layer stack with correctly computed IPv4 and UDP
+      checksums (UDP checksum may be zero per §4 of RFC 768; in
+      that case it MUST be present-but-zero, not absent). The
+      implementation anti-pattern is omitting the deparser emit for one
+      of the layers when conditional emit decides not to push it
+      — the `regression_conditional_deparser_on_emit` G3 case
+      below probes this.
+
+  - id: link_register_stability_under_no_state_change
+    clause: stability
+    target: link.is_down
+    while: "session.local_state unchanged AND R3 has not fired"
+    enforced_when: "${liveness_export} ∈ {link_register, both}"
+    notes: |
+      The link.is_down register slot for a session's
+      port_binding MUST NOT flip except when R2 or R3 explicitly
+      writes it. Implementations that recompute the register slot on
+      every tick (rather than only on state-change events) tend
+      to introduce a transient mismatch the FRR pattern's
+      `failover_decision_per_packet` invariant trips on.
+
+  - id: ttl_255_on_emit_when_single_hop
+    clause: stability
+    target: emitted_packet.ipv4.ttl
+    while: "rule R4 fires for a session with hop_type == single_hop"
+    enforced_when: "${packet_format_faithfulness} != D5.2_multihop_rfc5883"
+    notes: |
+      RFC 5881 §5 requires emitted single-hop BFD packets to
+      carry TTL = 255 (this is the same field whose check R1
+      enforces on receive). Implementations that emit with the
+      control-plane-installed `default_ttl` (often 64) silently
+      cause every peer to drop their probes — the session never
+      establishes.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+# Every entry maps to a G{1,2,3}-P{n}-T{m} rule from the test-goal framework.
+
+test_scaffolding:
+
+  G1:                                                         # functional correctness
+    - id: bfd_three_way_handshake_advance
+      rule_ref: G1-P1-T1                                      # one test per forwarding path / state transition
+      generate: |
+        Send a sequence of three BFD packets to an installed
+        session (peer_ip, ingress_port matching ${sessions}[0]).
+        Packet 1: state = Down, my_discr = peer_discr,
+        your_discr = 0; assert session.local_state advances
+        Down → Init.
+        Packet 2: state = Init, your_discr = session.local_discr;
+        assert session.local_state advances Init → Up.
+        Packet 3: state = Up, your_discr = session.local_discr;
+        assert session.local_state stays Up. After packet 3,
+        assert link[session.port_binding].is_down == 0 IF
+        ${liveness_export} ∈ {link_register, both}.
+
+    - id: non_bfd_passthrough
+      rule_ref: G1-P1-T1
+      generate: |
+        Send an ICMP echo request packet to an ingress port.
+        Assert the packet is forwarded to the downstream pipeline
+        unmodified (the pattern's R0 must not consume it). When
+        the pattern is composed with P-IPv4Routing, the downstream
+        pipeline is the routing pipeline; in standalone evaluation,
+        the pass-through decision should leave the packet observable
+        on the egress that the downstream pattern would have chosen.
+
+    - id: detection_time_expiry_marks_down
+      rule_ref: G1-P1-T5                                      # explicit transformation assertion
+      generate: |
+        Bring ${sessions}[0] to Up via the three-way handshake.
+        Then withhold all RX for
+        (session.detect_mult * session.negotiated_rx_interval +
+        2 * ${tick_period_us}) microseconds while feeding the
+        oracle time_tick events. Assert session.local_state
+        transitions Down within the window. Assert
+        link[session.port_binding].is_down flips to 1 IF
+        ${liveness_export} ∈ {link_register, both}. Tests the
+        `detection_bounded_latency` invariant.
+
+    - id: periodic_probe_origination
+      rule_ref: G1-P1-T3                                      # one test per table action — origination is its own action
+      requires: "${origination_mode} != no_origination_sink_only"
+      generate: |
+        Bring ${sessions}[0] to Up. Feed time_tick events for
+        2 * session.negotiated_tx_interval microseconds without
+        feeding any input BFD packets. Count the number of probes
+        emitted to session.peer_ip. Assert it is in the range
+        [1, 3] (one to three probes, accounting for jitter). For
+        each emitted probe assert:
+          - eth + ipv4 + udp + bfd layer stack present;
+          - ipv4.ttl == 255 (single_hop) or unrestricted (multi_hop);
+          - udp.dst_port == 3784 (single_hop) or 4784 (multi_hop);
+          - bfd.version == 1, bfd.length == 24
+            (at ${packet_format_faithfulness} != D5.0);
+          - bfd.my_discr == session.local_discr;
+          - bfd.your_discr == session.remote_discr;
+          - bfd.state == Up.
+
+    - id: poll_final_handshake
+      rule_ref: G1-P1-T2                                      # one test per protocol branch
+      requires: "${packet_format_faithfulness} != D5.0_minimal_8byte"
+      generate: |
+        Bring ${sessions}[0] to Up. Send a BFD packet with the
+        P flag set (Poll). Assert the switch responds within one
+        ${tick_period_us} with a packet carrying:
+          - flag_F == 1, flag_P == 0;
+          - your_discr == sender.my_discr;
+          - my_discr == session.local_discr;
+          - state == session.local_state.
+        The response MUST be emitted even though no periodic-emit
+        timer has fired (it is a synchronous reply per §6.5).
+
+  G2:                                                         # resource robustness / boundary
+    - id: session_capacity_overflow
+      rule_ref: G2-P1-T3                                      # capacity / overflow
+      requires: "${session_capacity} != unbounded"
+      generate: |
+        Install ${session_capacity} sessions successfully.
+        Attempt to install one more via the control plane (or
+        send an init-state BFD packet from a new peer at
+        ${session_lookup_key} ∈ {source_ip_and_remote_discr,
+        both}). Assert either the install is rejected, or no new
+        session is created. Then send a BFD packet matching the
+        rejected/dropped session; assert no session advance.
+
+    - id: malformed_bfd_drops
+      rule_ref: G2-P1-T2                                      # parser reject / malformed input
+      requires: "${packet_format_faithfulness} != D5.0_minimal_8byte"
+      generate: |
+        Construct five malformed BFD packets, each violating one
+        §6.8.6 cascade clause: (a) version = 0; (b) length = 18
+        (< 24, A bit clear); (c) detect_mult = 0; (d) M bit set;
+        (e) my_discr = 0. Send each to the switch on a port
+        matching ${sessions}[0].port_binding. Assert each is
+        dropped (no session advance, no link.is_down flip, no
+        response emitted). Mirrors the §6.8.6 reception cascade
+        verbatim.
+
+    - id: ttl_not_255_single_hop_drops
+      rule_ref: G2-P1-T3
+      requires: "${ttl_strictness} ∈ {strict_255, per_session_by_hop_type} ∧ ${packet_format_faithfulness} != D5.2_multihop_rfc5883"
+      generate: |
+        Construct a well-formed BFD packet (state = Up, valid
+        discriminators matching ${sessions}[0]) but with
+        ipv4.ttl = 64 and udp.dst_port = 3784. Send it. Assert
+        drop. Tests RFC 5881 §5 enforcement. Implementation bug:
+        forgetting the TTL=255 check on receive — every off-link
+        spoof packet that happens to match a session's 5-tuple
+        gets accepted.
+
+  G3:                                                         # security / bypass / regression for v1model bug patterns
+    - id: session_id_zero_drops_when_strict
+      rule_ref: G3-P2-T1                                      # bypass: tighten initial-packet path
+      requires: "${session_lookup_key} == your_discr_only"
+      generate: |
+        Send a BFD packet with your_discr = 0 (the initial-packet
+        case) to an ingress port matching ${sessions}[0]. Assert
+        the packet is dropped (no session advance) because
+        your_discr = 0 + your_discr_only lookup ⇒ §6.8.6 demux
+        miss. Verifies the tightened-demux variant.
+
+    - id: regression_conditional_deparser_on_emit
+      rule_ref: G3-P2-T2                                      # bug-driven: conditional deparser
+      requires: "${origination_mode} != no_origination_sink_only"
+      generate: |
+        Bring ${sessions}[0] to Up and force a periodic emit
+        (feed time_tick events past session.negotiated_tx_interval).
+        Capture the emitted probe. Verify the OUTPUT structure
+        is exactly Eth + IPv4 + UDP + BFD, with every IPv4 field
+        present (version=4, ihl=5, totalLen, identification,
+        flags, fragOffset, ttl=255, proto=17, srcAddr, dstAddr)
+        and a valid recomputed IPv4 checksum and UDP checksum.
+        Catches implementations that conditionally emit the BFD payload
+        inside the deparser ("packet.emit(hdr.bfd)" inside an
+        `if`), which silently corrupts the emit when the
+        condition mis-evaluates. The anti-pattern is
+        documented in the v1model bug catalogue's "Language
+        Semantic Pitfalls" category — this G3 entry is the first-corpus
+        probe of that pattern on a *switch-originated* packet
+        rather than a forwarded one.
+
+    - id: regression_std_metadata_drop_smoke
+      rule_ref: G3-P2-T3                                      # bug-driven: std_metadata.drop misread
+      generate: |
+        Send a sequence: (a) a malformed BFD packet that R1
+        drops; (b) a non-BFD packet (e.g., ICMP echo) on the
+        same ingress port. Assert (b) is forwarded normally by
+        R0 — the prior drop did NOT corrupt the program's
+        per-packet decision via a misread of
+        `standard_metadata.drop`. Catches implementations that read
+        `std.drop` to test "was the previous packet dropped?"
+        (the field is reserved; reads cross-contaminate the
+        decision on subsequent packets). Mirrors the regression
+        target documented in the v1model bug catalogue's
+        "Backend resource mapping error" category.
+
+    - id: regression_checksum_recompute_on_emit
+      rule_ref: G3-P2-T2                                      # bug-driven: checksum miss on origination
+      requires: "${origination_mode} != no_origination_sink_only ∧ ${packet_format_faithfulness} != D5.0_minimal_8byte"
+      generate: |
+        Force a periodic emit. Capture the probe. Compute the
+        expected IPv4 checksum from the emitted header bytes and
+        compare against the IPv4.checksum field in the captured
+        packet; assert bit-equal. Repeat for the UDP checksum
+        (if nonzero — UDP checksum MAY be 0 per RFC 768 §4, in
+        which case zero is acceptable). Implementation bug: copying an
+        old checksum value from a parsed-in template, rather
+        than recomputing from the emit-time bytes — silent
+        until a peer rejects the packet.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pair every harden with an ease on the same axis. Fourteen operators across
+# seven paired axes (capacity, faithfulness, detect-mult, origination, ttl,
+# echo, liveness-export).
+
+mutation_operators:
+
+  - id: shrink_session_capacity_4x
+    applicable_when: "${session_capacity} ≠ unbounded ∧ ${session_capacity} > 16"
+    effect: "${session_capacity} ← ${session_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${session_capacity} ≥ 4 ∧ ${session_capacity} ≥ |${sessions}|"
+    notes: |
+      Tighten the session-table capacity axis. At 64 → 16 the
+      program cannot rely on a generously-sized session table and
+      must consider per-port partitioning or aging. Pairs with
+      enlarge_session_capacity_2x.
+
+  - id: enlarge_session_capacity_2x
+    applicable_when: "${session_capacity} ≠ unbounded"
+    effect: "${session_capacity} ← ${session_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${session_capacity} ≤ 65536"
+    notes: |
+      Loosen the capacity axis. Pairs with
+      shrink_session_capacity_4x so difficulty recalibration
+      can recover from over-tightening.
+
+  - id: tighten_packet_format_faithfulness
+    applicable_when: "${packet_format_faithfulness} ≠ D5.3_echo_rfc5880"
+    effect: |
+      ${packet_format_faithfulness} ← next_ladder_step(${packet_format_faithfulness}) ∧
+      ${faithfulness} ← ${packet_format_faithfulness}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      The §6.8.6 cascade activates for the new faithfulness band
+      (D5.1+ enforces version/length/M-bit/A-bit checks; D5.2
+      adds the udp.dst_port=4784 path; D5.3 adds the echo rule
+      R5 and the packet_driven_recirculate origination option).
+    notes: |
+      Lift D5.0 → D5.1 → D5.2 → D5.3. Each step activates
+      additional discard clauses in R1 and (at D5.3) the echo
+      and recirculate-driven origination paths. The first
+      corpus pattern whose mutation chain explicitly lifts the
+      *wire format* of an originated packet.
+
+  - id: relax_packet_format_faithfulness
+    applicable_when: "${packet_format_faithfulness} ≠ D5.0_minimal_8byte"
+    effect: |
+      ${packet_format_faithfulness} ← prev_ladder_step(${packet_format_faithfulness}) ∧
+      ${faithfulness} ← ${packet_format_faithfulness}
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no session in ${sessions} requires a band-specific feature still active in the seed"
+    notes: |
+      Drop one rung on the faithfulness ladder. Pairs with
+      tighten_packet_format_faithfulness; used to ease an under-
+      band instance whose only failures are RFC-cascade pedantry.
+
+  - id: lower_detect_mult
+    applicable_when: "${detect_mult} > 1"
+    effect: "${detect_mult} ← max(1, ${detect_mult} - 1)"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${detect_mult} ≥ 1 ∧ ${detect_mult} * session.negotiated_rx_interval ≥ ${tick_period_us}"
+    notes: |
+      Tighten detection timing. detect_mult = 1 means the very
+      first missed packet declares Down — implementations that have any
+      per-tick slack in their R3 check or that misplace the
+      `>` vs `≥` comparison fail. The feasibility postcondition
+      ensures the detection window is still ≥ one tick period
+      so the harness can fire R3 at least once.
+
+  - id: raise_detect_mult
+    applicable_when: "${detect_mult} < 32"
+    effect: "${detect_mult} ← ${detect_mult} + 1"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${detect_mult} ≤ 32"
+    notes: |
+      Loosen detection timing. Pairs with lower_detect_mult.
+
+  - id: tighten_origination_to_packet_driven
+    applicable_when: "${origination_mode} == generator_entry_table"
+    effect: |
+      ${origination_mode} ← packet_driven_recirculate ∧
+      ${faithfulness} ← max(${faithfulness}, D5.3_echo_rfc5880)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      no R4-disabling parameter is active (i.e.,
+      ${transit_role} ∈ {source_and_sink, sink_only} and the
+      harness can inject recirculate stub packets at init).
+    notes: |
+      Move the emit path from a control-plane-installed
+      generator entry to a data-plane `recirculate()`-driven
+      loop. This is the first-corpus probe of the v1model
+      recirculation surface for switch-originated traffic —
+      the v1model bug catalogue notes recirculation as an
+      under-tested area, and this op is what activates it.
+
+  - id: relax_origination_to_generator_entry
+    applicable_when: "${origination_mode} == packet_driven_recirculate"
+    effect: "${origination_mode} ← generator_entry_table"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the harness can install a generator entry that fires every ${tick_period_us}"
+    notes: |
+      Drop back to the generator-entry origination path. Pairs
+      with tighten_origination_to_packet_driven.
+
+  - id: tighten_ttl_validation
+    applicable_when: "${ttl_strictness} == relaxed"
+    effect: "${ttl_strictness} ← strict_255"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "no session in ${sessions} has hop_type == multi_hop (cannot enforce strict_255 with multi-hop sessions)"
+    notes: |
+      Activate the RFC 5881 §5 TTL=255 check on R1's discard
+      cascade and the §5 TTL=255 invariant on R4's emit. Catches
+      implementations that omit the check (single-hop spoofing).
+
+  - id: relax_ttl_validation
+    applicable_when: "${ttl_strictness} == strict_255"
+    effect: "${ttl_strictness} ← relaxed"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "G2 entry `ttl_not_255_single_hop_drops` is dropped from the floor (its `requires:` guard turns it off)"
+    notes: |
+      Disable the TTL=255 check. Pairs with tighten_ttl_validation.
+
+  - id: enable_echo_reflection
+    applicable_when: "${echo_enabled} == false"
+    effect: |
+      ${echo_enabled} ← true ∧
+      ${packet_format_faithfulness} ← max(${packet_format_faithfulness}, D5.3_echo_rfc5880)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "R5 is added to the active rule set; ${origination_mode} != no_origination_sink_only"
+    notes: |
+      Activate R5 (echo reflection on UDP dst 3785). The implementation
+      must implement an additional ingress branch that swaps
+      src/dst and forwards on the ingress port. Lifts to D5.3.
+
+  - id: disable_echo_reflection
+    applicable_when: "${echo_enabled} == true"
+    effect: "${echo_enabled} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "R5 is removed from the active rule set"
+    notes: |
+      Strip echo reflection. Pairs with enable_echo_reflection.
+
+  - id: enable_liveness_register_export
+    applicable_when: "${liveness_export} == none"
+    effect: |
+      ${liveness_export} ← link_register ∧
+      add invariant link_register_stability_under_no_state_change to enforced set
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${liveness_register_capacity} ≥ |unique(${sessions}.port_binding)|"
+    notes: |
+      Activate the port-keyed liveness register export. R2 and
+      R3 gain a side effect that writes
+      link[session.port_binding].is_down. This is the consumer
+      interface for P-PURRFastReroute's
+      `swap_liveness_to_dataplane_register` operator at D5.3 —
+      enabling this op turns the BFD pattern into a usable
+      upstream signal for the FRR pattern.
+
+  - id: disable_liveness_register_export
+    applicable_when: "${liveness_export} ∈ {link_register, both}"
+    effect: |
+      ${liveness_export} ← (${liveness_export} == both ? digest_to_cp : none) ∧
+      remove invariant link_register_stability_under_no_state_change from enforced set
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no consuming pattern (e.g., P-PURRFastReroute) is composed in the seed expecting the register slot"
+    notes: |
+      Strip the register-export side effect. Pairs with
+      enable_liveness_register_export.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4. Tagged with the
+  faithfulness band each addresses; items marked [common-knowledge
+  baseline] are synthesised from internalised P4 / networking
+  knowledge rather than retrieved from a cited source (distinguishing
+  cited claims from synthesised gap-fills).
+
+    D5.0 anchor (packet_format_faithfulness: D5.0_minimal_8byte,
+                 origination_mode: generator_entry_table,
+                 ttl_strictness: strict_255,
+                 echo_enabled: false,
+                 liveness_export: none):
+      - One table: `session_lookup` (key: bfd.your_discr | meta
+        for the source-IP fallback, match_kind: exact) → action
+        `set_session(local_discr, peer_ip, port_binding, ...)`
+        that stashes the session row into metadata.
+      - One register: `last_rx_ts<bit<48>>(${session_capacity})`
+        keyed on a hash of (local_discr); R2 writes
+        std_metadata.ingress_global_timestamp into it.
+      - One generator entry: a control-plane-installed table
+        match that fires on tick metadata, looping over
+        ${session_capacity} slots and emitting a probe per
+        active slot. [common-knowledge baseline — the
+        v1model.p4 header documents the
+        `standard_metadata_t.ingress_global_timestamp` field
+        and the generator-entry mechanism in MyEgress.]
+      - MyComputeChecksum: incremental update on the BFD field
+        rewrites for R2 emit; fresh checksum from scratch for
+        R4 emit (the v1model `update_checksum` extern handles
+        both modes — recomputing from emit-time bytes is the
+        correct pattern for R4).
+      - Apply sequence in MyIngress:
+          if (hdr.bfd.isValid()) {
+            // R1 cascade
+            if (hdr.bfd.version != 1 || hdr.bfd.detect_mult == 0 ||
+                hdr.bfd.my_discr == 0 || hdr.bfd.flag_M == 1 ||
+                (hdr.bfd.your_discr != 0 && !session_lookup.apply().hit) ||
+                (ttl_strictness == strict_255 && hdr.ipv4.ttl != 255)) {
+              mark_to_drop(standard_metadata); return;
+            }
+            // R2 — state advance + Poll response
+            ...
+          } else if (hdr.eth.isValid() && hdr.ipv4.isValid() &&
+                     hdr.udp.isValid() && hdr.udp.dst_port != 3784 &&
+                     hdr.udp.dst_port != 4784) {
+            // R0 — pass through to downstream
+            forwarding_pipeline.apply();
+          }
+      - For R4 origination (generator_entry_table mode), use
+        the v1model `egress_port_spec` and `mcast_grp` metadata
+        in MyEgress, or a clone3() call from MyIngress that
+        emits a fresh copy per active session. [common-
+        knowledge baseline.]
+
+    D5.1 (packet_format_faithfulness: D5.1_rfc5880_mandatory):
+      - Header is now the full 24-byte RFC 5880 mandatory
+        section; the parser must extract Vers (4), Diag (6),
+        Sta (2), Flag bits P/F/C/A/D/M (1 each), Detect Mult
+        (8), Length (8), and the four 32-bit fields.
+      - R1's cascade activates the length-range and version
+        checks; R2 must update bfd.RemoteDemandMode and
+        bfd.RemoteMinRxInterval from the parsed fields.
+
+    D5.2 (packet_format_faithfulness: D5.2_multihop_rfc5883):
+      - The parser must select between udp.dst_port 3784 and
+        4784 in MyParser. Per RFC 5883 §3, TTL=255 enforcement
+        is incompatible with multi-hop; the seed will typically
+        set ${ttl_strictness} = per_session_by_hop_type so the
+        implementation gates the check on the matched session's
+        hop_type. [common-knowledge baseline — the per-session
+        gate is the canonical multi-hop implementation but is not
+        verbatim in RFC 5883.]
+
+    D5.3 (packet_format_faithfulness: D5.3_echo_rfc5880,
+          origination_mode: packet_driven_recirculate,
+          echo_enabled: true):
+      - R5 echo reflection: a one-rule ingress branch that
+        matches udp.dst_port == 3785, swaps src/dst at the IP
+        layer, and `egress_port_spec = std.ingress_port`.
+      - Data-plane origination: the implementation installs a
+        `recirculate()` call in MyEgress on a stub packet at
+        init; the recirculated packet matches a generator-style
+        table that increments through session slots and emits
+        a fresh probe per session, then drops the stub. The
+        implementation anti-pattern is forgetting to drop the stub on
+        its second pass → recirculation runaway (trips
+        no_loop). [common-knowledge baseline — recirculate
+        semantics documented in v1model.p4, but the stub-drop
+        discipline is convention.]
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Reading `standard_metadata.drop` to test "was the
+      previous packet dropped?" — this is a reserved-field
+      misread (a common v1model bug). The
+      `regression_std_metadata_drop_smoke` G3 case catches
+      cross-packet contamination from this misuse.
+
+    * Conditionally emitting hdr.bfd or hdr.udp inside
+      MyDeparser via `if (some_state_condition) packet.emit(
+      hdr.bfd)`. The `regression_conditional_deparser_on_emit`
+      G3 case catches this by asserting the full Eth+IPv4+UDP+
+      BFD structure on every R4-emitted probe. Note: this is
+      especially failure-prone on R4 because the originated
+      packet is freshly constructed in metadata rather than
+      copied from a parsed-in template, so any conditional
+      emit guard is a fresh failure surface.
+
+    * Copying an IPv4 or UDP checksum from a template instead
+      of recomputing via `update_checksum` on the emit-time
+      bytes. The `regression_checksum_recompute_on_emit` G3
+      case catches this. Particularly subtle on R4: an implementation
+      that builds the emit packet by `hdr.ipv4.setValid()`
+      followed by field-by-field assignment without invoking
+      `update_checksum` produces a packet that BMv2 will emit
+      with an all-zero checksum — many peers silently drop
+      it.
+
+    * Regenerating bfd.LocalDiscr at each emit ("randomise
+      per probe") — peers reject the session as a new one and
+      the session never establishes. The
+      `local_discriminator_persistence` invariant binds this
+      directly.
+
+    * Implementing R3 (detection timeout) as a control-plane
+      scrape rather than a data-plane tick-fed check — adds
+      one round-trip of CP latency to every Down declaration,
+      breaking `detection_bounded_latency`. The
+      `time_tick` entity is the v1.0 TPL vocabulary's
+      mechanism for keeping this in-pipeline.
+
+    * Using the v1model `egress_port_spec` to set the egress
+      port of an originated probe to 0 (broadcast) when the
+      session's port_binding is set — broadcasts every probe
+      to every port. The program must set egress_spec =
+      session.port_binding explicitly. [common-knowledge
+      baseline.]
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and (once the
+       oracle exists) the oracle audit must all pass.
+
+    2. The pattern's oracle MUST treat tick events distinctly
+       from packet events. `step(packet=None, ingress_port=-1,
+       state)` should be the tick path; `step(packet=
+       Scapy(...), ingress_port=N, state)` should be the
+       packet path. The oracle audit's canonical examples MUST
+       include one R3 timeout sequence (a long run of tick
+       events with no RX) and one R4 origination sequence
+       (tick events with the session already Up) so a
+       constant-baked oracle that hardcodes
+       `detect_mult * negotiated_rx_interval` diverges on at
+       least one example.
+
+    3. For anchor-band instances (D5.0_minimal_8byte, default
+       seeds), the pattern's behaviour reduces to a tiny
+       4-rule subset (R0, R1's structural-only checks, R2's
+       state advance, R4 generator-table emit) that should
+       compile and pass smoke testing in a 200-line P4
+       program. Higher bands (D5.1+) grow the rule set to
+       6 rules and add the full RFC 5880 reception cascade.
+
+    4. The cross-pattern composition with P-PURRFastReroute
+       requires:
+         - This pattern's seed sets
+           ${liveness_export} = link_register and
+           ${liveness_register_capacity} ≥ |unique(ports)| of
+           the composed topology.
+         - P-PURRFastReroute's seed sets its own
+           `liveness_source` parameter (not this pattern's) to
+           the value `dataplane_register`.
+         - The two patterns' instantiated tasks SHOULD share
+           the same `bindings.yaml` for the topology so the
+           port_binding ↔ frr_group.primary_port mapping is
+           consistent. Flag for v1.1 as a
+           cross-pattern-composition harness extension.

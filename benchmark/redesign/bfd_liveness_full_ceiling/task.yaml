@@ -1,0 +1,1294 @@
+task_name: bfd_liveness_full_ceiling
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-BFDLiveness
+pattern_version: '1.0'
+
+seed:
+  sessions:
+    - local_discr: 286331153
+      remote_discr: 0
+      local_state: Down
+      remote_state: Down
+      peer_ip: "10.0.1.1"
+      local_ip: "10.0.0.1"
+      port_binding: 1
+      hop_type: single_hop
+      role: active
+      detect_mult: 3
+      desired_min_tx_interval: 1000000
+      required_min_rx_interval: 1000000
+      required_min_echo_rx_interval: 0
+      local_udp_src_port: 49152
+    - local_discr: 572662306
+      remote_discr: 0
+      local_state: Down
+      remote_state: Down
+      peer_ip: "10.0.2.2"
+      local_ip: "10.0.0.2"
+      port_binding: 2
+      hop_type: single_hop
+      role: active
+      detect_mult: 3
+      desired_min_tx_interval: 1000000
+      required_min_rx_interval: 1000000
+      required_min_echo_rx_interval: 0
+      local_udp_src_port: 49153
+    - local_discr: 858993459
+      remote_discr: 0
+      local_state: Down
+      remote_state: Down
+      peer_ip: "10.0.3.3"
+      local_ip: "10.0.0.3"
+      port_binding: 3
+      hop_type: multi_hop
+      role: active
+      detect_mult: 3
+      desired_min_tx_interval: 1000000
+      required_min_rx_interval: 1000000
+      required_min_echo_rx_interval: 0
+      local_udp_src_port: 49154
+  session_capacity: 64
+  packet_format_faithfulness: D5.3_echo_rfc5880
+  origination_mode: generator_entry_table
+  ttl_strictness: strict_255
+  echo_enabled: true
+  liveness_export: none
+  failure_action_breadth: link_down_only
+
+description: |
+  A switch s1 runs a protocol-driven liveness check (Bidirectional
+  Forwarding Detection, BFD) against three peers, per RFC 5880 (the
+  core protocol), RFC 5881 (single-hop encapsulation) and RFC 5883
+  (multi-hop encapsulation). The switch terminates THREE configured
+  BFD sessions and must, for each: consume valid BFD control
+  packets, drop invalid ones, advance a per-session state machine,
+  and reply to "Poll" requests with the corresponding "Final"
+  reply. It must additionally reflect BFD Echo packets. The three
+  sessions span all three BFD encapsulations the switch has to
+  demultiplex on a single data plane:
+
+    - two SINGLE-HOP sessions (RFC 5881), one with each directly
+      attached host, carried on UDP destination port 3784;
+    - one MULTI-HOP session (RFC 5883) with a remote peer reached
+      through s1.p3, carried on UDP destination port 4784.
+
+  Traffic that is NOT a BFD packet is unaffected — it is passed
+  through to a downstream forwarding pipeline. You author both the
+  P4 program and the control-plane table entries that realise these
+  sessions and the forwarding pipeline (see "Control plane" below).
+
+  ## What a BFD control packet looks like on the wire
+
+  Every BFD control packet on this task is encapsulated as
+  Ethernet + IPv4 + UDP + BFD, with UDP destination port 3784
+  (single-hop, RFC 5881) or 4784 (multi-hop, RFC 5883). The two
+  control ports share one BFD section format and one state machine;
+  they differ only in the single-hop TTL rule (rule 2g) and in the
+  UDP destination port the switch uses for the Poll/Final reply.
+  Inside the UDP payload sits a 24-byte BFD section comprising:
+
+    - A protocol version (3 bits) which MUST equal 1.
+    - A 5-bit diagnostic code.
+    - A 2-bit state field with values: 0=AdminDown, 1=Down,
+      2=Init, 3=Up.
+    - Six 1-bit flags in the following order: P (Poll), F (Final),
+      C (Control Plane Independent), A (Authentication Present),
+      D (Demand), M (Multipoint).
+    - An 8-bit detection multiplier (MUST be nonzero).
+    - An 8-bit length field (MUST be at least 24).
+    - A 32-bit "My Discriminator" — the sender's session id (MUST
+      be nonzero).
+    - A 32-bit "Your Discriminator" — echo of the receiver's
+      session id, or 0 if the sender has not yet learned it.
+    - Three 32-bit time fields: Desired Min TX Interval,
+      Required Min RX Interval, Required Min Echo RX Interval
+      (each in microseconds).
+
+  ## Per-packet behaviour
+
+  For every frame s1 receives:
+
+   1. **Non-BFD passthrough.** If the frame is NOT a BFD packet —
+      i.e. NOT an IPv4 / UDP packet whose UDP destination port is
+      3784 (single-hop control, rules 2–6), 4784 (multi-hop control,
+      rules 2–6) or 3785 (BFD echo, rule 7) — it MUST be passed
+      through to the downstream forwarding pipeline (the one your
+      control plane installs; see "Control plane" below). The switch
+      MUST NOT consume or alter such traffic beyond the forwarding
+      rewrite that pipeline specifies.
+
+   2. **Reception cascade — drop on any of the following.** For a
+      BFD control packet, drop it (no state change, no response)
+      if ANY of these hold:
+        a. Protocol version is not 1.
+        b. Length field is less than 24.
+        c. Detection multiplier is 0.
+        d. Multipoint (M) flag is set.
+        e. My Discriminator is 0.
+        f. Your Discriminator is nonzero AND no configured
+           session has a matching local discriminator.
+        g. The packet arrived on UDP port 3784 (single-hop) AND its
+           IPv4 TTL is not 255 (RFC 5881 single-hop spoof
+           protection). This TTL check applies ONLY to single-hop
+           (3784) packets; multi-hop (4784) control packets carry
+           an arbitrary TTL and are NOT dropped for TTL.
+
+   3. **Session lookup.** If Your Discriminator is nonzero, look
+      up the session by Your Discriminator. If Your Discriminator
+      is 0, look up the session by (source IPv4 address, ingress
+      port). On miss with Your Discriminator nonzero, the packet
+      has already been dropped by rule 2(f). On miss with Your
+      Discriminator zero, drop the packet.
+
+   4. **State advance.** Given the looked-up session's current
+      local_state and the received state field, transition per
+      the following table (RFC 5880 §6.8.6):
+
+        - If received state is AdminDown: local_state → Down.
+        - Else if local_state is Down:
+            received state Down → local_state Init;
+            received state Init → local_state Up;
+            received state Up   → local_state stays Down.
+        - Else if local_state is Init:
+            received state Init → local_state Up;
+            received state Up   → local_state Up;
+            received state Down → local_state stays Init.
+        - Else if local_state is Up:
+            received state Down → local_state Down;
+            received state {Init, Up} → local_state stays Up.
+
+      The switch also records the received My Discriminator as
+      the session's remote discriminator, and the received state
+      as the session's remote_state.
+
+   5. **Poll / Final reply.** If the received packet has the
+      Poll flag set (P == 1), the switch MUST immediately emit a
+      BFD control packet back to the peer with:
+        - F=1, P=0;
+        - Your Discriminator = received My Discriminator;
+        - My Discriminator = session's local discriminator;
+        - State = updated local_state;
+        - Detection multiplier, Length, time fields = the
+          session's configured values;
+        - IPv4 TTL = 255;
+        - UDP destination port = the session's control port — 3784
+          for a single-hop session, 4784 for a multi-hop session —
+          and source port = session's configured source port;
+        - Source IP and destination IP per the session's
+          configured endpoints.
+      The reply is emitted out the port through which the
+      session's peer is reachable (the ingress port the Poll
+      arrived on).
+
+   6. **Consume the ingress BFD packet.** After processing,
+      the original ingress BFD control packet itself MUST NOT be
+      forwarded — it is the addressee of the protocol message
+      and is consumed.
+
+   7. **BFD Echo reflection.** A BFD Echo packet — an IPv4 / UDP
+      packet whose UDP destination port is 3785 — MUST be reflected
+      straight back to its sender: swap the IPv4 source and
+      destination addresses and emit the packet out the **ingress
+      port it arrived on**, leaving every other field (Ethernet
+      addresses, UDP ports, TTL, payload) unchanged. Echo packets
+      are NOT subject to the §6.8.6 reception cascade (no version /
+      TTL / discriminator checks apply), carry no BFD control
+      section, are NOT matched against any session, and do NOT
+      advance any session's state machine — the switch simply loops
+      the probe back so the sender can time its own forwarding path.
+      In particular, the reflected packet leaves on the ingress port
+      regardless of where the downstream forwarding table would
+      route its (pre-swap) destination address. (RFC 5880 §6.4 /
+      §6.8.9 echo function; single-hop encapsulation per RFC 5881.)
+
+  Note: this task does NOT exercise the protocol's periodic
+  origination or detection-time expiry behaviours; the harness
+  injects only ingress packets, not the kind of timer events
+  those rules require. Reference solutions MAY leave any
+  periodic-emit or timeout-driven logic unimplemented for the
+  purposes of this task; they will not be tested.
+
+  ## Topology
+
+  Three-port topology; s1 terminates all three sessions:
+    - h1 attaches at s1.p1; h1's IPv4 address is 10.0.1.1, MAC
+      08:00:00:00:01:01 (single-hop peer).
+    - h2 attaches at s1.p2; h2's IPv4 address is 10.0.2.2, MAC
+      08:00:00:00:02:02 (single-hop peer).
+    - the multi-hop peer is reached through s1.p3; its IPv4 address
+      is 10.0.3.3, MAC 08:00:00:00:03:03 (RFC 5883, several hops
+      away — TTL is not pinned to 255).
+    - s1's IPv4 endpoint for the session with h1 is 10.0.0.1
+      with MAC 08:00:00:00:00:01.
+    - s1's IPv4 endpoint for the session with h2 is 10.0.0.2
+      with MAC 08:00:00:00:00:02.
+    - s1's IPv4 endpoint for the multi-hop session is 10.0.0.3
+      with MAC 08:00:00:00:00:03.
+
+  ## Control plane
+
+  Your submission includes the control-plane table entries (the
+  `entries.json` half of the response). The evaluation harness
+  installs exactly the entries you provide and nothing else, so the
+  following state MUST be installed by your control plane:
+
+    - The three BFD sessions, each binding a local discriminator to
+      its (peer IPv4, ingress port, control UDP port, session
+      parameters). The established-session lookup is keyed on the
+      packet's Your Discriminator (matched against a session's local
+      discriminator):
+        * h1 session (single-hop, port 3784): local discriminator
+          0x11111111 (286331153), peer 10.0.1.1, ingress port s1.p1;
+        * h2 session (single-hop, port 3784): local discriminator
+          0x22222222 (572662306), peer 10.0.2.2, ingress port s1.p2;
+        * multi-hop session (port 4784): local discriminator
+          0x33333333 (858993459), peer 10.0.3.3, ingress port s1.p3.
+    - An initial-packet mapping from (peer IPv4, ingress port) to
+      the same session, used to disambiguate the first packet of a
+      session whose Your Discriminator is 0:
+        * (10.0.1.1, s1.p1) → h1 session;
+        * (10.0.2.2, s1.p2) → h2 session;
+        * (10.0.3.3, s1.p3) → multi-hop session.
+    - A downstream forwarding table that, for non-BFD IPv4 traffic
+      from h1 to h2 (or vice versa), maps the destination IP to the
+      egress port and rewrites the destination MAC:
+        * dst 10.0.2.2 → egress s1.p2, dst MAC 08:00:00:00:02:02 (h2);
+        * dst 10.0.1.1 → egress s1.p1, dst MAC 08:00:00:00:01:01 (h1).
+
+  You are free to choose the table and action names and the internal
+  structures used to realise this behaviour.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - from: h1
+      to: s1.p1
+    - from: s1.p2
+      to: h2
+    - from: s1.p3
+      to: h3
+
+hosts:
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+
+custom_headers:
+  - file: custom_headers.py
+    class: BFD
+    description: "RFC 5880 §4.1 mandatory section — 24-byte BFD control header"
+
+# Sessions 0/1 expose the following local discriminators:
+#   session 0: local_discr = 0x11111111 (286331153), peer = h1
+#   session 1: local_discr = 0x22222222 (572662306), peer = h2
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: rx_session0_first_packet_down_to_init
+    visibility: public
+    description: |
+      Session 0, first packet of the handshake. Peer (h1) sends a
+      BFD packet with My Discriminator = 0xAAAA0001, Your
+      Discriminator = 0 (peer has not yet learned ours), state =
+      Down. The switch resolves the session by (source IP,
+      ingress port), advances local_state Down → Init, records
+      remote_discr = 0xAAAA0001 and remote_state = Down. The
+      ingress packet is consumed (no forward).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1                          # Down
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: rx_session0_second_packet_init_to_up
+    visibility: hidden
+    description: |
+      Session 0, peer has learned our discriminator and is now
+      sending state=Init. With local_state currently Init (set by
+      the prior packet), local_state advances Init → Up.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1                          # Down
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 2                          # Init
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x11111111
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: rx_session0_poll_yields_final_reply
+    visibility: public
+    description: |
+      Session 0 is Up. Peer sends a Poll (P=1) packet. The switch
+      MUST emit a Final (F=1, P=0) reply on the ingress port,
+      addressed back to the peer, with discriminators swapped and
+      the session's local_state echoed back.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 2
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x11111111
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 3                          # Up
+            flag_P: 1                         # Poll
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x11111111
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.1"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+        IP.ttl: {action: change_to, value: 255}
+        UDP.sport: {action: change_to, value: 49152}
+        UDP.dport: {action: change_to, value: 3784}
+        BFD.flag_F: {action: change_to, value: 1}
+        BFD.flag_P: {action: change_to, value: 0}
+        BFD.your_discr: {action: change_to, value: 0xAAAA0001}
+        BFD.my_discr: {action: change_to, value: 0x11111111}
+        BFD.state: {action: change_to, value: 3}
+
+  - name: rx_session1_isolation_from_session0
+    visibility: hidden
+    description: |
+      Session 1 (h2) is independent from session 0 (h1). A first
+      packet on s1.p2 from h2 advances session 1, not session 0.
+      The packet is consumed; no forward.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.0.2", ttl: 255, proto: 17}
+        - UDP:   {sport: 49153, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xBBBB0002
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: rx_non_bfd_packet_passthrough
+    visibility: public
+    description: |
+      A non-BFD packet (ICMP from h1 to h2) MUST pass through to
+      the downstream forwarding pipeline your control plane
+      installs; the packet leaves s1.p2 with destination MAC
+      rewritten to h2's MAC.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 1}
+        - ICMP:  {type: 8, code: 0, id: 1, seq: 1}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+# --- G2: resource robustness / boundary ---
+
+  - name: drop_bfd_ttl_not_255
+    visibility: hidden
+    description: |
+      A well-formed single-hop BFD packet with IPv4 TTL = 64
+      (not 255) MUST be dropped. RFC 5881 §5 single-hop spoof
+      protection.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: drop_bfd_version_mismatch
+    visibility: hidden
+    description: "Version != 1 — RFC 5880 §6.8.6 first MUST drop."
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 0
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: drop_bfd_detect_mult_zero
+    visibility: hidden
+    description: "Detect Mult == 0 — RFC 5880 §6.8.6 MUST drop."
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 0
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: drop_bfd_my_discr_zero
+    visibility: hidden
+    description: "My Discriminator == 0 — RFC 5880 §6.8.6 MUST drop."
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0x00000000
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: drop_bfd_multipoint_flag_set
+    visibility: hidden
+    description: "M bit set — RFC 5880 §6.8.6 MUST drop."
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 1
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: drop_bfd_unknown_session_discr
+    visibility: hidden
+    description: |
+      Your Discriminator = 0xDEADBEEF references no installed
+      session. RFC 5880 §6.8.6 MUST drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 3
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0xDEADBEEF
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+# --- G3: security / bypass / regression for v1model bug patterns ---
+
+  - name: spoof_bfd_wrong_source_drops
+    visibility: hidden
+    description: |
+      Off-link spoof: a BFD packet for session 0 arrives on s1.p2
+      (h2's port, not h1's) with source IP 10.0.1.1 (claiming to
+      be h1). Because the initial-packet session_lookup keys on
+      (source_ip, ingress_port), the spoof MUST NOT bind to
+      session 0; the lookup misses on both tables (your_discr=0
+      with no (10.0.1.1, p2) match; your_discr != 0 would also
+      miss). MUST drop.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.2", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: regression_std_metadata_drop_smoke
+    visibility: hidden
+    description: |
+      Cross-packet contamination check. After a malformed BFD packet is dropped (R1), the
+      subsequent non-BFD ICMP forward MUST proceed normally. A
+      reference that reads `standard_metadata.drop` to test "was
+      the previous packet dropped?" cross-contaminates the
+      decision and would fail this test.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 1                      # malformed (M bit set)
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 1}
+        - ICMP:  {type: 8, code: 0, id: 1, seq: 1}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: regression_conditional_deparser_on_reply
+    visibility: hidden
+    description: |
+      Conditional-deparser check.
+      The Final reply emitted by the Poll/Final rule MUST carry
+      a full Eth+IPv4+UDP+BFD layer stack with all fields
+      intact. References that conditionally emit the BFD header
+      inside the deparser ("packet.emit(hdr.bfd)" inside an
+      `if`) silently corrupt the reply when the condition
+      mis-evaluates. Same scenario as
+      rx_session0_poll_yields_final_reply, but asserts the
+      BFD field values bit-equal.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 2
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x11111111
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 3
+            flag_P: 1
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x11111111
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.1"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+        IP.ttl: {action: change_to, value: 255}
+        UDP.dport: {action: change_to, value: 3784}
+        BFD.flag_F: {action: change_to, value: 1}
+        BFD.flag_P: {action: change_to, value: 0}
+        BFD.your_discr: {action: change_to, value: 0xAAAA0001}
+        BFD.my_discr: {action: change_to, value: 0x11111111}
+        BFD.detect_mult: {action: change_to, value: 3}
+        BFD.length: {action: change_to, value: 24}
+
+  - name: drop_admin_down_forces_local_down
+    visibility: hidden
+    description: |
+      RFC 5880 §6.8.6: a received state of AdminDown forces the
+      local session to Down regardless of current local_state.
+      After this packet, session 0 is Down. We verify by sending
+      a follow-up Down packet from the peer; the response cycle
+      restarts (Down → Init).
+
+      This test sends only the AdminDown packet (state=0). It is
+      consumed; no forward.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+          - UDP:   {sport: 49152, dport: 3784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 2
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xAAAA0001
+              your_discr: 0x11111111
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 255, proto: 17}
+        - UDP:   {sport: 49152, dport: 3784}
+        - BFD:
+            version: 1
+            diag: 7                            # 7 = Administratively Down
+            state: 0                           # AdminDown
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xAAAA0001
+            your_discr: 0x11111111
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+# --- G4: BFD Echo reflection (R5) ---
+
+  - name: echo_reflects_back_on_ingress_p1
+    visibility: public
+    description: |
+      A BFD Echo packet (UDP destination port 3785) from h1 MUST be
+      reflected back out the ingress port with its IPv4 source and
+      destination addresses swapped; every other field is unchanged.
+      Echo is not subject to the BFD control reception cascade and
+      does not touch any session.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 50000, dport: 3785}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.1"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+
+  - name: echo_reflects_back_on_ingress_p2
+    visibility: hidden
+    description: |
+      Session-2 side echo: a BFD Echo packet from h2 on s1.p2 is
+      reflected back out s1.p2 with IPv4 src/dst swapped.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.0.2", ttl: 255, proto: 17}
+        - UDP:   {sport: 50001, dport: 3785}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.2"}
+        IP.dst: {action: change_to, value: "10.0.2.2"}
+
+  - name: echo_reflected_on_ingress_not_routed_by_dst_ip
+    visibility: hidden
+    description: |
+      An echo packet on s1.p1 whose IPv4 destination is h2's address
+      (10.0.2.2) — which the downstream forwarding table would send
+      out s1.p2 — MUST still be reflected out the INGRESS port s1.p1,
+      not routed by destination IP. IPv4 src/dst are swapped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 255, proto: 17}
+        - UDP:   {sport: 53000, dport: 3785}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.2.2"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+
+  - name: echo_reflects_without_session_or_spoof_check
+    visibility: hidden
+    description: |
+      Echo carries no session binding: a packet on s1.p2 with source
+      IP 10.0.1.1 (h1's address, which would FAIL the BFD control
+      spoof check on this port) is still reflected, because echo is a
+      pure loopback with no (source IP, ingress port) session lookup.
+      Reflected out s1.p2 with IPv4 src/dst swapped.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.2", ttl: 255, proto: 17}
+        - UDP:   {sport: 52000, dport: 3785}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.2"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+
+  - name: echo_reflects_regardless_of_ttl
+    visibility: hidden
+    description: |
+      Echo packets are exempt from the single-hop TTL=255 rule that
+      applies to BFD control packets: a TTL=200 echo on s1.p1 is
+      still reflected (out s1.p1, IPv4 src/dst swapped, TTL left
+      unchanged), whereas a TTL=200 BFD control packet would be
+      dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.0.1", ttl: 200, proto: 17}
+        - UDP:   {sport: 54000, dport: 3785}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.1"}
+        IP.dst: {action: change_to, value: "10.0.1.1"}
+
+# --- G5: multi-hop BFD control (RFC 5883, UDP 4784) ---
+
+  - name: mh_first_packet_down_to_init
+    visibility: public
+    description: |
+      First packet of the multi-hop session, arriving on s1.p3 over
+      UDP port 4784 with TTL=200 (multi-hop packets are NOT pinned to
+      TTL=255). The switch resolves the session by (source IP,
+      ingress port), advances Down → Init, and consumes the packet.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+        - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+        - UDP:   {sport: 49154, dport: 4784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xCCCC0003
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: mh_poll_yields_final_reply_on_4784
+    visibility: hidden
+    description: |
+      Multi-hop Poll/Final: after the handshake the multi-hop peer
+      sends a Poll (P=1). The switch MUST emit a Final reply out
+      s1.p3 on UDP port 4784 (NOT 3784), discriminators swapped,
+      local_state echoed.
+    prior_inputs:
+      - port: s1.p3
+        layers:
+          - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+          - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+          - UDP:   {sport: 49154, dport: 4784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xCCCC0003
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+      - port: s1.p3
+        layers:
+          - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+          - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+          - UDP:   {sport: 49154, dport: 4784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 2
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xCCCC0003
+              your_discr: 0x33333333
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+        - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+        - UDP:   {sport: 49154, dport: 4784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 3
+            flag_P: 1
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xCCCC0003
+            your_discr: 0x33333333
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.src: {action: change_to, value: "10.0.0.3"}
+        IP.dst: {action: change_to, value: "10.0.3.3"}
+        IP.ttl: {action: change_to, value: 255}
+        UDP.sport: {action: change_to, value: 49154}
+        UDP.dport: {action: change_to, value: 4784}
+        BFD.flag_F: {action: change_to, value: 1}
+        BFD.flag_P: {action: change_to, value: 0}
+        BFD.my_discr: {action: change_to, value: 0x33333333}
+        BFD.your_discr: {action: change_to, value: 0xCCCC0003}
+        BFD.state: {action: change_to, value: 3}
+
+  - name: mh_init_to_up_consumed
+    visibility: hidden
+    description: |
+      Multi-hop session advances Init → Up on a received Init packet
+      (your_discr echoes our 0x33333333); no Poll, so the packet is
+      consumed (no forward).
+    prior_inputs:
+      - port: s1.p3
+        layers:
+          - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+          - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+          - UDP:   {sport: 49154, dport: 4784}
+          - BFD:
+              version: 1
+              diag: 0
+              state: 1
+              flag_P: 0
+              flag_F: 0
+              flag_C: 0
+              flag_A: 0
+              flag_D: 0
+              flag_M: 0
+              detect_mult: 3
+              length: 24
+              my_discr: 0xCCCC0003
+              your_discr: 0x00000000
+              desired_min_tx_interval: 1000000
+              required_min_rx_interval: 1000000
+              required_min_echo_rx_interval: 0
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+        - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 200, proto: 17}
+        - UDP:   {sport: 49154, dport: 4784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 2
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xCCCC0003
+            your_discr: 0x33333333
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop
+
+  - name: mh_low_ttl_not_dropped_consumed
+    visibility: hidden
+    description: |
+      A multi-hop control packet with TTL=1 MUST NOT be dropped for
+      TTL (the 255 rule is single-hop-only); it is processed and
+      consumed (first packet, advances Down → Init). A solution that
+      applies the single-hop TTL=255 check to 4784 would wrongly
+      drop — but the observable here is the same consume/drop, so
+      this case documents the TTL exemption alongside the 4784
+      Poll/Final reply that does discriminate.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "08:00:00:00:03:03", dst: "08:00:00:00:00:03"}
+        - IP:    {src: "10.0.3.3", dst: "10.0.0.3", ttl: 1, proto: 17}
+        - UDP:   {sport: 49154, dport: 4784}
+        - BFD:
+            version: 1
+            diag: 0
+            state: 1
+            flag_P: 0
+            flag_F: 0
+            flag_C: 0
+            flag_A: 0
+            flag_D: 0
+            flag_M: 0
+            detect_mult: 3
+            length: 24
+            my_discr: 0xCCCC0003
+            your_discr: 0x00000000
+            desired_min_tx_interval: 1000000
+            required_min_rx_interval: 1000000
+            required_min_echo_rx_interval: 0
+    expected:
+      behavior: drop

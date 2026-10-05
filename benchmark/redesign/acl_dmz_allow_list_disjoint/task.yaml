@@ -1,0 +1,556 @@
+task_name: acl_dmz_allow_list_disjoint
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ACL
+pattern_version: '1.0'
+seed:
+  rule_count_capacity: 64
+  match_field_breadth: tuple5
+  priority_depth: 16
+  action_breadth: permit_deny
+  default_action: deny
+  faithfulness: D5.0_first_match_priority
+description: |
+  A switch s1 stands between an external Internet-facing interface, a DMZ
+  serving public-facing services, and an internal LAN. It enforces a
+  stateless access-control policy: every IPv4 datagram is classified
+  against the access-control list given below; admitted
+  datagrams are forwarded to the host they are addressed to, denied
+  datagrams are silently discarded. Inspired by the policy-rule
+  terminology of RFC 3198 (Policy-Based Management).
+
+  ## Topology and roles
+
+    - s1.p1 — external interface (Internet-facing).
+    - s1.p2 — DMZ web/api tier. Two hosts: web1 (192.0.2.10) and web2
+              (192.0.2.11).
+    - s1.p3 — DMZ services tier. Two hosts: dns1 (192.0.2.20, the
+              public DNS resolver) and mail1 (192.0.2.30, the public
+              mail server).
+    - s1.p4 — internal LAN.
+
+  ## Policy entries (the access-control list)
+
+  Each entry has a priority (larger = higher precedence), a condition over
+  the packet's 5-tuple (IPv4 source address, IPv4 destination address, IPv4
+  protocol number, L4 source port, L4 destination port — any field shown as
+  "any" is unconstrained and matches every value; IPv4 conditions are single
+  addresses or prefixes), and an action (*permit* or *deny*).
+
+  The installed entries' conditions are mutually non-overlapping: no single
+  packet can satisfy the condition of more than one entry, so priority never
+  has to break a tie (a packet matches exactly one entry or none).
+
+  THIS LIST IS THE COMPLETE POLICY. You must install all of these entries
+  into your classification table(s). The harness does not supply them;
+  reproducing them faithfully is part of the task.
+
+    | prio | action | src IP | dst IP        | proto | dport |
+    |------|--------|--------|---------------|-------|-------|
+    |  120 | permit | any    | 192.0.2.10/32 | 6     | 443   |
+    |  120 | permit | any    | 192.0.2.10/32 | 6     | 80    |
+    |   60 | permit | any    | 192.0.2.10/32 | 6     | 8080  |
+    |   50 | permit | any    | 192.0.2.10/32 | 1     | any   |
+    |  120 | permit | any    | 192.0.2.11/32 | 6     | 443   |
+    |  120 | permit | any    | 192.0.2.11/32 | 6     | 80    |
+    |  100 | permit | any    | 192.0.2.20/32 | 17    | 53    |
+    |  100 | permit | any    | 192.0.2.20/32 | 6     | 53    |
+    |   80 | permit | any    | 192.0.2.30/32 | 6     | 25    |
+    |   80 | permit | any    | 192.0.2.30/32 | 6     | 465   |
+    |   30 | deny   | any    | 192.0.2.10/32 | 6     | 23    |
+    |   30 | deny   | any    | 192.0.2.10/32 | 6     | 22    |
+    |   30 | deny   | any    | 192.0.2.11/32 | 6     | 3389  |
+
+  ## Classification rules
+
+  For every frame received on any port:
+
+    R1. If the frame is not an IPv4 datagram (e.g. ARP, IPv6, raw
+        Ethernet), it MUST be discarded. No output, no internal state
+        change.
+
+    R2. For an IPv4 datagram, evaluate the policy entries: find the
+        entry whose condition admits the packet's 5-tuple (source IP,
+        destination IP, IPv4 protocol, L4 source port, L4 destination
+        port). At most one entry can match. If no entry's condition
+        admits the packet, the packet MUST be discarded.
+
+    R3. If the matching entry's action is *permit*, the packet is
+        admitted: it MUST be forwarded toward its IPv4 destination
+        address (see "Forwarding of admitted packets" below).
+
+    R4. If the matching entry's action is *deny*, the packet MUST be
+        discarded. No output, no internal state change.
+
+  ## Forwarding of admitted packets
+
+  An admitted packet is delivered to the host whose IPv4 address it is
+  destined to, using the destination-host map below. You must install
+  these mappings. The switch must:
+
+    - Send the packet out the host's port.
+    - Replace the Ethernet destination address with the destination
+      host's MAC.
+    - Replace the Ethernet source address with the egress port's own MAC.
+    - Decrement the IPv4 hop count by exactly one.
+    - Leave the IPv4 source and destination addresses unchanged.
+    - Leave the IPv4 protocol, L4 ports, and payload bytes unchanged.
+    - Ensure the IPv4 header checksum is valid on egress.
+
+    | dst IP/32     | egress port | destination host MAC |
+    |---------------|-------------|----------------------|
+    | 192.0.2.10/32 | s1.p2       | 08:00:00:00:02:0a    |
+    | 192.0.2.11/32 | s1.p2       | 08:00:00:00:02:0b    |
+    | 192.0.2.20/32 | s1.p3       | 08:00:00:00:03:14    |
+    | 192.0.2.30/32 | s1.p3       | 08:00:00:00:03:1e    |
+
+  Each port's own (source) MAC, written into Ethernet src on egress:
+
+    | port  | port MAC          |
+    |-------|-------------------|
+    | s1.p1 | 08:00:00:00:00:01 |
+    | s1.p2 | 08:00:00:00:00:02 |
+    | s1.p3 | 08:00:00:00:00:03 |
+    | s1.p4 | 08:00:00:00:00:04 |
+
+  If a permitted packet's destination has no entry in the map above, it
+  is treated as an unreachable destination and MUST be discarded.
+
+  ## Side requirements
+
+    - The set of policy entries is consulted on every IPv4 datagram.
+    - The decision is stateless: no per-flow state is maintained, no
+      record of past packets influences the verdict for the current
+      packet.
+    - The policy is closed: if no entry's condition admits a packet,
+      the packet is dropped (negative-policy default).
+
+  ## Control plane
+
+  You install both:
+    - The policy entries (the access-control list above).
+    - The destination-host → (egress port, host MAC) mapping above, used
+      by the forwarding stage.
+
+  Both tables are fully specified above; install them as given.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: external
+    to: s1.p1
+  - from: s1.p2
+    to: dmz_web
+  - from: s1.p3
+    to: dmz_svc
+  - from: s1.p4
+    to: lan
+hosts:
+  partner1:
+    ip: 198.51.100.10
+    mac: 08:00:00:00:11:0a
+    port: s1.p1
+  web1:
+    ip: 192.0.2.10
+    mac: 08:00:00:00:02:0a
+    port: s1.p2
+  web2:
+    ip: 192.0.2.11
+    mac: 08:00:00:00:02:0b
+    port: s1.p2
+  dns1:
+    ip: 192.0.2.20
+    mac: 08:00:00:00:03:14
+    port: s1.p3
+  mail1:
+    ip: 192.0.2.30
+    mac: 08:00:00:00:03:1e
+    port: s1.p3
+test_cases:
+- name: permit_web1_https
+  visibility: public
+  description: TCP/443 to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 51000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_web1_http
+  visibility: hidden
+  description: TCP/80 to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 51001
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_web2_https
+  visibility: hidden
+  description: TCP/443 to web2 (192.0.2.11).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 203.0.113.10
+        dst: 192.0.2.11
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 51002
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0b
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_dns_udp
+  visibility: hidden
+  description: UDP/53 to dns1 (192.0.2.20).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 203.0.113.42
+        dst: 192.0.2.20
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:14
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_dns_tcp
+  visibility: hidden
+  description: TCP/53 to dns1 (192.0.2.20).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 203.0.113.42
+        dst: 192.0.2.20
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 49010
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:14
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_mail_smtp
+  visibility: hidden
+  description: TCP/25 to mail1 (192.0.2.30).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 203.0.113.42
+        dst: 192.0.2.30
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 49001
+        dport: 25
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:1e
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_icmp_echo_to_web1
+  visibility: hidden
+  description: ICMP echo request to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 1
+    - ICMP:
+        type: 8
+        code: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_web1_alt_8080
+  visibility: hidden
+  description: TCP/8080 to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 52002
+        dport: 8080
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_web1_ttl_one_decrements_to_zero
+  visibility: hidden
+  description: TCP/443 to web1 (192.0.2.10) with IP TTL=1.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 33003
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: drop_telnet_web1
+  visibility: hidden
+  description: TCP/23 (telnet) to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 52001
+        dport: 23
+  expected:
+    behavior: drop
+- name: drop_ssh_web1
+  visibility: hidden
+  description: TCP/22 (SSH) to web1 (192.0.2.10).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 52003
+        dport: 22
+  expected:
+    behavior: drop
+- name: drop_rdp_web2
+  visibility: hidden
+  description: TCP/3389 (RDP) to web2 (192.0.2.11).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.11
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 52004
+        dport: 3389
+  expected:
+    behavior: drop
+- name: drop_table_miss_default_deny
+  visibility: public
+  description: TCP/443 to an unlisted destination host (192.0.2.99).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 198.51.100.10
+        dst: 192.0.2.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 52000
+        dport: 443
+  expected:
+    behavior: drop
+- name: drop_udp_to_wrong_host
+  visibility: hidden
+  description: UDP/53 to web1 (192.0.2.10), not the DNS resolver host.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 203.0.113.42
+        dst: 192.0.2.10
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49002
+        dport: 53
+  expected:
+    behavior: drop
+- name: drop_non_ipv4_arp_default_deny
+  visibility: public
+  description: An ARP frame (non-IPv4) arrives on the external interface.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:00:01
+        type: 2054
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

@@ -1,0 +1,162 @@
+{
+  "oracle_hash": "9cf493d7ff6c5f3134b4cb1f87b667c2b3aa08019be443661c29df68f00352a0",
+  "instance": "gtpu_encap_ceiling-default",
+  "ran_at": "2026-05-30T01:36:52.528064Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_unknown_port_role_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_n3_without_udp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_n3_udp_non_gtpu_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_uplink_decap_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_outer_dst_mismatch_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_unknown_teid_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_lax_accepts_bad_version",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_strict_malformed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_end_marker_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_downlink_encap_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_downlink_encap_qfi_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_unknown_ue_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r7_oversize_drop_strict_mtu",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_downlink_encap_dscp_copy_hashed_srcport",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_uplink_decap_alt_session_table",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_downlink_encap_alt_bearer_table",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "teid_decap_routing_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_header_field_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_ipv4_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "gtpu_length_field_correct": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "gtpu_header_wellformed_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "qfi_set_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "teid_decap_routing_correctness",
+      "inner_payload_persistence",
+      "outer_header_field_completeness",
+      "outer_ipv4_checksum_validity",
+      "gtpu_length_field_correct",
+      "gtpu_header_wellformed_on_tx",
+      "qfi_set_on_tx"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "3gpp_ts_29281"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

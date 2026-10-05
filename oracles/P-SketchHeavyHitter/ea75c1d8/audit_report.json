@@ -1,0 +1,111 @@
+{
+  "oracle_hash": "e6a96b80fb027a3135eed795c1c740be38d64bff939945bbc69a9b79f87982a6",
+  "instance": "sketch_heavy_hitter_anchor-default",
+  "ran_at": "2026-05-29T20:16:24.053276Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "anchor_non_ipv4_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "anchor_ipv4_forward_p1_to_p2",
+        "status": "pass"
+      },
+      {
+        "example_id": "anchor_ipv4_forward_p2_to_p1",
+        "status": "pass"
+      },
+      {
+        "example_id": "anchor_repeated_source_still_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "anchor_lpm_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_heavy_regime_policed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_sketch_resize_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "counter_persistence_within_epoch": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "heavy_storage_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "bounded_emit_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "heavy_bucket_fairness": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "no_packet_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "forwarding_independence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "counter_persistence_within_epoch",
+      "heavy_storage_no_orphan",
+      "bounded_emit_latency",
+      "heavy_bucket_fairness",
+      "no_packet_loop",
+      "forwarding_independence"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "sonata_sigcomm18",
+      "sketchlib_nsdi22",
+      "elasticsketch_sigcomm18",
+      "flymon_sigcomm22",
+      "sketchovsky_nsdi23",
+      "heterosketch_nsdi22"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,756 @@
+task_name: aqm_fairqueue_ceiling
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-AQMFairQueue
+pattern_version: '1.0'
+seed:
+  window: 4
+  quantum: 256
+  fair_share_k: 4
+  sketch_rows: 2
+  sketch_width: 64
+  hash_polynomial: crc32
+  hash_independence: pairwise
+  byte_accounting: on_wire_length
+  marking_threshold_k: 64
+  marking_mode: single_threshold
+  not_ect_action: drop
+  ce_persistence_strict: true
+  dscp_preservation_strict: true
+  checksum_recompute: required
+  queue_depth_signal: synthetic_qdepth
+  eligibility_protocol: tcp
+  non_ipv4_action: drop
+  account_policy: account_on_admit
+  marking_coupling: decoupled
+  faithfulness: D5.0_fq_then_step_ecn
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: sub
+    to: s1.p1
+  - from: s1.p2
+    to: core
+  - from: s1.p3
+    to: spare
+hosts:
+  sub:
+    note: subscriber side (access); IPv4 sources in 10.0.1.0/24
+  core:
+    mac: 08:00:00:00:02:01
+    note: upstream core; admitted traffic egresses here
+  spare:
+    note: carries no production traffic
+description: |
+  An access switch s1 runs a two-stage active-queue-management block on TCP
+  traffic from subscribers toward an upstream core network. Stage one enforces
+  approximate per-flow fair-bandwidth admission; stage two applies queue-depth
+  Explicit Congestion Notification (ECN) marking to the packets that admission
+  lets through. Inspired by approximate fair queueing (Sharma et al., NSDI 2018)
+  and DCTCP/RFC 3168 congestion marking.
+
+  ## Topology and roles
+
+    - s1 has three external connection points: an ACCESS connection (s1.p1)
+      facing subscribers, a CORE connection (s1.p2) facing the upstream router
+      whose Ethernet address is 08:00:00:00:02:01, and a third connection
+      (s1.p3) that carries no production traffic.
+    - Any frame arriving on a connection other than the ACCESS one must be
+      discarded.
+
+  ## Stage ordering (the load-bearing contract)
+
+  The two stages run in a fixed order: FAIRNESS ADMISSION first, then ECN
+  MARKING. A packet that fairness admission discards is never seen by the
+  marking stage — its queue-depth signal is never consulted and its ECN field
+  is never inspected or changed. Only a packet that admission lets through is
+  eligible to be marked, preserved, or congestion-dropped by stage two.
+
+  ## Eligibility
+
+  A subscriber packet is eligible only when ALL of the following hold; the
+  checks short-circuit in the order listed, and a packet that fails an earlier
+  check is never inspected against later checks and never affects any internal
+  state:
+
+    1. The packet arrived on the ACCESS connection.
+    2. The packet carries an IPv4 payload. (A non-IPv4 frame is discarded.)
+    3. The IPv4 payload is TCP. (A non-TCP IPv4 packet is discarded.)
+    4. The IPv4 time-to-live is greater than zero. (TTL == 0 is discarded;
+       a packet with TTL == 1 is eligible and, if forwarded, egresses with
+       TTL == 0 — decrement exactly once, never twice.)
+
+  ## Stage one — approximate per-flow fair admission
+
+  The switch maintains an approximate per-flow byte estimate keyed on the IPv4
+  SOURCE address, using two slot indices into a table of width 64:
+
+    - first index  = (last octet of the source address) mod 64.
+    - second index = (third-last octet XOR second-last octet of the source
+                     address) mod 64.
+
+  A flow's estimated admitted-byte total is the MINIMUM of the byte counts at
+  those two slots (use the MIN, not the sum, not either single value). The
+  switch also keeps one global "total bytes admitted" counter. All byte sizes
+  are the on-wire frame length (the full Ethernet frame, including header).
+
+  For the current packet it derives:
+
+    - flow_round    = (per-flow byte estimate) / 256, integer division.
+    - current_round = (global bytes admitted)  / 1024, integer division.
+    - round_shift   = max(0, flow_round - current_round).   (the clamp is
+                      mandatory — a flow trailing the global round never has a
+                      negative or wrap-around shift.)
+
+  Admission decision:
+
+    - If round_shift is 4 or greater, the packet is OUT OF its fair share: it
+      is DROPPED, and per-flow and global state MUST NOT change. This drop is
+      final — the marking stage is not consulted.
+    - Otherwise the packet is ADMITTED. On admission, the per-flow estimate
+      (both slots) and the global counter are EACH incremented by exactly the
+      on-wire frame length. This accounting happens at admission time, BEFORE
+      the marking stage runs (see "Accounting order" below).
+
+  ## Stage two — queue-depth ECN marking (admitted packets only)
+
+  Each admitted packet carries an observed egress queue depth, supplied by a
+  control-plane table keyed on the IPv4 DESTINATION address (you choose the
+  representation). Install these entries; a destination not listed has depth 0:
+
+      | destination | queue depth |
+      |-------------|-------------|
+      | 10.0.2.10   | 0           |
+      | 10.0.2.20   | 63          |
+      | 10.0.2.30   | 64          |
+      | 10.0.2.40   | 200         |
+
+  A packet is CONGESTED when its queue depth is greater than or equal to 64
+  (a strict >= boundary: depth 64 is congested, depth 63 is not). The IPv4 ECN
+  field is the low 2 bits of the diffserv/ToS byte: 00 = Not-ECT, 01 and 10 =
+  ECN-capable (ECT), 11 = CE (congestion experienced). On an admitted packet:
+
+    1. CONGESTED and ECN == Not-ECT (00): the packet MUST be DROPPED. A
+       congestion signal cannot be delivered to a non-ECN-capable flow, so it
+       is tail-dropped rather than marked.
+    2. CONGESTED and ECN is ECT (01 or 10): the ECN field MUST be set to CE
+       (11) and the packet forwarded. Both ECT codepoints map to CE.
+    3. CONGESTED and ECN == CE (11): the packet is forwarded with its ECN
+       field UNCHANGED — a CE codepoint must never be cleared.
+    4. NOT congested (depth < 64): the packet is forwarded with its ECN field
+       UNCHANGED, whatever its value.
+
+  The marking decision changes ONLY the low 2 ECN bits; the high 6 bits of the
+  diffserv byte (the DSCP class) MUST be preserved exactly.
+
+  ## What an admitted-and-forwarded packet looks like at the CORE connection
+
+  For every packet that is admitted and forwarded (cases 2, 3, 4 above):
+
+    - Its IPv4 identification field equals the round_shift computed for it.
+    - Its IPv4 ECN bits are set per the marking rule above (CE on case 2;
+      unchanged on cases 3 and 4); the DSCP bits are unchanged.
+    - Its IPv4 TTL is reduced by exactly one.
+    - Its Ethernet destination address is replaced by 08:00:00:00:02:01.
+    - Every other field is byte-identical to the received packet, and the
+      datagram remains a well-formed IPv4 packet an unmodified downstream
+      receiver accepts — in particular the IPv4 header checksum is valid over
+      EVERY field this switch changed (identification, the ECN bits, and TTL),
+      recomputed once.
+
+  ## Accounting order (a deliberate, observable choice)
+
+  Fair-share byte accounting reflects ADMISSION, not delivery. A packet that
+  stage one admits but stage two then congestion-drops (case 1, Not-ECT above
+  threshold) STILL has its bytes counted into the per-flow estimate and the
+  global counter — it passed the fairness filter, so it consumes its share.
+  Only packets that fairness discards (round_shift >= 4) or that fail
+  eligibility leave the state unchanged.
+test_cases:
+- name: admit_below_threshold_passthrough
+  visibility: public
+  goal_class: G1
+  description: 'Cold ECT(0) flow to an idle-queue destination (depth 0 < K): fairness-admitted, not congested, forwarded on the core port with ECN unchanged, round_shift 0 stamped into IP.id, TTL-1, Ether.dst rewritten.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: admit_above_threshold_marked
+  visibility: public
+  goal_class: G1
+  description: 'Cold ECT(0) flow to a destination at depth 64 == K: fairness-admitted AND congested, so ECN is marked ECT->CE (tos low 2 bits 10->11) and forwarded; IP.id 0, TTL-1, checksum valid over id+ecn+ttl.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.30
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 3
+- name: fairness_drop_not_marked
+  visibility: public
+  goal_class: G1
+  description: Stage-ordering check. After a same-source byte burst pushes round_shift >= window, the next packet of that source — to a deeply-congested destination (depth 200) and ECN-capable — is DROPPED by the fairness filter and never reaches the marker. A marking-before-fairness implementation would instead mark CE and forward.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.2.40
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  expected:
+    behavior: drop
+- name: ce_preserved_on_admitted_congested
+  visibility: hidden
+  goal_class: G1
+  description: 'Cold CE flow (tos ECN bits = 11) to depth 64 == K: fairness-admitted, congested, but already CE — RFC 3168 forbids changing it, so ECN is preserved and the packet forwarded.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.30
+        ttl: 64
+        tos: 3
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: account_reflects_admission_not_delivery
+  visibility: hidden
+  goal_class: G1
+  description: Accounting-order check. A large Not-ECT packet to depth 64 is admitted by the fairness filter (counting its bytes) but tail-dropped by the marker. The follow-up same-source ECT packet to an idle destination is admitted with round_shift > 0 — proving the tail-dropped packet's bytes WERE accounted.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.9
+        dst: 10.0.2.30
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.9
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  expected:
+    behavior: drop
+- name: cross_flow_isolation_min_protects
+  visibility: hidden
+  goal_class: G1
+  description: A heavy source A is bursted to a high round_shift; a fresh source B (distinct address) is then admitted at round_shift 0 — the min-across-rows count-min estimator isolates B from A's accumulated bytes.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.20
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.30
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_marking_at_threshold_minus_one_passthrough
+  visibility: hidden
+  goal_class: G2
+  description: 'ECT(0) to depth 63 == K-1: below the strict congestion boundary, so the packet is forwarded with ECN UNCHANGED (no mark). Pairs with the at-K mark to enclose the strict >= marking boundary.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.20
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: not_ect_below_threshold_admit
+  visibility: hidden
+  goal_class: G2
+  description: 'Not-ECT to depth 63 < K: not congested, so the Not-ECT packet is forwarded unchanged (not dropped). The admit side of the marking boundary on the Not-ECT path.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.20
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_fairness_admit_at_window_minus_one
+  visibility: hidden
+  goal_class: G2
+  description: 'A same-source burst sets round_shift to exactly window-1: the next packet is ADMITTED with IP.id == window-1 (the admit side of the strict fairness >= boundary), to an idle destination so no marking interferes.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 3
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: boundary_fairness_drop_at_window
+  visibility: hidden
+  goal_class: G2
+  description: 'One quantum further than the admit boundary: round_shift == window exactly, so the packet is DROPPED by the fairness filter. An off-by-one (> instead of >=) admits it.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.12
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.12
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=
+  expected:
+    behavior: drop
+- name: ttl_one_admitted_egresses_ttl_zero
+  visibility: hidden
+  goal_class: G2
+  description: An eligible ECT packet with TTL=1 to an idle destination is admitted and forwarded with egress TTL=0 (decrement once, do not drop); checksum recomputed over the new TTL and the round_shift stamp.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.2.10
+        ttl: 1
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: wrong_port_drop
+  visibility: hidden
+  goal_class: G2
+  description: A frame arriving on a non-access port (port 3) is dropped before any stage.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:03:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: not_ect_admitted_then_tail_dropped
+  visibility: hidden
+  goal_class: G3
+  description: 'Cold Not-ECT to depth 64 == K: fairness-admits it, but RFC 3168 §6.1.2 forbids marking Not-ECT, so the marker tail-drops it. An implementation implementing ''any admitted congested packet -> mark CE'' wrongly forwards it.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.4
+        dst: 10.0.2.30
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: dscp_preserved_under_mark
+  visibility: hidden
+  goal_class: G3
+  description: 'ECT(0) carrying DSCP=AF11 (tos = 0b101000_10 = 42) to depth 64: marked to CE so tos becomes 0b101000_11 = 43 — the high 6 DSCP bits are preserved, only the low 2 ECN bits change. A write-too-wide on the diffserv byte clobbers DSCP.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.30
+        ttl: 64
+        tos: 162
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.id:
+        action: change_to
+        value: 0
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 163
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) has neither a fairness flowkey nor an ECN field — dropped (parser edge case, conditional deparsing).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.2.10
+  expected:
+    behavior: drop
+- name: non_eligible_udp_drop
+  visibility: hidden
+  goal_class: G3
+  description: 'TCP-only eligibility: a UDP packet is dropped before consuming any sketch state.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.10
+        ttl: 64
+        tos: 2
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop

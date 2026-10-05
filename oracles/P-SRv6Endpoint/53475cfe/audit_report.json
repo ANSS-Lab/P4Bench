@@ -1,0 +1,103 @@
+{
+  "oracle_hash": "8457ff6a0fcb431d7c07ad42ec2c30c53c417b6b41223cbaab630230831bb892",
+  "instance": "srv6_endpoint_anchor-default",
+  "ran_at": "2026-05-29T17:48:25.263766Z",
+  "canonical_examples": {
+    "passed": 10,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv6_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_no_srh_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_not_local_sid_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_segleft_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_end_basic_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_end_multi_segment_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_injected_fib_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_injected_local_sid_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_default_sid_not_injected_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "segleft_decrement": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "da_is_new_segment": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "hoplimit_decrement": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "segment_list_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "segleft_decrement",
+      "da_is_new_segment",
+      "hoplimit_decrement",
+      "segment_list_preserved"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC8754",
+      "RFC8986"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,1411 @@
+# P-BFDFastReroute — BFD Liveness ∘ Primary/Backup Fast-Reroute (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-BFDLiveness (RFC 5880/5881/5883
+# bidirectional liveness detection with switch-originated probes) with
+# P-PURRFastReroute (primary/backup next-hop fast-reroute under per-port
+# liveness, PURR CoNEXT '19) into the canonical end-to-end failover loop the
+# P7:resilience-and-failover category needs: the switch DETECTS a path failure
+# with BFD and REROUTES data traffic around it structurally in the same
+# pipeline. This is the natural "liveness signal drives reroute" pair.
+#
+# The two constituents were authored to compose HERE and only here: the BFD
+# pattern's `enable_liveness_register_export` operator produces a port-keyed
+# `link.is_down` register, and the FRR pattern's
+# `swap_liveness_to_dataplane_register` operator consumes that exact register.
+# This composition fixes both ends: BFD's `liveness_export = link_register`
+# and FRR's `liveness_source = dataplane_register` are NOT free parameters
+# here — they are the wiring that makes the composition a composition. The
+# `link.is_down` register array is the SHARED state and the entire
+# composition surface: BFD writes it (R2 on session Up → 0, R7 on detection
+# timeout → 1), the FRR demux reads it (R5/R6), and the two stages exchange
+# nothing else.
+#
+# The value of this *chained* pattern (versus instantiating P-BFDLiveness and
+# P-PURRFastReroute independently) is the DETECT ↔ REROUTE contract between
+# the liveness-detection stage and the structural-failover stage — a contract
+# invisible when the components are tested in isolation:
+#   (a) the FRR demux for destination D selects the backup port iff BFD has
+#       declared D's primary egress port down via detection timeout — same
+#       register, one pipeline pass (liveness_drives_reroute);
+#   (b) a port BFD considers Up is NEVER rerouted: the FRR demux reads the
+#       SAME bit BFD wrote and no other liveness source (no_phantom_reroute);
+#   (c) when the BFD session recovers (transitions back to Up, clearing
+#       is_down), the FRR demux returns to the primary — failover is
+#       reversible (recovery_restores_primary);
+#   (d) the end-to-end response — first data packet to D taking the backup
+#       after the failure — is bounded by BFD's detection time plus PURR's
+#       one-packet structural failover, with no control-plane round trip
+#       (detection_to_reroute_bounded_latency).
+# See `bridging_notes:` for the v1model failure modes this composition
+# exposes that neither standalone pattern reaches.
+#
+# Instances are produced by binding the parameters below. The cross-axis
+# `composition` target_capability tag is used because, although BOTH
+# constituents are individually `redesign` (each moves a fixed-function ASIC
+# primitive — BFD probe origination, FRR demux — into programmable logic),
+# the composed NF is reported on the `composition` composite frontier
+# because its load-bearing failure modes are
+# the cross-stage detect↔reroute interactions, not the per-stage failures of
+# either constituent, and it reuses two distinct audited oracles.
+
+pattern_id: P-BFDFastReroute
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                              # both halves are routing-family: liveness signalling (BFD) ∘ destination-based forwarding with failover (FRR)
+  prescriptive: [P7:resilience-and-failover, P16:packet-origination]  # fast-reroute / port-liveness ∘ switch-originated BFD probes
+target_capability: composition                          # composite of two redesign primitives reported on the `composition` composite frontier; failure modes are detect↔reroute stage interactions, cross-cutting
+summary: >
+  End-to-end failover loop composing BFD liveness detection (P-BFDLiveness)
+  with primary/backup fast-reroute (P-PURRFastReroute) in a single pipeline.
+  BFD control sessions monitor the liveness of next-hop ports: each ingress
+  BFD packet advances the Down→Init→Up handshake and stamps a receive
+  timestamp; a periodic time_tick detection check declares a session Down
+  when it misses its detection window and writes a port-keyed register
+  the shared link[port].is_down register slot to 1; a recovery (session back
+  to Up) clears it. The
+  FRR demux then forwards each IPv4 data packet over a (primary, backup) pair
+  keyed on the destination, reading THAT SAME register to pick the primary
+  while its port is up and the backup once BFD has marked it down — with TTL
+  decrement and Ethernet rewrite. The composition's load-bearing contract is
+  the detect↔reroute wiring: the FRR demux reads exactly the register BFD
+  writes (liveness_drives_reroute); a port BFD considers Up is never rerouted
+  (no_phantom_reroute); recovery returns the destination to its primary
+  (recovery_restores_primary); and the end-to-end response is bounded by the
+  BFD detection time plus PURR's one-packet structural failover, with no
+  control-plane round trip (detection_to_reroute_bounded_latency).
+  Faithfulness ladder: D5.0 minimal-8-byte BFD + exact-keyed FRR + single-hop
+  + generator-entry origination → D5.1 full RFC 5880 mandatory section +
+  LPM-keyed FRR groups with overlap + cascaded double-down drop → D5.2
+  multi-hop (RFC 5883) BFD + data-plane recirculate-driven origination. The
+  parameter-rebinding mutation surface lifts session capacity / detection multiplier / BFD
+  packet faithfulness / origination mode / TTL strictness on the detection
+  half and FRR table capacity / match kind / cascaded protection / TTL
+  strictness on the reroute half independently, so the same composed oracle
+  covers everything from a minimal single-session, single-prefix detect-then-
+  reroute loop to a multi-hop, recirculate-originated, cascaded-protection
+  fabric over overlapping LPM routes.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: purr_conext19
+      title: "PURR: A Primitive for Reconfigurable Fast Reroute"
+      venue: "ACM CoNEXT 2019"
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-PURRFastReroute. PURR (CoNEXT 2019) motivates the
+        two-table FRR primitive this composition reroutes over: a forwarding
+        entry emits a *pair* of next-hops (primary + backup) per destination,
+        and a per-port liveness lookup selects between them in a single
+        match-action demux — failover is "structural" (one match-action
+        lookup, no per-packet recirculation or probe) and tolerates multiple
+        concurrent failures with minimal memory. The cited contribution this
+        composition preserves and completes: PURR's liveness lookup is
+        control-plane-driven in the standalone anchor; HERE the data plane
+        produces its own liveness via BFD, closing the detection→reroute loop
+        the standalone FRR pattern leaves to the controller. Supplies the
+        reroute-half ground truth (liveness demux → primary/backup forward +
+        L2 rewrite + TTL decrement) and motivates the `frr_match_kind`,
+        `cascaded_backup`, and `ttl_decrement_strict` parameters. Validated on
+        Tofino but pure-table P4 that runs in BMv2 unchanged.
+
+  rfcs:
+    - cite: rfc5880
+      title: "Bidirectional Forwarding Detection (BFD)"
+      sections: ["§6.2 state machine", "§6.8.4 detection time", "§6.8.6 reception of BFD Control packets", "§6.8.7 transmission"]
+      role: normative_behaviour
+      quote: "If the Detect Mult field is zero, the packet MUST be discarded."
+      relevance: |
+        Inherited from P-BFDLiveness. The authoritative source for the
+        detection half. The composition preserves the MUST-clauses that bind
+        the data-plane liveness signal:
+          - §6.8.4 detection time = Detect Mult × max(RequiredMinRxInterval,
+            RemoteDesiredMinTxInterval) — the deadline whose expiry (checked
+            on a time_tick, R7) declares the port down and is the EVENT that
+            drives the reroute. This formula is the heart of
+            detection_to_reroute_bounded_latency.
+          - §6.2 / §6.8.6 state machine — Down → Init → Up on ingress, and the
+            reverse on detection timeout. The Up transition (R2) clears
+            is_down (recovery_restores_primary); the timeout transition (R7)
+            sets it (liveness_drives_reroute).
+          - §6.8.6 reception cascade — version, length, Detect Mult == 0,
+            M bit, My/Your Discriminator validity — every malformed BFD frame
+            MUST drop (R1) so it never corrupts the liveness signal the FRR
+            demux trusts.
+          - §6.8.7 transmission — periodic emit at the negotiated TX cadence
+            (R8); the `origination_mode` parameter selects generator-entry
+            (anchor) vs data-plane recirculate (D5.2).
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model implementation — a `register<bit<1>>(N)` shared
+        between the BFD detection writes and the FRR demux reads, the
+        recirculate-vs-generator-entry emit path, hash-keyed session lookup —
+        is widely-known P4-on-v1model practice, flagged
+        `[common-knowledge baseline]` in `bridging_notes:` rather than
+        re-attributed to the RFC.
+
+    - cite: rfc5881
+      title: "BFD for IPv4 and IPv6 (Single Hop)"
+      sections: ["§4 encapsulation", "§5 TTL/Hop Limit"]
+      role: normative_behaviour
+      quote: "All received BFD Control packets that are demultiplexed to the session MUST be discarded if the received TTL or Hop Limit is not equal to 255."
+      relevance: |
+        Inherited from P-BFDLiveness. Single-hop encapsulation the D5.0/D5.1
+        bands honour: UDP destination port 3784 for control packets, and the
+        TTL/Hop-Limit-255 transmit-and-receive requirement that the
+        `ttl_strictness` parameter binds (R1's TTL sub-clause on receive,
+        ttl_255_on_emit on origination). The receive check is what stops an
+        off-link spoof from poisoning the liveness register the FRR demux
+        reads.
+
+    - cite: rfc5883
+      title: "BFD for Multihop Paths"
+      sections: ["§5 encapsulation"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-BFDLiveness. Multi-hop encapsulation the D5.2 band
+        honours: UDP destination port 4784, and the relaxed-TTL rule (TTL=255
+        cannot be enforced across multiple hops), exposed via
+        `ttl_strictness = per_session_by_hop_type`. Lets the composition
+        monitor a multi-hop next-hop's liveness when the protected path is
+        not a single physical link.
+
+  tutorials: []                                               # no p4lang/tutorials BFD-or-FRR exercise
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      The unit of work, dispatched by header type. A BFD control packet
+      (UDP 3784/4784) drives the detection stage and is consumed; an IPv4
+      non-BFD packet drives the FRR demux and is forwarded/dropped; a
+      time_tick drives the detection-timeout and origination rules. No
+      per-packet state beyond the shared liveness register and the session
+      table.
+
+  bfd_session:                             # the BFD session — reused from P-BFDLiveness
+    name: bfd_session
+    keyed_by: bfd.LocalDiscr               # primary lookup once Your Discriminator is nonzero (§6.8.6)
+    aux_key: "(peer_ip, ingress_port) — used at Your Discriminator == 0 per §6.3 / RFC 5881 §3 / RFC 5883 §4"
+    attrs:
+      local_discr:           int
+      remote_discr:          int
+      local_state:           enum          # ∈ {AdminDown, Down, Init, Up}
+      remote_state:          enum
+      last_rx_timestamp:     int           # µs of last valid RX
+      last_tx_timestamp:     int           # µs of last TX
+      negotiated_tx_interval: int
+      negotiated_rx_interval: int
+      detect_mult:           int
+      peer_ip:               address
+      local_ip:              address
+      port_binding:          port          # the next-hop port whose liveness this session monitors — the JOIN to frr_group.primary_port
+      hop_type:              enum          # single_hop (RFC 5881) | multi_hop (RFC 5883)
+    capacity: ${session_capacity}
+    notes: |
+      Control-plane-installed BFD session plus the data-plane-mutated fields
+      (local_state, remote_state, last_rx_timestamp, last_tx_timestamp). The
+      composition-critical attr is `port_binding`: the egress port whose
+      liveness the session monitors. The instantiation MUST wire each
+      session's port_binding to some frr_group's primary_port (the
+      detect↔reroute join) — otherwise the detection signal drives no reroute
+      and the composition is degenerate.
+
+  frr_group:                               # plays the TPL `bucket` role — the (primary, backup) pair for a destination; reused from P-PURRFastReroute
+    name: frr_group
+    keyed_by: hdr.ipv4.dst                 # match_kind selected by ${frr_match_kind}
+    attrs:
+      primary_port:   port
+      backup_port:    port
+      primary_mac:    address
+      backup_mac:     address
+    capacity: ${frr_table_capacity}
+    notes: |
+      A control-plane-installed FRR binding, one per protected destination.
+      Each ships a (primary, backup) next-hop pair; the per-port liveness
+      demux in R5/R6 picks one per packet by reading link[primary_port].
+      is_down. The primary_port of at least one group MUST be the
+      port_binding of a BFD session (the detect↔reroute join).
+
+  link:                                    # THE SHARED LIVENESS REGISTER — written by the BFD stage, read by the FRR stage
+    keyed_by: egress_port
+    attrs:
+      is_down: bool
+    capacity: ${liveness_register_capacity}
+    notes: |
+      The entire composition surface. This is a single port-keyed
+      register<bit<1>> array. The BFD stage WRITES it: R2 clears
+      link[session.port_binding].is_down ← 0 when a session reaches Up; R7
+      sets it ← 1 when a session's detection timer expires. The FRR stage
+      READS it: R5/R6 test value(link[frr_group.primary_port].is_down, ==, 1)
+      to choose primary vs backup. No control-plane port_down table exists in
+      this composition — the liveness source is FIXED to this data-plane
+      register (this is the P-BFDLiveness `link_register` export wired to the
+      P-PURRFastReroute `dataplane_register` source). An implementation that keeps a
+      separate FRR liveness source breaks liveness_drives_reroute.
+
+  time_tick:                               # periodic event source — R7 and R8 fire on tick events
+    period: ${tick_period_us}
+    notes: |
+      A periodic event the harness injects at ${tick_period_us}-µs cadence.
+      R7 (detection-time check → write is_down) and R8 (periodic emit) fire
+      on tick events, not on packets. The v1.0 vocabulary's mechanism for
+      switch-originated periodic behaviour.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+# Two parameter families — BFD (detection stage) and FRR (reroute stage) —
+# plus the derived composition faithfulness ladder. The cross-pattern wiring
+# parameters (BFD liveness_export, FRR liveness_source) are FIXED by the
+# composition and are not free knobs (see `link` entity).
+
+parameters:
+
+  # ── BFD stage (from P-BFDLiveness) ────────────────────────────────────────
+
+  sessions:
+    type: list[bfd_session_entry]
+    constraint: |
+      every entry has local_discr ∈ [1, 2^32-1] unique across the list,
+      remote_discr ∈ [0, 2^32-1] (0 on init), peer_ip:ipv4, local_ip:ipv4,
+      port_binding ∈ valid port ids, detect_mult ∈ [1, 255],
+      desired_min_tx_interval ∈ [1000, 1e9] µs, required_min_rx_interval ∈
+      [1, 1e9] µs, hop_type ∈ {single_hop, multi_hop}, role ∈
+      {active, passive}. COMPOSITION CONSTRAINT: every session.port_binding
+      MUST equal the primary_port of at least one entry in ${frr_groups}.
+    notes: |
+      Control-plane-installed BFD session descriptors. Anchor seeds install
+      1–2 sessions monitoring the primary ports of the FRR groups; D5.2
+      (multi-hop) seeds install a cross-router session.
+
+  session_capacity:
+    type: int | unbounded
+    range: "[4, 65536]"
+    default: unbounded
+    notes: "Max BFD sessions the data-plane session table holds. Walked down by shrink_session_capacity_4x."
+
+  detect_mult:
+    type: int
+    range: "[1, 32]"
+    default: 3
+    notes: |
+      Default detection multiplier. Detection time = detect_mult ×
+      negotiated_rx_interval (§6.8.4); lowering it (lower_detect_mult)
+      tightens detection timing and catches per-tick slack in R7.
+
+  packet_format_faithfulness:
+    type: enum
+    values: [D5.0_minimal_8byte, D5.1_rfc5880_mandatory, D5.2_multihop_rfc5883]
+    default: D5.0_minimal_8byte
+    notes: |
+      Faithfulness ladder for the BFD wire format. D5.0 is
+      an 8-byte My/Your-Discriminator stand-in (waives length/version
+      sub-checks in R1); D5.1 lifts to the full RFC 5880 24-byte mandatory
+      section with the complete reception cascade; D5.2 adds the multi-hop
+      UDP-port-4784 + relaxed-TTL encapsulation of RFC 5883. Seed-only
+      parameter, not a Table 1 design-space tag. (This composition omits the
+      P-BFDLiveness D5.3 echo band — echo is orthogonal to the reroute loop.)
+
+  origination_mode:
+    type: enum
+    values: [no_origination_sink_only, generator_entry_table, packet_driven_recirculate]
+    default: generator_entry_table
+    notes: |
+      How the periodic BFD probe is emitted (R8). generator_entry_table is the
+      anchor (control-plane generator entry fires every tick);
+      packet_driven_recirculate is the D5.2 harden (data-plane recirculate()
+      origination, first-corpus probe of the v1model recirculation surface);
+      no_origination_sink_only disables R8 (the peer does all emitting — a
+      degenerate ease setting for asymmetric topologies).
+
+  ttl_strictness:
+    type: enum
+    values: [strict_255, relaxed, per_session_by_hop_type]
+    default: strict_255
+    notes: |
+      How R1 enforces the RFC 5881 §5 TTL=255 requirement on received BFD
+      packets (and ttl_255_on_emit on R8). strict_255 is the single-hop
+      anchor; relaxed is the multi-hop default; per_session_by_hop_type gates
+      the check on the session's hop_type (required when D5.2 mixes hop types).
+      Note: this is the BFD-RECEIVE TTL check and is INDEPENDENT of
+      ${ttl_decrement_strict} (the FRR-forward TTL decrement).
+
+  session_lookup_key:
+    type: enum
+    values: [your_discr_only, source_ip_and_remote_discr, both]
+    default: both
+    notes: |
+      Per §6.8.6 demux: `both` (primary key Your Discriminator, fallback to
+      source-IP/ingress-port when Your Discr == 0) is the RFC-compliant
+      default; `your_discr_only` rejects every Your Discr == 0 packet
+      (stricter than RFC; sessions must be pre-bound).
+
+  tick_period_us:
+    type: int
+    range: "[100, 1000000]"
+    default: 10000
+    notes: |
+      How often the harness fires a time_tick. Should evenly divide the
+      smallest negotiated TX interval. 10 ms is the anchor; the detection
+      window must stay ≥ one tick (feasibility-checked by lower_detect_mult).
+
+  liveness_register_capacity:
+    type: int
+    range: "[8, 512]"
+    default: 64
+    notes: |
+      Slots in the shared link.is_down register array. Must be ≥ the number of
+      distinct ports the topology uses (checked at instantiation:
+      |unique(sessions.port_binding) ∪ unique(frr_groups.primary_port,
+      backup_port)| ≤ liveness_register_capacity).
+
+  # ── FRR stage (from P-PURRFastReroute) ────────────────────────────────────
+
+  frr_groups:
+    type: list[frr_group_entry]
+    constraint: |
+      every entry has dst:ipv4_address or (prefix:ipv4_cidr + prefix_len ∈
+      [0, 32]); primary_port, backup_port ∈ valid port ids with primary_port ≠
+      backup_port; primary_mac, backup_mac:mac_address. At least one entry's
+      primary_port is the port_binding of a session in ${sessions}.
+    notes: |
+      Control-plane-installed FRR bindings, one per protected destination.
+      ${frr_match_kind} selects exact (anchor) vs lpm (D5.1+).
+
+  frr_match_kind:
+    type: enum
+    values: [exact, lpm]
+    default: exact
+    notes: |
+      How the FRR table keys are matched. exact keys on the literal
+      destination IP (anchor); lpm keys on the destination prefix with
+      longest-prefix priority (D5.1+), opening the ternary-without-priority
+      implementation bug.
+
+  frr_table_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: "Max FRR bindings. Walked down by shrink_frr_capacity_4x."
+
+  port_down_capacity:
+    type: int
+    range: "[1, 64]"
+    default: 64
+    notes: |
+      Max ports simultaneously markable down in the shared register. Anchor
+      uses the default; tighter values stress multi-failure scenarios.
+
+  cascaded_backup:
+    type: bool
+    default: false
+    notes: |
+      When false, R6 uses the backup unconditionally if the primary is down
+      (even a black-holed backup). When true, R6 additionally checks the
+      backup port's is_down and R4 drops when BOTH are down — PURR's
+      N-1-protection mode. In this composition BOTH ports' liveness comes from
+      the BFD-written register, so cascaded protection requires BFD sessions
+      monitoring both the primary and backup ports of the protected group.
+
+  ttl_decrement_strict:
+    type: bool
+    default: true
+    notes: |
+      When true, every forwarded data packet (R5/R6) decrements hdr.ipv4.ttl
+      by exactly one and ttl_quantum_one is enforced. Anchor is true.
+      Independent of ${ttl_strictness} (the BFD-receive check).
+
+  default_action_on_miss:
+    type: enum
+    values: [drop, use_default_route]
+    default: drop
+    notes: |
+      Behaviour when the FRR table has no match for an IPv4 data packet. drop
+      is the anchor; use_default_route adds a 0.0.0.0/0 catch-all, realisable
+      only at ${frr_match_kind} == lpm.
+
+  # ── Composition (derived) ─────────────────────────────────────────────────
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_detect_then_reroute          # anchor — minimal-8byte BFD + exact FRR + single-hop + generator-entry origination + no cascade
+      - D5.1_rfc_bfd_lpm_frr              # + full RFC 5880 mandatory section + LPM FRR groups w/ overlap + cascaded double-down drop
+      - D5.2_multihop_recirculate         # + multi-hop (RFC 5883) BFD + data-plane recirculate-driven origination
+    default: D5.0_detect_then_reroute
+    notes: |
+      Composition faithfulness ladder. DERIVED from
+      (packet_format_faithfulness, frr_match_kind, cascaded_backup,
+      origination_mode): the tighten/relax-faithfulness, swap-match-kind,
+      enable-cascaded, and tighten-origination operators advance it as a
+      side-effect; it is not moved by a standalone operator. D5.0 is the clean
+      detect-then-reroute loop over single-failure protection; D5.1 adds the
+      full RFC reception cascade, LPM routing, and the both-down drop; D5.2
+      swaps to multi-hop BFD and data-plane recirculate origination. Seed
+      parameter, not a Table 1 design-space tag.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics on the PACKET path (R0–R6). The packet flows
+# detection-stage → reroute-stage by header type: a BFD control packet is
+# consumed by the detection stage (R1/R2) and writes the shared liveness
+# register; an IPv4 non-BFD packet falls through to the FRR demux (R3–R6) and
+# reads that register. The two stages exchange ONLY the link.is_down register.
+# Tick-path rules (R7, R8) fire on time_tick entities, per-session, and are
+# not mutually exclusive with each other (the first-match cascade governs the
+# packet path).
+#
+# bfd_control := header_present(udp) ∧ (match(udp.dst_port, 3784) ∨ match(udp.dst_port, 4784))
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP, any non-IPv4 ethertype — dropped. Both BFD control
+      (IPv4/UDP) and FRR data (IPv4) are IPv4, so non-IPv4 frames are out of
+      the composition's match domain. G3 parser-edge / conditional-deparser
+      anchor. Lifted from P-PURRFastReroute R0.
+
+  - id: R1_invalid_bfd_drop
+    when: |
+      bfd_control
+      ∧ (
+          ¬match(bfd.version, 1)
+        ∨ value(bfd.length, <, 24)                              # waived at D5.0 (8-byte stand-in)
+        ∨ value(bfd.length, >, udp_payload_length)
+        ∨ match(bfd.detect_mult, 0)
+        ∨ match(bfd.flag_M, 1)
+        ∨ match(bfd.my_discr, 0)
+        ∨ ( value(bfd.your_discr, !=, 0) ∧ ¬exists(bfd_session, by_local_discr(bfd.your_discr)) )
+        ∨ (
+            ${ttl_strictness} ∈ {strict_255, per_session_by_hop_type}
+            ∧ match(udp.dst_port, 3784)
+            ∧ value(ipv4.ttl, !=, 255)                          # RFC 5881 §5
+          )
+      )
+    enforced_when: "${packet_format_faithfulness} != D5.0_minimal_8byte ∨ match(bfd.my_discr, 0) ∨ match(bfd.detect_mult, 0)"
+    then:
+      - drop
+    notes: |
+      The §6.8.6 reception cascade. Every malformed BFD frame MUST drop before
+      it can poison the liveness register the FRR demux trusts. At D5.0 the
+      length/version sub-checks are relaxed (8-byte stand-in); the structural
+      checks (my_discr, detect_mult, your_discr-vs-session) and the TTL=255
+      receive check still apply. Lifted from P-BFDLiveness R1.
+
+  - id: R2_valid_bfd_rx_session_advance
+    when: |
+      bfd_control
+        ∧ ¬(R1_invalid_bfd_drop.fires)
+        ∧ (
+            exists(bfd_session, by_local_discr(bfd.your_discr))
+            ∨ (
+                ${session_lookup_key} ∈ {source_ip_and_remote_discr, both}
+                ∧ match(bfd.your_discr, 0)
+                ∧ exists(bfd_session, by_peer_ip_and_port(ipv4.src, std.ingress_port))
+              )
+          )
+    given:
+      session: by_local_discr(bfd.your_discr) if value(bfd.your_discr, !=, 0)
+               else by_peer_ip_and_port(ipv4.src, std.ingress_port)
+    then:
+      - "bind(bfd_session, session.key, attrs: {
+            remote_discr: bfd.my_discr,
+            remote_state: bfd.state,
+            last_rx_timestamp: now_us,
+            negotiated_rx_interval: max(session.required_min_rx_interval, bfd.desired_min_tx_interval)
+          })"
+      - "transition(bfd_session, advance_per_§6.8.6_state_table(session.local_state, bfd.state))"
+      - "bind(link, session.port_binding, attrs: {is_down: (session.local_state == Up ? 0 : (session.local_state == Down ? 1 : link[session.port_binding].is_down))})"
+      - "emit(bfd_response with flag_F=1, flag_P=0, your_discr=bfd.my_discr, my_discr=session.local_discr, state=session.local_state) IF match(bfd.flag_P, 1)"
+      - drop                                                    # the ingress BFD packet is consumed (the switch is its destination)
+    notes: |
+      The §6.8.6 receive-path state machine. Effects, in order: bind session
+      attrs from the packet; transition local_state; WRITE the shared liveness
+      register — clear link[port_binding].is_down ← 0 on reaching Up
+      (recovery_restores_primary), set ← 1 on Down; reply to a Poll. The
+      ingress BFD packet is then consumed (dropped — it never enters the FRR
+      demux: bfd_control_not_rerouted). Lifted from P-BFDLiveness R2 with the
+      liveness_export = link_register side-effect always active.
+
+  - id: R3_frr_table_miss
+    when: |
+      header_present(ipv4) ∧ ¬bfd_control
+        ∧ ¬exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+    then:
+      - "${default_action_on_miss}"
+    notes: |
+      An IPv4 data packet whose destination no FRR binding covers. drop is the
+      anchor; use_default_route wires a 0.0.0.0/0 catch-all at lpm. Lifted
+      from P-PURRFastReroute R1.
+
+  - id: R4_cascaded_double_down_drop
+    when: |
+      header_present(ipv4) ∧ ¬bfd_control
+        ∧ ${cascaded_backup}
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1)
+        ∧ exists(link, frr_group.backup_port)  ∧ value(link.is_down, ==, 1)
+    enforced_when: "${cascaded_backup}"
+    given:
+      frr_group: by_key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})
+    then:
+      - drop
+    notes: |
+      Both the primary AND backup ports of the destination's FRR group are
+      marked down in the shared register (by BFD detection timeouts). Only
+      fires at ${cascaded_backup} == true; otherwise R6 absorbs this case and
+      the black-holed backup is "used". Hoisted above R6 so first-match yields
+      the drop. Lifted from P-PURRFastReroute R4.
+
+  - id: R5_frr_primary_up_forward
+    when: |
+      header_present(ipv4) ∧ ¬bfd_control
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ ¬( exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1) )
+    given:
+      frr_group: by_key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})
+    then:
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_group.primary_mac)
+      - forward(frr_group.primary_port)
+    notes: |
+      Primary path. The primary's egress port is NOT marked down in the shared
+      register — i.e., BFD has not declared it down (no_phantom_reroute: the
+      ONLY thing that puts a bit in the register is a BFD event). Lifted from
+      P-PURRFastReroute R2, reading the BFD-written register.
+
+  - id: R6_frr_primary_down_forward_backup
+    when: |
+      header_present(ipv4) ∧ ¬bfd_control
+        ∧ exists(frr_group, key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind}))
+        ∧ exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1)
+        ∧ ¬( ${cascaded_backup} ∧ exists(link, frr_group.backup_port) ∧ value(link.is_down, ==, 1) )
+    given:
+      frr_group: by_key_match(hdr.ipv4.dst, ${frr_groups}, ${frr_match_kind})
+    then:
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_group.backup_mac)
+      - forward(frr_group.backup_port)
+    notes: |
+      Backup path. The primary's egress port IS marked down in the shared
+      register — BFD declared it down (R7 detection timeout) or has not yet
+      brought it Up. The L2 rewrite MUST use the BACKUP MAC, not the primary
+      MAC (ether_rewrite_correctness_on_backup). This rule firing is the
+      observable end of the detect↔reroute loop. Lifted from
+      P-PURRFastReroute R3, reading the BFD-written register.
+
+  - id: R7_bfd_detection_timeout_to_down
+    when: |
+      header_present(time_tick)
+        ∧ exists(bfd_session, by_local_discr(any))
+        ∧ value(session.local_state, ∈, {Init, Up})
+        ∧ elapsed(now_us - session.last_rx_timestamp, >, session.detect_mult * session.negotiated_rx_interval)
+    given:
+      session: by_local_discr(any_eligible_session)
+    then:
+      - "transition(bfd_session, Down)"
+      - "bind(link, session.port_binding, attrs: {is_down: 1})"      # WRITE the shared register — drives the FRR reroute
+    notes: |
+      §6.8.4 detection-time check. Fires once per tick per session whose
+      last_rx_timestamp is beyond the detection window. The transition to Down
+      WRITES link[session.port_binding].is_down ← 1 — the EVENT that drives
+      the FRR demux to the backup (liveness_drives_reroute). Lifted from
+      P-BFDLiveness R3 with the liveness register write always active.
+
+  - id: R8_periodic_origination
+    when: |
+      header_present(time_tick)
+        ∧ exists(bfd_session, by_local_discr(any))
+        ∧ value(session.local_state, ∈, {Down, Init, Up})
+        ∧ ¬(value(session.local_state, ==, Down) ∧ value(session.remote_discr, ==, 0) ∧ value(session.role, ==, passive))
+        ∧ elapsed(now_us - session.last_tx_timestamp, ≥, session.negotiated_tx_interval)
+        ∧ ${origination_mode} != no_origination_sink_only
+    given:
+      session: by_local_discr(any_eligible_session)
+    then:
+      - "emit(bfd_packet with version=1, state=session.local_state, flag_P=session.poll_pending, flag_F=0,
+              detect_mult=session.detect_mult, length=24,
+              my_discr=session.local_discr, your_discr=session.remote_discr,
+              encapsulated_in: ipv4_udp(src=session.local_ip, dst=session.peer_ip,
+                                       udp_dst_port=(session.hop_type == single_hop ? 3784 : 4784),
+                                       ipv4_ttl=255))
+              applying_jitter_up_to_25_percent_per_§6.8.7"
+      - "set(session.last_tx_timestamp, now_us)"
+    enforced_when: "${origination_mode} ∈ {generator_entry_table, packet_driven_recirculate}"
+    notes: |
+      §6.8.7 transmission. Periodic emit at the negotiated TX rate, so the peer
+      sees this switch's liveness (and this switch's own detection loop runs
+      against the peer's probes). ${origination_mode} selects generator-entry
+      (anchor) vs data-plane recirculate (D5.2). Lifted from P-BFDLiveness R4.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  # ── Composition-specific (the detect↔reroute contract) ───────────────────
+
+  - id: liveness_drives_reroute
+    clause: stability
+    target: forward_decision
+    while: "R5 ∨ R6 fires (any IPv4 data forward)"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      The composition's MASTER invariant. The FRR demux for destination D
+      selects the backup port IFF link[D's primary_port].is_down == 1, and
+      that bit is written ONLY by the BFD stage (R2 clears on Up, R7 sets on
+      detection timeout). The FRR stage reads exactly the register the BFD
+      stage writes — there is no second liveness source. Catches the dominant
+      composition bug: keeping the FRR liveness as an independent control-plane
+      port_down table (or a constant) so the BFD detection never actually
+      reroutes data traffic. The composed analogue of pin_precedes_path in
+      P-LBFailover, re-cast for a detect-then-reroute loop.
+
+  - id: no_phantom_reroute
+    clause: stability
+    target: forward_decision
+    while: "R5 ∨ R6 fires"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      A destination whose primary port BFD considers Up MUST be forwarded over
+      its primary (R5). The FRR demux never reroutes on anything other than
+      the BFD-written is_down bit — not on a hash, not on a stale control-plane
+      table, not on the BFD session state read directly (it must go through the
+      register). Catches an implementation that fails over spuriously, or that reads the
+      session table instead of the shared register and so reroutes a port whose
+      session is merely Init.
+
+  - id: recovery_restores_primary
+    clause: stability
+    target: "link[port].is_down"
+    while: "a session monitoring `port` transitions Down→…→Up"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      Failover is REVERSIBLE. When a BFD session recovers (reaches Up via the
+      handshake, R2), link[port_binding].is_down is cleared to 0 and the FRR
+      demux returns the destination to its primary. Catches the very common
+      implementation bug of setting is_down on timeout (R7) but never clearing it on
+      recovery — the path stays on the backup forever. Neither standalone
+      pattern probes the full down→up→down register cycle end-to-end.
+
+  - id: detection_to_reroute_bounded_latency
+    clause: bounded_latency
+    target: end_to_end_failover_response
+    bound: "session.detect_mult * session.negotiated_rx_interval + ${tick_period_us} + 1"
+    notes: |
+      The end-to-end bound: the first IPv4 data packet to D arriving after the
+      detection deadline MUST take the backup, within BFD's detection window
+      (detect_mult × negotiated_rx_interval, +1 tick for the discrete R7
+      check) plus PURR's one-packet structural failover (+1 packet). Composes
+      detection_bounded_latency (BFD) with failover_bounded_latency (PURR). An
+      implementation that defers either the detection check or the demux to a
+      control-plane upcall fails this — there is NO control-plane round trip in
+      the loop.
+
+  - id: bfd_control_not_rerouted
+    clause: no_orphan
+    target: bfd_control_packet
+    while: "a BFD control packet (UDP 3784/4784) ingresses"
+    notes: |
+      A BFD control packet is consumed by the detection stage (R2 drops it
+      after updating state) and MUST NOT enter the FRR demux — it is never
+      forwarded out a data egress as if it were transit traffic. Symmetrically,
+      an IPv4 non-BFD data packet MUST NOT mutate session state. Catches an
+      implementation that lets the first-match cascade leak a BFD packet into R5/R6 (or
+      a data packet into R2), cross-contaminating the two stages.
+
+  # ── BFD-stage invariants (from P-BFDLiveness) ─────────────────────────────
+
+  - id: detection_bounded_latency
+    clause: bounded_latency
+    target: session_down_declaration
+    bound: "session.detect_mult * session.negotiated_rx_interval + ${tick_period_us}"
+    notes: |
+      §6.8.4 detection-time bound (extended one tick for the discrete R7
+      check). The first missed-window event triggers Down within one tick.
+      Lifted from P-BFDLiveness.
+
+  - id: local_discriminator_persistence
+    clause: persistence
+    target: session.local_discr
+    while: "session is bound"
+    free_under: []
+    notes: |
+      §6.8.6: bfd.LocalDiscr is chosen once per session and MUST NOT change
+      for the session's lifetime. Implementation bug: regenerating it per emit. Lifted
+      from P-BFDLiveness.
+
+  - id: session_state_advance_monotonic_in_normal_path
+    clause: stability
+    target: session.local_state
+    while: "no detection timeout AND no AdminDown received"
+    notes: |
+      Under steady-state RX, local_state advances Down → Init → Up and does
+      not bounce backwards. Lifted from P-BFDLiveness.
+
+  - id: emit_packet_structure_completeness
+    clause: stability
+    target: emitted_bfd_packet_layers
+    while: "rule R8 fires"
+    notes: |
+      Every R8-emitted packet MUST carry a full Eth + IPv4 + UDP + BFD stack
+      with correctly recomputed IPv4/UDP checksums. The conditional-deparser
+      anti-pattern (a guarded packet.emit on the origination path) is probed by
+      regression_conditional_deparser_on_emit. Lifted from P-BFDLiveness.
+
+  - id: ttl_255_on_emit_when_single_hop
+    clause: stability
+    target: emitted_packet.ipv4.ttl
+    while: "rule R8 fires for a session with hop_type == single_hop"
+    enforced_when: "${packet_format_faithfulness} != D5.2_multihop_rfc5883"
+    notes: |
+      RFC 5881 §5: emitted single-hop BFD packets carry TTL = 255. Implementations
+      that emit with the default TTL (64) cause the peer to drop every probe.
+      Lifted from P-BFDLiveness.
+
+  - id: link_register_stability_under_no_state_change
+    clause: stability
+    target: link.is_down
+    while: "no session monitoring `port` changes state AND R7 has not fired for it"
+    notes: |
+      The shared is_down slot MUST NOT flip except when R2 or R7 explicitly
+      writes it. Implementations that recompute the register every tick introduce a
+      transient mismatch failover_decision_per_packet trips on. This invariant
+      is the linchpin between the two stages — it is what lets the FRR demux
+      trust the bit. Lifted from P-BFDLiveness.
+
+  # ── FRR-stage invariants (from P-PURRFastReroute) ─────────────────────────
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "R5 ∨ R6 fires"
+    enforced_when: "${ttl_decrement_strict}"
+    notes: |
+      RFC 1812 §5.3.1 — data packets decremented by exactly one per forward,
+      on both primary and backup paths. Lifted from P-PURRFastReroute.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "R5 ∨ R6 fires"
+    free_under: []
+    notes: |
+      The FRR stage forwards — it does NOT translate addresses. Both IPv4 src
+      and dst are preserved across the reroute (this is plain forwarding, not
+      NAT — distinguishes this composition from P-LBFailover, whose LB stage
+      DNATs). Lifted from P-PURRFastReroute.
+
+  - id: ether_rewrite_correctness_on_primary
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "R5 fires"
+    notes: |
+      On the primary path, hdr.ethernet.dst MUST equal the group's
+      primary_mac. Lifted from P-PURRFastReroute.
+
+  - id: ether_rewrite_correctness_on_backup
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "R6 fires"
+    notes: |
+      On the backup path, hdr.ethernet.dst MUST equal the group's backup_mac —
+      NOT primary_mac. Lifted from P-PURRFastReroute.
+
+  - id: failover_decision_per_packet
+    clause: stability
+    target: forward_decision
+    while: "exists(frr_group, dst) ∧ link.is_down state unchanged"
+    notes: |
+      Under a fixed register state, the primary-vs-backup choice for a dst is a
+      deterministic function of dst and the installed liveness. Catches hashing
+      the demux. Lifted from P-PURRFastReroute.
+
+  - id: failover_bounded_latency
+    clause: bounded_latency
+    target: failover_response
+    bound: 1
+    notes: |
+      The first packet observing is_down == 1 takes the backup — one-packet
+      structural failover, no recirculation. ANDed with no_loop it rules out
+      recirculation-based failover. Lifted from P-PURRFastReroute.
+
+  - id: no_orphan_links
+    clause: no_orphan
+    target: link
+    notes: |
+      Every is_down register slot has a defined population mechanism — it is
+      written ONLY by R2/R7 (the BFD stage); the pattern declares no implicit
+      decay. Lifted from P-PURRFastReroute, sharpened: here the ONLY writer is
+      the BFD stage (no control-plane port_down table).
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No indefinite recirculation. Data packets egress on a definite port or
+      drop; BFD control packets are consumed; the packet_driven_recirculate
+      origination mode recirculates one stub per emit exactly once. An implementation
+      that recirculates to re-apply the demux, or fails to consume the
+      origination stub, trips this. Lifted from both constituents.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ─────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The composition's
+# distinctive entries are the DETECT↔REROUTE probes
+# (detect_then_reroute_golden_path, recovery_restores_primary,
+# no_phantom_reroute) that neither standalone pattern can express. By
+# convention, stateful sequences use TTL=64 warm-ups via
+# prior_inputs and time_tick injection for the detection clock.
+
+test_scaffolding:
+
+  G1:
+    - id: detect_then_reroute_golden_path
+      rule_ref: G1-P1-T5                                     # the signature composition probe
+      generate: |
+        (1) Bring session S (monitoring port P = frr_group Gi's primary_port)
+        to Up via the three-way handshake. (2) Send an IPv4 data packet to a
+        dst covered by Gi; assert it forwards on P (primary) with
+        hdr.ethernet.dst == Gi.primary_mac, TTL decremented, IPv4 addrs
+        unchanged. (3) Withhold all RX for S and feed time_tick events past
+        (S.detect_mult * S.negotiated_rx_interval + ${tick_period_us}); assert
+        S transitions Down and link[P].is_down flips to 1. (4) Resend the data
+        packet; assert it now forwards on Gi.backup_port with
+        hdr.ethernet.dst == Gi.backup_mac. The composition's master probe — an
+        implementation whose FRR liveness is independent of BFD never reroutes at
+        step 4. Anchors liveness_drives_reroute + detection_bounded_latency.
+
+    - id: recovery_restores_primary
+      rule_ref: G1-P1-T5
+      generate: |
+        Continue from detect_then_reroute_golden_path (dst on backup after a
+        timeout). Resume RX for S (send a valid Up BFD packet); assert S
+        returns to Up and link[P].is_down clears to 0. Resend the data packet;
+        assert it forwards on Gi.primary_port again. Anchors
+        recovery_restores_primary — the down→up→primary half of the cycle an
+        implementation that never clears is_down fails.
+
+    - id: bfd_handshake_brings_link_up
+      rule_ref: G1-P1-T1                                     # per-state-transition coverage
+      generate: |
+        Send the three BFD packets (Down→Init, Init→Up, Up) to session S.
+        Assert local_state advances Down → Init → Up and, after the Up packet,
+        link[S.port_binding].is_down == 0. The detection stage in isolation
+        (the reroute stage's input precondition).
+
+    - id: non_bfd_data_uses_frr_primary
+      rule_ref: G1-P1-T1
+      generate: |
+        With session S Up (port P not down), send an IPv4 non-BFD data packet
+        to a dst covered by frr_group Gi (primary_port == P). Assert it
+        forwards on P with the primary L2 rewrite. Confirms the BFD-stage
+        pass-through (R0-equivalent) hands non-BFD traffic to the FRR demux.
+
+  G2:
+    - id: detection_latency_within_bound
+      rule_ref: G2-P1-T3
+      generate: |
+        Bring S Up, then withhold RX. Feed time_tick events one at a time.
+        Assert the FIRST data packet sent AFTER the tick that crosses the
+        detection deadline takes the backup, and a data packet sent on the
+        tick BEFORE the deadline still takes the primary. Pins
+        detection_to_reroute_bounded_latency to ±1 tick.
+
+    - id: malformed_bfd_does_not_reroute
+      rule_ref: G2-P1-T2                                     # malformed input + cross-stage
+      requires: "${packet_format_faithfulness} != D5.0_minimal_8byte"
+      generate: |
+        With S Up, send a malformed BFD packet (e.g. detect_mult=0 or
+        my_discr=0). Assert it is dropped (R1), S stays Up, link[P].is_down
+        stays 0, and a subsequent data packet still takes the primary. A
+        malformed probe MUST NOT poison the liveness register.
+
+    - id: frr_table_miss_drops
+      rule_ref: G2-P1-T1
+      generate: |
+        Send an IPv4 data packet to a dst covered by no frr_group (no
+        0.0.0.0/0 catch-all). Assert drop (R3).
+
+  G3:
+    - id: no_phantom_reroute
+      rule_ref: G3-P1-T4
+      generate: |
+        With S Up and link[P].is_down == 0, send several data packets to Gi's
+        dst. Assert EVERY one takes the primary — the demux must not fail over
+        a port BFD considers up. Then verify a SECOND group Gj whose primary
+        port has NO monitoring session (and is not in any down set) also always
+        takes its primary. Anchors no_phantom_reroute.
+
+    - id: bfd_control_not_forwarded
+      rule_ref: G3-P1-T4                                     # cross-stage isolation
+      generate: |
+        Send a well-formed BFD control packet (UDP 3784) to S. Assert it is
+        consumed (no copy egresses a data port) and S's state advances. Then
+        send an IPv4 data packet whose dst equals the BFD packet's dst IP;
+        assert it is FRR-forwarded normally (the BFD packet did not corrupt the
+        FRR decision). Anchors bfd_control_not_rerouted.
+
+    - id: non_ipv4_dropped
+      rule_ref: G3-P1-T1                                     # conditional-deparser / parser-edge anchor
+      generate: |
+        Send a non-IPv4 frame (ARP 0x0806 / IPv6 0x86DD). Assert drop (R0).
+        Targets the common v1model conditional-deparser bug on the FRR path.
+
+    - id: checksum_after_ttl_on_reroute
+      rule_ref: G1-P4-T1                                     # #1 silent-failure v1model bug (FRR forward)
+      generate: |
+        Force a data packet onto the backup path (S timed out). Assert the
+        egress IPv4 header checksum is VALID over the TTL decrement and that
+        src/dst/totalLen are unchanged. The #1-silent-failure probe on the
+        rerouted forward.
+
+    - id: regression_conditional_deparser_on_emit
+      rule_ref: G3-P2-T2                                     # bug-driven: conditional deparser (origination)
+      requires: "${origination_mode} != no_origination_sink_only"
+      generate: |
+        Force a periodic emit (feed ticks past negotiated_tx_interval with S
+        Up). Capture the probe; verify the OUTPUT is exactly Eth + IPv4 + UDP +
+        BFD with every IPv4 field present and a valid recomputed IPv4/UDP
+        checksum. Catches a guarded packet.emit on the switch-originated path.
+
+    - id: regression_std_metadata_drop_smoke
+      rule_ref: G3-P2-T2                                     # bug-driven: std_metadata.drop misread
+      generate: |
+        Send (a) a non-IPv4 frame R0 drops, then (b) a data packet R5/R6
+        forwards. Assert (b) forwards normally — the prior drop did not corrupt
+        the per-packet decision via a std_metadata.drop misread.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease on the same axis. Operators move
+# exactly one axis (single-axis displacement); the composition faithfulness is
+# DERIVED and bumped as a side-effect of the feature-breadth operators rather
+# than by a standalone operator.
+
+mutation_operators:
+
+  # ── BFD session-table capacity ────────────────────────────────────────────
+  - id: shrink_session_capacity_4x
+    applicable_when: "${session_capacity} ≠ unbounded ∧ ${session_capacity} > 16"
+    effect: "${session_capacity} ← ${session_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${session_capacity} ≥ 4 ∧ ${session_capacity} ≥ |${sessions}|"
+    notes: "Tighten the session-table budget. Pairs with enlarge_session_capacity_2x."
+
+  - id: enlarge_session_capacity_2x
+    applicable_when: "${session_capacity} ≠ unbounded"
+    effect: "${session_capacity} ← ${session_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${session_capacity} ≤ 65536"
+    notes: "Loosen the session-table budget. Pairs with shrink_session_capacity_4x."
+
+  # ── FRR table capacity ────────────────────────────────────────────────────
+  - id: shrink_frr_capacity_4x
+    applicable_when: "${frr_table_capacity} ≠ unbounded ∧ ${frr_table_capacity} > 64"
+    effect: "${frr_table_capacity} ← ${frr_table_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${frr_table_capacity} ≥ 16"
+    notes: "Tighten the FRR-binding budget. Pairs with enlarge_frr_capacity_2x."
+
+  - id: enlarge_frr_capacity_2x
+    applicable_when: "${frr_table_capacity} ≠ unbounded"
+    effect: "${frr_table_capacity} ← ${frr_table_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${frr_table_capacity} ≤ 65536"
+    notes: "Loosen the FRR-binding budget. Pairs with shrink_frr_capacity_4x."
+
+  # ── BFD packet faithfulness (bumps composition faithfulness) ──────────────
+  - id: tighten_bfd_packet_faithfulness
+    applicable_when: "${packet_format_faithfulness} ≠ D5.2_multihop_rfc5883"
+    effect: |
+      ${packet_format_faithfulness} ← next_ladder_step(${packet_format_faithfulness}) ∧
+      ${faithfulness} ← max(${faithfulness}, ladder_for(${packet_format_faithfulness}))
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      D5.1 activates the full §6.8.6 cascade (version/length/M-bit checks);
+      D5.2 adds the udp.dst_port=4784 multi-hop path and sets
+      ${ttl_strictness} ← per_session_by_hop_type for the mixed-hop sessions.
+    notes: |
+      Lift D5.0 → D5.1 → D5.2 on the BFD wire format. Each step grows the
+      reception cascade and (at D5.2) the multi-hop encapsulation. Pairs with
+      relax_bfd_packet_faithfulness.
+
+  - id: relax_bfd_packet_faithfulness
+    applicable_when: "${packet_format_faithfulness} ≠ D5.0_minimal_8byte"
+    effect: |
+      ${packet_format_faithfulness} ← prev_ladder_step(${packet_format_faithfulness}) ∧
+      ${faithfulness} ← recompute_from(packet_format_faithfulness, frr_match_kind, cascaded_backup, origination_mode)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no session in ${sessions} requires a band-specific feature still active in the seed (e.g. no multi_hop session at D5.1)"
+    notes: "Drop one rung on the BFD faithfulness ladder. Pairs with tighten_bfd_packet_faithfulness."
+
+  # ── FRR match kind (bumps composition faithfulness) ───────────────────────
+  - id: swap_frr_match_kind_to_lpm
+    applicable_when: "${frr_match_kind} == exact"
+    effect: |
+      ${frr_match_kind} ← lpm ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_rfc_bfd_lpm_frr)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${frr_groups} entries can be re-expressed as (prefix, prefix_len)"
+    notes: |
+      Lift the FRR table to LPM keying — activates the ternary-without-priority
+      implementation bug. Pair with inject_route_overlap_stress to exercise the
+      longest-prefix property. Pairs with swap_frr_match_kind_to_exact.
+
+  - id: swap_frr_match_kind_to_exact
+    applicable_when: "${frr_match_kind} == lpm"
+    effect: |
+      ${frr_match_kind} ← exact ∧
+      ${faithfulness} ← recompute_from(packet_format_faithfulness, frr_match_kind, cascaded_backup, origination_mode)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no two ${frr_groups} entries share the same dst"
+    notes: "Drop back to exact FRR keying. Pairs with swap_frr_match_kind_to_lpm."
+
+  # ── FRR cascaded protection (bumps composition faithfulness) ──────────────
+  - id: enable_cascaded_backup
+    applicable_when: "${cascaded_backup} == false"
+    effect: |
+      ${cascaded_backup} ← true ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_rfc_bfd_lpm_frr)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "R4 is added to the active rule set ∧ a `cascaded_double_down_drop` G3 entry is materialised ∧ ${port_down_capacity} ≥ 2 ∧ ≥1 protected group has BFD sessions monitoring BOTH its primary and backup ports"
+    notes: |
+      Activate R4 and the both-down-drop semantics. The implementation adds a second
+      register read on the backup port; the seed must add a BFD session
+      monitoring the backup port so the both-down state is reachable through
+      the detect↔reroute loop. Pairs with disable_cascaded_backup.
+
+  - id: disable_cascaded_backup
+    applicable_when: "${cascaded_backup} == true"
+    effect: |
+      ${cascaded_backup} ← false ∧
+      ${faithfulness} ← recompute_from(packet_format_faithfulness, frr_match_kind, cascaded_backup, origination_mode)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "R4 is removed from the active rule set"
+    notes: "Strip cascaded protection. Pairs with enable_cascaded_backup."
+
+  # ── BFD origination mode (bumps composition faithfulness) ─────────────────
+  - id: tighten_origination_to_recirculate
+    applicable_when: "${origination_mode} == generator_entry_table"
+    effect: |
+      ${origination_mode} ← packet_driven_recirculate ∧
+      ${faithfulness} ← max(${faithfulness}, D5.2_multihop_recirculate)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "the harness can inject recirculate stub packets at init ∧ no R8-disabling parameter is active"
+    notes: |
+      Move the emit path from a control-plane generator entry to a data-plane
+      recirculate() loop — the v1model recirculation surface for
+      switch-originated traffic. Pairs with relax_origination_to_generator_entry.
+
+  - id: relax_origination_to_generator_entry
+    applicable_when: "${origination_mode} == packet_driven_recirculate"
+    effect: "${origination_mode} ← generator_entry_table"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the harness can install a generator entry that fires every ${tick_period_us}"
+    notes: "Drop back to generator-entry origination. Pairs with tighten_origination_to_recirculate."
+
+  # ── BFD detection multiplier ──────────────────────────────────────────────
+  - id: lower_detect_mult
+    applicable_when: "${detect_mult} > 1"
+    effect: "${detect_mult} ← max(1, ${detect_mult} - 1)"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${detect_mult} ≥ 1 ∧ ${detect_mult} * session.negotiated_rx_interval ≥ ${tick_period_us}"
+    notes: |
+      Tighten detection timing — at detect_mult = 1 the first missed packet
+      declares Down, so any per-tick slack in R7 (or a `>` vs `≥` slip)
+      surfaces as a late reroute. Pairs with raise_detect_mult.
+
+  - id: raise_detect_mult
+    applicable_when: "${detect_mult} < 32"
+    effect: "${detect_mult} ← ${detect_mult} + 1"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${detect_mult} ≤ 32"
+    notes: "Loosen detection timing. Pairs with lower_detect_mult."
+
+  # ── BFD receive TTL strictness ────────────────────────────────────────────
+  - id: tighten_bfd_ttl_validation
+    applicable_when: "${ttl_strictness} == relaxed"
+    effect: "${ttl_strictness} ← strict_255"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "no session in ${sessions} has hop_type == multi_hop"
+    notes: "Activate the RFC 5881 §5 TTL=255 receive check (R1) + emit invariant. Pairs with relax_bfd_ttl_validation."
+
+  - id: relax_bfd_ttl_validation
+    applicable_when: "${ttl_strictness} == strict_255"
+    effect: "${ttl_strictness} ← relaxed"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "G2 entry `ttl_not_255_single_hop_drops` (if present) is dropped from the floor"
+    notes: "Disable the BFD-receive TTL check. Pairs with tighten_bfd_ttl_validation."
+
+  # ── FRR forward TTL strictness ────────────────────────────────────────────
+  - id: enable_strict_frr_ttl
+    applicable_when: "${ttl_decrement_strict} == false"
+    effect: "${ttl_decrement_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "checksum_after_ttl_on_reroute is included in the G3 set"
+    notes: "Enforce exact TTL decrement-by-one on every data forward. Pairs with relax_frr_ttl."
+
+  - id: relax_frr_ttl
+    applicable_when: "${ttl_decrement_strict} == true"
+    effect: |
+      ${ttl_decrement_strict} ← false ∧
+      ttl_quantum_one invariant moves to advisory
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Tunnel-style seeds may not decrement TTL on the demux. Pairs with enable_strict_frr_ttl."
+
+  # ── Route overlap stress ──────────────────────────────────────────────────
+  - id: inject_route_overlap_stress
+    applicable_when: "${frr_match_kind} == lpm ∧ 'lpm_longest_match_priority' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${frr_groups} so ≥30% of installed prefixes overlap (a /16 plus
+      several /24s and /32s within it). Add G2 test `lpm_longest_match_priority`
+      sending packets requiring 3 levels of LPM tie-break.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${frr_table_capacity} ≥ 64 ∨ ${frr_table_capacity} == unbounded"
+    notes: "Catches ternary-without-priority at D5.1+. Pairs with restrict_to_disjoint_prefixes."
+
+  - id: restrict_to_disjoint_prefixes
+    applicable_when: "${frr_match_kind} == lpm ∧ overlapping prefixes present in ${frr_groups}"
+    effect: |
+      Replace ${frr_groups} with a disjoint set. Remove G2
+      `lpm_longest_match_priority` if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "every dst address is matched by at most one entry"
+    notes: "Pairs with inject_route_overlap_stress."
+
+  # ── Hidden-coverage: down→up→down flap cycle ──────────────────────────────
+  - id: add_flap_cycle_test
+    applicable_when: "'reroute_flap_cycle' ∉ test_scaffolding.G1"
+    effect: |
+      Add a G1 test `reroute_flap_cycle`: drive a session Up→(timeout)Down→
+      (recover)Up→(timeout)Down, sending a data packet after each transition;
+      assert the egress migrates primary→backup→primary→backup in lockstep
+      with link[port].is_down. Probes the full register-cycle hysteresis
+      neither constituent reaches.
+    axis: hidden-coverage
+    direction: harden
+    feasibility_postcondition: "|${sessions}| ≥ 1 ∧ at least one frr_group's primary_port is a monitored port_binding"
+    notes: "Test-rigor harden on liveness_drives_reroute + recovery_restores_primary. Pairs with drop_flap_cycle_test."
+
+  - id: drop_flap_cycle_test
+    applicable_when: "'reroute_flap_cycle' ∈ test_scaffolding.G1"
+    effect: "Remove the `reroute_flap_cycle` G1 test."
+    axis: hidden-coverage
+    direction: ease
+    feasibility_postcondition: "G1 still contains ≥ 3 entries"
+    notes: "Test-rigor ease. Pairs with add_flap_cycle_test."
+
+  # ── Input-form: spec noise ────────────────────────────────────────────────
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the noisify_spec_low protocol shared with the constituent patterns:
+        • 1 distractor clause about deployment / out-of-scope behaviour that is
+          true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, session,
+          group) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Presentation-noise harden. Pairs with denoisify_spec."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Presentation-noise ease. Pairs with noisify_spec_low."
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this composed pattern in v1model P4. Items marked
+  [common-knowledge baseline] are synthesised from internalised P4 /
+  networking knowledge rather than retrieved from a cited source.
+
+    Anchor (faithfulness=D5.0_detect_then_reroute, packet_format_faithfulness=
+            D5.0_minimal_8byte, frr_match_kind=exact, cascaded=false,
+            origination=generator_entry_table, ttl_strictness=strict_255,
+            ttl_decrement_strict=true):
+      - THE shared register: `register<bit<1>>(${liveness_register_capacity})
+        link_down`. This single array is the entire composition surface. The
+        BFD stage writes it; the FRR stage reads it. Do NOT introduce a second
+        control-plane port_down table — there is none in this composition.
+      - Pre-stage demux in MyParser/MyIngress by header:
+          if (hdr.udp.isValid() && (hdr.udp.dstPort == 3784 ||
+              hdr.udp.dstPort == 4784)) { /* BFD stage */ }
+          else if (hdr.ipv4.isValid())  { /* FRR stage */ }
+          else                          { mark_to_drop(); }      // R0
+      - BFD stage (R1/R2): one `session_lookup` table (key bfd.your_discr,
+        match exact; metadata fallback for the source-IP path) → set_session
+        action stashing the row; the §6.8.6 cascade as an if-guard (R1); on a
+        valid RX, advance state, stamp last_rx into a
+        `register<bit<48>>` keyed by session slot, and WRITE the shared
+        register: link_down.write(session.port_binding,
+        (local_state == Up ? 0 : (local_state == Down ? 1 : current))); then
+        mark_to_drop() (the BFD packet is consumed). [common-knowledge baseline]
+      - Tick stage (R7/R8): a generator/recirculate-driven path that, per
+        active session, checks
+        std.ingress_global_timestamp - last_rx > detect_mult *
+        negotiated_rx_interval and on expiry transitions Down and
+        link_down.write(session.port_binding, 1) (R7); and emits a fresh probe
+        per active session at the TX cadence (R8). [common-knowledge baseline —
+        the v1model generator-entry / recirculate mechanism.]
+      - FRR stage (R3–R6): `frr_table` (key hdr.ipv4.dstAddr, exact for
+        anchor) → set_frr(primary_port, backup_port, primary_mac, backup_mac)
+        into metadata; default drop (R3). Then
+        link_down.read(primary_down, meta.primary_port). If primary_down == 0:
+        egress=primary_port, dmac=primary_mac (R5); else egress=backup_port,
+        dmac=backup_mac (R6). ttl-- ; ether.src = ether.dst(old);
+        ether.dst = dmac.
+      - MyComputeChecksum: a SINGLE incremental update over the TTL change for
+        the FRR forward; a fresh from-scratch checksum for the R8 originated
+        probe.
+
+      STAGE WIRING is load-bearing: the FRR demux MUST read the SAME
+      `link_down` register the BFD R7 writes — not a separately-installed
+      control-plane port_down table, not the session-state register read
+      directly. A program that keeps the FRR liveness independent compiles and
+      passes every standalone-FRR test, yet the BFD detection never reroutes a
+      single data packet — liveness_drives_reroute and the
+      detect_then_reroute_golden_path test catch exactly this.
+
+    D5.1 (full RFC 5880 mandatory + LPM FRR + cascaded):
+      - Parse the full 24-byte BFD section; activate the length/version/M-bit
+        cascade in R1.
+      - `frr_table` becomes lpm-keyed — use match_kind lpm, NOT ternary
+        without prefix-length priority.
+      - cascaded: add a second link_down.read on meta.backup_port; if
+        primary_down && backup_down → mark_to_drop() (R4), decided BEFORE the
+        backup forward. Note both bits come from the shared register, so the
+        seed installs a BFD session on the backup port too.
+
+    D5.2 (multi-hop BFD + recirculate origination):
+      - Parser selects udp.dstPort 3784 vs 4784; per RFC 5883 the TTL=255
+        receive check is gated per session hop_type
+        (${ttl_strictness} = per_session_by_hop_type).
+      - Data-plane origination: install a recirculate() on a stub at init; the
+        recirculated packet drives the per-session emit, then the stub is
+        DROPPED on its second pass. Forgetting the stub drop → recirculation
+        runaway (trips no_loop). [common-knowledge baseline]
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Keeping the FRR liveness as an independent control-plane port_down table
+      (or a constant), so BFD detection never drives a reroute. The single
+      sharpest composition bug — liveness_drives_reroute /
+      detect_then_reroute_golden_path catch it.
+    * Setting link_down on timeout (R7) but never clearing it on recovery (R2)
+      — the path sticks on the backup forever. recovery_restores_primary
+      catches it.
+    * Reading the BFD session-state register directly in the FRR demux instead
+      of the port-keyed link_down register — couples the two stages on the
+      wrong key (session slot ≠ egress port) and reroutes spuriously when a
+      session is merely Init. no_phantom_reroute / link_register_stability
+      catch it.
+    * Letting the first-match cascade leak a BFD control packet into the FRR
+      forward (or a data packet into the session advance). bfd_control_not_
+      rerouted catches the cross-stage leak.
+    * Implementing the detection check (R7) as a control-plane scrape, or the
+      FRR demux via recirculate() — both add latency the composed
+      detection_to_reroute_bounded_latency / failover_bounded_latency
+      invariants reject even when the eventual forwarding is correct.
+    * Two separate IPv4 checksum updates, or a stale/template checksum on the
+      originated probe. checksum_after_ttl_on_reroute /
+      regression_checksum_recompute_on_emit catch these (the #1 silent-failure
+      v1model bug).
+    * Regenerating bfd.LocalDiscr per emit — local_discriminator_persistence.
+    * Reading standard_metadata.drop to test "was this dropped?" — reserved-
+      field misread (a common v1model bug). Use mark_to_drop().
+
+  v2 deferrals (out of scope for this v1.0 composition):
+    * BFD Echo function (RFC 5880 §6.8.9) — orthogonal to the reroute loop;
+      this composition omits the P-BFDLiveness D5.3 echo band.
+    * Demand mode (no periodic transmit) — not modelled in v1.0.
+    * Per-port source-MAC rewriting from a port_mac table — inherited
+      P-PURRFastReroute v1.1 deferral; the composition keeps primary_mac /
+      backup_mac on the FRR group.
+    * Routing non-protected transit traffic through a separate FIB — would
+      make this BFDLiveness ∘ IPv4Routing ∘ PURR, a three-way chain; kept out
+      to preserve a clean two-oracle composition (FRR-table-miss drops).
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and (once the oracle exists)
+       the oracle audit must all pass.
+
+    2. The composed oracle reuses the audited P-BFDLiveness oracle (instantiated
+       with liveness_export = link_register) for the liveness ground truth and
+       the audited P-PURRFastReroute oracle (instantiated with liveness_source =
+       dataplane_register) for the reroute ground truth (oracles are
+       content-addressed). The new audited surface is ONLY the detect↔reroute
+       glue: (a) the BFD R2/R7 register writes become the FRR R5/R6 register
+       reads, keyed on egress port; (b) the join constraint that every
+       session.port_binding equals some frr_group.primary_port. The oracle MUST
+       treat tick events distinctly from packet events
+       (step(packet=None, ingress_port=-1, state) is the tick path). Confirm
+       the oracle audit exercises liveness_drives_reroute and
+       recovery_restores_primary at their extremes (a full down→up→down cycle).
+
+    3. For anchor instances (D5.0_detect_then_reroute, single session
+       monitoring one FRR group's primary port, exact FRR, generator-entry
+       origination), the resulting task SHOULD be behaviourally "BFD brings the
+       link up, data forwards on the primary; BFD times out, data reroutes to
+       the backup; BFD recovers, data returns to the primary." Cross-check by
+       hand-running the public test set through the oracle; in particular
+       verify the detect_then_reroute_golden_path test FAILS a reference whose
+       FRR liveness is an independent control-plane table (the composition's
+       reason for existing).
+
+    4. This composite occupies the (D5:routing, P7:resilience-and-failover ∪
+       P16:packet-origination) cell. When recalibrating difficulty by
+       mutation, a harder instance is most naturally reached by
+       lifting to D5.1 (full RFC cascade + LPM + cascaded) plus the flap-cycle
+       hidden test, the hardest by stacking D5.2 (multi-hop + recirculate
+       origination) + tight session/FRR capacity + spec noise.

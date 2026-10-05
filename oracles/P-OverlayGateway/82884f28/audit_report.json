@@ -1,0 +1,97 @@
+{
+  "oracle_hash": "ee8f34233eab1403bfdc52701c07768ee45d1ec8c1f11de0af6a169fcae20984",
+  "instance": "overlay_gateway_anchor-default",
+  "ran_at": "2026-06-15T22:44:10.409572Z",
+  "canonical_examples": {
+    "passed": 6,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "encap_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_acl_deny_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_no_vxlan_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_forward_udp_inner",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "acl_on_inner": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "decap_before_route": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "vni_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_header_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "acl_on_inner",
+      "decap_before_route",
+      "vni_isolation",
+      "outer_header_completeness",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Mahalingam et al., VXLAN: A Framework for Overlaying Virtualized L2 Networks over L3 Networks, 2014",
+      "RFC7348",
+      "RFC1812",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

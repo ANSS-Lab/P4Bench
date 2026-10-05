@@ -1,0 +1,416 @@
+task_name: ipv4_routing_mut1
+task_type: full_program
+complexity: medium
+source: tutorial
+pattern: P-IPv4Routing
+pattern_version: '1.0'
+
+seed:
+  fib_capacity: unbounded
+  max_nexthop_group_size: 1
+  multipath_mode: none
+  hash_algo: crc16
+  ecmp_remap_algo: hash_threshold
+  martian_filter_enabled: true
+  emit_icmp_errors: false
+  default_action: drop
+  faithfulness: D5.0_static_fib
+
+description: |
+  Implement IPv4 unicast forwarding on a single switch s1, per the router
+  requirements of RFC 1812, with source-address (martian) filtering and a
+  forwarding table containing overlapping prefixes that must be resolved by
+  longest-prefix match.
+
+  ## Forwarding table
+
+  Install these entries. The table is matched by LONGEST-prefix on the IPv4
+  destination address — several entries overlap, and the most specific
+  (longest) matching prefix decides the packet. Each entry names the egress
+  port, the next-hop MAC (new Ethernet destination), and the egress port's
+  own MAC (new Ethernet source):
+
+    | destination prefix | egress port | next-hop MAC      | egress-port MAC   |
+    |---------------------|-------------|-------------------|-------------------|
+    | 10.0.0.0/8          | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 10.0.0.0/16         | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.1.0/24         | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 10.0.2.0/24         | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+    | 10.0.2.0/28         | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 10.0.2.7/32         | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.3.0/24         | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  For example 10.0.2.7 matches five entries (/8, /16, /24, /28, /32) and the
+  /32 wins (egress s1.p2); 10.0.2.5 matches down to the /28 (s1.p1);
+  10.0.2.50 matches the /24 (s1.p3); 10.0.5.5 matches the /16 (s1.p2);
+  10.9.9.9 matches only the /8 (s1.p1).
+
+  ## What the switch MUST do
+
+   1. **Non-IPv4 drop.** Any non-IPv4 frame (ARP, IPv6, …) MUST NOT be
+      forwarded.
+
+   2. **Martian-source drop.** An IPv4 packet whose SOURCE address is in any
+      of these ranges MUST be dropped (RFC 1812 §5.3.7) — this is filtered on
+      the SOURCE, not the destination:
+        - 127.0.0.0/8   (loopback)
+        - 0.0.0.0/8     (this-network)
+        - 224.0.0.0/4   (multicast)
+        - 255.255.255.255 (limited broadcast)
+
+   3. **TTL handling.** If TTL == 0, drop before forwarding. Otherwise the
+      packet is eligible and its TTL MUST be decremented by EXACTLY one (a
+      packet with TTL == 1 forwards with egress TTL == 0; do not drop it, do
+      not decrement twice).
+
+   4. **Forward on the longest matching route.** For an eligible packet whose
+      destination matches the table, forward out the LONGEST-prefix match's
+      egress port; rewrite Ethernet source ← that port's own MAC, Ethernet
+      destination ← the next-hop MAC; leave the IPv4 src/dst unchanged; keep
+      the IPv4 header checksum valid on egress (the TTL changed).
+
+   5. **No route → drop.** A destination matching no entry is dropped.
+
+   6. **Limited-broadcast drop.** Destination 255.255.255.255 MUST be
+      dropped unconditionally (RFC 1812 §5.3.5.1).
+
+   7. **Directed-broadcast drop.** A destination that is the all-ones host
+      address of one of the configured subnets MUST be dropped (RFC 1812
+      §5.3.5.2), not forwarded — e.g. 10.0.2.15 (the /28 broadcast),
+      10.0.1.255 (a /24 broadcast), 10.0.255.255 (the /16 broadcast),
+      10.255.255.255 (the /8 broadcast).
+
+  ## Topology
+
+  One switch s1 with three hosts:
+    - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: "08:00:00:00:03:03"
+    port: s1.p3
+
+test_cases:
+
+# --- G1: functional correctness (LPM tie-break ladder) ---
+
+  - name: fwd_lpm_24b_to_p3
+    visibility: public
+    description: |
+      10.0.2.50 matches /8, /16, /24 — the /24 (10.0.2.0/24) is longest and
+      sends it to s1.p3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+
+  - name: fwd_lpm_32_to_p2
+    visibility: public
+    description: |
+      10.0.2.7 matches five entries (/8 /16 /24 /28 /32); the /32 wins and
+      sends it to s1.p2 — longest-prefix priority across all five levels.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.7", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: drop_martian_src_loopback
+    visibility: public
+    description: |
+      Martian source: 127.0.0.1 is loopback (127.0.0.0/8). Even though the
+      destination 10.0.2.50 has a route, the packet MUST be dropped on the
+      SOURCE filter.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "127.0.0.1", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: fwd_lpm_8_to_p1
+    visibility: hidden
+    description: |
+      10.9.9.9 matches only the /8 → s1.p1.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:02:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.9.9.9", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:01:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_lpm_16_to_p2
+    visibility: hidden
+    description: |
+      10.0.5.5 matches /8 and /16 — the /16 is longer → s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_lpm_24a_to_p1
+    visibility: hidden
+    description: |
+      10.0.1.50 matches /8, /16, /24 (10.0.1.0/24) — the /24 wins → s1.p1.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:02:00"}
+        - IP:    {src: "10.0.3.3", dst: "10.0.1.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:01:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_lpm_28_to_p1
+    visibility: hidden
+    description: |
+      10.0.2.5 matches /8, /16, /24, /28 (10.0.2.0/28) — the /28 is longer
+      than the /24, so it overrides 10.0.2.0/24 and sends to s1.p1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.5", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:01:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_h1_to_h3
+    visibility: hidden
+    description: |
+      10.0.3.3 matches /8 and /24 (10.0.3.0/24) — the /24 wins → s1.p3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", ttl: 64}
+        - UDP:   {sport: 5353, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_ttl_one_post_decrement_zero
+    visibility: hidden
+    description: |
+      TTL == 1 forwards (to 10.0.2.50 → s1.p3) with egress TTL == 0.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 1}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.ttl:    {action: change_to, value: 0}
+
+# --- G2: robustness / boundary ---
+
+  - name: drop_ttl_zero
+    visibility: hidden
+    description: |
+      TTL == 0 to a routable destination MUST be dropped before forwarding.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 0}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_no_route
+    visibility: hidden
+    description: |
+      11.1.1.1 is outside 10.0.0.0/8 and matches no entry → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "11.1.1.1", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+# --- G3: security / bypass ---
+
+  - name: drop_martian_src_thisnet
+    visibility: hidden
+    description: |
+      Martian source 0.0.0.42 is in 0.0.0.0/8 → drop on the source filter.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "0.0.0.42", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_martian_src_multicast
+    visibility: hidden
+    description: |
+      Martian source 224.1.2.3 is in 224.0.0.0/4 (multicast) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "224.1.2.3", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_martian_src_broadcast
+    visibility: hidden
+    description: |
+      Martian source 255.255.255.255 → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "255.255.255.255", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: drop_non_ipv4_arp
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) MUST NOT be forwarded.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.50", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop
+
+  - name: drop_limited_broadcast_dst
+    visibility: hidden
+    description: |
+      Destination 255.255.255.255 MUST be dropped unconditionally.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - IP:    {src: "10.0.1.1", dst: "255.255.255.255", ttl: 64}
+        - UDP:   {sport: 68, dport: 67}
+    expected:
+      behavior: drop
+
+  - name: drop_directed_broadcast_28
+    visibility: hidden
+    description: |
+      10.0.2.15 is the all-ones host of the 10.0.2.0/28 subnet (directed
+      broadcast) and MUST be dropped, not forwarded out s1.p1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.15", ttl: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: drop_directed_broadcast_24
+    visibility: hidden
+    description: |
+      10.0.1.255 is a /24 directed broadcast → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.1.255", ttl: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: drop_directed_broadcast_16
+    visibility: hidden
+    description: |
+      10.0.255.255 is the /16 (10.0.0.0/16) directed broadcast → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.255.255", ttl: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop

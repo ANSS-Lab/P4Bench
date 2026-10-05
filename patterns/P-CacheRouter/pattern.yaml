@@ -1,0 +1,263 @@
+# P-CacheRouter — In-switch KV cache in front of a backend store:
+#                  stateless ACL ∘ NetCache KV-cache ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the in-network key-value cache the NetCache (SOSP'17) data plane
+# runs in one pass: a stateless ternary ACL (P-ACL, P4) admission gate, an
+# in-switch KV cache that serves cached reads directly and maintains coherence
+# (P-NetCacheKV, P17), and an LPM unicast forwarder to the backend store
+# (P-IPv4Routing, P1). The value of the *chained* pattern over the three apart
+# is the cross-stage ORDERING and the cache-coherence data dependence between
+# stages — invisible when each half is tested alone:
+#   (a) ACL-BEFORE-CACHE — the admission verdict keys on the ORIGINAL 5-tuple
+#       and runs first; a denied client is dropped BEFORE the cache is consulted
+#       or mutated, so a deny never reflects a cached value and never
+#       invalidates a key. Neither half binds this: standalone P-ACL has no
+#       cache to precede; standalone P-NetCacheKV has no policy gate.
+#   (b) HIT-SERVED-LOCALLY — a cache HIT short-circuits the forwarder entirely:
+#       the switch synthesises the reply and egresses it back on the INGRESS
+#       (client) port with the L3/L4 endpoints swapped and the value encoded in
+#       the reply; the backend store never sees the request. A MISS falls
+#       through to the LPM forwarder toward the store.
+#   (c) WRITE-INVALIDATION COHERENCE — a write-through request invalidates the
+#       cached value for its key, then is forwarded to the store; a later read
+#       of that same key therefore MISSES and is routed to the store rather than
+#       served stale. This stateful ordering (invalidate, then a later read
+#       observes the absence) is the load-bearing composite contract — only
+#       visible across a write→read sequence, not in any single packet.
+
+pattern_id: P-CacheRouter
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D8:in-network-state-serving"
+    - "D9:cache-coherence"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P4:stateless-classification"
+    - "P17:in-switch-key-value-cache"
+
+target_capability: composition   # chains a redesign (P-ACL/P-IPv4Routing) and an in-network-state primitive (P-NetCacheKV); failure modes are cross-cutting
+
+summary: >
+  In-switch key-value cache fronting a backend store. Every IPv4/UDP packet is
+  (1) classified by a stateless ternary ACL on its original 5-tuple — a deny
+  drops it before the cache is consulted or mutated; (2) dispatched by request
+  type: a READ request whose key is cached is served locally — the switch emits
+  a reply back on the ingress (client) port with the IP src/dst and UDP
+  sport/dport swapped and the cached value encoded in the reply, while a READ
+  miss falls through to the forwarder; a WRITE request invalidates the cached
+  value for its key (write-through coherence) and is then forwarded to the
+  store; (3) forwarded by LPM toward the store with TTL decrement and next-hop
+  MAC rewrite for everything not served from cache. The pipeline order
+  ACL → cache → route, the hit-served-locally short-circuit, and the
+  write-invalidates-then-later-read-misses coherence dependence are the
+  load-bearing composite contracts.
+
+grounding:
+  papers:
+    - cite: "Jin et al., NetCache: Balancing Key-Value Stores with Fast In-Network Caching, SOSP 2017"
+      role: in-switch KV cache lookup/serve + write-through invalidation coherence
+  rfcs:
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: ACL classification vocabulary (permit/deny)
+    - id: RFC768
+      title: "User Datagram Protocol"
+      role: UDP request/reply transport for the KV protocol
+      quote: "Destination Port has a meaning within the context of a particular internet destination address."
+
+entities:
+  acl_table:
+    type: bucket
+    key: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {action: "permit|deny", priority: int}
+    capacity: ${rule_count_capacity}
+    eviction: none
+    notes: stateless ternary first-match-by-priority; evaluated on the request 5-tuple before the cache.
+  kv_cache:
+    type: bucket
+    key: [cache_key]
+    attrs: {value: int, valid: bool}
+    capacity: ${cache_capacity}
+    eviction: ${cache_eviction}
+    notes: in-switch key-value cache; a hit serves the read locally, a write-through invalidates the key.
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table toward the store; consulted on a cache miss or a write-through.
+
+parameters:
+  client_subnet:        {type: cidr,   default: "10.0.1.0/24"}
+  store_subnet:         {type: cidr,   default: "10.0.2.0/24"}
+  read_dport:           {type: int,    default: 7777, constraint: "1 <= read_dport <= 65535"}
+  write_dport:          {type: int,    default: 7778, constraint: "1 <= write_dport <= 65535"}
+  cache_entries:        {type: list,   default: []}
+  cache_capacity:       {type: int,    default: 256,  constraint: "cache_capacity >= 1"}
+  cache_eviction:       {type: enum,   values: [none, LRU, FIFO], default: none}
+  acl_rules:            {type: list,   default: []}
+  rule_count_capacity:  {type: int,    default: 256}
+  match_field_breadth:  {type: enum,   values: [dst_only, tuple3, tuple5], default: tuple5}
+  priority_depth:       {type: int,    default: 16}
+  default_acl_action:   {type: enum,   values: [permit, deny], default: permit}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [acl_cache_route], default: acl_cache_route}
+  client_port:          {type: int,    default: 1}
+  store_port:           {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable/cacheable header.
+
+  - id: R1_acl_classify
+    when: "header_present(IPv4)"
+    given: {match: "acl_table on the request 5-tuple by descending priority"}
+    then: ["drop(pkt) if matched action == deny or (miss and default_acl_action == deny)"]
+    notes: stateless classification before the cache; the deny path neither serves nor mutates any cache entry (acl_precedes_cache).
+
+  - id: R2_cache_read_hit
+    when: "not denied and UDP dport == read_dport and key is cached and valid"
+    given: {match: "kv_cache by cache_key (UDP.sport low byte)"}
+    then:
+      - "swap(IP.src, IP.dst)"
+      - "swap(UDP.sport, UDP.dport)"
+      - "encode(value -> IP.id)"
+      - "forward(pkt, ingress_port)"
+    notes: hit served locally — the reply egresses the INGRESS (client) port; the store never sees the request.
+
+  - id: R3_cache_read_miss
+    when: "not denied and UDP dport == read_dport and key is not cached (or invalid)"
+    given: {match: "fib LPM on IP.dst (the store)"}
+    then: ["route(pkt) toward the store"]
+    notes: a read miss falls through to the forwarder (R5).
+
+  - id: R4_cache_write_invalidate
+    when: "not denied and UDP dport == write_dport"
+    given: {match: "kv_cache by cache_key (UDP.sport low byte)"}
+    then:
+      - "invalidate(kv_cache, cache_key)"
+      - "route(pkt) toward the store"
+    notes: write-through — invalidate the cached value for the key (a later read of it MISSES), then forward (R5).
+
+  - id: R5_route_forward
+    when: "not dropped by R0-R1 and not served by R2 (read miss, write, or other IPv4)"
+    given: {match: "fib LPM on IP.dst"}
+    then:
+      - "drop(pkt) if no LPM match or IP.ttl == 0"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: LPM forward toward the store; one checksum recompute covers the TTL decrement.
+
+invariants:
+  - id: acl_precedes_cache
+    clause: stability
+    target: "a denied request neither serves a cached value nor invalidates a key"
+    notes: the ACL verdict is computed first and a deny short-circuits before R2-R4.
+  - id: hit_served_locally
+    clause: stability
+    target: "a cached read egresses the ingress port and never reaches the store"
+    notes: the reply has swapped endpoints and the value encoded in IP.id.
+  - id: write_invalidation_coherence
+    clause: persistence
+    target: "after a write-through to a key, the next read of that key misses and is routed to the store"
+    free_under: [cache_eviction]
+    notes: coherence dependence visible only across a write->read sequence.
+  - id: read_reply_endpoint_swap
+    clause: stability
+    target: "a hit reply has IP src/dst and UDP sport/dport swapped relative to the request"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases on routed packets; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: cache_hit_reply
+      generate: "a read request for a cached key is answered locally on the ingress port with swapped endpoints and the value in IP.id"
+    - id: cache_miss_route
+      generate: "a read request for an uncached key is routed to the store, TTL-1"
+    - id: acl_deny_drop
+      generate: "a request matching an ACL deny rule is dropped before the cache"
+  G2:
+    - id: write_invalidate_route
+      generate: "a write request invalidates its key and is forwarded to the store"
+    - id: non_read_write_route
+      generate: "an ordinary IPv4/UDP packet (neither read nor write port) is routed to the store"
+    - id: ttl_one_forwards_zero
+      generate: "a routed packet with ttl==1 forwards with egress ttl==0; ttl==0 drops"
+  G3:
+    - id: write_then_read_misses
+      generate: "a write-through to a cached key, then a read of that key -> the read MISSES and is routed (coherence)"
+    - id: deny_leaves_cache_intact
+      generate: "a denied write does NOT invalidate; a later permitted read of that key still HITS"
+    - id: non_ipv4_drop
+      generate: "an ARP frame is dropped before classification"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: flip_default_to_deny
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "${default_acl_action}: permit -> deny (unlisted requests dropped; only explicit permits pass)"
+    feasibility_postcondition: "at least one explicit permit rule exists"
+  - id: shrink_cache_capacity_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "cache_capacity /= 4 and cache_eviction: none -> LRU (cache pressure + eviction)"
+  - id: expand_match_field_breadth
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "match_field_breadth: dst_only -> tuple5 (full 5-tuple ACL matching)"
+  - id: enable_cache_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "cache_eviction: none -> LRU (an evicted key's read misses until re-warmed)"
+  - id: disable_acl
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "${acl_rules}: [] and ${default_acl_action}: permit (cache+route only; the ACL stage is a pass-through)"
+  - id: read_only_no_writes
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "drop the write/invalidation stage (R4); only reads and ordinary routing remain (static cache); oracle regenerated"
+    feasibility_postcondition: "the cache is preloaded with all served keys"
+
+bridging_notes: |
+  - The ACL is stateless first-match by descending priority on the request
+    5-tuple. A miss falls through to default_acl_action. The ACL runs BEFORE the
+    cache so a deny neither serves a value nor invalidates a key.
+  - Request type is decided by the UDP destination port: read_dport (7777) is a
+    READ, write_dport (7778) is a WRITE. The cache key is the low byte of
+    UDP.sport (key = UDP.sport & 0xFF). This keeps the key observable and
+    unit-testable.
+  - READ hit: the switch synthesises the reply IN PLACE — IP.src/IP.dst are
+    swapped, UDP.sport/UDP.dport are swapped, and the 16-bit cached value is
+    written into IP.id. The reply egresses the INGRESS (client) port; the store
+    never sees the request. READ miss: route on IP.dst (the store) via LPM.
+  - WRITE: invalidate the cached value for the key (it becomes a miss for any
+    later read), then forward to the store via LPM (write-through). The
+    invalidation is the coherence contract — observable only across a
+    write->read sequence (model with prior_inputs: write, then read of the same
+    key -> miss/route).
+  - LPM forwards on IP.dst for everything not served from cache. TTL is
+    decremented exactly once; ttl==0 drops. One checksum recompute covers the
+    TTL decrement (the hit-reply endpoint swap recomputes its own checksums).
+  - The store lives in store_subnet on store_port; clients in client_subnet on
+    client_port. A hit reply is the only packet that egresses the client port.

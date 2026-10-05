@@ -1,0 +1,351 @@
+task_name: ipv4_routing_mut3
+task_type: full_program
+complexity: high
+source: tutorial
+pattern: P-IPv4Routing
+pattern_version: '1.0'
+
+seed:
+  multipath_mode: ecmp_hash_5tuple
+  max_nexthop_group_size: 2
+  hash_algo: crc16
+  ecmp_remap_algo: hash_threshold
+  fib_capacity: unbounded
+  martian_filter_enabled: false
+  emit_icmp_errors: false
+  default_action: drop
+  faithfulness: D5.1_ecmp
+
+description: |
+  Implement IPv4 unicast forwarding with Equal-Cost Multi-Path (ECMP) on a
+  single switch s1, per RFC 1812 and RFC 2992. Most of the forwarding is
+  ordinary longest-prefix-match forwarding; one destination prefix is served
+  by a GROUP of two equal-cost next-hops, and traffic to it must be
+  load-balanced across the two members on a per-flow basis.
+
+  ## Forwarding table
+
+    | destination prefix | next-hop(s)                                   |
+    |---------------------|-----------------------------------------------|
+    | 10.0.2.0/24         | ECMP group of TWO equal-cost next-hops:       |
+    |                     |   • s1.p2, next-hop MAC 08:00:00:00:02:02     |
+    |                     |   • s1.p3, next-hop MAC 08:00:00:00:03:03     |
+    | 10.0.3.0/24         | single next-hop: s1.p4, MAC 08:00:00:00:04:04 |
+
+  The egress-port source MACs are: s1.p2 → 08:00:00:00:02:00, s1.p3 →
+  08:00:00:00:03:00, s1.p4 → 08:00:00:00:04:00.
+
+  ## A "flow"
+
+  A flow is identified by the IPv4 5-tuple: (source address, destination
+  address, protocol, L4 source port, L4 destination port).
+
+  ## What the switch MUST do
+
+   1. **Non-IPv4 drop.** Non-IPv4 frames (ARP, …) MUST NOT be forwarded.
+
+   2. **TTL handling.** TTL == 0 → drop before forwarding. Otherwise the
+      packet is eligible and its TTL MUST be decremented by exactly one (a
+      TTL == 1 packet forwards with egress TTL == 0).
+
+   3. **Single-path forward.** For an eligible packet whose longest-prefix
+      match is a single-next-hop route (e.g. 10.0.3.0/24), forward out that
+      next-hop's port, rewrite Ethernet source ← the egress port's MAC and
+      Ethernet destination ← the next-hop MAC, decrement TTL, and keep the
+      IPv4 checksum valid.
+
+   4. **ECMP forward (load balancing).** For an eligible packet whose
+      longest-prefix match is the ECMP group (10.0.2.0/24), select ONE of the
+      group's two next-hops and forward as in rule 3 (rewrite Ethernet
+      source/destination for the chosen member, decrement TTL, keep checksum
+      valid). The selection MUST satisfy:
+      a. **Per-flow consistency.** Every packet of the same flow (same
+         5-tuple) MUST be sent to the SAME next-hop. The selection MUST
+         depend ONLY on the 5-tuple — it MUST NOT depend on fields that vary
+         between packets of one flow (the TTL, the IPv4 identification field,
+         payload, etc.). Otherwise a single flow would be split across the two
+         members and reordered.
+      b. **Distribution.** Different flows MUST be spread across BOTH members
+         (not all collapsed onto one). Roughly even spreading is expected over
+         many distinct flows.
+
+   5. **No route → drop.** A destination matching no entry is dropped.
+
+   6. **Limited-broadcast drop.** Destination 255.255.255.255 MUST be dropped.
+
+   7. **Directed-broadcast drop.** The all-ones host address of a configured
+      subnet (e.g. 10.0.2.255 for 10.0.2.0/24) MUST be dropped, not forwarded.
+
+  ## Topology
+
+  One switch s1 with four hosts:
+    - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+    - h4 at s1.p4. IPv4 10.0.4.4, MAC 08:00:00:00:04:04. s1.p4 MAC 08:00:00:00:04:00.
+
+  Test traffic for the ECMP prefix arrives on s1.p1; the group members are
+  s1.p2 / s1.p3.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+        p4: 4
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+    - {from: s1.p4, to: h4}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: "08:00:00:00:03:03"
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4/24
+    mac: "08:00:00:00:04:04"
+    port: s1.p4
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: ecmp_flow_consistency_tcp
+    visibility: public
+    description: |
+      One TCP flow (5-tuple fixed: 10.0.1.1:5000 → 10.0.2.50:80) sent as a
+      burst of four packets with DIFFERENT TTLs (64, 50, 33, 12). All four
+      MUST exit on the SAME ECMP member (one of s1.p2 / s1.p3) — the next-hop
+      choice depends only on the 5-tuple, not the TTL.
+    prior_inputs:
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5000, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 50}}, {TCP: {sport: 5000, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 33}}, {TCP: {sport: 5000, dport: 80}}]}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 12}
+        - TCP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: ecmp_consistent
+      output_ports: [s1.p2, s1.p3]
+      min_count: 4
+
+  - name: ecmp_distribution_tcp
+    visibility: public
+    description: |
+      Twelve distinct TCP flows (varying source port 5000..5011) to
+      10.0.2.50 MUST be spread across BOTH ECMP members — a constant /
+      non-hashed index would pile every flow onto one member.
+    prior_inputs:
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5000, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5001, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5002, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5003, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5004, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5005, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5006, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5007, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5008, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5009, dport: 80}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}}, {TCP: {sport: 5010, dport: 80}}]}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 64}
+        - TCP:   {sport: 5011, dport: 80}
+    expected:
+      behavior: ecmp_distributes
+      output_ports: [s1.p2, s1.p3]
+      min_distinct_ports: 2
+
+  - name: singleton_route_forward
+    visibility: public
+    description: |
+      The single-next-hop route 10.0.3.0/24 → s1.p4. A packet to 10.0.3.3
+      forwards out s1.p4 with the s1.p4 / h4 MAC rewrite and TTL decrement.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p4
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:04:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:04:04"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+
+  - name: ecmp_flow_consistency_udp
+    visibility: hidden
+    description: |
+      A UDP flow (10.0.1.1:6000 → 10.0.2.77:53) burst with varied TTL — all
+      packets MUST land on one member. Distinct 5-tuple from the TCP flow, so
+      it may pick a different member, but it must be internally consistent.
+    prior_inputs:
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.77", ttl: 64}}, {UDP: {sport: 6000, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.77", ttl: 40}}, {UDP: {sport: 6000, dport: 53}}]}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.77", ttl: 17}
+        - UDP:   {sport: 6000, dport: 53}
+    expected:
+      behavior: ecmp_consistent
+      output_ports: [s1.p2, s1.p3]
+      min_count: 3
+
+  - name: ecmp_flow_consistency_second_tuple
+    visibility: hidden
+    description: |
+      A second TCP flow (source port 7777) burst with varied TTL — must be
+      internally consistent (all on one member).
+    prior_inputs:
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 60}}, {TCP: {sport: 7777, dport: 443}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.50", ttl: 25}}, {TCP: {sport: 7777, dport: 443}}]}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 5}
+        - TCP:   {sport: 7777, dport: 443}
+    expected:
+      behavior: ecmp_consistent
+      output_ports: [s1.p2, s1.p3]
+      min_count: 3
+
+# --- G2: robustness / boundary ---
+
+  - name: singleton_ttl_one_forward
+    visibility: hidden
+    description: |
+      TTL == 1 to the singleton route forwards with egress TTL == 0.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", ttl: 1}
+        - TCP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p4
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:04:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:04:04"}
+        IP.ttl:    {action: change_to, value: 0}
+
+  - name: drop_ttl_zero_ecmp
+    visibility: hidden
+    description: |
+      TTL == 0 to the ECMP prefix MUST be dropped before any next-hop pick.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.50", ttl: 0}
+        - TCP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: drop_no_route
+    visibility: hidden
+    description: |
+      11.1.1.1 matches no route → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "11.1.1.1", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop
+
+# --- G3: security / bypass ---
+
+  - name: ecmp_distribution_udp
+    visibility: hidden
+    description: |
+      Twelve distinct UDP flows (varying source port) to 10.0.2.88 spread
+      across BOTH ECMP members.
+    prior_inputs:
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6000, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6001, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6002, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6003, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6004, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6005, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6006, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6007, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6008, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6009, dport: 53}}]}
+      - {port: s1.p1, layers: [{Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}}, {IP: {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}}, {UDP: {sport: 6010, dport: 53}}]}
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.88", ttl: 64}
+        - UDP:   {sport: 6011, dport: 53}
+    expected:
+      behavior: ecmp_distributes
+      output_ports: [s1.p2, s1.p3]
+      min_distinct_ports: 2
+
+  - name: drop_non_ipv4_arp
+    visibility: hidden
+    description: |
+      Non-IPv4 (ARP) MUST NOT be forwarded.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.50", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop
+
+  - name: drop_limited_broadcast_dst
+    visibility: hidden
+    description: |
+      Destination 255.255.255.255 MUST be dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - IP:    {src: "10.0.1.1", dst: "255.255.255.255", ttl: 64}
+        - UDP:   {sport: 68, dport: 67}
+    expected:
+      behavior: drop
+
+  - name: drop_directed_broadcast_ecmp_prefix
+    visibility: hidden
+    description: |
+      10.0.2.255 is the directed broadcast of the 10.0.2.0/24 ECMP prefix and
+      MUST be dropped, not ECMP-forwarded.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.255", ttl: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop

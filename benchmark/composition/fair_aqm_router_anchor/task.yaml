@@ -1,0 +1,613 @@
+task_name: fair_aqm_router_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-FairAQMRouter
+pattern_version: '1.0'
+seed:
+  fair_budget: 3000
+  flowkey_fields:
+  - ipv4_src
+  - ipv4_dst
+  - proto
+  - l4_src
+  - l4_dst
+  byte_accounting: on_wire_ip_len
+  flow_capacity: 1024
+  window_eviction: none
+  mark_threshold_k: 3
+  not_ect_action: drop
+  ce_persistence_strict: true
+  dscp_preservation_strict: true
+  fib_capacity: 1024
+  pipeline_order: route_afq_ecn
+  ingress_port: 1
+  egress_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: ingress
+    to: s1.p1
+  - from: s1.p2
+    to: egress
+hosts:
+  ingress:
+    note: sender side; ingress on s1.p1
+  egress:
+    note: destinations in 198.51.100.0/24; egress on s1.p2; next hop 08:00:00:00:02:02
+description: |-
+  Implement a congestion-aware edge router for BMv2 (v1model) that enforces
+  per-flow fairness, signals congestion via ECN, and forwards IPv4 traffic — all
+  in a single pass.
+
+  Topology: port 1 is the ingress; port 2 is the egress. Destinations in
+  198.51.100.0/24 are reachable via port 2.
+
+  Required behaviour, per IPv4 packet:
+
+  - Forwarding. A packet is delivered toward its destination: it leaves on the
+    port that reaches that destination, with its hop count decremented by one and
+    its next-hop link address set. A packet that arrives with a hop count of zero
+    (already expired), or addressed to a destination the router has no route to,
+    is dropped — and such a packet must not affect any per-flow accounting. (A
+    packet arriving with a hop count of one is still delivered, leaving with a
+    hop count of zero.)
+
+  - Per-flow fairness. Each flow (identified by its source and destination
+    addresses, protocol, and transport ports) is allowed up to 3000 bytes of
+    traffic within the current period, measured by each packet's IP total length.
+    The router accumulates the IP total length of each of a flow's packets; once a
+    flow's accumulated total would exceed 3000 bytes, further packets from that
+    flow are dropped as exceeding its fair share. The limit is strict: a packet
+    that brings a flow's running total to exactly 3000 bytes is still delivered;
+    the first packet that would carry the total past 3000 bytes is dropped.
+
+  - Congestion signalling. The router tracks how loaded it is by counting the
+    packets it has admitted in the current period. Once it has admitted 3 packets
+    in the period — that is, on the 3rd admitted packet and on every admitted
+    packet after it — it signals congestion on the traffic it forwards: a packet
+    whose sender has declared itself congestion-aware is marked as having
+    experienced congestion, leaving the rest of that packet's traffic-class
+    information intact; a packet whose sender has NOT declared itself
+    congestion-aware cannot be signalled and is dropped instead. A packet already
+    carrying the congestion signal keeps it. Before the router has admitted that
+    many packets, admitted packets are forwarded untouched.
+
+  Both the P4 program and its table entries are yours to author. Ordering
+  matters: a packet that has exhausted its flow's fair share is dropped for that
+  reason and is never given a congestion mark, even under load. A packet's L2/L3
+  integrity (including its header checksum) must be preserved across every field
+  the router rewrites.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: under_budget_below_threshold_forward
+  visibility: public
+  goal_class: G1
+  description: 'A single ECN-capable packet, well within its flow''s fair share and with the router not yet loaded, is forwarded unchanged toward its destination: the hop count is decremented, the next-hop link address is set, and the traffic-class byte (including the ECN bits) is left intact with a valid header checksum.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: congested_ect_marked_ce
+  visibility: public
+  goal_class: G1
+  description: 'With three packets now admitted in the current period (this ECN-capable packet is the 3rd), the router signals congestion on it: only the 2-bit ECN field becomes the congestion codepoint, the rest of the traffic-class byte is preserved, and the header checksum is recomputed. It still forwards out the egress port.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 7003
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: change_to
+        value: 3
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 7001
+        dport: 80
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.6
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 7002
+        dport: 80
+- name: over_budget_drop
+  visibility: public
+  goal_class: G1
+  description: A flow that has already carried its full byte allowance has its next packet dropped as exceeding its fair share.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.8
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9001
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.8
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.8
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9001
+        dport: 80
+- name: budget_boundary_admit_at_exact
+  visibility: hidden
+  goal_class: G2
+  description: A packet that brings its flow exactly to the byte allowance is still admitted and forwarded (the over-share comparison is strict).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.9
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9100
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.9
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9100
+        dport: 80
+- name: budget_boundary_drop_just_over
+  visibility: hidden
+  goal_class: G2
+  description: The first packet that would take a flow past its byte allowance is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.10
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 40
+    - TCP:
+        sport: 9200
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.10
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9200
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.10
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9200
+        dport: 80
+- name: congested_not_ect_dropped
+  visibility: hidden
+  goal_class: G2
+  description: Under load, a packet whose sender has not declared itself congestion-aware cannot be signalled and is dropped instead of marked.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 0
+        len: 500
+    - TCP:
+        sport: 7003
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: An admitted packet arriving with a hop count of 1 is forwarded with an egress hop count of 0 — decremented exactly once.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.11
+        dst: 198.51.100.9
+        ttl: 1
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 5500
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: expired_hopcount_dropped
+  visibility: hidden
+  goal_class: G2
+  description: A packet that arrives with an already-expired hop count of 0 is dropped at the forwarding stage, before any per-flow accounting occurs.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.13
+        dst: 198.51.100.9
+        ttl: 0
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 5600
+        dport: 80
+  expected:
+    behavior: drop
+- name: admit_before_mark_over_budget_never_marked
+  visibility: hidden
+  goal_class: G3
+  description: A flow that is BOTH over its byte allowance AND arriving while the router is loaded is dropped for exceeding its fair share — it is never given a congestion mark. The fairness check precedes the congestion-signalling stage. The two prior packets of this flow bring it to its allowance and, with a third admitted packet from another flow, the queue is loaded; the graded packet is over budget.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.12
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9300
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.12
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9300
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.12
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1500
+    - TCP:
+        sport: 9300
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.6
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 500
+    - TCP:
+        sport: 7002
+        dport: 80
+- name: dscp_preserved_on_mark
+  visibility: hidden
+  goal_class: G3
+  description: When a congestion-aware packet is marked under load, its traffic-class (DSCP) bits are preserved; only the 2 congestion-notification bits change. Here the tos byte 0b101000_10 becomes 0b101000_11.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 162
+        len: 500
+    - TCP:
+        sport: 7003
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: change_to
+        value: 163
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+- name: ce_preserved_under_congestion
+  visibility: hidden
+  goal_class: G3
+  description: A packet already carrying the congestion-experienced signal is forwarded verbatim under load — not dropped and not re-marked.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+        tos: 3
+        len: 500
+    - TCP:
+        sport: 7003
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.tos:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+- name: no_route_no_budget_consumed
+  visibility: hidden
+  goal_class: G3
+  description: A packet addressed to a destination the router cannot reach is dropped at the forwarding stage, before any per-flow byte accounting occurs.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.5
+        dst: 203.0.113.7
+        ttl: 64
+        proto: 6
+        tos: 2
+        len: 1000
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before any stage.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:02:02
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 198.51.100.9
+  expected:
+    behavior: drop

@@ -1,0 +1,107 @@
+{
+  "oracle_hash": "21f6b54426e2f21878b15274546bfd71751e2fd0baff3833e0280307c4086165",
+  "instance": "mpls_label_switch_anchor-default",
+  "ran_at": "2026-06-15T21:43:01.648622Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r3_swap_default_100",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_swap_default_300",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_swap_two_label_stack_top_only",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_swap_ttl_two_egress_one",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_ttl_one_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_unknown_label_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_reserved_label_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_non_mpls_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_default_label_miss_under_injected_lfib",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_swap_injected_label_500",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_pop_op_unsupported_under_swap_only",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "mpls_ttl_quantum_one": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "label_stack_below_top_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      }
+    },
+    "uncovered": [
+      "label_stack_below_top_preserved",
+      "payload_preservation"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC 3032 \u00a72.1 / \u00a72.4 / \u00a73",
+      "RFC 3031 \u00a73.10 (NHLFE) / \u00a73.18"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

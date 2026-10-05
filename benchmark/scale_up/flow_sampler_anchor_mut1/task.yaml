@@ -1,0 +1,849 @@
+task_name: flow_sampler_anchor_mut1
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-FlowSampler
+pattern_version: '1.0'
+seed:
+  egress_map:
+  - dst: 10.0.1.1
+    egress_port: 1
+  - dst: 10.0.2.2
+    egress_port: 2
+  default_egress: 2
+  non_ipv4_egress: 2
+  sample_rate: 2
+  collector_port: 3
+  sampler_scope: global
+  sampler_cells: 1
+  sample_header: none
+  hash_algo: crc32
+  faithfulness: D5.0_count_based
+description: "Implement a deterministic 1-in-N packet sampler on a single switch s1, in the\nspirit of an sFlow-style telemetry agent (RFC 3176) under the flow-selection\nframework of RFC 7014. The switch\
+  \ forwards every packet normally and, on a\nfixed, repeating schedule, also delivers a copy of selected packets to a\ndedicated telemetry collector port.\n\n## Required behaviour\n\n - The switch maintains\
+  \ an internal packet counter that advances by exactly one\n   for every IPv4 packet it processes, in arrival order.\n - Every IPv4 packet is forwarded on its normal egress port according to the\n   destination\
+  \ policy below. Forwarding is non-destructive: the forwarded packet\n   is delivered unchanged (no header field is rewritten and no hop count is\n   decremented).\n - On every Nth IPv4 packet \u2014 that\
+  \ is, whenever the counter reaches an exact\n   multiple of the sampling interval N = 2 \u2014 the switch ALSO delivers a verbatim\n   copy of that packet to the telemetry collector port. This sample\
+  \ is additive:\n   the original packet is still forwarded normally on its egress. Sampling is\n   deterministic and count-based: the copy is emitted on exactly the 2nd, 4th,\n   6th, ... packet and on\
+  \ no others.\n - A packet that is not on a sampling boundary is forwarded only; no copy is\n   delivered to the collector port. The collector port carries sampled copies\n   only \u2014 never a mis-routed\
+  \ original.\n - A frame that is not IPv4 is forwarded on its static egress but is NOT sampled\n   and MUST NOT advance the sampler counter (the sampler observes the IPv4\n   packet stream only).\n - The\
+  \ sampled copy preserves the original packet's headers and payload (it is a\n   copy, not a move); the original in flight is not mutated by the sampling.\n\n## Forwarding policy (destination \u2192 egress)\n\
+  \nThe control plane installs these as table entries.\n\n    | destination IP | egress port |\n    |----------------|-------------|\n    | 10.0.1.1       | s1.p1       |\n    | 10.0.2.2       | s1.p2 \
+  \      |\n\nA packet whose destination is not listed is forwarded on the default egress\ns1.p2. The telemetry collector is s1.p3 \u2014 distinct from every forwarding egress.\n\n## Topology\n\nOne switch\
+  \ s1 with three ports:\n  - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01.\n  - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02.\n  - the telemetry collector at s1.p3 (receives sampled copies only).\n"
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: collector
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  collector:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+test_cases:
+- name: single_packet_forwarded_not_sampled
+  visibility: public
+  description: A single IPv4 packet on a fresh switch is forwarded on its normal egress and is NOT sampled (the sampler counter reaches 1, which is not a multiple of the sampling interval). No copy appears
+    on the telemetry collector port.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: nth_packet_is_sampled_to_collector
+  visibility: public
+  description: 'After 1 identical packets have advanced the counter, the next (the 2th) packet is forwarded on its normal egress AND a verbatim copy of it is mirrored to the telemetry collector port. The
+    sample is additive: the original is still forwarded normally.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: packet_after_sample_not_sampled
+  visibility: public
+  description: "The packet immediately after a sampling boundary (the 3th packet) is forwarded but NOT sampled \u2014 exactly one sample fires per interval, on the boundary packet only."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: second_period_2n_packet_sampled
+  visibility: hidden
+  description: "After 3 packets have advanced the counter, the 4th packet is sampled \u2014 the every-Nth spacing holds across a second period, not just the first. A one-shot 'sample once then stop' implementation\
+    \ fails this test."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: sample_copy_preserves_headers
+  visibility: hidden
+  description: On the 2th packet the mirrored copy on the collector port is a byte-faithful copy of the original (same IPv4 src/dst and L4 ports); the clone is non-destructive of the in-flight original.
+    Probed with a distinct 5-tuple to pin field preservation.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 6001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: udp_packet_sampled_on_boundary
+  visibility: hidden
+  description: 'Sampling is L4-agnostic over the IPv4 stream: with the counter warmed to 1 by UDP packets, the 2th (UDP) packet is forwarded and mirrored to the collector exactly like the TCP path.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5353
+        dport: 53
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5353
+        dport: 53
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: one_below_period_not_sampled
+  visibility: hidden
+  description: "The (1)th packet (one below the sampling interval) is forwarded but NOT sampled \u2014 the off-by-one boundary of the count-based selector. A 'sample on counter >= N' (rather than 'counter\
+    \ mod N == 0') bug would wrongly fire here on later packets."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: long_train_third_period_sampled
+  visibility: hidden
+  description: "After 5 packets, the 6th packet is sampled \u2014 the modulo arithmetic holds across three full periods and is not a one-shot. A counter that saturates or an interval implemented as a one-time\
+    \ threshold fails here."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: long_train_off_boundary_not_sampled
+  visibility: hidden
+  description: "The 7th packet, one past the third sampling boundary, is forwarded but NOT sampled \u2014 pins that the selector fires ONLY on exact multiples of the interval over a long train."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: non_ipv4_not_sampled_and_no_counter_advance
+  visibility: hidden
+  description: "A non-IPv4 frame (ARP) interleaved into the train is forwarded but MUST NOT be sampled and MUST NOT advance the sampler counter. Here 1 IPv4 packets plus one ARP frame leave the counter\
+    \ at 1; the next IPv4 packet would be the Nth \u2014 but THIS test packet is the ARP frame itself, which is forwarded with no clone on the collector."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: counter_spacing_unaffected_by_non_ipv4
+  visibility: hidden
+  description: "With 1 IPv4 packets and an interleaved ARP frame (which does not advance the counter), the next IPv4 packet is the 2th and IS sampled \u2014 the ARP frame did not perturb the every-Nth IPv4\
+    \ spacing."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: collector_receives_only_samples
+  visibility: hidden
+  description: A non-boundary IPv4 packet (counter not a multiple of the interval) is forwarded on its normal egress and produces NOTHING on the telemetry collector port. The collector receives ONLY sampled
+    copies, never a mis-routed original.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: distinct_destination_forward_egress
+  visibility: hidden
+  description: A packet to the other host destination is forwarded on ITS egress port; on the 2th packet it is additionally mirrored to the same collector port. Confirms the sample target is independent
+    of the forwarding egress.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.1.1
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p3
+- name: second_packet_sampled_dense
+  visibility: hidden
+  description: With a single warm-up packet, the 2nd IPv4 packet reaches an exact multiple of the sampling interval and is forwarded normally AND mirrored to the telemetry collector port. The denser 1-in-2
+    interval fires its first sample after only one prior packet.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+- name: sixth_packet_sampled_dense
+  visibility: hidden
+  description: "After five IPv4 packets have advanced the counter, the 6th packet is forwarded normally AND mirrored to the collector port \u2014 the 1-in-2 selector fires on the 2nd, 4th and 6th packet,\
+    \ sampling positions that a coarser interval would pass over. Pins the every-2nd spacing across three periods."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 2
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p2
+    - s1.p3
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

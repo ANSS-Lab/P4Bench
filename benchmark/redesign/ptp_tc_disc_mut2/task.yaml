@@ -1,0 +1,571 @@
+task_name: ptp_tc_disc_mut2
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-PTPTransparentClock
+pattern_version: '1.0'
+
+seed:
+  faithfulness: D5.2_twostep
+  step_mode: two_step
+  delay_mechanism: p2p
+  correction_field_faithfulness: full64_scaled_ns
+  transport: udp_ipv4
+  domain_handling: multi_domain_filtered
+  active_domains: [0]
+  corrected_message_types: sync_only
+  correlation_capacity: unbounded
+  link_delays:
+    - ingress_port: 1
+      mean_link_delay: 100000000
+    - ingress_port: 2
+      mean_link_delay: 10000000
+  link_delay_capacity: 64
+
+scoring:
+  public_weight: 0.2   # public-overfitting cannot exceed 0.2
+  hidden_weight: 0.8
+
+description: |
+  A switch s1 sits on the path between a time master and a time slave and
+  acts as a Precision Time Protocol (PTP, IEEE 1588) *two-step peer-to-peer
+  transparent clock*. Concept attribution: IEEE 1588 transparent clock; the
+  two-step flag, the end-to-end vs peer-to-peer mechanism, and the
+  clock-domain vocabulary follow RFC 8173 (the PTPv2 MIB).
+
+  Unlike a one-step transparent clock (which corrects an event message in
+  transit), a TWO-STEP transparent clock does NOT modify the event message.
+  Instead it measures the message's switch contribution and remembers it,
+  then writes it into the *paired follow-up message* that the master sends
+  shortly after. Concretely, for the Sync / Follow_Up exchange:
+
+    - When a **Sync** (messageType 0x0) transits the switch, the switch
+      forwards it UNCHANGED and remembers the switch's contribution for it
+      (see below), indexed by the Sync's identity.
+    - When the matching **Follow_Up** (messageType 0x8) transits the switch,
+      the switch adds the remembered contribution to the Follow_Up's
+      correctionField.
+
+  PTP runs over UDP/IPv4 (IEEE 1588 Annex D): event messages (Sync) arrive as
+  Ethernet / IPv4 / UDP with UDP destination port 319; general messages
+  (Follow_Up, Announce, …) with UDP destination port 320.
+
+  ## What a PTP message looks like on the wire
+
+  After the UDP header sits a 34-byte PTP common header:
+
+    - byte 0: a 4-bit transportSpecific field, then a 4-bit **messageType**
+      (the low nibble of the byte).
+    - byte 1: a 4-bit minorVersionPTP, then a 4-bit versionPTP.
+    - bytes 2-3: messageLength (16 bits).
+    - byte 4: **domainNumber**.
+    - byte 5: minorSdoId / reserved.
+    - bytes 6-7: flagField (16 bits).
+    - bytes 8-15: **correctionField** — a 64-bit value in units of
+      2^-16 nanoseconds (the integer nanosecond count is the value shifted
+      left by 16 bits).
+    - bytes 16-19: a 32-bit messageTypeSpecific / **reserved** field.
+    - bytes 20-29: **sourcePortIdentity** = an 8-byte clockIdentity followed
+      by a 2-byte portNumber. This identifies the sending clock/port.
+    - bytes 30-31: **sequenceId** (16 bits).
+    - byte 32: controlField.
+    - byte 33: logMessageInterval.
+
+  A Sync and its Follow_Up carry the **same sourcePortIdentity and the same
+  sequenceId** — that pairing is how the switch matches them.
+
+  ## Topology, forwarding, and per-link configuration
+
+  Two hosts attach to s1:
+
+    - h1 (master side) at s1.p1; IPv4 10.0.1.1, MAC 08:00:00:00:01:01.
+    - h2 (slave side)  at s1.p2; IPv4 10.0.2.2, MAC 08:00:00:00:02:02.
+
+  s1 forwards every frame toward the host that owns the destination IPv4
+  address (10.0.1.1 → s1.p1, 10.0.2.2 → s1.p2), rewriting the Ethernet
+  destination to that host's MAC. You provide the forwarding table and
+  entries. The switch does NOT decrement the IPv4 TTL and does not otherwise
+  alter forwarded headers beyond the correction below.
+
+  The control plane configures a **mean link delay**, in nanoseconds, per
+  ingress link. You provide this per-ingress-port table and entries:
+
+    - the link arriving on s1.p1 has mean link delay **100000000 ns**;
+    - the link arriving on s1.p2 has mean link delay **10000000 ns**.
+
+  ## Per-packet behaviour
+
+   1. **Non-PTP passthrough.** A frame that is not an IPv4/UDP packet with UDP
+      destination port 319 or 320 is forwarded normally with no PTP
+      processing.
+
+   2. **Sync (messageType 0x0), domainNumber 0.** Compute the switch's
+      contribution = (the message's **residence time** — the elapsed time
+      between entering and leaving the switch) PLUS the **mean link delay** of
+      its ingress link. Remember that contribution, indexed by the Sync's
+      (sourcePortIdentity, sequenceId). Forward the Sync **UNMODIFIED** — its
+      correctionField and reserved field MUST be byte-identical to the input.
+
+   3. **Follow_Up (messageType 0x8), domainNumber 0.** Look up the remembered
+      contribution for this message's (sourcePortIdentity, sequenceId). If one
+      exists: convert it to the correctionField's units (2^-16 ns) and **ADD**
+      it to the Follow_Up's existing correctionField (do not overwrite); clear
+      the 32-bit reserved field to zero; recompute the UDP checksum; and
+      consume the remembered entry so a later Follow_Up for the same pair does
+      not get the correction again. If none exists (the Sync was never seen, or
+      the entry was already consumed), forward the Follow_Up UNMODIFIED.
+
+   4. **Domain filter.** Only domainNumber 0 is handled as above. A Sync or
+      Follow_Up with any other domainNumber is forwarded UNMODIFIED (not
+      remembered, not corrected).
+
+   5. **Other PTP messages.** Any other PTP messageType (Delay_Req 0x1,
+      Pdelay_Req 0x2, Pdelay_Resp 0x3, Announce 0xB, Signaling 0xC,
+      Management 0xD, Delay_Resp 0x9, Pdelay_Resp_Follow_Up 0xA) is forwarded
+      UNMODIFIED — this two-step clock corrects only the Sync/Follow_Up
+      exchange.
+
+   6. **Transparency.** The correction is only ever added to a Follow_Up's
+      correctionField, and only once per Sync/Follow_Up pair; it never
+      overwrites the field. Everything else passes through untouched.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - from: h1
+      to: s1.p1
+    - from: s1.p2
+      to: h2
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+
+custom_headers:
+  - file: custom_headers.py
+    class: PTP
+    description: "IEEE 1588 PTP common header (34 bytes) over UDP/IPv4, ports 319/320"
+
+# Two-step correction-arithmetic note for the expected blocks.
+#   The Sync is forwarded UNMODIFIED (correctionField + reserved unchanged).
+#   The paired Follow_Up gets: correctionField_out = correctionField_in_FU
+#       + ((sync_residence + sync_ingress_mean_link_delay) << 16).
+#   The mean link delay is a control-plane CONSTANT and dominates the small
+#   non-deterministic residence, so the corrected Follow_Up lands in a tight,
+#   predictable range (same windows as mut1):
+#     Sync ingressed s1.p1 -> Follow_Up correctionField in [288028576710656, 288683936710656]
+#     Sync ingressed s1.p2 -> Follow_Up correctionField in [282130336710656, 282785696710656]
+#   Sync and its Follow_Up share PTP (clockIdentity, portNumber, sequenceId)
+#   for correlation; they use DIFFERENT UDP source ports purely so the harness
+#   can isolate the Follow_Up's output from the Sync's.
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: sync_forwarded_unmodified_twostep
+    visibility: public
+    description: |
+      A domain-0 Sync (messageType 0x0) transits the switch. A two-step
+      transparent clock MUST forward it UNMODIFIED — correctionField and
+      reserved byte-identical to the input. A one-step implementation that
+      corrects the Sync in transit (changing correctionField and/or clearing
+      reserved) fails here. This is the headline two-step discriminator.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0xDEADBEEF
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 100
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: followup_carries_stored_residence
+    visibility: public
+    description: |
+      A Sync transits first (warm-up), then its paired Follow_Up (messageType
+      0x8, same clockIdentity/portNumber/sequenceId) transits. The Follow_Up
+      MUST carry the stored contribution = (Sync residence + s1.p1 mean link
+      delay), added to its own correctionField, with the reserved field
+      cleared. Requires cross-packet correlation state keyed by the PTP
+      identity. (The Sync and Follow_Up use different UDP source ports so the
+      harness isolates the Follow_Up's output.)
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+          - UDP:   {sport: 49152, dport: 319}
+          - PTP:
+              messageType: 0x0
+              versionPTP: 2
+              messageLength: 44
+              domainNumber: 0
+              correctionField: 0x0001000000000000
+              reserved: 0x00000000
+              clockIdentity: 0x001122FFFE334455
+              portNumber: 1
+              sequenceId: 100
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49153, dport: 320}
+        - PTP:
+            messageType: 0x8
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x12345678
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 100
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: non_ptp_passthrough_unmodified
+    visibility: public
+    description: |
+      A plain non-PTP packet (IPv4/TCP from h1 to h2) is forwarded toward h2
+      (s1.p2) with the Ethernet destination rewritten and the TTL unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 6}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl: {action: unchanged}
+
+  - name: announce_correction_field_untouched
+    visibility: hidden
+    description: |
+      A PTP Announce (messageType 0xB) on the general port (320) MUST pass
+      through with its correctionField byte-identical.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 320}
+        - PTP:
+            messageType: 0xB
+            versionPTP: 2
+            messageLength: 64
+            domainNumber: 0
+            correctionField: 0x0000000000000ABC
+            reserved: 0x00000000
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 7
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: orphan_followup_forwarded_unmodified
+    visibility: hidden
+    description: |
+      A Follow_Up that arrives with NO previously-seen matching Sync (different
+      clockIdentity/sequenceId, never stored) MUST be forwarded UNMODIFIED —
+      correctionField and reserved unchanged. A switch that blindly applies a
+      cold-start (zero / garbage) stored value, or clears reserved
+      unconditionally, fails. Tests the cold-start / orphan path.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49153, dport: 320}
+        - PTP:
+            messageType: 0x8
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0000000000000055
+            reserved: 0xABCDEF01
+            clockIdentity: 0x00AABBFFFECCDDEE
+            portNumber: 9
+            sequenceId: 777
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: followup_per_port_link_delay_p2
+    visibility: hidden
+    description: |
+      A Sync ingressing on s1.p2 (from h2 toward h1) is remembered with the
+      s1.p2 mean link delay (10000000 ns). Its paired Follow_Up (also on s1.p2)
+      MUST carry that port-2 contribution — landing in the port-2 range, which
+      does not overlap the port-1 range. Tests that the stored value uses the
+      Sync's per-port link delay.
+    prior_inputs:
+      - port: s1.p2
+        layers:
+          - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:00:02"}
+          - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, proto: 17}
+          - UDP:   {sport: 49152, dport: 319}
+          - PTP:
+              messageType: 0x0
+              versionPTP: 2
+              messageLength: 44
+              domainNumber: 0
+              correctionField: 0x0001000000000000
+              reserved: 0x00000000
+              clockIdentity: 0x00FFEEDDCCBBAA99
+              portNumber: 2
+              sequenceId: 200
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:00:02"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49153, dport: 320}
+        - PTP:
+            messageType: 0x8
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000DD
+            clockIdentity: 0x00FFEEDDCCBBAA99
+            portNumber: 2
+            sequenceId: 200
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        PTP.correctionField: {action: change_to_range, min: 282130336710656, max: 282785696710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+# --- G2: resource robustness / boundary ---
+
+  - name: non_ptp_udp_other_port_passthrough
+    visibility: hidden
+    description: |
+      A UDP packet on a non-PTP destination port (1234) MUST be forwarded
+      normally, not treated as PTP.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 1234}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl: {action: unchanged}
+
+  - name: followup_applied_exactly_once
+    visibility: hidden
+    description: |
+      After a Sync and its Follow_Up have been processed (the stored entry
+      consumed), a SECOND Follow_Up for the SAME (sourcePortIdentity,
+      sequenceId) MUST be forwarded UNMODIFIED — the correction is applied
+      exactly once. A switch that does not consume/evict the entry would apply
+      the stored correction twice and fail. (The second Follow_Up uses a third
+      UDP source port so the harness isolates its output.)
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+          - UDP:   {sport: 49152, dport: 319}
+          - PTP:
+              messageType: 0x0
+              versionPTP: 2
+              messageLength: 44
+              domainNumber: 0
+              correctionField: 0x0001000000000000
+              reserved: 0x00000000
+              clockIdentity: 0x001122FFFE334455
+              portNumber: 1
+              sequenceId: 300
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+          - UDP:   {sport: 49153, dport: 320}
+          - PTP:
+              messageType: 0x8
+              versionPTP: 2
+              messageLength: 44
+              domainNumber: 0
+              correctionField: 0x0001000000000000
+              reserved: 0x00000000
+              clockIdentity: 0x001122FFFE334455
+              portNumber: 1
+              sequenceId: 300
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49154, dport: 320}
+        - PTP:
+            messageType: 0x8
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x5A5A5A5A
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 300
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+# --- G3: regression for v1model bug patterns + two-step surfaces ---
+
+  - name: sync_other_domain_not_remembered
+    visibility: hidden
+    description: |
+      A Sync with domainNumber = 5 (outside the corrected set {0}) MUST be
+      forwarded UNMODIFIED — correctionField and reserved unchanged. (It is
+      also not remembered, but that is observed via its Follow_Up elsewhere.)
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x0
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 5
+            correctionField: 0x0001000000000000
+            reserved: 0x44556677
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 301
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}
+
+  - name: followup_udp_checksum_recomputed
+    visibility: hidden
+    description: |
+      Regression for the #1 silent-failure bug family. After applying the
+      stored correction to a Follow_Up (rewriting correctionField + clearing
+      reserved, both inside the UDP payload), the UDP checksum MUST be
+      recomputed. The check recomputes the UDP checksum over the EMITTED output
+      and asserts it matches the emitted field. Residence-independent.
+    prior_inputs:
+      - port: s1.p1
+        layers:
+          - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+          - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+          - UDP:   {sport: 49152, dport: 319}
+          - PTP:
+              messageType: 0x0
+              versionPTP: 2
+              messageLength: 44
+              domainNumber: 0
+              correctionField: 0x0001000000000000
+              reserved: 0x00000000
+              clockIdentity: 0x001122FFFE334455
+              portNumber: 1
+              sequenceId: 400
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49153, dport: 320}
+        - PTP:
+            messageType: 0x8
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x0F0F0F0F
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 400
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        UDP.chksum: {action: checksum_valid}
+        PTP.correctionField: {action: change_to_range, min: 288028576710656, max: 288683936710656}
+        PTP.reserved: {action: change_to, value: 0}
+
+  - name: delay_req_not_corrected_sync_only
+    visibility: hidden
+    description: |
+      Under the sync-only correction policy, a Delay_Req (messageType 0x1)
+      event message MUST be forwarded UNMODIFIED — it is neither corrected in
+      transit nor remembered. Catches a switch that corrects all event types.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:00:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 319}
+        - PTP:
+            messageType: 0x1
+            versionPTP: 2
+            messageLength: 44
+            domainNumber: 0
+            correctionField: 0x0001000000000000
+            reserved: 0x000000AA
+            clockIdentity: 0x001122FFFE334455
+            portNumber: 1
+            sequenceId: 500
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        PTP.correctionField: {action: unchanged}
+        PTP.reserved: {action: unchanged}

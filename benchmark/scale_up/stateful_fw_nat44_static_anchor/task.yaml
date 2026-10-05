@@ -1,0 +1,489 @@
+task_name: stateful_fw_nat44_static_anchor
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-StatefulFW-NAT44
+pattern_version: '1.0'
+seed:
+  internal_subnet: 10.0.1.0/24
+  public_ip: 203.0.113.1
+  mode: static
+  port_pool_range:
+  - 10000
+  - 20000
+  conntrack_capacity: 256
+  eviction_policy: timeout
+  idle_timeout_s: 300
+  faithfulness: D5.0_static_acl_static_nat
+  endpoint_independent_mapping: true
+  persistence_strict: false
+  static_mappings:
+  - internal_ip: 10.0.1.5
+    internal_port: 5000
+    proto: 17
+    ext_port: 10000
+  - internal_ip: 10.0.1.5
+    internal_port: 6000
+    proto: 6
+    ext_port: 10001
+description: "A switch s1 sits at the boundary between a private network and the public\nInternet. It performs static network\
+  \ address-and-port translation (NAT)\nbehind a single public address and acts as a packet filter that admits\ninbound traffic\
+  \ only on the specific external ports the operator has\nbound.\n\n## Topology and roles\n\n  - s1.internal \u2014 the port\
+  \ facing the private side. The internal host h1\n    lives in 10.0.1.0/24; the host used by tests holds 10.0.1.5 with\n\
+  \    hardware address 00:00:00:00:01:05.\n  - s1.external \u2014 the port facing the public Internet. A single external\n\
+  \    peer h2 holds 8.8.8.8 with hardware address 00:00:00:00:08:08.\n  - The public address advertised on the external side\
+  \ is 203.0.113.1; no\n    host owns this address directly \u2014 the switch terminates and re-targets\n    traffic addressed\
+  \ to it.\n  - The switch's next-hop hardware address is 00:00:00:00:00:01 on the\n    internal side and 00:00:00:00:00:02\
+  \ on the external side. (The output\n    Ethernet source is an implementation detail; tests only check the\n    Ethernet\
+  \ destination.)\n\n## NAT policy (installed by the control plane)\n\nThe translation policy is fixed and supplied to the\
+  \ switch as control-plane\nentries \u2014 the data plane does not allocate anything at run time. The policy\nis the following\
+  \ set of bidirectional bindings:\n\n  | internal IPv4 | internal port | protocol | public IPv4 | external port |\n  |---------------|---------------|----------|-------------|---------------|\n\
+  \  | 10.0.1.5      | 5000          | UDP      | 203.0.113.1 | 10000         |\n  | 10.0.1.5      | 6000          | TCP \
+  \     | 203.0.113.1 | 10001         |\n\nEach row defines one binding usable in both directions. Your submission\nmust install\
+  \ these bindings as table entries; the data plane consults them\nto decide whether and how to translate each packet.\n\n\
+  ## Eligibility\n\nA packet is processed only when both hold, checked in order; a packet that\nfails either check is silently\
+  \ discarded:\n\n  1. It is an IPv4 datagram.\n  2. Its IPv4 payload is TCP or UDP. (ICMP and every other transport\n   \
+  \  protocol are out of scope and discarded.)\n\n## Outbound side (packets received on s1.internal)\n\n  - If the IPv4 source\
+  \ is NOT in 10.0.1.0/24, discard the packet.\n  - Otherwise look up (IPv4 source, transport source port, protocol) among\n\
+  \    the installed bindings.\n      * If a binding matches, rewrite the IPv4 source to 203.0.113.1 and\n        the transport\
+  \ source port to the binding's external port, set the\n        Ethernet destination to the external peer (00:00:00:00:08:08),\n\
+  \        decrement the IPv4 TTL by one (the datagram must remain a\n        well-formed IPv4 packet a downstream receiver\
+  \ would accept), leave\n        every other field (IPv4 destination, transport destination port,\n        sequence numbers,\
+  \ payload) byte-identical, and forward out\n        s1.external. The match does NOT depend on the packet's destination.\n\
+  \      * If no binding matches, discard the packet.\n\n## Inbound side (packets received on s1.external)\n\n  - If the IPv4\
+  \ destination is NOT 203.0.113.1, discard the packet.\n  - Otherwise look up (transport destination port, protocol) among\
+  \ the\n    installed bindings' external ports.\n      * If a binding matches, rewrite the IPv4 destination to the binding's\n\
+  \        internal IPv4 address and the transport destination port to the\n        binding's internal port, set the Ethernet\
+  \ destination to the\n        internal host (00:00:00:00:01:05), decrement the IPv4 TTL by one,\n        leave every other\
+  \ field byte-identical, and forward out\n        s1.internal.\n      * If no binding matches (including a packet whose protocol\
+  \ differs\n        from the bound protocol for that port), discard the packet.\n\n## On discard\n\nA discarded packet produces\
+  \ NO output on any port.\n"
+topology:
+  switches:
+  - name: s1
+    ports:
+      internal: 1
+      external: 2
+  links:
+  - from: h1
+    to: s1.internal
+  - from: s1.external
+    to: h2
+hosts:
+  h1:
+    ip: 10.0.1.5/24
+    mac: 00:00:00:00:01:05
+    port: s1.internal
+  h2:
+    ip: 8.8.8.8/24
+    mac: 00:00:00:00:08:08
+    port: s1.external
+test_cases:
+- name: outbound_udp_snat_mapped
+  visibility: public
+  description: An outbound UDP packet from 10.0.1.5:5000 to 8.8.8.8:53 matches the installed NAT binding for (10.0.1.5, 5000,
+    UDP). The source IP is rewritten to 203.0.113.1 and the source port to the bound external port 10000, the TTL is decremented
+    by one, the Ethernet destination is set to the external peer (00:00:00:00:08:08), and the packet is forwarded out s1.external.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 10000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_udp_dnat_mapped
+  visibility: public
+  description: An inbound UDP packet from 8.8.8.8:53 to 203.0.113.1:10000 matches the installed binding for external port
+    10000 / UDP. The destination IP is rewritten to 10.0.1.5 and the destination port to 5000, the TTL is decremented by one,
+    the Ethernet destination is set to the internal host (00:00:00:00:01:05), and the packet is forwarded out s1.internal.
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 10000
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: inbound_unmapped_port_dropped
+  visibility: public
+  description: An inbound TCP packet to 203.0.113.1:22000 has no installed NAT binding for external port 22000 and MUST be
+    dropped (default-deny on the external side).
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 22000
+        flags: SA
+  expected:
+    behavior: drop
+- name: outbound_unmapped_source_dropped
+  visibility: public
+  description: "An outbound UDP packet from 10.0.1.5:9999 has no installed NAT binding for (10.0.1.5, 9999, UDP) and MUST\
+    \ be dropped \u2014 only sources with an installed binding are translated and forwarded."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 9999
+        dport: 53
+  expected:
+    behavior: drop
+- name: outbound_tcp_snat_mapped
+  visibility: hidden
+  description: An outbound TCP packet from 10.0.1.5:6000 to 8.8.8.8:80 matches the installed binding for (10.0.1.5, 6000,
+    TCP). The source is rewritten to 203.0.113.1:10001, TTL decremented, Ethernet destination set to the external peer, forwarded
+    out s1.external. Translation is L4-agnostic.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: change_to
+        value: 10001
+      TCP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_tcp_dnat_mapped
+  visibility: hidden
+  description: An inbound TCP packet from 8.8.8.8:80 to 203.0.113.1:10001 matches the binding for external port 10001 / TCP
+    and is DNAT-translated to 10.0.1.5:6000, TTL decremented, forwarded out s1.internal.
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 10001
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 6000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: inbound_udp_dnat_dport_rewrite
+  visibility: hidden
+  description: 'An inbound UDP packet from 8.8.8.8:4444 to 203.0.113.1:10000 matches the binding for external port 10000 /
+    UDP and is DNAT-translated: the destination address becomes 10.0.1.5 and the destination port is rewritten 10000 -> 5000,
+    TTL decremented, Ethernet destination set to the internal host, forwarded out s1.internal. Hidden coverage of the UDP
+    destination-port active transform (a copy/identity NAT survives the public-only inbound_udp_dnat_mapped case).'
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 4444
+        dport: 10000
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: outbound_foreign_subnet_dropped
+  visibility: hidden
+  description: An outbound UDP packet whose IPv4 source (10.0.99.99) is OUTSIDE the internal subnet 10.0.1.0/24 MUST be dropped,
+    regardless of port.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.99.99
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: outbound_icmp_dropped
+  visibility: hidden
+  description: "An ICMP echo from the internal host is dropped \u2014 only TCP and UDP are in scope for translation."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_icmp_dropped
+  visibility: hidden
+  description: "An inbound ICMP echo addressed at the public IP is dropped \u2014 the same TCP/UDP-only scope applies on the\
+    \ inbound side."
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_wrong_dst_dropped
+  visibility: hidden
+  description: "An inbound UDP packet whose IPv4 destination is NOT the public IP (here addressed directly to 10.0.1.5) MUST\
+    \ be dropped \u2014 the public-IP gate sits before any binding lookup."
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 10.0.1.5
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 5000
+  expected:
+    behavior: drop
+- name: inbound_proto_mismatch_dropped
+  visibility: hidden
+  description: 'An inbound TCP packet to 203.0.113.1:10000 MUST be dropped: external port 10000 is bound for UDP only, and
+    a binding matches on protocol as well as port.'
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 10000
+        flags: SA
+  expected:
+    behavior: drop
+- name: inbound_random_source_default_deny
+  visibility: hidden
+  description: "An inbound TCP packet from an unrelated external IP (192.0.2.50:80) to 203.0.113.1:30000 with no installed\
+    \ binding MUST be dropped \u2014 default-deny is independent of source."
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 192.0.2.50
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 30000
+        flags: SA
+  expected:
+    behavior: drop
+- name: outbound_endpoint_independent_snat
+  visibility: hidden
+  description: "An outbound UDP packet from 10.0.1.5:5000 to a DIFFERENT destination (1.1.1.1:53) still matches the (10.0.1.5,\
+    \ 5000, UDP) binding and is SNAT-translated to 203.0.113.1:10000 \u2014 the binding depends only on the internal (ip,\
+    \ port, protocol), not on the destination."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 1.1.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 10000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: non_ipv4_dropped
+  visibility: hidden
+  description: A non-IPv4 frame (a bare Ethernet frame) is dropped unconditionally on either side.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

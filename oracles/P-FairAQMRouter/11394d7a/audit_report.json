@@ -1,0 +1,110 @@
+{
+  "oracle_hash": "ce8b2e8596d4701a3ad35acb2245db00f935a05440e61dbc2b89ebb835f027fc",
+  "instance": "fair_aqm_router_anchor-default",
+  "ran_at": "2026-06-17T01:46:40.810600Z",
+  "canonical_examples": {
+    "passed": 7,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_expired_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "under_budget_below_threshold_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "over_budget_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "congested_ect_marked_ce",
+        "status": "pass"
+      },
+      {
+        "example_id": "congested_not_ect_dropped",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "admit_before_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ect_gated_marking": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "route_gates_all": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "dscp_preserved_under_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "admit_before_mark",
+      "ect_gated_marking",
+      "route_gates_all",
+      "dscp_preserved_under_mark",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Sharma et al., Approximating Fair Queueing on Reconfigurable Switches (AFQ), NSDI 2018",
+      "Alizadeh et al., Data Center TCP (DCTCP), SIGCOMM 2010",
+      "RFC1812",
+      "RFC3168",
+      "RFC8257"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

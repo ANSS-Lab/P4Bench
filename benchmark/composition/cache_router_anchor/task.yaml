@@ -1,0 +1,441 @@
+task_name: cache_router_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-CacheRouter
+pattern_version: '1.0'
+seed:
+  acl_rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 10.0.1.66/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_acl_action: permit
+  client_subnet: 10.0.1.0/24
+  store_subnet: 10.0.2.0/24
+  read_dport: 7777
+  write_dport: 7778
+  cache_entries:
+  - key: 16
+    value: 4242
+  - key: 32
+    value: 48879
+  cache_capacity: 256
+  cache_eviction: none
+  fib_capacity: 1024
+  pipeline_order: acl_cache_route
+  client_port: 1
+  store_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: clients
+    to: s1.p1
+  - from: s1.p2
+    to: store
+hosts:
+  clients:
+    note: KV clients in 10.0.1.0/24; ingress on s1.p1
+  store:
+    note: backend key-value store in 10.0.2.0/24; ingress on s1.p2
+description: |-
+  Implement an in-network key-value cache router for BMv2 (v1model) that enforces
+  an access policy, answers cacheable lookups directly from the switch, and
+  forwards the remaining traffic toward a backend store — all in a single pass.
+
+  Topology: port 1 faces the clients (hosts in 10.0.1.0/24); port 2 faces the
+  backend key-value store (10.0.2.0/24). Clients use a small UDP request/reply
+  protocol. A request is a UDP datagram; its kind is determined by the UDP
+  destination port: destination port 7777 means "read this key", destination
+  port 7778 means "write this key". The key the request concerns is carried in
+  the low byte of the UDP source port (key = UDP.sport & 0xFF).
+
+  The operator has pre-populated the switch's cache with exactly these
+  key -> value entries (each value is a 16-bit number):
+
+    - key 0x10 -> 4242   (0x1092)
+    - key 0x20 -> 48879  (0xBEEF)
+
+  No other keys are cached. A read for any key not in this list is a cache miss.
+
+  Required behaviour, per IPv4 packet:
+
+  - Access policy. A packet's original addressing is checked against an
+    administrator-defined permit/deny policy before anything else. A denied
+    packet is dropped and leaves no trace — it neither produces an answer nor
+    disturbs any stored value. Client 10.0.1.66 is denied; everything else is
+    permitted by default.
+
+  - Serving and coherence. A read whose key the switch holds is answered by the
+    switch itself: the switch synthesises the reply in place — it swaps the IPv4
+    source/destination, swaps the UDP source/destination ports, writes the stored
+    16-bit value into the IPv4 identification field, and sends the reply straight
+    back toward the client on the port the request arrived on (the client-facing
+    ingress port); the backend store is not involved, so a correctly served read
+    produces no packet toward the store. A read for a key the switch does not
+    (currently) hold is passed through to the store. A write makes the switch's
+    copy of that key stale, so that any later read of the same key is no longer
+    answered locally and is passed through to the store instead — the switch must
+    not serve a value it was told to overwrite.
+
+  - Forwarding. Any packet that is passed through — read misses, writes, and
+    ordinary traffic — is delivered toward its destination: it leaves on the
+    correct port toward the correct next hop, with its hop count decremented
+    exactly once and its L2/L3 integrity preserved. The hop count is gated before
+    forwarding: a packet that arrives with hop count 0 (already expired) is
+    dropped; a packet that arrives with hop count 1 is still forwarded and leaves
+    with hop count 0 (decremented exactly once — it is not dropped on this account
+    and not decremented twice). A packet with no known route is also dropped.
+
+  Both the P4 program and its table entries are yours to author. The router must
+  behave correctly across a request sequence: a key that has been written is not
+  served from the switch on the next read; a denied request changes nothing.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: cache_hit_reply
+  visibility: public
+  goal_class: G1
+  description: 'A read request for a cached key (key 0x10) is answered locally by the switch and sent back on the client (ingress) port: the IP source/destination and the UDP source/destination ports are swapped relative to the request, and the cached 16-bit value (4242) is carried in the IP identification field. The backend store is not involved.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7777
+  expected:
+    behavior: drop
+- name: cache_miss_route
+  visibility: public
+  goal_class: G1
+  description: A read request for a key the switch does not hold (key 0x99) is passed through toward the backend store on port 2, with the hop count decremented and the next-hop MAC rewritten. The addressing is unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 153
+        dport: 7777
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: unchanged
+- name: acl_deny_drop
+  visibility: public
+  goal_class: G1
+  description: A read from the denied client (10.0.1.66) is dropped by the access policy before the cache is consulted.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7777
+  expected:
+    behavior: drop
+- name: write_invalidate_route
+  visibility: hidden
+  goal_class: G2
+  description: A write request (write port) for key 0x10 is passed through toward the store on port 2 (TTL-1, next-hop MAC rewritten); the addressing is unchanged. The write makes the switch's copy of that key stale.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7778
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: unchanged
+- name: second_cached_key_hit
+  visibility: hidden
+  goal_class: G2
+  description: A read for the OTHER cached key (key 0x20) is also answered locally on the client port with swapped endpoints and its own value (0xBEEF=48879) in IP.id — distinct keys carry distinct values.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.51
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 32
+        dport: 7777
+  expected:
+    behavior: drop
+- name: non_read_write_route
+  visibility: hidden
+  goal_class: G2
+  description: An ordinary IPv4/UDP packet whose destination port is neither the read nor the write port is simply routed toward the store on port 2 (TTL-1), untouched by the cache.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 9999
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: unchanged
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A routed read miss with ttl==1 is forwarded with egress ttl==0 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.9
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 153
+        dport: 7777
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: unchanged
+- name: write_then_read_misses
+  visibility: hidden
+  goal_class: G3
+  description: After a write-through to key 0x10, a subsequent read of key 0x10 MISSES and is routed to the store on port 2 instead of being served the stale value — the write invalidated the switch's copy (coherence).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7777
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7778
+- name: deny_leaves_cache_intact
+  visibility: hidden
+  goal_class: G3
+  description: A write from the DENIED client (10.0.1.66) to key 0x10 is dropped by the policy and therefore does NOT invalidate the cache; a later permitted read of key 0x10 still HITS and is answered locally on the client port — the deny short-circuits before the cache.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7777
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7778
+- name: write_other_key_then_hit
+  visibility: hidden
+  goal_class: G3
+  description: A write-through to key 0x20 does not affect key 0x10; a subsequent read of key 0x10 still HITS locally on the client port — invalidation is per-key.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 16
+        dport: 7777
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 32
+        dport: 7778
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.2.9
+  expected:
+    behavior: drop

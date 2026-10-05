@@ -1,0 +1,617 @@
+task_name: switchml_agg_disc
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-SwitchMLAgg
+pattern_version: '1.0'
+seed:
+  worker_ports:
+  - 1
+  - 2
+  result_multicast_group: 1
+  n_workers: 2
+  n_slots: 4
+  vector_width: 1
+  value_width_bits: 32
+  aggregation_op: sum
+  faithfulness: D5.0_exact_integer
+  loss_tolerance: none
+  barrier_policy: strict
+  worker_id_collision_handling: bitmap_dedup
+  slot_collision_policy: drop
+  result_delivery: multicast_all
+  workload_skew: uniform
+description: |
+  A switch s1 acts as an in-network aggregator for a small distributed
+  training job, in the style of in-network Allreduce (SwitchML, Sapio et
+  al., NSDI 2021; ATP, Lao et al., NSDI 2021). Two worker hosts repeatedly
+  send partial results to the switch; the switch combines each worker's
+  contribution and, once every worker has contributed its share, sends the
+  combined result back to all the workers. The point of doing this on the
+  switch is that the workers no longer have to exchange and re-combine
+  their results among themselves — the network does the reduction on the
+  path.
+
+  ## What a contribution looks like on the wire
+
+  Aggregation traffic uses a custom Ethernet payload (EtherType 0x88B5)
+  with these fields, in order:
+
+    - `job_id`    (16 bits) — which training job this block belongs to.
+    - `slot_id`   (16 bits) — which aggregation slot this block targets. A
+                  job streams its result in pieces; each piece carries the
+                  slot it belongs to.
+    - `worker_id` (16 bits) — which worker sent this block. In this
+                  deployment there are 2 workers, with worker_id 0 and 1.
+    - `reserved`  (16 bits) — unused; carry it through unchanged.
+    - `val`       (32 bits) — the worker's integer value for this slot.
+
+  Any frame that does NOT carry this header (ordinary IPv4, ARP, etc.) is
+  not aggregation traffic — see rule 1.
+
+  ## Aggregation state
+
+  The switch keeps a small pool of `${n_slots}` aggregation slots. Each
+  slot, while a round is in progress, must remember:
+
+    - which job currently occupies it,
+    - the running combination of the values seen so far this round,
+    - which workers have already contributed this round (so a repeat from
+      the same worker is not counted twice).
+
+  A "round" for a slot begins with the first contribution to an empty slot
+  and ends when the slot has collected one contribution from each of the
+  `${n_workers}` workers.
+
+  ## What the switch MUST do
+
+  Process each aggregation block (a frame carrying the header above) by
+  its (job_id, slot_id) slot:
+
+   1. **Non-aggregation passthrough.** A frame with no aggregation header
+      is ordinary traffic. Forward it by its IPv4 destination using the
+      installed forwarding entries (h1 ↔ 10.0.1.1 on p1, h2 ↔ 10.0.2.2 on
+      p2, h3 ↔ 10.0.3.3 on p3), rewriting the destination MAC to the
+      target host's MAC. A non-IPv4 frame with no aggregation header and
+      no forwarding entry is dropped. Aggregation processing MUST NOT
+      disturb this path, and ordinary traffic MUST NOT disturb any slot.
+
+   2. **Repeat from a worker already counted.** If the block's worker has
+      already contributed to this slot's current round (its contribution
+      is already reflected in the slot), the block is a repeat — it MUST
+      be dropped and MUST NOT change the slot in any way (no second
+      combine, no change to which workers are counted). The combined
+      result MUST be exactly as if the repeat had never arrived.
+
+   3. **A block whose slot is busy with another job.** If the slot is
+      currently occupied by a DIFFERENT job_id, this block MUST be dropped,
+      and the occupying job's slot MUST be left untouched.
+
+   4. **First contribution of a round.** If the slot is empty, this block
+      opens a new round: record its value as the running combination, mark
+      its worker as counted, and record its job_id as the occupant. Do not
+      send anything yet (unless this single contribution already completes
+      the round — see rule 6).
+
+   5. **A further, non-final contribution.** If the slot is occupied by the
+      same job, this worker has not yet been counted this round, and the
+      round is still missing at least one more worker after this one:
+      combine this block's value into the running combination (for this
+      job the combination is integer addition), mark the worker as counted,
+      and send nothing.
+
+   6. **The completing contribution.** If this block is the last worker the
+      round was waiting for (after counting it, all `${n_workers}` workers
+      have now contributed): combine its value into the running
+      combination, then send the combined result back to BOTH worker ports
+      (s1.p1 and s1.p2). The result is the same aggregation block with its
+      `val` field overwritten by the combined total; the other header
+      fields are carried through. Finally, reset the slot so the next round
+      for that (job_id, slot_id) starts fresh — the next first contribution
+      to that slot MUST begin from that contribution's value, not from the
+      previous round's total.
+
+  ## Combination rule
+
+  For this deployment the combination is integer **addition** of the `val`
+  fields across the workers. The total MUST be exact: if the running sum
+  would exceed the 32-bit range it MUST saturate at the 32-bit maximum
+  (4294967295), never wrap around to a small number.
+
+  ## Threshold / completion semantics
+
+  A round completes on the contribution from the `${n_workers}`-th DISTINCT
+  worker — not before (a single worker's block alone does not complete a
+  2-worker round) and not after (a repeat from an already-counted worker
+  does not push the count past `${n_workers}`). The result is sent exactly
+  once per round, on the completing block.
+
+  ## Topology
+
+  One switch s1 with three hosts:
+    - h1 (worker 0) at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01.
+    - h2 (worker 1) at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02.
+    - h3 (result collector) at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03.
+
+  Workers send aggregation blocks and receive the combined result back on
+  their own ports. h3 carries ordinary traffic only in this deployment.
+custom_headers:
+- file: custom_headers.py
+  class: SwitchML
+  description: SwitchML/ATP aggregation block — (job_id, slot_id, worker_id, reserved, val) over EtherType 0x88B5
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: h2
+    to: s1.p2
+  - from: h3
+    to: s1.p3
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+test_cases:
+- name: two_worker_sum_completes
+  visibility: public
+  description: |
+    Golden path. Worker 0 contributes val=10 to (job 1, slot 0); then
+    worker 1 contributes val=32 — the completing block of a 2-worker
+    round. The switch MUST send the combined total (42) back to BOTH
+    worker ports.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 1
+        val: 32
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p2
+    transformations:
+      SwitchML.val:
+        action: change_to
+        value: 42
+- name: partial_contribution_no_emit
+  visibility: public
+  description: |
+    A single contribution to an empty slot opens a round but does NOT
+    complete a 2-worker round. The block is consumed (no output) and the
+    slot holds the partial value, waiting for the second worker.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 5
+  expected:
+    behavior: drop
+- name: ordinary_traffic_passthrough
+  visibility: public
+  description: |
+    Non-aggregation IPv4 traffic from h1 to h2 is forwarded by its
+    destination, untouched by the aggregator.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: multi_slot_isolation
+  visibility: hidden
+  description: |
+    Two slots in flight. Worker 0 has opened slot 0 (val=100, still
+    partial) and slot 1 (val=3, still partial). Worker 1 then completes
+    slot 1 with val=4. The result for slot 1 (7) is sent to both worker
+    ports; slot 0 is untouched and emits nothing. Slots must not
+    cross-contaminate.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 100
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 1
+        worker_id: 0
+        val: 3
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 1
+        worker_id: 1
+        val: 4
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p2
+    transformations:
+      SwitchML.val:
+        action: change_to
+        value: 7
+- name: slot_reset_reopens_round
+  visibility: hidden
+  description: |
+    After a round completes and the slot resets, a fresh contribution to
+    the same slot MUST start a NEW round from its own value — not
+    accumulate onto the previous round's total. Worker 0 (10) + worker 1
+    (32) completes and resets slot 0; then worker 0 sends val=7 to slot 0
+    again. That block opens a new partial round (count 1 of 2) and is
+    consumed — no emit, and crucially the slot does not hold 42+7.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 1
+        val: 32
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 7
+  expected:
+    behavior: drop
+- name: value_saturation_no_wrap
+  visibility: hidden
+  description: |
+    Exact-integer combination must saturate, not wrap. Worker 0
+    contributes the 32-bit maximum (4294967295); worker 1 adds 5. The
+    combined total MUST be 4294967295 (clamped), never 4 (a modular
+    wrap).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 4294967295
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 1
+        val: 5
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p2
+    transformations:
+      SwitchML.val:
+        action: change_to
+        value: 4294967295
+- name: duplicate_worker_idempotent_dedup
+  visibility: hidden
+  description: |
+    Exactly-once accumulation under retransmission. Worker 0 contributes
+    val=10, then RETRANSMITS the same block (a duplicate). Worker 1 then
+    completes with val=32. The combined total MUST be 42 (10+32), NOT 52
+    — worker 0's duplicate must be deduplicated and not counted twice.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 1
+        val: 32
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p2
+    transformations:
+      SwitchML.val:
+        action: change_to
+        value: 42
+- name: duplicate_block_itself_dropped
+  visibility: hidden
+  description: |
+    The duplicate block, in isolation, is dropped. Worker 0 has already
+    contributed val=10 to slot 0; a second, identical worker 0 block
+    arrives. It MUST be dropped (and leaves the slot unchanged — it does
+    not complete the round, since only one distinct worker is counted).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  expected:
+    behavior: drop
+- name: completion_on_exact_worker_count
+  visibility: hidden
+  description: |
+    Off-by-one / read-after-write ordering check. The result must fire on
+    the SECOND distinct worker, with the correct total. Worker 0 (val=1)
+    then worker 1 (val=2) on slot 2: the completing block produces total
+    3 to both worker ports. A check-then-increment inversion would emit
+    early (after worker 0) or compute the wrong total here.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 2
+        worker_id: 0
+        val: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 2
+        worker_id: 1
+        val: 2
+  expected:
+    behavior: forward
+    output_ports:
+    - s1.p1
+    - s1.p2
+    transformations:
+      SwitchML.val:
+        action: change_to
+        value: 3
+- name: passthrough_while_round_pending
+  visibility: hidden
+  description: |
+    Conditional-emit / aggregation-independence check. A round is partway
+    open on slot 0 (worker 0 contributed). An ordinary IPv4 packet then
+    arrives; it MUST be forwarded normally (to s1.p2) and MUST NOT emit
+    any aggregation result — only a completing aggregation block emits.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 10
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: cross_job_slot_collision_drop
+  visibility: hidden
+  description: |
+    No cross-job contamination under the strict barrier. Job 1's worker 0
+    occupies slot 0 (val=100). A block from a DIFFERENT job (job 2)
+    targeting the same slot 0 MUST be dropped — it must not be folded into
+    job 1's running total, and job 1's slot must be left untouched.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 100
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 2
+        slot_id: 0
+        worker_id: 0
+        val: 9
+  expected:
+    behavior: drop
+- name: different_job_different_slot_opens_round
+  visibility: hidden
+  description: |
+    A different job on a DIFFERENT slot is not a collision — it opens its
+    own round. Job 1 occupies slot 0; job 2's worker 0 targets the empty
+    slot 1. That block opens job 2's round on slot 1 (count 1 of 2) and is
+    consumed — no emit, no interference with job 1.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 1
+        slot_id: 0
+        worker_id: 0
+        val: 100
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 34997
+    - SwitchML:
+        job_id: 2
+        slot_id: 1
+        worker_id: 0
+        val: 9
+  expected:
+    behavior: drop

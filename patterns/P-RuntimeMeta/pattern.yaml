@@ -1,0 +1,1044 @@
+# P-RuntimeMeta — in-switch observability / meta-NF: mirror-on-match to a
+# collector plus per-rule packet/byte counters readable by the control plane
+# (sFlow / NetFlow / SPAN lineage).
+#
+# TPL v1.0 task pattern. Fills the P15 "runtime /
+# meta NFs" prescriptive cell — the last empty Pn row, authored so that
+# every prescriptive category is covered. P15 is the WEAKEST TPL fit
+# ("behavioural spec is awkward to express in the pattern vocabulary"): the
+# subset that IS expressible in the v1.0 vocabulary is the observability /
+# tap slice — mirror-on-match to a collector port (the `mirror` postcondition)
+# plus per-rule packet/byte counters (the `inc` postcondition + a `persistence`
+# monotonicity invariant). Runtime pipeline reconfiguration and NF-of-NFs
+# self-verification — the OTHER half of P15 — remain v2-deferred (they need
+# primitives the v1.0 TPL lacks) and are deliberately out of scope here; see
+# `bridging_notes`. target_capability = relocate: a dedicated monitoring
+# appliance / tap / sFlow agent (host- or appliance-side observability) is
+# being relocated DOWN into the switch data plane, the structurally hardest
+# LLM frontier.
+#
+# The pattern's signature awkwardness — and its honest corpus value — is the
+# OBSERVABILITY GAP: the per-rule counters are read by the CONTROL PLANE, not
+# emitted in any packet, so counter correctness is NOT directly observable in
+# the v1.0 harness packet trace (the same unobservable-axis situation as
+# P-NetCacheKV's capacity/associativity levers). What the harness CAN observe
+# is (a) the mirrored copy on the collector port, (b) the 1-in-N sampling
+# cadence of those copies, (c) that the ORIGINAL packet is forwarded
+# byte-identical regardless of mirroring (observation is non-destructive), and
+# (d) that the mirrored copy does not itself loop / re-mirror. The gradable
+# difficulty therefore concentrates on the v1model clone/mirror surface (the
+# common v1model conditional-clone-in-deparser + standard_metadata bug magnets), the
+# sampling-cadence arithmetic, and — at the harder rungs — mirror truncation
+# (length recompute) and a count-based 1-in-N off-by-one. Grounded in
+# RFC 3176 sFlow normative sampling + the I1/P5/D4.3 observability cluster
+# of the NF literature survey.
+
+pattern_id: P-RuntimeMeta
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry]                                # counter-based monitoring + sampled mirroring is the classic telemetry/observability family (sFlow, NetFlow); the closest surveyed descriptive leaf — P15 has no native descriptive counterpart
+  prescriptive: [P15:runtime-meta-functions]                  # runtime / meta NFs — observability slice (the `relocate` row in the NF-category table; representative primitives include "observability")
+
+target_capability: relocate                                   # a host/appliance-side monitoring agent (sFlow exporter / SPAN tap) relocated into the switch
+
+summary: >
+  An in-switch observability / meta network function: classify traffic
+  against a control-plane-installed monitor table, MIRROR matching packets
+  to a collector port for off-box analysis, and maintain per-rule packet
+  and byte COUNTERS that the control plane reads out of band (the sFlow /
+  NetFlow / SPAN lineage). Forwarding itself is a trivial pass-through
+  (an exact-match L2 FIB on the Ethernet destination); the pattern's
+  substance is the observation overlay layered beside it. On a monitored
+  ingress port, a packet matching a monitor rule increments that rule's
+  counters and — when the rule is a mirror rule AND the packet is selected
+  by the sampling policy — is copied to the collector port while the
+  original is still forwarded normally and UNMODIFIED (observation is
+  non-destructive — the defining property a meta-NF must not violate).
+  Sampling ladders from mirror-all (the anchor) through a hash-based
+  per-flow 1-in-N selector (verifiable, deterministic) to a count-based
+  1-in-N cadence (the off-by-one trap) and optional header-only mirror
+  truncation. Because the counters are read by the control plane and never
+  appear in a packet, counter correctness is largely UNOBSERVABLE in the
+  v1.0 harness; the gradable surface is the mirror cadence, the
+  non-destructive-forward guarantee, the no-self-loop guarantee on the
+  mirrored copy, and the v1model conditional-clone / deparser bug magnets
+  (a common v1model bug). Faithfulness anchors at D5.0 (mirror every monitored match,
+  packets-only counters, single match field, full copy, default-forward)
+  and ladders through D5.1 (hash 1-in-N sampling, packet+byte counters,
+  5-tuple trigger), D5.2 (count-based 1-in-N, per-direction counters,
+  header-only truncation, default-drop) and D5.3 (bounded monitor-table
+  capacity under adversarial workload).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # the counter+sampled-mirror observability MECHANISM (sFlow/NetFlow agent, SPAN/Everflow-style debug mirroring) is engineering-mature and predates / sits outside the SIGCOMM/NSDI/CoNEXT 2017–2026 corpus by construction — "runtime / meta NFs" (P15) is exactly such a publication-record gap. The query-driven-telemetry papers in the corpus (Sonata, FlyMon) address a different P9 mechanism (compiled dataflow queries + sketches), not the tap/counter slice modelled here. Authoritative grounding is the sFlow RFC (normative sampling) + the observability cluster of the NF literature survey.
+
+  rfcs:
+    - cite: rfc3176
+      title: "RFC 3176 — InMon Corporation's sFlow: A Method for Monitoring Traffic in Switched and Routed Networks"
+      sections: ["§2.1 Packet Flow Sampling", "§2.1.2 Random Number Generation", "§2.2 Counter Sampling", "§4 sFlow Datagrams / collector"]
+      quote: "When the counter reaches zero a sample is taken."
+      quote_source: "RFC 3176 §2.1 Packet Flow Sampling (verbatim; cached at patterns/P-RuntimeMeta/grounding/rfc3176.txt). Grounds the count-down sampling trigger of the monitored mirror/sample rule (R1)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      role: normative_behaviour
+      relevance: |
+        The normative source for the sampling + counter mechanism this
+        pattern models. The clauses that bind data-plane
+        behaviour:
+
+          - §2.1 Packet Flow Sampling — sampling is a 1-in-N selection:
+            "the agent maintains ... Total_Packets [eligible] and
+            Total_Samples [taken]" with the requirement
+            "Total_Packets / Total_Samples = Rate". When a packet is
+            sampled the agent forwards the sampled packet (header or
+            features) to the collector. The pattern's `${sample_rate}`
+            (N) and the R1/R2 sample-hit split realise the 1-in-N
+            selection; the `sample_cadence_one_in_n` G2 test pins the
+            aggregate rate equation.
+
+          - §2.1.2 — the canonical sampler resets a skip-counter "to a
+            random integer" so the long-run rate holds without aliasing.
+            The pattern uses a DETERMINISTIC selector instead — a per-flow
+            hash (`hash_5tuple_1_in_n`) or an exact count-based cadence
+            (`deterministic_count_1_in_n`) — because a randomised selector
+            is not reproducible by a deterministic oracle (recorded as a
+            faithfulness-vs-verifiability bridging note); the deterministic
+            forms preserve the rate equation while remaining gradable.
+
+          - §2.2 Counter Sampling — interface packet/byte counters are
+            polled by the agent on an interval and bundled into the sample
+            datagram. The pattern's `mon_rule` packet/byte counters and the
+            `counter_monotonicity` invariant model the data-plane half (the
+            counts the control plane later polls); the OUT-OF-BAND poll is
+            why counter values are not in the packet trace — the pattern's
+            documented observability gap.
+
+          - §4 / collector — samples are sent to a configured collector
+            host/port. The pattern's `${collector_port}` is the in-switch
+            analogue (the mirror egress toward the off-box analyzer);
+            excluding it from the monitored set is what keeps the mirrored
+            copy from re-triggering observation (`no_mirror_loop`).
+      common_knowledge_baseline_used: |
+        The concrete BMv2 / v1model implementation — realising `mirror` via
+        `clone3` / `clone_preserving_field_list(CloneType.I2E, session, ...)`
+        with a mirror session bound to `${collector_port}`, the
+        `direct_counter` / `counter` extern for the per-rule packet/byte
+        counts, and the deparser-side discipline that the cloned copy is
+        emitted exactly once and not recirculated — is widely-known
+        P4-on-v1model practice, flagged `[common-knowledge baseline]` in
+        `bridging_notes` rather than attributed to RFC 3176.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic. Forwarding is a stateless pass-through; the only per-packet
+      decisions are (i) which egress port the L2 FIB resolves, (ii) whether
+      a monitor rule matches, and (iii) whether the sampling policy selects
+      this packet for mirroring. No per-flow / connection / session row is
+      maintained — the only cross-packet state is the per-rule counters
+      (and, under count-based sampling, a per-rule skip counter).
+
+  link:                                                       # port-keyed monitoring role
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      monitored: bool                                         # true on ports whose traffic is observed (tapped)
+    populated_from:
+      monitored_rows: ${monitored_ports}                     # one row per monitored ingress port
+    notes: |
+      Marks which ingress ports are monitored (tapped). R1/R2 fire only
+      under `ingress(monitored)`. The dedicated `${collector_port}` is
+      NEVER in `${monitored_ports}` — that exclusion is what prevents the
+      mirrored copy (which egresses the collector port) from re-entering
+      the observation path and re-mirroring (`no_mirror_loop`). This is the
+      same "exclude the side-channel egress from scoring/observation"
+      convention P-SYNCookieGuard and P-NetCacheKV use for switch-originated
+      traffic.
+
+  l2_fib:                                                     # `bucket` — Ethernet dst → pass-through egress port (trivial base forwarding)
+    type: bucket
+    keyed_by_tuple: [eth_dst]
+    attrs:
+      egress_port: port
+    capacity: ${l2_fib_capacity}
+    populated_from: ${l2_fib_entries}
+    notes: |
+      The base forwarding table: an exact match on `ethernet.dstAddr`
+      resolving the pass-through egress port. Deliberately trivial (no
+      header rewrite, no TTL decrement — that is P-IPv4Routing's surface):
+      the pattern's substance is the observation overlay, not the
+      forwarding. Gives every packet a deterministic egress so the
+      "forwarded byte-identical under mirror" property is checkable.
+
+  mon_rule:                                                   # `bucket` — classification key → mirror flag + per-rule counters (the sFlow/SPAN monitor table)
+    type: bucket
+    keyed_by_tuple: [ipv4_dst, ipv4_src, ipv4_proto, l4_src, l4_dst, vlan, dscp]   # ${mon_match_fields} selects the active prefix: ipv4_dst_only → [ipv4_dst]; five_tuple → [ipv4_dst,ipv4_src,ipv4_proto,l4_src,l4_dst]; five_tuple_plus → +[vlan,dscp]
+    attrs:
+      should_mirror: bool                                     # true ⇒ matching+sampled packets are mirrored to the collector; false ⇒ count-only rule
+      pkt_count:     counter                                  # per-rule packet counter (control-plane-readable)
+      byte_count:    counter                                  # per-rule byte counter (enforced_when ${counter_granularity} ⊇ bytes)
+      sample_skip:   counter                                  # per-rule skip counter for count-based 1-in-N (enforced_when ${sampling_policy} == deterministic_count_1_in_n)
+    capacity: ${mon_rule_capacity}
+    populated_from: ${mon_rule_entries}
+    notes: |
+      The monitor / SPAN classification table — the heart of the pattern.
+      A control-plane-installed rule keyed on `${mon_match_fields}` carries
+      a mirror flag and the per-rule counters the control plane polls. The
+      counters are STATE the data plane writes (`inc`) and the control
+      plane reads OUT OF BAND — so they never appear in the packet trace,
+      which is the pattern's documented observability gap (counter
+      granularity is a near-unobservable axis in the v1.0 harness, the
+      P-NetCacheKV situation). The `sample_skip` attr exists only under the
+      count-based sampling policy.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  monitored_ports:
+    type: list[int]
+    constraint: "every entry is a port number in [1, 511] (BMv2 simple_switch range); MUST NOT contain ${collector_port}."
+    notes: |
+      Ingress ports whose traffic is observed. Populate the `link` entity's
+      `monitored == true` rows; R1/R2 fire only under `ingress(monitored)`.
+
+  collector_port:
+    type: int
+    range: "[1, 511]"
+    constraint: "disjoint from ${monitored_ports}."
+    notes: |
+      The mirror / SPAN destination — the in-switch egress toward the
+      off-box collector (sFlow analyzer). Mirrored copies egress here; it is
+      excluded from `${monitored_ports}` so a mirrored copy is not itself
+      observed/mirrored (`no_mirror_loop`).
+
+  l2_fib_entries:
+    type: list[l2_fib_entry]
+    constraint: "every entry has eth_dst:address (unique across the list) and egress_port:int ∈ valid ports; egress_port MAY equal a monitored or collector port."
+    notes: |
+      The (eth_dst → egress_port) rows that populate `l2_fib`. Drives the
+      pass-through forward in R1/R2/R3.
+
+  mon_rule_entries:
+    type: list[mon_rule_entry]
+    constraint: |
+      every entry supplies the ${mon_match_fields} key, should_mirror:bool,
+      and zero-initialised counters; keys are unique across the list;
+      |entries| ≤ ${mon_rule_capacity} when bounded.
+    notes: |
+      The monitor rules. Drives R1/R2's `exists(mon_rule, ...)` lookup and
+      supplies the per-rule mirror flag + counters.
+
+  mon_match_fields:
+    type: enum
+    values: [ipv4_dst_only, five_tuple, five_tuple_plus]
+    default: ipv4_dst_only
+    notes: |
+      Which header fields the monitor table keys on — the MIRROR-TRIGGER
+      BREADTH. `ipv4_dst_only` (anchor) is a single exact field;
+      `five_tuple` keys on (src,dst,proto,sport,dport) ternary;
+      `five_tuple_plus` adds VLAN / DSCP. Widening the trigger widens the
+      protocol/feature surface the SUT must classify on — `feature-breadth`.
+      Binds `mon_key_fields` (the `mon_rule` key tuple).
+
+  counter_granularity:
+    type: enum
+    values: [packets_only, packets_and_bytes, per_rule_per_direction]
+    default: packets_only
+    notes: |
+      How finely the per-rule counters are maintained. `packets_only`
+      (anchor) keeps one packet counter per rule; `packets_and_bytes` adds
+      the byte counter; `per_rule_per_direction` splits each into
+      ingress/egress-direction counters. NOTE: counters are
+      control-plane-read and absent from the packet trace, so this axis is
+      largely UNOBSERVABLE in the v1.0 harness — it widens the SUT's
+      required surface (feature-breadth) but is graded only structurally /
+      via the `counter_monotonicity` invariant, not by a packet assertion.
+
+  sampling_policy:
+    type: enum
+    values: [mirror_all, hash_5tuple_1_in_n, deterministic_count_1_in_n]
+    default: mirror_all
+    notes: |
+      Which matching packets are mirrored. `mirror_all` (anchor) mirrors
+      every matched mirror-rule packet. `hash_5tuple_1_in_n` mirrors a
+      packet iff `hash(5-tuple) mod ${sample_rate} == 0` — a DETERMINISTIC
+      per-flow 1-in-N selector (the INTMetadata convention; fully
+      reproducible by the oracle and verifiable: the same flow is always
+      sampled or always skipped). `deterministic_count_1_in_n` mirrors
+      every Nth matching packet via the per-rule `sample_skip` counter —
+      the inc-then-check off-by-one trap (a common v1model bug). Counters increment on EVERY
+      match regardless of the sampling outcome; sampling gates only the
+      mirror.
+
+  sample_rate:
+    type: int
+    range: "[1, 4096]"
+    default: 1
+    enforced_when: "${sampling_policy} != mirror_all"
+    notes: |
+      The 1-in-N sampling ratio N (sFlow RFC 3176 §2.1 Rate). `1` is the
+      degenerate "sample every packet" (equivalent to mirror_all);
+      production sFlow runs N in the hundreds–thousands. The
+      `sample_cadence_one_in_n` G2 test asserts the aggregate rate equation
+      Total_Packets / Total_Samples ≈ N.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${sampling_policy} == hash_5tuple_1_in_n"
+    notes: |
+      Hash function for the per-flow sample selector. `xor_fold` is the
+      cheapest/weakest — under adversarial 5-tuples it collapses the
+      sampled set, used to harden via `swap_hash_to_xor_fold`. The hash
+      extern is itself a common v1model bug magnet (wrong field list / width).
+
+  mon_rule_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: |
+      Maximum number of monitor rules the table holds. `unbounded` (anchor);
+      `shrink_rule_capacity_4x` tightens it so a TCAM-of-everything strategy
+      no longer fits.
+
+  l2_fib_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: |
+      Capacity of the base L2 FIB. Held generous (the forwarding is not the
+      pattern's difficulty surface); exposed only so a strict-scale variant
+      can bound it alongside `mon_rule_capacity`.
+
+  default_action:
+    type: enum
+    values: [forward_flood, drop]
+    default: forward_flood
+    notes: |
+      What happens to a packet whose `ethernet.dstAddr` misses the L2 FIB
+      (and which matched no monitor rule). `forward_flood` (anchor) sends it
+      to a configured flood/uplink set; `drop` is the strict default-deny.
+      Moved by the strictness operators.
+
+  mirror_truncation:
+    type: enum
+    values: [full, l2l3l4_headers]
+    default: full
+    notes: |
+      Whether the mirrored copy carries the full packet (`full`, anchor) or
+      is truncated to the L2/L3/L4 headers (`l2l3l4_headers`, the sFlow
+      "selective truncation" / NF-survey P5 practice). Truncation forces the
+      SUT to recompute the mirrored copy's length and emit only a header
+      prefix on the clone path — a harder, OBSERVABLE lever (the collector
+      copy's length is checkable). Moved by the faithfulness ladder.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of flow-tuples in the G-test traffic. `uniform` (anchor);
+      `raise_workload_skew` ladders to `zipfian` then `adversarial`
+      (collision-prone tuples that stress `${hash_algo}` quality on the
+      sample selector).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_mirror_all, D5.1_hash_sampled, D5.2_count_truncate, D5.3_strict_scale]
+    default: D5.0_mirror_all
+    notes: |
+      The feature ladder. D5.0 is the minimal observer (mirror every
+      monitored match, packets-only counters, single match field, full
+      copy, default-forward, no sampling). D5.1 lifts to hash-based 1-in-N
+      sampling, packet+byte counters, and a 5-tuple trigger. D5.2 swaps to
+      the count-based 1-in-N cadence (off-by-one trap), per-direction
+      counters, header-only mirror truncation, and default-drop. D5.3 bounds
+      the monitor-table capacity under adversarial workload. This is a
+      feature-surface ladder (observability has no exact↔approximate STATE
+      fidelity — the counters are exact), so its operators carry
+      `axis: feature-breadth`, not `faithfulness`.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true fires;
+# subsequent rules are not evaluated for that packet. A rule's `then` block
+# may carry BOTH a `mirror` (side copy) and a `forward` (original delivery) —
+# observation is non-destructive.
+
+rules:
+
+  - id: R0_unparseable_drop
+    when: "¬header_present(ethernet) ∨ ¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The monitor table keys on IPv4 fields and the base FIB is exercised
+      with IPv4 traffic; anything that fails to parse to IPv4 (ARP, IPv6,
+      LLDP) is out of scope and dropped. Keeping this explicit avoids a
+      mis-keyed monitor lookup on a non-IPv4 packet.
+
+  - id: R1_monitored_mirror_and_forward
+    when: |
+      ingress(monitored)
+        ∧ exists(mon_rule, mon_key(${mon_match_fields}))
+        ∧ value(mon_rule.should_mirror, ==, true)
+        ∧ sample_selected(${sampling_policy}, ${sample_rate}, ${hash_algo}, mon_rule.sample_skip)
+    given:
+      port_role:  by_key(standard_metadata.ingress_port)
+      mon_rule:   by_key(mon_key(${mon_match_fields}))
+      l2_fib:     by_key(ethernet.dstAddr)
+    then:
+      - "inc(mon_rule.pkt_count)"
+      - "inc(mon_rule.byte_count)"                            # observed only when ${counter_granularity} ⊇ bytes; a no-op otherwise
+      - "mirror(${collector_port})"                           # side copy to the collector — truncated per ${mirror_truncation}
+      - forward(l2_fib.egress_port)                           # ORIGINAL still delivered, unmodified
+    notes: |
+      The mirror path: a monitored packet that matches a MIRROR rule and is
+      SELECTED by the sampling policy is (1) counted, (2) copied to the
+      collector port, and (3) forwarded normally and byte-identical. The
+      three v1model traps live here: (a) the clone must fire ONLY on this
+      sampled path and exactly once (`conditional_clone_only_on_sampled_path`,
+      `no_mirror_loop`); (b) the mirror MUST NOT corrupt the original's
+      forward decision or any field (`forward_unmodified_under_mirror`); (c)
+      under `${mirror_truncation} == l2l3l4_headers` the cloned copy's length
+      must be recomputed to the header prefix. The `mirror` and `forward`
+      co-occurring in one `then` is the non-destructive-observation idiom.
+
+  - id: R2_monitored_count_only
+    when: |
+      ingress(monitored)
+        ∧ exists(mon_rule, mon_key(${mon_match_fields}))
+    given:
+      mon_rule:  by_key(mon_key(${mon_match_fields}))
+      l2_fib:    by_key(ethernet.dstAddr)
+    then:
+      - "inc(mon_rule.pkt_count)"
+      - "inc(mon_rule.byte_count)"
+      - forward(l2_fib.egress_port)
+    notes: |
+      Reached when a monitored packet matched a monitor rule but R1 did NOT
+      fire — i.e. the rule is count-only (`should_mirror == false`) OR the
+      sampling policy did not select this packet. Either way the per-rule
+      counters STILL increment (sFlow counts every eligible packet; sampling
+      gates only the mirror), and the packet is forwarded normally with NO
+      collector copy. The disjoint count-only partner of R1.
+
+  - id: R3_unmonitored_or_unruled_forward
+    when: "exists(l2_fib, ethernet.dstAddr)"
+    given:
+      l2_fib:  by_key(ethernet.dstAddr)
+    then:
+      - forward(l2_fib.egress_port)
+    notes: |
+      A packet on an unmonitored port, or on a monitored port that matched
+      no monitor rule, is simply forwarded by the base L2 FIB — no counters,
+      no mirror. (Counters belong to monitor rules; an unruled packet has
+      none.)
+
+  - id: R4_fib_miss_flood
+    when: "¬exists(l2_fib, ethernet.dstAddr) ∧ ${default_action} == forward_flood"
+    then:
+      - forward(flood_group)
+    notes: |
+      Base-FIB miss under the permissive default: flood to the configured
+      flood/uplink group. R3's disjoint miss partner. Note: even a monitored
+      packet that matched a monitor rule reaches R1/R2 first (their `forward`
+      uses the FIB egress); R4/R5 govern only the no-monitor-rule miss path.
+
+  - id: R5_fib_miss_drop
+    when: "¬exists(l2_fib, ethernet.dstAddr) ∧ ${default_action} == drop"
+    then:
+      - drop
+    notes: |
+      Base-FIB miss under the strict default-deny (`${default_action} ==
+      drop`). The disjoint partner of R4 — exactly one of R4/R5 is live for
+      a given seed, selected by `${default_action}`.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_mirror_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      The mirrored copy egressing `${collector_port}` MUST NOT re-enter the
+      observation path and produce a second copy, and MUST NOT recirculate.
+      Guaranteed structurally by excluding `${collector_port}` from
+      `${monitored_ports}` and by cloning exactly once (I2E). Implementation
+      anti-pattern: a clone session that itself triggers ingress monitoring,
+      or a recirculated clone — an unbounded mirror storm. The canonical
+      clone-bug pin.
+
+  - id: forward_unmodified_under_mirror
+    clause: persistence
+    target: "(ethernet.*, ipv4.*, l4_payload, forward_egress)"
+    while: "rule R1 fires"
+    free_under: []
+    notes: |
+      THE defining meta-NF property: observation is NON-DESTRUCTIVE. When a
+      packet is mirrored, the ORIGINAL is still delivered to its L2-FIB
+      egress, byte-for-byte identical — no header field altered, no TTL
+      decrement, no egress redirect caused by the mirror action. Implementation
+      anti-pattern: the clone API writing `standard_metadata.egress_spec` /
+      a clone field in a way that hijacks or drops the original
+      (`forward_unmodified_under_mirror` G3 test). This is the observability
+      analogue of P-GTPUEncap's inner-payload-persistence.
+
+  - id: counter_monotonicity
+    clause: persistence
+    target: "(mon_rule.pkt_count, mon_rule.byte_count)"
+    while: "rule R1 fires ∨ rule R2 fires"
+    free_under: ["inc"]
+    notes: |
+      Per-rule counters are MONOTONIC NON-DECREASING in the data plane: the
+      only data-plane write is `inc` (on every matched packet); the data
+      plane never decrements or zeroes them (control-plane reset is out of
+      data-plane scope). NOTE: because counters are control-plane-read and
+      absent from the packet trace, this invariant is checked STRUCTURALLY
+      (the reference never emits a `dec`/reset on the counter path), not by a
+      packet assertion — the pattern's observability gap made explicit.
+
+  - id: conditional_clone_only_on_sampled_path
+    clause: stability
+    target: "(mirror_decision, ${collector_port})"
+    while: "egress(packet)"
+    notes: |
+      A collector copy appears IFF a monitored packet matched a mirror rule
+      AND the sampling policy selected it (R1). No collector copy on the
+      count-only path (R2), the unruled path (R3), or the FIB-miss path
+      (R4). Implementation anti-pattern: the common v1model conditional-clone bug — cloning
+      unconditionally, or guarding the clone on the wrong predicate so
+      non-sampled / non-mirror traffic leaks to the collector
+      (`conditional_clone_only_on_sampled_path` G3 test).
+
+  - id: mirror_copy_fidelity
+    clause: stability
+    target: "(collector_copy_contents)"
+    while: "rule R1 fires ∧ egress(${collector_port})"
+    notes: |
+      The mirrored copy on the collector port is a faithful image of the
+      observed packet — the FULL packet under `${mirror_truncation} == full`,
+      or exactly the L2/L3/L4 header prefix under `l2l3l4_headers`. Implementation
+      anti-pattern: mirroring the post-egress-rewritten form instead of the
+      observed form, or (under truncation) emitting the wrong length / a
+      garbage tail. Pinned by `mirror_basic` (full) and
+      `mirror_truncation_header_only` (truncated) tests.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: mirror_basic
+      generate: |
+        Install an L2 FIB entry (eth_dst D → egress port P) and a MIRROR
+        monitor rule matching the packet's ${mon_match_fields} key with
+        should_mirror = true (at D5.0, sampling_policy = mirror_all). Send a
+        matching IPv4 packet on a monitored port. Assert (a) a copy of the
+        packet appears on ${collector_port}, AND (b) the original is
+        forwarded to P. (Anchor — mirror-on-match, sFlow §2.1.)
+
+    - id: count_only_no_collector_copy
+      generate: |
+        Install a COUNT-ONLY monitor rule (should_mirror = false) matching
+        the packet. Send a matching IPv4 packet on a monitored port. Assert
+        the packet is forwarded to its L2-FIB egress and NO copy appears on
+        ${collector_port}. (Counters increment but never leave the box;
+        only mirror rules produce collector copies.)
+
+    - id: forward_unmodified_under_mirror
+      generate: |
+        Same setup as `mirror_basic`. Capture the ORIGINAL forwarded packet
+        on port P and assert it is byte-for-byte identical to the input —
+        ethernet src/dst unchanged, ipv4 TTL unchanged (NO decrement),
+        every field intact. Observation must be non-destructive. (G1 +
+        the meta-NF defining property; cross-links the
+        `forward_unmodified_under_mirror` invariant.)
+
+    - id: unmonitored_port_not_mirrored
+      generate: |
+        Send a packet that WOULD match a mirror rule, but on an UNMONITORED
+        ingress port. Assert it is forwarded by the L2 FIB and produces NO
+        collector copy (R3 — monitoring is gated on ingress port role).
+
+  G2:
+    - id: sample_cadence_one_in_n
+      requires: "${sampling_policy} != mirror_all"
+      generate: |
+        Send ${sample_rate} * K matching packets (K ≥ 8) through a mirror
+        rule. Under hash_5tuple_1_in_n use distinct 5-tuples; under
+        deterministic_count_1_in_n use the same rule. Count collector copies
+        and assert the aggregate rate Total_Packets / Total_Samples ≈
+        ${sample_rate} (within sFlow §2.1's ±10% tolerance for the hash
+        variant; EXACT — every Nth — for the count variant). Catches a
+        sampler that mirrors all, mirrors none, or has an off-by-one
+        cadence.
+
+    - id: rule_capacity_limit
+      requires: "${mon_rule_capacity} != unbounded"
+      generate: |
+        Install exactly ${mon_rule_capacity} monitor rules, then exercise
+        matched and unmatched keys. Assert matched keys mirror/count and a
+        key beyond capacity falls through to R3/R4 (no spurious mirror).
+        (Capacity boundary.)
+
+    - id: fib_miss_default_action
+      generate: |
+        Send an IPv4 packet whose ethernet.dstAddr misses the L2 FIB and
+        matches no monitor rule. Assert the configured ${default_action}
+        (flood vs drop). R4.
+
+  G3:
+    - id: no_mirror_loop
+      generate: |
+        Configure ${collector_port} and send a mirror-rule packet. Assert
+        EXACTLY ONE copy appears on ${collector_port} (not two, not a
+        storm), and that the mirrored copy does not itself generate further
+        collector copies / recirculate. Catches a clone session that
+        re-triggers monitoring or a recirculated clone. (common v1model clone bug.)
+
+    - id: conditional_clone_only_on_sampled_path
+      generate: |
+        In one run against the same SUT, send: (1) a mirror-rule SAMPLED
+        packet, (2) a count-only-rule packet, (3) an unruled packet on a
+        monitored port, (4) a packet on an unmonitored port. Assert a
+        collector copy appears for (1) ONLY. Catches the common v1model
+        conditional-clone-in-deparser bug where the clone is emitted
+        unconditionally or guarded on the wrong predicate, leaking
+        non-sampled traffic to the collector.
+
+    - id: counter_no_double_count_on_clone
+      generate: |
+        Send one mirror-rule packet (sampled). Assert — via the reference's
+        structural counter trace (counters are not in the packet trace) —
+        that the rule's pkt_count increments by EXACTLY ONE, not two (the
+        cloned copy must not re-enter the counting path). Catches a clone
+        that double-counts. (Structural / oracle-side check per the
+        observability gap.)
+
+    - id: mirror_truncation_header_only
+      requires: "${mirror_truncation} == l2l3l4_headers"
+      generate: |
+        Send a mirror-rule packet with a large payload. Assert the collector
+        copy carries only the L2/L3/L4 header prefix (correct truncated
+        length), while the ORIGINAL forwarded packet retains its full
+        payload. Catches an implementation that truncates the original, mis-computes
+        the truncated length, or fails to truncate at all.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Harden operators paired with ease counterparts on the same axis; every
+# operator declares `direction` so difficulty recalibration picks from
+# the matching pool (harden when r > r* + δ, ease when r < r* − δ).
+
+mutation_operators:
+
+  - id: widen_mirror_trigger
+    applicable_when: "${mon_match_fields} ∈ {ipv4_dst_only, five_tuple}"
+    effect: "${mon_match_fields} ← next_breadth(${mon_match_fields})"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${mon_match_fields} ∈ {five_tuple, five_tuple_plus}"
+    kind: parameter
+    notes: |
+      Widen the monitor-table key (ipv4_dst_only → five_tuple →
+      five_tuple_plus). More fields to classify on — more of the protocol
+      surface the SUT must parse and match.
+
+  - id: narrow_mirror_trigger
+    applicable_when: "${mon_match_fields} ∈ {five_tuple, five_tuple_plus}"
+    effect: "${mon_match_fields} ← prev_breadth(${mon_match_fields})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${mon_match_fields} ∈ {ipv4_dst_only, five_tuple}"
+    kind: parameter
+    notes: "Paired ease counterpart of `widen_mirror_trigger`."
+
+  - id: raise_counter_granularity
+    applicable_when: "${counter_granularity} ∈ {packets_only, packets_and_bytes}"
+    effect: "${counter_granularity} ← next_gran(${counter_granularity})"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${counter_granularity} ∈ {packets_and_bytes, per_rule_per_direction}"
+    kind: parameter
+    notes: |
+      Add the byte counter, then split per direction. Widens the required
+      counter surface. NOTE: counters are control-plane-read, so the
+      realised δ on this axis is expected to be small in the v1.0 harness
+      (the observability gap) — recorded for realised-vs-declared
+      difficulty attribution.
+
+  - id: lower_counter_granularity
+    applicable_when: "${counter_granularity} ∈ {packets_and_bytes, per_rule_per_direction}"
+    effect: "${counter_granularity} ← prev_gran(${counter_granularity})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${counter_granularity} ∈ {packets_only, packets_and_bytes}"
+    kind: parameter
+    notes: "Paired ease counterpart of `raise_counter_granularity`."
+
+  - id: enable_sampling
+    applicable_when: "${sampling_policy} == mirror_all"
+    effect: "${sampling_policy} ← hash_5tuple_1_in_n ∧ ${sample_rate} ← max(${sample_rate}, 64)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${sampling_policy} == hash_5tuple_1_in_n ∧ ${sample_rate} > 1"
+    kind: parameter
+    notes: |
+      Turn on 1-in-N sampling (the deterministic per-flow hash selector).
+      Adds the sample-decision predicate and the hash extern to the SUT's
+      surface; the `sample_cadence_one_in_n` test goes live.
+
+  - id: disable_sampling
+    applicable_when: "${sampling_policy} == hash_5tuple_1_in_n"
+    effect: "${sampling_policy} ← mirror_all"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${sampling_policy} == mirror_all"
+    kind: parameter
+    notes: "Paired ease counterpart of `enable_sampling` — back to mirror-all."
+
+  - id: swap_sampling_to_count
+    applicable_when: "${sampling_policy} == hash_5tuple_1_in_n"
+    effect: "${sampling_policy} ← deterministic_count_1_in_n"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${sampling_policy} == deterministic_count_1_in_n"
+    kind: parameter
+    notes: |
+      Swap the per-flow hash selector for an EXACT count-based 1-in-N
+      cadence (every Nth matching packet). Stricter: the SUT must maintain a
+      per-rule skip counter and get the inc-then-check ordering right — the
+      classic v1model off-by-one / read-before-write bug. The cadence test
+      tightens from ±10% to exact.
+
+  - id: swap_sampling_to_hash
+    applicable_when: "${sampling_policy} == deterministic_count_1_in_n"
+    effect: "${sampling_policy} ← hash_5tuple_1_in_n"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${sampling_policy} == hash_5tuple_1_in_n"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `swap_sampling_to_count` — back to the
+      stateless per-flow hash selector (±10% tolerance, no skip counter).
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: "${sampling_policy} == hash_5tuple_1_in_n ∧ ${hash_algo} ∈ {crc16, crc32}"
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    kind: parameter
+    notes: |
+      Weakest hash on the sample selector. Under adversarial 5-tuples
+      xor_fold collapses the sampled set so the cadence skews — hardens the
+      panel against a blindly-copied CRC pattern.
+
+  - id: swap_hash_to_crc32
+    applicable_when: "${sampling_policy} == hash_5tuple_1_in_n ∧ ${hash_algo} ∈ {xor_fold, crc16}"
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    kind: parameter
+    notes: "Paired ease counterpart of `swap_hash_to_xor_fold` — strongest entropy."
+
+  - id: enable_mirror_truncation
+    applicable_when: "${mirror_truncation} == full"
+    effect: "${mirror_truncation} ← l2l3l4_headers"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${mirror_truncation} == l2l3l4_headers"
+    kind: parameter
+    notes: |
+      Truncate the mirrored copy to the L2/L3/L4 header prefix (sFlow
+      header-sampling / P5 selective-truncation). The SUT must emit only a
+      header prefix on the clone path AND recompute its length while leaving
+      the original full — an OBSERVABLE, harder lever and a strong ceiling
+      candidate. The `mirror_truncation_header_only` test goes live.
+
+  - id: disable_mirror_truncation
+    applicable_when: "${mirror_truncation} == l2l3l4_headers"
+    effect: "${mirror_truncation} ← full"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${mirror_truncation} == full"
+    kind: parameter
+    notes: "Paired ease counterpart of `enable_mirror_truncation` — full-copy mirror."
+
+  - id: shrink_rule_capacity_4x
+    applicable_when: "${mon_rule_capacity} != unbounded ∧ ${mon_rule_capacity} > 64"
+    effect: "${mon_rule_capacity} ← ${mon_rule_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${mon_rule_capacity} ≥ 16"
+    kind: parameter
+    notes: "Tighten the monitor table 4× so a TCAM-of-everything strategy no longer fits."
+
+  - id: enlarge_rule_capacity_2x
+    applicable_when: "${mon_rule_capacity} != unbounded ∧ ${mon_rule_capacity} < 65536"
+    effect: "${mon_rule_capacity} ← ${mon_rule_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${mon_rule_capacity} ≤ 65536"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_rule_capacity_4x` (doubles, not
+      quadruples — the asymmetry gives a slow climb back after an over-harden).
+
+  - id: enable_default_drop
+    applicable_when: "${default_action} == forward_flood"
+    effect: "${default_action} ← drop"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${default_action} == drop"
+    kind: parameter
+    notes: |
+      Switch the FIB-miss default from flood to strict default-deny. The SUT
+      must implement the explicit miss-drop (R4) rather than relying on a
+      permissive default.
+
+  - id: enable_default_forward
+    applicable_when: "${default_action} == drop"
+    effect: "${default_action} ← forward_flood"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${default_action} == forward_flood"
+    kind: parameter
+    notes: "Paired ease counterpart of `enable_default_drop`."
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the flow-tuple distribution skew (uniform → zipfian →
+      adversarial). Combined with a weak `${hash_algo}` this skews the
+      sampling cadence and stresses the selector.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: "Paired ease counterpart of `raise_workload_skew`."
+
+  - id: tighten_faithfulness
+    applicable_when: "${faithfulness} ∈ {D5.0_mirror_all, D5.1_hash_sampled, D5.2_count_truncate}"
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_hash_sampled then
+          ${sampling_policy} ← hash_5tuple_1_in_n ∧ ${sample_rate} ← 64 ∧
+          ${counter_granularity} ← packets_and_bytes ∧
+          ${mon_match_fields} ← five_tuple ) ∧
+      ( if ${faithfulness}_post == D5.2_count_truncate then
+          ${sampling_policy} ← deterministic_count_1_in_n ∧
+          ${counter_granularity} ← per_rule_per_direction ∧
+          ${mirror_truncation} ← l2l3l4_headers ∧
+          ${default_action} ← drop ) ∧
+      ( if ${faithfulness}_post == D5.3_strict_scale then
+          ${mon_rule_capacity} ← bounded(${mon_rule_entries}) ∧
+          ${workload_skew} ← adversarial )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${faithfulness} ≠ D5.0_mirror_all"
+    kind: parameter
+    notes: |
+      Lift the feature ladder one rung, applying the entailed parameter
+      bindings. D5.0→D5.1 turns on hash sampling + byte counters + 5-tuple
+      trigger; D5.1→D5.2 swaps to count-based cadence + per-direction
+      counters + header truncation + default-drop (the big jump); D5.2→D5.3
+      bounds capacity under adversarial workload. Each step widens the
+      feature surface (`feature-breadth` — observability has no
+      exact↔approximate state fidelity).
+
+  - id: loosen_faithfulness
+    applicable_when: "${faithfulness} ∈ {D5.1_hash_sampled, D5.2_count_truncate, D5.3_strict_scale}"
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_mirror_all then
+          ${sampling_policy} ← mirror_all ∧
+          ${counter_granularity} ← packets_only ∧
+          ${mon_match_fields} ← ipv4_dst_only ∧
+          ${mirror_truncation} ← full ∧
+          ${default_action} ← forward_flood ) ∧
+      ( if ${faithfulness}_post == D5.1_hash_sampled then
+          ${sampling_policy} ← hash_5tuple_1_in_n ∧
+          ${mirror_truncation} ← full ∧
+          ${default_action} ← forward_flood ) ∧
+      ( if ${faithfulness}_post == D5.2_count_truncate then
+          ${mon_rule_capacity} ← unbounded ∧ ${workload_skew} ← uniform )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${faithfulness} ≠ D5.3_strict_scale"
+    kind: parameter
+    notes: "Paired ease counterpart of `tighten_faithfulness` — steps the ladder back and reverts entailed bindings."
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source to task.description so the SUT sees a
+      host-side reference implementation in addition to the behavioural spec
+      — the heaviest difficulty lever, load-bearing for
+      a `relocate` pattern where the baseline cannot redesign
+      the host-side observability agent from a behavioural spec alone.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: "Starter-library operator; pairs with `revert_input_form_to_behavioural`."
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`. The
+      default state for a relocate-frontier ceiling instance — the SUT must
+      design the clone/mirror + sampling pipeline from the behavioural spec
+      alone.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Scope note (the "weakest TPL fit" caveat, made precise):
+  P15 "runtime / meta NFs" spans THREE mechanism slices — (1) observability
+  (counters + sampled mirroring), (2) runtime pipeline reconfiguration
+  (re-keying tables / swapping the pipeline at runtime), and (3) NF-of-NFs
+  self-verification (a meta-NF that checks another NF's invariants live).
+  Only slice (1) is expressible in the v1.0 TPL vocabulary — `mirror` +
+  `inc` + the `persistence`/`no_loop`/`stability` invariants cover it
+  cleanly. Slices (2) and (3) need primitives the v1.0 language does not
+  have (runtime reconfiguration, cross-NF assertion) and are explicitly
+  v2-deferred — this pattern does NOT attempt them. That deliberate
+  narrowing is why P-RuntimeMeta is the thinnest extension pattern.
+
+  THE OBSERVABILITY GAP (the load-bearing caveat for instantiation +
+  difficulty calibration): per-rule counters are read by the CONTROL PLANE and never
+  appear in any packet, so in the v1.0 harness (which observes only the
+  packet trace — drop/forward/egress/transform) counter VALUE correctness
+  is not directly gradable. The oracle therefore grades:
+    - mirror behaviour (a copy on ${collector_port}) — OBSERVABLE;
+    - the 1-in-N sampling cadence of those copies — OBSERVABLE;
+    - the original forwarded byte-identical under mirror — OBSERVABLE;
+    - exactly-one copy / no mirror loop — OBSERVABLE;
+    - counter monotonicity / no-double-count — STRUCTURAL (oracle-side
+      counter trace, not a packet assertion).
+  Consequence for difficulty: the gradable difficulty lives in the clone/mirror
+  + sampling + truncation surface, NOT in counter granularity. Expect
+  `raise_counter_granularity` to show a near-null realised δ — it is
+  retained for surface completeness, but the harden levers
+  that actually move the baseline are `enable_mirror_truncation`,
+  `swap_sampling_to_count`, and `revert_input_form_to_behavioural`. This is
+  the same unobservable-axis bracketing P-NetCacheKV documents; if the
+  hardest instance cannot reach a genuine r* ≈ 0 on the OBSERVABLE surface,
+  the pattern is dropped to v2 rather than publishing a degenerate one.
+
+  Common implementations to v1model P4 (every entry `[common-knowledge baseline]`,
+  not RFC-cited):
+
+    Anchor (D5.0_mirror_all; sampling_policy = mirror_all,
+                 counter_granularity = packets_only, mon_match_fields =
+                 ipv4_dst_only, mirror_truncation = full, default_action =
+                 forward_flood):
+      - Tables: l2_fib_table (exact on ethernet.dstAddr → set_egress),
+        mon_rule_table (exact/ternary on the ${mon_match_fields} key →
+        set_mirror action carrying should_mirror + a direct_counter), keyed
+        and counted per matched rule.
+      - Mirror: a v1model clone — `clone3(CloneType.I2E, MIRROR_SESSION,
+        {})` (older) or `clone_preserving_field_list(...)` — with the mirror
+        session bound to ${collector_port} via the CLI
+        (`mirroring_add MIRROR_SESSION <collector_port>`). The clone fires
+        only inside the mirror action; the ORIGINAL keeps its
+        `egress_spec`. THE #1 bug: writing egress_spec / dropping the
+        original inside the mirror path (`forward_unmodified_under_mirror`).
+      - Counters: a `direct_counter(CounterType.packets_and_bytes)` attached
+        to mon_rule_table, `.count()`-ed in the action — control-plane-read,
+        not in the packet (the observability gap).
+      - no_loop: ${collector_port} must NOT be a monitored ingress; the
+        clone is I2E and never recirculated (`no_mirror_loop`).
+
+    D5.1 (hash 1-in-N + byte counters + 5-tuple): add the sample predicate
+    `hash(sample_hash, HashAlgorithm.crc16, 0, {ipv4.src, ipv4.dst,
+    ipv4.proto, l4.src, l4.dst}, N)` and clone only when the hash result ==
+    0; widen mon_rule_table to a 5-tuple ternary key; counter to
+    packets_and_bytes. The hash field-list / width is a common v1model hash-extern
+    bug magnet.
+
+    D5.2 (count-based 1-in-N + truncation + default-drop): replace the hash
+    with a per-rule skip register — `read; if (skip+1 >= N) { skip=0;
+    clone } else { skip=skip+1 }` — the inc-then-check off-by-one trap;
+    truncate the cloned copy to the header prefix (emit only L2/L3/L4 on the
+    clone, recompute length) while the original keeps its full payload;
+    R4 drops on FIB miss.
+
+    D5.3 (strict scale): bound mon_rule_table capacity to the installed
+    entry count under adversarial flow-tuples.
+
+  Anti-pattern implementations to reject during reference review:
+    * Cloning unconditionally / on the wrong predicate — leaks non-sampled
+      or non-mirror traffic to the collector
+      (`conditional_clone_only_on_sampled_path`).
+    * The mirror action hijacking/ dropping the ORIGINAL's forward decision
+      (`forward_unmodified_under_mirror`) — observation must be
+      non-destructive.
+    * A clone session that re-enters monitoring or a recirculated clone —
+      mirror storm (`no_mirror_loop`).
+    * Double-counting the cloned copy (`counter_no_double_count_on_clone`).
+    * Truncating the ORIGINAL instead of the clone, or mis-computing the
+      truncated length (`mirror_truncation_header_only`).
+    * inc-then-check off-by-one on the count-based sampler
+      (`sample_cadence_one_in_n`, exact variant).
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must all
+       pass validation.
+
+    2. The oracle MUST grade only the OBSERVABLE surface (mirror copy,
+       cadence, non-destructive forward, no-loop) plus the STRUCTURAL
+       counter checks — never assert a counter VALUE via the packet trace
+       (the observability gap). The oracle audit's canonical examples should
+       exercise `${sample_rate}` at its range extremes through runtime state,
+       per the parametric-source contract.
+
+    3. As a `relocate`-frontier pattern: if the
+       hardest instance cannot reach a genuine r* ≈ 0 on the observable
+       surface (the audit-cost / TPL-fit risk), the pattern is dropped to v2
+       rather than publishing a degenerate family. The
+       expected hardest lever is the behavioural-only D5.2 seed (count-based
+       cadence + header truncation, `revert_input_form_to_behavioural`); the
+       `ladder_input_form_to_python_ref` operator is the documented recovery
+       toward a discriminating difficulty.
+
+    4. The pattern composes as the observation overlay beside any forwarding
+       pattern (P-IPv4Routing, P-ACL): a P-RuntimeMeta instance whose base
+       FIB is replaced by a real router is a candidate composite
+       (P-TelemetryRouter). Within the v1
+       corpus the base forwarding is the trivial L2 FIB.

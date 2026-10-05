@@ -1,0 +1,868 @@
+task_name: ecn_marker_disc_mut3
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ECNMarker
+pattern_version: '1.0'
+
+seed:
+  access_port: 1
+  core_port:   2
+  marking_threshold_k:        64
+  min_threshold:              32
+  marking_probability_max:    1.0
+  marking_mode:               red_proportional
+  faithfulness:               D5.2_red_proportional
+  not_ect_action:             drop
+  ce_persistence_strict:      true
+  dscp_preservation_strict:   true
+  checksum_recompute:         required
+  queue_depth_signal:         synthetic_qdepth
+  non_ipv4_action:            drop
+  eligibility_protocol:       tcp_only
+  workload_skew:              uniform
+
+description: |
+  A switch s1 sits between two hosts and acts as an Active Queue
+  Management (AQM) block that performs Explicit Congestion Notification
+  (ECN) marking on IPv4 traffic per RFC 3168 and RFC 8257 (DCTCP). On
+  every IPv4 packet the switch sees on its tenant-facing port, it
+  observes a queue-depth signal carried by the test harness and decides
+  whether to (a) pass the packet through unchanged, (b) rewrite the
+  packet's ECN field from ECT(0) or ECT(1) to CE ("Congestion
+  Experienced") and forward the packet, or (c) drop the packet outright.
+
+  ## The ECN field
+
+  The 8-bit IPv4 ToS / DiffServ byte is split into two sub-fields per
+  RFC 3168 §5 / §19:
+
+    - The high 6 bits are the Differentiated Services Code Point (DSCP).
+      DSCP is the traffic-class label set by an upstream classifier.
+    - The low 2 bits are the ECN field. Its four codepoints are:
+        00 = Not-ECT  (the endpoints do not support ECN)
+        01 = ECT(1)
+        10 = ECT(0)
+        11 = CE        (Congestion Experienced)
+      Both ECT(0) and ECT(1) indicate the endpoints DO support ECN; they
+      are equivalent for marking purposes. CE indicates a router on the
+      path has observed congestion and has signalled it without dropping.
+
+  ## What the switch MUST do
+
+  The marking law is a Random Early Detection (RED) style proportional
+  ramp with two configured queue-depth thresholds:
+
+    - MIN_TH (in this deployment, 32) — the lower edge of the ramp.
+      Below this depth, no marking pressure: every eligible packet is
+      forwarded with the ECN field untouched.
+    - MAX_TH (in this deployment, 64; we keep the symbol K for the upper
+      edge) — the upper edge of the ramp. At and above this depth,
+      marking pressure is at its peak.
+    - P_MAX (in this deployment, 1.0) — the maximum marking probability,
+      reached at DEPTH = K and above.
+
+  Let DEPTH denote the queue-depth signal observed for the packet at
+  processing time. The test harness puts the synthetic DEPTH value in
+  the packet's IPv4 identification (`hdr.ipv4.id`) field before sending
+  each packet to the switch; the switch reads that field. (In production
+  this would be `enq_qdepth` / `deq_qdepth` metadata; the
+  identification-field carrier is a unit-testable substitute.)
+
+  The marking probability `MARK_P` for an eligible packet is computed as
+
+      if   DEPTH >= K:                 MARK_P = P_MAX
+      elif DEPTH >= MIN_TH and K > MIN_TH:
+                                       MARK_P = P_MAX * (DEPTH - MIN_TH) / (K - MIN_TH)
+      else:                            MARK_P = 0
+
+  The switch then draws a per-packet random value `U` uniformly from
+  [0, 1) and applies marking iff `U < MARK_P`.
+
+  **Deterministic test-harness convention.** For audit reproducibility,
+  the test harness used by this benchmark fixes `U = 0` on every packet
+  (the audited oracle reads U from `state[config]["rng_value"]`
+  and defaults to 0.0 when absent). Under U = 0, the comparison
+  `U < MARK_P` is true whenever MARK_P > 0, which in turn is true for
+  every DEPTH > MIN_TH. So the *effective* marking decision visible to
+  the test set is:
+
+      DEPTH <= MIN_TH       (DEPTH in 0..32):  NO marking pressure
+      MIN_TH < DEPTH < K    (DEPTH in 33..63): marking pressure FIRES (RED ramp)
+      DEPTH >= K            (DEPTH >= 64):     marking pressure FIRES (peak)
+
+  A program that does NOT implement the RED ramp (e.g., one that only
+  checks `DEPTH >= K`) passes packets at DEPTH 33..63 unmarked and fails
+  the mid-band tests. An implementation that wires U from a real per-packet
+  random source into the comparison
+  passes the deterministic-zone tests (since the deterministic zones
+  are MARK_P = 0 or MARK_P = 1, where U is irrelevant) — but the
+  benchmark cannot evaluate true RED behaviour on the mid-band tests
+  unless the program uses a deterministic U source as well. The simplest
+  conforming implementation is therefore: implement the RED ramp
+  exactly as written above, and use `U = 0` as the program's
+  per-packet random value. This is
+  the test-aware convention; the program does NOT need to source true
+  randomness for this benchmark.
+
+  Marking pressure does NOT mean unconditional CE rewrite — it interacts
+  with the packet's existing ECN codepoint per the rules in §§3-6
+  below. Numbered MUST / MUST-NOT statements:
+
+   1. **Eligibility short-circuit.**
+
+      a. Frames arriving on any port other than the tenant-facing port
+         (s1.p1) MUST be dropped before any ECN inspection.
+
+      b. Non-IPv4 frames (ARP, IPv6, MPLS, raw Ethernet) MUST be
+         dropped — ECN is an IPv4 / IPv6 feature, and this task is
+         scoped to IPv4 only; non-IP traffic has no ECN field to act on.
+
+      c. IPv4 frames whose L4 protocol is NOT TCP MUST be dropped
+         before any congestion / ECN check. This deployment follows
+         the DCTCP convention of marking TCP only (RFC 8257 §3.1):
+         IPv4/UDP, IPv4/ICMP, IPv4/GRE, IPv4/IPv6-in-IPv4, and every
+         other non-TCP IPv4 packet is rejected at the eligibility
+         stage. The drop is unconditional on DEPTH — non-TCP packets
+         are dropped whether DEPTH is above or below K. Only IPv4/TCP
+         packets proceed to the threshold / ECN decision in §§2-6.
+
+   2. **No marking pressure — passthrough.**
+
+      a. If DEPTH ≤ MIN_TH (i.e. the RED ramp computes MARK_P = 0), the
+         packet MUST be forwarded to s1.p2 unchanged. The 8-bit
+         ToS/DiffServ byte, including both the DSCP sub-field and the
+         ECN sub-field, MUST be preserved verbatim. The IPv4 header
+         checksum MUST remain unchanged (because no header field is
+         modified).
+
+   3. **Marking pressure on ECT — rewrite to CE.**
+
+      a. If the RED ramp fires (i.e. MARK_P > 0 AND U < MARK_P, which
+         under the test harness's U = 0 fixture means DEPTH > MIN_TH)
+         and the packet's ECN field is ECT(0) (`10`) or ECT(1) (`01`),
+         the switch MUST rewrite the ECN field to CE (`11`) and forward
+         the packet to s1.p2.
+
+      b. ONLY the 2-bit ECN sub-field of the ToS/DiffServ byte may
+         change. The 6-bit DSCP sub-field (the high 6 bits) MUST be
+         preserved exactly. An implementation that rewrites the full 8-bit ToS
+         byte clobbers DSCP and violates RFC 3168 §19 (DSCP / ECN
+         independence).
+
+      c. The IPv4 header checksum MUST be recomputed after the ECN-bit
+         rewrite, since the ToS/DiffServ byte is covered by the
+         checksum and its value has changed (RFC 791 §3.1, inherited).
+
+      d. Both ECT codepoints (`10` and `01`) behave identically — both
+         MUST be coerced to CE (`11`). They are equivalent for marking
+         purposes per RFC 3168 §6.1.1.
+
+   4. **Marking pressure on CE — preserve (no unmark).**
+
+      a. If the RED ramp fires and the packet's ECN field is CE (`11`)
+         on ingress, the switch MUST forward the packet to s1.p2 with
+         the ECN field STILL set to CE. RFC 3168 §6.1.5 is explicit:
+         "once the CE codepoint is set in a packet, the router MUST
+         NOT change the codepoint back to ECT or Not-ECT." CE is
+         irreversible at a single hop.
+
+      b. Since no header field is modified, the IPv4 checksum MUST
+         remain unchanged.
+
+   5. **Marking pressure on Not-ECT — drop.**
+
+      a. If the RED ramp fires and the packet's ECN field is Not-ECT
+         (`00`), the switch MUST drop the packet. RFC 3168 §6.1.2 is
+         binding
+         on this: "the router MUST NOT mark a packet as CE if the ECN
+         field is `00` (Not-ECT)" — Not-ECT packets indicate the
+         endpoints do not understand ECN, so marking them would be
+         silently lost; the only safe congestion signal for them is
+         drop.
+
+   6. **No marking pressure on Not-ECT — forwarded too.**
+
+      a. If MARK_P = 0 (DEPTH ≤ MIN_TH) and the packet's ECN field is
+         Not-ECT (`00`), the packet MUST be forwarded to s1.p2
+         unchanged — Not-ECT-on-congestion is a drop, but Not-ECT-
+         without-congestion is a legitimate non-ECN packet that the
+         router should forward.
+
+  ## Boundary semantics
+
+  The two ramp boundaries are MIN_TH (=32) and K (=64). The comparisons
+  match the formula above:
+
+    - At DEPTH = MIN_TH exactly: MARK_P = P_MAX * (32-32)/(64-32) = 0.
+      Under U=0 the comparison `U < MARK_P` is `0 < 0` = false, so
+      DEPTH = 32 is in the no-pressure zone (§§2, 6 fire).
+    - At DEPTH = MIN_TH + 1 (= 33): MARK_P > 0, so under U=0 the
+      ramp fires (§§3-5 fire).
+    - At DEPTH = K - 1 (= 63): MARK_P > 0, ramp fires.
+    - At DEPTH = K (= 64) exactly: MARK_P = P_MAX = 1.0, ramp fires
+      (deterministic ceiling).
+
+  ## Topology
+
+  Two hosts on a single switch s1:
+    - h1 attaches at s1.p1. h1's IPv4 address is 10.0.1.1; h1's MAC is
+      08:00:00:00:01:01.
+    - h2 attaches at s1.p2. h2's IPv4 address is 10.0.2.2; h2's MAC is
+      08:00:00:00:02:02.
+
+  Every test sends a packet from h1 to h2 with a specific synthetic
+  DEPTH value carried in the IPv4 identification field.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: below_threshold_ect_passthrough
+    visibility: public
+    description: |
+      No-marking-pressure ECT passthrough. DEPTH = 20 (≤ MIN_TH = 32);
+      ECN = ECT(0). MARK_P = 0, so the RED ramp does not fire. Forward
+      to s1.p2 with the ToS byte unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 20}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+        IP.id:  {action: unchanged}
+
+  - name: above_threshold_ect_marked
+    visibility: public
+    description: |
+      Above-threshold ECT mark. DEPTH = 100 (≥ K); ECN = ECT(0)
+      (tos = 0b00000010 = 2). The switch MUST forward the packet to
+      s1.p2 with the ECN bits rewritten to CE (tos = 0b00000011 = 3),
+      the IPv4 checksum recomputed, and DSCP unchanged (DSCP was 0
+      here; preservation is trivial but the action is on the bit
+      pattern).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 100}
+        - TCP:   {sport: 5001, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: above_threshold_ect_one_also_marked
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.1 codepoint equivalence. ECT(0) and ECT(1) are
+      equivalent for marking — both MUST be coerced to CE on congestion.
+      DEPTH = 100; ECN = ECT(1) (tos = 0b00000001 = 1). Expected output
+      ToS = 0b00000011 = 3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 1, id: 100}
+        - TCP:   {sport: 5002, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: ce_persists_above_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE persistence above threshold. DEPTH = 100;
+      ECN = CE already on ingress (tos = 0b00000011 = 3). The switch
+      MUST forward unchanged — CE is irreversible. Any modification to
+      the ECN bits, including a "remark to CE" that overwrites with the
+      same value, would invalidate the checksum unnecessarily, so the
+      program MUST take the no-op branch.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 100}
+        - TCP:   {sport: 5003, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: ce_persists_below_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE persistence in the no-pressure zone. DEPTH = 10
+      (well below MIN_TH = 32); ECN = CE on ingress. Forward unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 10}
+        - TCP:   {sport: 5004, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+# --- G2: robustness / boundary ---
+
+  - name: boundary_at_exactly_threshold_ect_marked
+    visibility: public
+    description: |
+      Boundary case at DEPTH = K = 64 exactly. ECN = ECT(0). MARK_P =
+      P_MAX = 1.0; `U < 1.0` is true for any U in [0, 1). Mark
+      deterministically.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 64}
+        - TCP:   {sport: 5005, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: boundary_at_threshold_minus_one_passthrough
+    visibility: hidden
+    description: |
+      Boundary case at DEPTH = MIN_TH = 32 exactly. ECN = ECT(0).
+      MARK_P = P_MAX * (32-32)/(64-32) = 0, so `U < 0` is false under
+      any U. Forward unchanged — DEPTH = MIN_TH is INSIDE the no-
+      pressure zone, not the ramp. An implementation that uses `DEPTH >=
+      MIN_TH` as the ramp-fire condition instead of `MARK_P > 0`
+      (equivalently `DEPTH > MIN_TH`) would mark here and fail.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 32}
+        - TCP:   {sport: 5006, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: dscp_high_value_preserved_under_mark
+    visibility: hidden
+    description: |
+      DSCP preservation at non-zero DSCP. The input ToS byte is
+      0b10100010 = 162 (DSCP = 0b101000 = 40 = CS5; ECN = ECT(0)).
+      DEPTH = 80 (≥ K). Expected output ToS = 0b10100011 = 163 —
+      DSCP unchanged (0b101000), ECN rewritten to CE (0b11). An implementation
+      that writes the full 8-bit ToS byte instead of bit-masking the
+      low 2 bits will clobber DSCP and fail.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 162, id: 80}
+        - TCP:   {sport: 5007, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 163}
+
+# --- G3: security / bypass ---
+
+  - name: not_ect_above_threshold_drop_not_silent_mark
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.2 MUST: Not-ECT on congestion MUST be dropped,
+      NOT marked. DEPTH = 100 (≥ K); ECN = Not-ECT (tos = 0). A
+      program that implements "any packet above K → mark with CE"
+      silently coerces Not-ECT to CE and violates the spec — the
+      endpoints would not understand the CE signal anyway, so this
+      bug is silently lost on the wire.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 100}
+        - TCP:   {sport: 5008, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: dscp_preservation_under_mark
+    visibility: hidden
+    description: |
+      RFC 3168 §19 DSCP / ECN independence — security-grade check.
+      Input ToS = 0b00101000_10 written byte-wise as 0b00101010 = 42
+      (DSCP = 0b001010 = 10 = AF11; ECN = ECT(0)). DEPTH = 80 (≥ K).
+      Expected output ToS = 0b00101011 = 43 — DSCP unchanged, ECN
+      now CE. This is the common v1model "write-too-wide
+      on bit-packed field" bug; an implementation that writes the full
+      8-bit `hdr.ipv4.diffserv` will overwrite the AF11 marking.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 42, id: 80}
+        - TCP:   {sport: 5009, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 43}
+
+  - name: ce_no_silent_unmark_below_threshold
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE-no-unmark — security-grade check. DEPTH = 0
+      (deep below threshold); ECN = CE on ingress (tos = 3). An implementation
+      that implements "below threshold → write ECN bits to ECT(0)"
+      (a "renormalise" misreading) silently unmarks CE, hiding
+      upstream-detected congestion from the receiver. Expected:
+      ToS preserved at 3.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 0}
+        - TCP:   {sport: 5010, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: not_ect_below_threshold_passthrough
+    visibility: hidden
+    description: |
+      Below-threshold Not-ECT is forwarded, NOT dropped. Not-ECT-
+      on-congestion is a drop (per case 5); Not-ECT-without-
+      congestion is a legitimate non-ECN packet that the router
+      forwards unmolested. DEPTH = 10; ECN = Not-ECT. Catches a
+      common over-broad reading of the §6.1.2 MUST that drops ALL
+      Not-ECT packets regardless of congestion state.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 10}
+        - TCP:   {sport: 5011, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+# --- G3: TCP-only eligibility checks (activated under tcp_only) ---
+
+  - name: udp_above_threshold_dropped_under_tcp_only
+    visibility: public
+    description: |
+      TCP-only eligibility check under congestion (§1c). DEPTH = 100
+      (≥ K), but the L4 protocol is UDP, not TCP. The packet MUST be
+      DROPPED at the eligibility stage before any ECN inspection.
+      ECN = ECT(0) on ingress — the program MUST NOT mark and forward;
+      the §1c eligibility short-circuit takes priority over the
+      §3 above-threshold mark path.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 100}
+        - UDP:   {sport: 5100, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: udp_below_threshold_dropped_under_tcp_only
+    visibility: hidden
+    description: |
+      TCP-only eligibility unconditional on DEPTH (§1c). DEPTH = 10
+      (< K), L4 = UDP. The §1c eligibility short-circuit fires
+      regardless of depth; the packet MUST be dropped. An implementation that
+      only checks the protocol field on the above-threshold mark
+      branch would forward this UDP packet (because the threshold
+      check is false) and fail the test.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 10}
+        - UDP:   {sport: 5101, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: icmp_dropped_under_tcp_only
+    visibility: hidden
+    description: |
+      TCP-only eligibility for non-UDP, non-TCP L4 (§1c). ICMP is
+      neither TCP nor UDP — it is a distinct L4 protocol (proto = 1)
+      with no port fields. An implementation that conditions on `proto == 17`
+      (UDP) instead of `proto != 6` (not-TCP) would treat ICMP as
+      "TCP enough" and let it through. DEPTH = 80; expected: drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 80}
+        - ICMP:  {type: 8, code: 0}
+    expected:
+      behavior: drop
+
+# --- G2: RED-ramp mid-band boundary checks (activated under D5.2) ---
+
+  - name: red_ramp_just_above_min_threshold_ect_marked
+    visibility: public
+    description: |
+      RED-ramp check at the lower edge. DEPTH = 33 (MIN_TH + 1); ECN
+      = ECT(0). MARK_P = 1.0 * (33-32)/(64-32) = 1/32 ≈ 0.031. Under
+      U = 0 (the deterministic test fixture), the comparison
+      `0 < 0.031` is true, so the ramp fires and the ECT bits MUST
+      be rewritten to CE. An implementation that uses `DEPTH >= K = 64` as
+      the marking condition (the D5.1 / parent / mut1 law) FORWARDS
+      this packet unmarked and fails. A program that implements the
+      RED ramp with `DEPTH > MIN_TH` (equivalently `MARK_P > 0`)
+      passes.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 33}
+        - TCP:   {sport: 5200, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: red_ramp_just_below_k_ect_marked
+    visibility: hidden
+    description: |
+      RED-ramp check at the upper edge. DEPTH = 63 (K - 1); ECN =
+      ECT(0). MARK_P = 1.0 * (63-32)/(64-32) = 31/32 ≈ 0.969. Under
+      U = 0 the ramp fires; mark ECT → CE. Pairs with the lower-edge
+      test to enclose the ramp.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 63}
+        - TCP:   {sport: 5201, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: red_ramp_not_ect_dropped_in_ramp_zone
+    visibility: hidden
+    description: |
+      RED-ramp check with Not-ECT in the ramp zone. DEPTH = 40 (in
+      [MIN_TH + 1, K - 1]); ECN = Not-ECT. MARK_P = 1.0 * (40-32)/
+      (64-32) = 0.25; U = 0 < 0.25 = true → ramp fires. RFC 3168
+      §6.1.2: Not-ECT under marking pressure MUST drop. An implementation
+      that only checks `DEPTH >= K = 64` would forward this Not-ECT
+      packet (wrong) or even mark it as CE (worse).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 40}
+        - TCP:   {sport: 5202, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+# --- Added adversarial hidden tests beyond pattern scaffolding ---
+# Pattern + seed + oracle unchanged.
+# These test failure-mode invariants not covered by mut2's 18 cases:
+# R0 wrong-port priority, R1 non-IPv4 drop, extreme depth values, DSCP and
+# CE invariants inside the RED ramp zone, MIN_TH boundary across all four
+# ECN codepoints, K boundary with Not-ECT.
+
+  - name: wrong_port_tcp_eligible_dropped
+    visibility: hidden
+    description: |
+      R0 wrong-port priority over R2/R3/R4. The packet is a fully eligible
+      TCP packet at DEPTH = 100 (above K) with ECN = ECT(0) — under normal
+      flow this would mark to CE. But the ingress is s1.p2 (the core-facing
+      port, NOT the tenant-facing s1.p1 access port). The wrong-port
+      eligibility short-circuit (§1a) MUST fire first; the packet is
+      dropped before any congestion / ECN check is reached. An implementation that
+      checks port eligibility only after marking pressure is computed (or
+      that omits the wrong-port check entirely) would mark and forward and
+      fail.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, tos: 2, id: 100}
+        - TCP:   {sport: 5300, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: wrong_port_udp_R0_takes_priority_over_R2
+    visibility: hidden
+    description: |
+      R0 priority over R2 (TCP-only eligibility) is a stronger test than
+      the plain wrong-port case. The packet is UDP on s1.p2 at DEPTH = 10.
+      Under right-port ingress R2 (non-TCP drop) would fire; under wrong
+      ingress R0 fires. The packet MUST drop, but the discriminator is
+      that a program implementing only the R2 path (UDP→drop on the right
+      port) and forwarding everything else on s1.p2 unconditionally would
+      get this wrong.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.1", ttl: 64, tos: 0, id: 10}
+        - UDP:   {sport: 5301, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: non_ipv4_arp_dropped
+    visibility: hidden
+    description: |
+      R1 non-IPv4 eligibility short-circuit (§1b). An ARP request frame
+      on the access port s1.p1. ECN is an IPv4 / IPv6 feature, so the
+      frame MUST be dropped before any congestion / ECN decision is
+      reached. An implementation that uses the v1model `default action` deparser
+      pattern (parser reaches `accept` regardless of ethertype, then
+      `MyIngress` looks at `hdr.ipv4.isValid()`) handles this correctly;
+      an implementation that conditions only on `hdr.tcp.isValid()` and forwards
+      everything else unconditionally would forward this ARP packet and
+      fail.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02", type: 0x0806}
+        - ARP:   {psrc: "10.0.1.1", pdst: "10.0.2.2", hwsrc: "08:00:00:00:01:01"}
+    expected:
+      behavior: drop
+
+  - name: depth_zero_ect_passthrough
+    visibility: hidden
+    description: |
+      Extreme low depth boundary. DEPTH = 0 (the absolute minimum); ECN =
+      ECT(0). MARK_P = 0; no marking pressure. Forward unchanged. Probes
+      whether the program handles the `depth == 0` case correctly — an
+      implementation that conditions on `depth > 0` (perhaps as a "is there a
+      depth signal?" check) would skip ECN handling entirely or default
+      to dropping; both fail this case.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 0}
+        - TCP:   {sport: 5302, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: depth_max_u16_ect_marked
+    visibility: hidden
+    description: |
+      Extreme high depth boundary. DEPTH = 65535 (the maximum the 16-bit
+      hdr.ipv4.identification field can carry); ECN = ECT(0). DEPTH ≫ K,
+      so MARK_P = P_MAX = 1.0; mark to CE. Probes for u16 overflow /
+      truncation bugs in the program's depth comparison (e.g., an implementation
+      that reads only the low 8 bits of identification and computes 65535
+      mod 256 = 255 versus a hypothetical K=64 would still mark, but
+      reads of the upper byte that mis-sign-extend would not).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 2, id: 65535}
+        - TCP:   {sport: 5303, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 3}
+
+  - name: dscp_preserved_in_red_ramp_mid_zone
+    visibility: hidden
+    description: |
+      DSCP preservation invariant under marking pressure in the RED ramp
+      zone (not just above K). DEPTH = 40; input ToS = 50 = 0b001100_10
+      (DSCP = 0b001100 = 12 = AF22; ECN = ECT(0)). Under U=0 the ramp
+      fires (MARK_P = 0.25 > 0). Expected: ToS = 51 = 0b001100_11 (DSCP
+      preserved, ECN now CE). The discriminator is an implementation that writes
+      the full 8-bit `hdr.ipv4.diffserv` byte (e.g., `= 8w0b00000011`)
+      and clobbers DSCP to 0; mut2's existing dscp_preservation test
+      uses DEPTH = 80 (above-K deterministic zone), so an implementation that
+      only implemented the bit-precise rewrite on the above-K path would
+      still pass mut2 but fail here.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 50, id: 40}
+        - TCP:   {sport: 5304, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 51}
+
+  - name: ce_persists_in_red_ramp_mid_zone
+    visibility: hidden
+    description: |
+      RFC 3168 §6.1.5 CE persistence invariant in the RED ramp mid-band
+      (not just above K). DEPTH = 50; ECN = CE on ingress (tos = 3). The
+      ramp fires (MARK_P > 0), but R5's "CE preserve" branch takes
+      precedence — a CE packet that already signals congestion is
+      forwarded unchanged with no further header modification. An implementation
+      that applies the mark write unconditionally in the ramp zone
+      (e.g., `if marking_pressure: hdr.ipv4.ecn = 2w0b11`) overwrites CE
+      with CE (no value change) but unnecessarily forces a checksum
+      recompute — which is a §6.1.5 violation only in spirit, not in
+      bit-output. The strict G3 test of this is harder to assert from
+      the wire; the load-bearing assertion is that the output ToS is
+      bit-for-bit unchanged (3, not anything else).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 50}
+        - TCP:   {sport: 5305, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: min_th_boundary_not_ect_passthrough
+    visibility: hidden
+    description: |
+      Boundary completeness at DEPTH = MIN_TH = 32 with ECN = Not-ECT
+      (`00`). MARK_P = 0 (since DEPTH = MIN_TH, not >). No marking
+      pressure; Not-ECT-without-pressure is forwarded unchanged (per
+      §6: only Not-ECT-with-pressure drops). Pairs with mut2's
+      `boundary_at_threshold_minus_one_passthrough` (ECT at DEPTH=32)
+      and the new `min_th_boundary_ce_passthrough` (CE at DEPTH=32) to
+      enclose the MIN_TH boundary across three of the four ECN
+      codepoints.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 32}
+        - TCP:   {sport: 5306, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: min_th_boundary_ce_passthrough
+    visibility: hidden
+    description: |
+      Boundary completeness at DEPTH = MIN_TH = 32 with ECN = CE (`11`).
+      No marking pressure (MARK_P = 0 at the boundary itself); R5 still
+      preserves CE on egress. Forward unchanged. Pairs with the
+      Not-ECT@32 and ECT@32 cases to enclose MIN_TH across codepoints.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 32}
+        - TCP:   {sport: 5307, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: min_th_plus_one_not_ect_dropped
+    visibility: hidden
+    description: |
+      Strict-boundary symmetry. DEPTH = 33 (MIN_TH + 1); ECN = Not-ECT.
+      MARK_P = 1/32 ≈ 0.031; U = 0 < 0.031 → ramp fires. The Not-ECT-
+      under-pressure drop rule (§5) applies even at the very lowest
+      ramp-fire depth. This pairs with the ECT@33 mark test to enclose
+      the lower ramp edge on both ECT and Not-ECT — an implementation that
+      conditions Not-ECT drop on `DEPTH >= K = 64` (the D5.1 / mut1
+      law) but conditions ECT mark on `DEPTH > MIN_TH` (the new D5.2
+      law) would still mark ECT@33 but forward Not-ECT@33 unmarked,
+      failing this case.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 33}
+        - TCP:   {sport: 5308, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: k_minus_one_ce_persists
+    visibility: hidden
+    description: |
+      Upper-ramp-edge CE persistence. DEPTH = 63 (K - 1); ECN = CE on
+      ingress. The ramp fires (MARK_P ≈ 0.97), but R5 preserves CE
+      unchanged. Probes the interaction between marking pressure
+      decision and CE persistence at the upper ramp boundary — an
+      implementation that uses `depth >= K = 64` as its mark condition would
+      passthrough CE here unchanged (correct outcome but for the wrong
+      reason); the real assertion is that CE persistence holds even
+      where the ramp law fires.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 3, id: 63}
+        - TCP:   {sport: 5309, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: k_exactly_not_ect_dropped
+    visibility: hidden
+    description: |
+      K-boundary completeness with Not-ECT. DEPTH = 64 (K exactly); ECN
+      = Not-ECT. MARK_P = P_MAX = 1.0 (peak); Not-ECT-under-peak-
+      pressure drops. Pairs with mut2's `boundary_at_exactly_threshold_
+      ect_marked` (ECT@64) to enclose the K boundary across both
+      pressured ECN codepoints. An implementation with `DEPTH > K = 64` (strict
+      `>`) would let this Not-ECT packet escape unmarked at K exactly,
+      failing both this case and the ECT counterpart.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0, id: 64}
+        - TCP:   {sport: 5310, dport: 80, flags: "S"}
+    expected:
+      behavior: drop

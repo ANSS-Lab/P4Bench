@@ -1,0 +1,263 @@
+task_name: mpls_label_switch_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-MPLSLabelSwitch
+pattern_version: '1.0'
+
+seed:
+  lfib_capacity: unbounded
+  enable_pop: false
+  enable_push: false
+  reserved_label_policy: drop
+  faithfulness: D.swap_only
+
+description: |
+  Implement a transit MPLS Label-Switching Router (LSR) on a single switch s1
+  (RFC 3031 / RFC 3032). MPLS-labelled frames carry a label stack followed by an
+  IPv4 payload. The switch forwards each frame according to its TOP label and the
+  label-forwarding policy below, and drops anything the policy does not cover.
+
+  ## Label-forwarding policy (top label → out-label, egress)
+
+  Each row replaces the top label with its out-label and forwards the frame out
+  the egress port; the control plane installs these as table entries.
+
+    | top label | out label | egress port | next-hop MAC      | egress-port MAC   |
+    |-----------|-----------|-------------|-------------------|-------------------|
+    | 100       | 200       | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 300       | 400       | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+   - A frame that is not MPLS-labelled is dropped.
+   - The top label's MPLS TTL is decremented by one on egress; a frame whose top
+     label arrives with TTL 0 or 1 is dropped rather than forwarded.
+   - On a policy hit the top label is replaced with its out-label and the frame
+     is forwarded out the bound egress port, with the Ethernet source set to the
+     egress port's own MAC and the destination set to the next-hop MAC. Any
+     labels beneath the top, and the encapsulated IPv4 packet (including its
+     TTL), are left unchanged.
+   - A frame whose top label is not covered by the policy — including reserved
+     labels that are not installed — is dropped.
+
+  ## Topology
+
+  One switch s1 with three ports (p1 ingress; p2/p3 egress toward downstream
+  LSRs). s1.p2 MAC 08:00:00:00:02:00, s1.p3 MAC 08:00:00:00:03:00.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.1.1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "10.0.2.2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "10.0.3.3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: swap_label_100
+    visibility: public
+    description: |
+      A frame whose top label is 100.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        MPLS.label: {action: change_to, value: 200}
+        MPLS.ttl:   {action: decremented_by, delta: 1}
+        Ether.src:  {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst:  {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:     {action: unchanged}
+        IP.dst:     {action: unchanged}
+
+  - name: swap_label_300
+    visibility: public
+    description: |
+      A frame whose top label is 300.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 300, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        MPLS.label: {action: change_to, value: 400}
+        MPLS.ttl:   {action: decremented_by, delta: 1}
+        Ether.src:  {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst:  {action: change_to, value: "08:00:00:00:03:03"}
+
+  - name: drop_mpls_ttl_one
+    visibility: public
+    description: |
+      A frame whose top label is 100 but whose MPLS TTL is 1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 1, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: swap_two_label_stack_top_only
+    visibility: hidden
+    description: |
+      A two-label stack (top 100, S=0; inner 50, S=1). Only the TOP label is
+      swapped to 200; the inner label 50 is preserved. Forwards out s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 64, s: 0, cos: 0}
+        - MPLS:  {label: 50, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        MPLS.label: {action: change_to, value: 200}
+        MPLS.ttl:   {action: decremented_by, delta: 1}
+
+  - name: swap_preserves_inner_ip
+    visibility: hidden
+    description: |
+      The inner IPv4 packet (its destination and TTL) is unchanged across the
+      label swap — MPLS swap does not touch the inner IP TTL.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.5.5", dst: "10.0.8.8", ttl: 33}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        MPLS.label: {action: change_to, value: 200}
+        IP.ttl:     {action: unchanged}
+        IP.dst:     {action: unchanged}
+        IP.src:     {action: unchanged}
+
+  - name: swap_ttl_two_egress_one
+    visibility: hidden
+    description: |
+      Top-label TTL 2 forwards (not drops) with egress TTL 1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 2, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        MPLS.label: {action: change_to, value: 200}
+        MPLS.ttl:   {action: change_to, value: 1}
+
+# --- G2: robustness / boundary ---
+
+  - name: drop_unknown_label
+    visibility: hidden
+    description: |
+      Top label 999 is not in the LFIB → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 999, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: drop_mpls_ttl_zero
+    visibility: hidden
+    description: |
+      Top-label TTL 0 → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 100, ttl: 0, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+# --- G3: out of scope ---
+
+  - name: drop_non_mpls
+    visibility: hidden
+    description: |
+      A plain IPv4 frame (EtherType 0x0800, no MPLS shim) is out of scope for
+      this LSR → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: drop_reserved_label_explicit_null
+    visibility: hidden
+    description: |
+      The reserved IPv4 explicit-null label 0 is not installed in the LFIB →
+      drop (it is not a transit-swappable label here).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 0, ttl: 64, s: 1, cos: 0}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: swap_label_300_to_p3
+    visibility: hidden
+    description: |
+      A labeled packet with top label 300 is label-switched out s1.p3 with its
+      Ethernet addresses rewritten for the next hop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00", type: 0x8847}
+        - MPLS:  {label: 300, ttl: 50, s: 1, cos: 0}
+        - IP:    {src: "10.0.2.2", dst: "10.0.8.8", ttl: 40}
+        - UDP:   {sport: 6000, dport: 7000}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        MPLS.label: {action: change_to, value: 400}
+        MPLS.ttl:   {action: decremented_by, delta: 1}
+        Ether.src:  {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst:  {action: change_to, value: "08:00:00:00:03:03"}

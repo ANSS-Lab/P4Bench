@@ -1,0 +1,143 @@
+{
+  "oracle_hash": "6d96ce6201f73910725ce9878d1616f3a7aa30251a7e982c760938ac05c44ada",
+  "instance": "netlock_anchor_mut2-shared_fifo",
+  "ran_at": "2026-06-16T21:32:05.699499Z",
+  "canonical_examples": {
+    "passed": 16,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_lock_frame_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_lock_free_grant",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_lock_held_deny_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_lock_held_deny_nack",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_unlock_holder_release",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_then_relock_grant",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5x_unlock_non_holder_deny",
+        "status": "pass"
+      },
+      {
+        "example_id": "holder_check_off_any_release",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_unlock_not_held_noop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_shared_compatible_grant",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_exclusive_denied_while_shared",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4s_shared_release_coreader_blocks_exclusive",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3b_lock_held_enqueue",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_unlock_grant_fifo_head",
+        "status": "pass"
+      },
+      {
+        "example_id": "independent_locks_isolated",
+        "status": "pass"
+      },
+      {
+        "example_id": "hash_index_aliased_collision_deny",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "mutual_exclusion": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "reader_writer_exclusion": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "holder_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "release_grants_free": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_locks": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "lock_fairness": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      }
+    },
+    "uncovered": [
+      "mutual_exclusion",
+      "reader_writer_exclusion",
+      "holder_persistence",
+      "release_grants_free",
+      "no_orphan_locks",
+      "lock_fairness"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Yu et al., NetLock: Fast, Centralized Lock Management Using Programmable Switches, SIGCOMM/NSDI 2020",
+      "Mellor-Crummey & Scott, Algorithms for Scalable Synchronization on Shared-Memory Multiprocessors (MCS locks), ACM TOCS 1991"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

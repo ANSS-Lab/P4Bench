@@ -1,0 +1,154 @@
+{
+  "oracle_hash": "b5138cd8cbd631b27f87b42cc68312292e36e4d0ce5a5f5e057ef140b95bee32",
+  "instance": "stateful_fw_tpl_mut1-default",
+  "ran_at": "2026-06-17T14:20:55.015637Z",
+  "canonical_examples": {
+    "passed": 14,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop_internal",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_internal_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_acl_permit_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_no_acl_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "external_non_tcp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "internal_lpm_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "stateless_return_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "reflexive_return_admitted",
+        "status": "pass"
+      },
+      {
+        "example_id": "capacity_evict_oldest_return_dropped",
+        "status": "pass"
+      },
+      {
+        "example_id": "capacity_strict_first_flow_survives",
+        "status": "pass"
+      },
+      {
+        "example_id": "d52_outbound_in_subnet_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "d52_outbound_spoofed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "d52_reflexive_synack_admitted",
+        "status": "pass"
+      },
+      {
+        "example_id": "d52_reflexive_bare_ack_handshake_violation_dropped",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "default_deny_external": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "state_consistency_under_eviction": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_flow_state": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_spoofed_outbound": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_zero_ttl_emission": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_fragment_inspection": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "default_deny_external",
+      "state_consistency_under_eviction",
+      "no_orphan_flow_state",
+      "no_loop",
+      "bounded_latency",
+      "no_spoofed_outbound",
+      "no_zero_ttl_emission",
+      "no_fragment_inspection"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "tea_sigcomm20",
+      "ribosome_nsdi23",
+      "mantis_sigcomm20",
+      "RFC2979",
+      "RFC5382"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

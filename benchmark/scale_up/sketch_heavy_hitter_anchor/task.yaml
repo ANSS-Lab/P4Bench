@@ -1,0 +1,525 @@
+task_name: sketch_heavy_hitter_anchor
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-SketchHeavyHitter
+pattern_version: '1.0'
+seed:
+  flowkey_fields:
+  - hdr.ipv4.srcAddr
+  sketch_type: count_min
+  sketch_depth: 2
+  sketch_width: 16
+  max_register_cells: 4096
+  counter_width_bits: 32
+  hash_polynomial: crc32
+  hash_independence: pairwise
+  heavy_threshold: 4
+  heavy_capacity: 256
+  heavy_eviction: replace_min
+  epoch_packets: 1048576
+  epoch_seconds: 60
+  epoch_trigger: both
+  readout_mode: threshold_emit
+  faithfulness: D5.2_heavy_hitter
+  n_levels: 1
+  workload_skew: adversarial_collision
+  forwarding_independence_strict: false
+description: |
+  A switch s1 sits between two hosts and forwards IPv4 traffic by
+  longest-prefix match on the destination address, while continuously
+  estimating how often each IPv4 source address is seen. Unlike a passive
+  monitor, this switch ACTS on the estimate: any source that the estimate
+  identifies as a heavy hitter has its over-threshold traffic discarded
+  (policed). The estimator must use a fixed-size shared record so its memory
+  does not grow with the number of distinct sources observed.
+
+  ## Topology and roles
+
+    - s1.p1 — the port that faces host h1 (10.0.1.1, 08:00:00:00:01:01).
+    - s1.p2 — the port that faces host h2 (10.0.2.2, 08:00:00:00:02:02).
+
+  The control plane installs an IPv4 routing table covering 10.0.1.0/24
+  (egress s1.p1) and 10.0.2.0/24 (egress s1.p2) with the corresponding
+  next-hop hardware addresses. A datagram whose destination matches no
+  routing entry MUST be discarded.
+
+  ## Eligibility
+
+  A frame is eligible only if it carries an IPv4 datagram. Non-IPv4 frames
+  (e.g. ARP) MUST be discarded; they MUST NOT be forwarded, MUST NOT alter
+  any internal estimation state, and MUST NOT produce a response.
+
+  ## Frequency estimation and the heavy-hitter rule
+
+  For every eligible IPv4 datagram the switch updates a fixed-size frequency
+  estimator keyed by the IPv4 SOURCE address, then reads back an estimate of
+  how many datagrams that source has contributed in the current observation
+  window. The estimator maintains a Count-Min sketch: TWO counter rows, each
+  of width 16 cells, and each row is indexed by an INDEPENDENT hash of the
+  source address (so two sources that collide in one row generally land in
+  different cells of the other). On each eligible datagram both of the
+  source's row cells are incremented. A source's frequency estimate is the
+  MINIMUM of its two row cells. Because the rows are fixed-size and shared
+  across sources, this estimate may OVER-count when sources collide in a row,
+  but it NEVER under-counts: the reported estimate for a source is at least
+  its true count. Taking the minimum across the two independently-hashed rows
+  bounds the over-count — a source that merely shares ONE of its two row
+  cells with a heavy source (but not the other) keeps its estimate clipped by
+  the unshared row, so it MUST NOT be reported as heavy on that basis alone.
+
+  A source is a HEAVY HITTER once its estimate reaches 4 (estimate >= 4). The
+  estimator is updated for the current datagram BEFORE this comparison, so
+  the datagram that brings a source's estimate up to 4 is itself classified
+  as belonging to a heavy hitter.
+
+  ## Required per-datagram behaviour
+
+    1. Update the source-frequency estimator for the datagram's IPv4 source.
+    2. If the source's resulting estimate is below 4, the datagram is a
+       normal (light) datagram: forward it by longest-prefix match on its
+       destination. The forwarded datagram MUST have its Ethernet source set
+       to the matching route's outgoing-side hardware address, its Ethernet
+       destination set to the next-hop hardware address, its IPv4 hop count
+       decremented by exactly one, and every other field byte-identical to
+       the received datagram. A destination matching no route is discarded.
+    3. If the source's resulting estimate has reached 4, the source is a
+       heavy hitter and THIS datagram (and every later datagram from that
+       source in the same window) MUST be DROPPED — not forwarded, not
+       mirrored. This policing is the only observable readout of the
+       detector.
+
+  Distinct sources are tracked independently: one source becoming heavy MUST
+  NOT cause datagrams of an unrelated, under-threshold source to be dropped.
+
+  Discarded datagrams (ineligible, policed, or unroutable) produce NO output.
+
+  ## Observation window
+
+  The estimator is bounded to an observation window whose end is recognised
+  by a packet-count threshold or a wall-clock duration configured by the
+  control plane; at the window boundary the record is reset to zero. The
+  test corpus does not place any datagram near the window boundary.
+
+  Grounded in the Sonata (SIGCOMM '18) reduce-by-key telemetry pattern and
+  SketchLib's (NSDI '22) catalogue of in-network frequency estimators,
+  specialised to a drop-on-threshold policing readout.
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+test_cases:
+- name: light_flow_forwarded
+  visibility: public
+  description: A source (10.0.1.1) that has been seen only once is well below the heavy-hitter threshold, so its packet is forwarded normally out the destination's port (10.0.2.2 -> s1.p2) with the next-hop MAC rewrite and the hop count decremented by one. The frequency estimate does not reach the threshold, so no policing occurs.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: heavy_flow_policed_dropped
+  visibility: public
+  description: Source 10.0.1.2 has already had three packets observed. A fourth packet pushes its frequency estimate to the heavy-hitter level, so the source is classified as a heavy hitter and THIS packet is DROPPED (policed) rather than forwarded.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_drop
+  visibility: public
+  description: A non-IPv4 frame (ARP) is dropped unconditionally and never updates the frequency estimate — eligibility is unchanged from the base NF.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+- name: heavy_flow_stays_policed_after_crossing
+  visibility: hidden
+  description: After 10.0.1.2 has crossed the threshold (four prior packets), a fifth packet of the same source is STILL dropped — once a source is a heavy hitter for the window, all of its further packets are policed.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: third_packet_still_below_threshold_forwards
+  visibility: hidden
+  description: The third packet of source 10.0.1.2 brings its estimate to 3, still below the heavy-hitter level, so it is forwarded normally. Detection fires only when the estimate REACHES that level, not before.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: collision_innocent_flow_not_false_positive
+  visibility: hidden
+  description: 'An innocent source (10.0.2.2) shares ONE of its two hash buckets with the heavy source 10.0.1.2 but not the other. After four packets of 10.0.1.2 have inflated the shared bucket, a single packet of 10.0.2.2 is forwarded normally (out s1.p1 toward 10.0.1.1): its frequency estimate stays below the heavy-hitter level because the unshared bucket clips it, so the innocent flow is not falsely classified as heavy.'
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: heavy_flow_other_direction_policed
+  visibility: hidden
+  description: A heavy source on the return path (10.0.2.2 sending toward 10.0.1.1) is policed the same way once its estimate crosses the threshold — the drop verdict is independent of forwarding direction.
+  prior_inputs:
+  - port: s1.p2
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  - port: s1.p2
+    layers: *id002
+  - port: s1.p2
+    layers: *id002
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: light_flow_forwards_under_heavy_noise
+  visibility: hidden
+  description: Even after the heavy source 10.0.1.2 has been policed, an unrelated light source 10.0.1.1 (disjoint counters) is forwarded normally — heavy classification is per-source, not global.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: under_threshold_lpm_miss_drop
+  visibility: hidden
+  description: An under-threshold source whose destination matches no routing entry (192.168.99.99) is dropped by the routing default — independent of the heavy-hitter logic.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 192.168.99.99
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: heavy_source_first_packet_forwards
+  visibility: hidden
+  description: The very first packet of source 10.0.1.2 (estimate 1) is forwarded normally — a source becomes heavy only after enough packets accumulate to reach the threshold.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 1000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: exactly_at_threshold_drops
+  visibility: hidden
+  description: The packet that brings 10.0.1.2's estimate up to exactly the heavy-hitter level is policed — the comparison is estimate >= the level, so the boundary packet itself is dropped, not the one after it.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.2.2
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 2000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: non_ipv4_drop_with_active_heavy
+  visibility: hidden
+  description: An ARP frame is dropped regardless of any heavy-hitter state and never perturbs the sketch — R0 fires before the eligibility check.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

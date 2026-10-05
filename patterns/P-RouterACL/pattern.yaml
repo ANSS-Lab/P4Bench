@@ -1,0 +1,1362 @@
+# P-RouterACL — Edge: IPv4 Unicast Router ∘ Stateless ACL (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-IPv4Routing (destination-based LPM
+# forwarder, RFC 1812) with P-ACL (stateless TCAM-style priority
+# classifier, RFC 3198 / P4Runtime §9.1) into a single edge / access
+# router — the canonical "router with an ACL" every campus, branch, and
+# datacenter top-of-rack switch deploys: an inbound packet is first
+# classified by a control-plane-installed ACL, and only packets the ACL
+# admits proceed to the IPv4 forwarding decision.
+#
+# The value of this *chained* pattern (versus instantiating P-IPv4Routing
+# and P-ACL independently) is the STAGE-ORDERING contract between the two
+# stateless stages — a contract that is invisible when the components are
+# tested in isolation:
+#   (a) the ACL stage executes BEFORE the FIB, so a denied packet is never
+#       routed (no FIB lookup, no L2 rewrite, no TTL decrement);
+#   (b) an ACL `redirect` verdict OVERRIDES the FIB's egress decision —
+#       the policy port wins over the longest-prefix-match port;
+#   (c) an ACL `mark` verdict rewrites DSCP and THEN routes, so the IPv4
+#       header checksum must be recomputed exactly once over BOTH the DSCP
+#       rewrite AND the routing TTL decrement.
+# See `bridging_notes:` for the v1model failure modes this composition
+# exposes that neither standalone pattern reaches.
+#
+# The cross-axis
+# `composition` target_capability tag is used because this
+# NF chains two redesign primitives (P-ACL redesigns the fixed-function
+# ACL TCAM; P-IPv4Routing redesigns the fixed-function L3 forwarder) into
+# a single composed NF whose structural failure modes are stage-ordering
+# interactions, not the per-stage failures of either constituent.
+
+pattern_id: P-RouterACL
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing, D7:security]            # composed NF straddles destination-based forwarding and policy/security
+  prescriptive: [P1:forwarding, P4:policy]           # LPM forwarder ∘ composite-condition match-action ACL
+target_capability: composition                          # chained composition of two redesign primitives; failure modes are stage-ordering, cross-cutting
+summary: >
+  Edge / access router composing a stateless TCAM-style ACL with an IPv4
+  unicast LPM forwarder in a single pipeline pass. An ingress packet is
+  classified by a control-plane-installed first-match-by-priority ACL into
+  one of {permit, deny, mark, redirect}; deny drops before any forwarding,
+  redirect overrides the FIB's egress decision with the rule's policy
+  port, mark rewrites DSCP and then routes, and permit (or a default-permit
+  table miss) proceeds to the longest-prefix-match FIB lookup with TTL
+  decrement, Ethernet rewrite, and checksum recompute. The composition's
+  load-bearing contract is stage ordering: ACL classification strictly
+  precedes routing, and a denied packet is never routed. Faithfulness
+  ladder: D5.0 permit/deny ACL + single-next-hop static FIB → D5.1 + DSCP
+  marking + ECMP groups → D5.2 + policy redirect that overrides the
+  routing decision. The parameter-rebinding mutation surface lifts ACL capacity / match
+  breadth / priority depth / action breadth / default policy and FIB
+  capacity / multipath mode / hash family / martian filtering
+  independently, so the same composed oracle covers everything from a
+  16-rule deny-list over a 3-prefix FIB to a 4096-rule mark+redirect ACL
+  over an ECMP-distributed scaled FIB.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: contra_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-IPv4Routing. Contra (NSDI 2020) documents the
+        realistic FIB scales (10²–10⁴ prefixes per switch) that motivate
+        the `fib_capacity` parameter and the
+        `shrink_fib_capacity_4x` harden operator on the routing half of
+        this composition. Cited as the engineering ceiling for scaled-FIB
+        instances rather than as an anchor reference; the ACL half is
+        mature engineering with no research-publication slot (see the
+        P-ACL grounding note below).
+
+  rfcs:
+    - id: RFC1812
+      sections: ["2.2.3", "4.2.2", "5.2.1", "5.2.2", "5.3.1", "5.3.4", "5.3.5", "5.3.7", "5.3.8"]
+      role: canonical_spec
+      grounds: lpm_longest_match_correctness
+      quote: >-
+        an IP datagram generally requires the router to choose the address
+        and relevant interface of the next-hop router or (for the final hop)
+        the destination host.
+      quote_source: "RFC 1812 §2.2.3 Routers (verbatim; cached at patterns/P-RouterACL/grounding/RFC1812.txt)"
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        Requirements for IP Version 4 Routers — canonical for the routing
+        half AND for the composition's stage-ordering contract:
+          - §5.2.1   Forwarding algorithm step ordering (validate →
+                     forward decision → TTL → checksum → L2 rewrite →
+                     transmit), the routed-path skeleton R8/R9 realise.
+          - §5.3.1   TTL decrement-by-one and TTL-exhausted discard —
+                     basis for R2 and the ttl_quantum_one invariant.
+          - §5.2.2.5 Header-checksum recompute on TTL (and, in this
+                     composition, DSCP) change — basis for
+                     mark_then_route_single_checksum and
+                     ip_checksum_validity.
+          - §4.2.2.9 / §5.3.4 Longest-prefix-match FIB semantics, no-route
+                     ⇒ drop — basis for R8/R9/R10 and
+                     lpm_longest_match_correctness.
+          - §5.3.7   Martian source filtering — basis for R4 (guard-gated).
+          - §5.3.5   Limited-broadcast discard — basis for R3.
+          - §5.3.8   "A router MAY provide configurable administrative
+                     filters that permit or deny forwarding based on
+                     packet header fields" — the normative basis for
+                     attaching an ACL stage to the forwarder and for the
+                     `acl_precedes_routing` invariant: when an administrative
+                     filter denies a datagram it MUST NOT be forwarded.
+
+    - id: RFC3198
+      sections: ["2.3", "2.4", "2.5"]
+      role: domain_concepts
+      relevance: |
+        Inherited from P-ACL. Terminology for Policy-Based Management:
+        the condition-action pair as the unit of a policy rule, and the
+        separation of policy condition (the ternary match predicate) from
+        policy action (the {permit, deny, mark, redirect} consequence).
+        RFC 3198 does NOT mandate first-match-by-priority (that is the
+        programmable-switch TCAM realisation, P4Runtime §9.1) nor a
+        default-action policy — so the composition treats
+        `acl_default_action` as a first-class parameter.
+
+    - id: RFC2992
+      sections: ["1", "2.2", "3"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-IPv4Routing. Hash-threshold ECMP keys a flow on
+        the 5-tuple and pins every packet of one flow to one next-hop
+        (§2.2) — the binding property the `ecmp_flow_consistency`
+        invariant enforces on the routed path when `multipath_mode != none`.
+        Enumerates the hash families the `hash_algo` parameter and
+        `swap_hash_to_xor_fold` operator target.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The canonical p4lang/tutorials "basic" exercise — a 3-host /
+        single-switch topology with a single LPM table on
+        hdr.ipv4.dstAddr whose action rewrites Ethernet src/dst,
+        decrements TTL, and forwards to the matched egress port. Supplies
+        the routing-stage topology and the routed-path L2-rewrite
+        convention this composition layers the ACL stage in front of.
+
+    - path: tutorials/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        Inherited from P-ACL. Supplies the control-plane-installed
+        first-match-table convention (entries loaded from sX-runtime.json,
+        explicit default action on miss). P-RouterACL's ACL stage
+        generalises this to a ternary key + `@priority` and chains its
+        verdict into the basic-exercise forwarder.
+
+
+  posts:
+    - url: https://s3-us-west-2.amazonaws.com/p4runtime/docs/master/P4Runtime-Spec.pdf
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-ACL. P4Runtime v1.3.0 §9.1 (TableEntry priority):
+        a ternary match key requires a non-zero priority, higher number
+        wins. Normative basis for `priority_correctness` /
+        `no_priority_ambiguity` on the ACL stage and for the
+        `bit<1>` vs `bool` boundary on the permit/deny decision bit.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Both composed stages are stateless —
+      the ACL classifier and the FIB forwarder derive every decision from
+      hdr.ethernet, hdr.vlan (when present), hdr.ipv4, hdr.tcp/udp,
+      std.ingress_port, and the control-plane-installed tables. This is
+      what makes P-RouterACL a pure two-stage *pipeline* composition,
+      distinct from P-StatefulFW-NAT44 whose composition value is a SHARED
+      stateful conntrack entity.
+
+  acl_rule:                                # plays the TPL `bucket` role — aggregate state across a class
+    keyed_by_tuple: [rule_id]
+    attrs:
+      priority:    int
+      match_spec:  "dict[field, (value, mask)]"   # ternary key over ${match_field_breadth}
+      action:      "enum {permit, deny, mark, redirect}"
+      action_args: "dict[arg, value]"             # mark: {dscp}; redirect: {egress_port}
+    capacity: ${acl_capacity}
+    notes: |
+      The ACL rule set (reused from P-ACL). One bucket holds the entire
+      control-plane-installed classifier table. First-match semantics is
+      BY PRIORITY: among all entries whose match_spec admits the packet,
+      the entry with the largest `priority` wins; ties are forbidden by
+      `no_priority_ambiguity`. The classifier runs to completion (yields a
+      verdict) BEFORE the FIB is consulted.
+
+  route:                                   # plays the `bucket` role — prefix / class
+    keyed_by_lpm: hdr.ipv4.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int               # for tie-break diagnostics; the LPM primitive selects longest
+    capacity: ${fib_capacity}
+    notes: |
+      A FIB entry (reused from P-IPv4Routing). The LPM table is keyed on
+      the destination address; the matched entry yields a
+      nexthop_group_id. Consulted ONLY for packets the ACL stage admitted
+      with a {permit, mark} verdict — never for denied or redirected
+      packets.
+
+  nexthop_group:                           # also a `bucket` — a set of one or more next-hops
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops:   "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac:   "list[address]"          # per-egress source MAC for the L2 rewrite
+    notes: |
+      A multipath group (reused from P-IPv4Routing). Singletons
+      (|nexthops| == 1) handle non-ECMP routes; |nexthops| > 1 enables
+      ECMP picking per ${multipath_mode}.
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Flow tuple used solely by ECMP hashing on the routed path to pin
+      every packet of one flow onto one next-hop (RFC 2992 §2.2). Not
+      materialised as data-plane state; the hash is recomputed per packet.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+# Two parameter families — ACL (acl_*) and FIB (fib_* / routing) — disambiguated
+# by prefix where the standalone patterns collide (notably default_action).
+
+parameters:
+
+  # ── ACL stage (from P-ACL) ──────────────────────────────────────────────
+
+  acl_rules:
+    type: list[acl_rule]
+    constraint: |
+      every entry has priority:int ∈ [1, 2^31 - 1], match_spec well-formed
+      over the fields configured by ${match_field_breadth}, action ∈
+      allowed-by-${action_breadth}; no two entries share both
+      (priority, match_spec).
+    notes: |
+      Control-plane-installed ACL entries; |acl_rules| ≤ ${acl_capacity}.
+
+  acl_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: 256
+    notes: |
+      Maximum number of ACL entries the classifier table can host. Edge /
+      branch ACLs sit at 256; datacenter aggregation at 4096–16384.
+      `shrink_acl_capacity_4x` exercises this axis.
+
+  match_field_breadth:
+    type: enum
+    values: [tuple5, tuple5_vrf, tuple5_vrf_vlan, tuple5_vrf_vlan_dscp]
+    default: tuple5
+    notes: |
+      Width of the ACL ternary key (from P-ACL). tuple5 is the canonical
+      5-tuple; each subsequent value adds one orthogonal field the parser
+      must extract and the table must key on.
+
+  priority_depth:
+    type: int
+    range: "[1, 4096]"
+    default: 16
+    notes: |
+      Number of distinct ACL priority levels the seed uses. High depth
+      (≥256) forces the implementation to reason about TCAM priority-encoder cost.
+
+  action_breadth:
+    type: enum
+    values: [permit_deny, permit_deny_mark, permit_deny_mark_redirect]
+    default: permit_deny
+    notes: |
+      The ACL action set the data plane realises. permit_deny is the
+      pure access-router filter (admit-to-FIB or drop). permit_deny_mark
+      adds DSCP rewrite-then-route (the QoS-classifying router). The full
+      permit_deny_mark_redirect adds policy redirect that OVERRIDES the
+      FIB egress decision — the composition's signature stage-ordering
+      surface (redirect_overrides_fib invariant).
+
+  acl_default_action:
+    type: enum
+    values: [permit, deny]
+    default: permit
+    notes: |
+      ACL behaviour on classifier miss. `permit` (default) routes the
+      packet normally (deny-list edge ACL); `deny` drops it (allow-list /
+      zero-trust ACL — a packet must be explicitly admitted to be routed).
+      The implementation MUST declare the table's default action; omission is the
+      common v1model bug "missing default_action crash" pattern. Distinct from the FIB's
+      no-route behaviour (R10), which always drops.
+
+  # ── FIB / routing stage (from P-IPv4Routing) ────────────────────────────
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0, 32],
+      nexthop_group_id:int; LPM relation well-formed (no two entries share
+      both prefix AND prefix_len). A default route is 0.0.0.0/0.
+    notes: |
+      Control-plane-installed FIB consulted for {permit, mark} verdicts.
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights are positive ints"
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of FIB route entries. `shrink_fib_capacity_4x`
+      exercises this axis (Contra-realistic 10⁴ → 256).
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+    notes: |
+      Largest ECMP group size the FIB can host. Drives ECMP scaffolding
+      and the implementation's group-indexing structure.
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_3tuple, ecmp_hash_5tuple]
+    default: none
+    notes: |
+      none              → singleton next-hops only (anchor; matches the
+                          basic tutorial forwarder).
+      ecmp_hash_3tuple  → hash over (ipv4.src, ipv4.dst, ipv4.proto).
+      ecmp_hash_5tuple  → hash over the full 5-tuple (RFC 2992 default).
+      WCMP is out of scope for this composition (kept on the standalone
+      P-IPv4Routing pattern) to bound the composed oracle's surface.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Hash family used by ECMP on the routed path. xor_fold is the
+      weakest, used by `swap_hash_to_xor_fold` to harden hash quality.
+
+  martian_filter_enabled:
+    type: bool
+    default: false
+    notes: |
+      RFC 1812 §5.3.7 source-address filtering on the routed path. When
+      true, R4 drops packets with source ∈ {127.0.0.0/8, 0.0.0.0/8,
+      224.0.0.0/4, 255.255.255.255}.
+
+  # ── Composition (derived) ───────────────────────────────────────────────
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_acl_then_static_route       # anchor — permit/deny ACL + single-next-hop FIB
+      - D5.1_acl_mark_ecmp_route         # + DSCP marking and/or ECMP groups
+      - D5.2_acl_redirect_override       # + policy redirect overriding the FIB decision
+    default: D5.0_acl_then_static_route
+    notes: |
+      Composition faithfulness ladder. DERIVED from
+      (action_breadth, multipath_mode): expand_action_breadth and
+      enable_ecmp_5tuple advance it as a side-effect; it is not moved by a
+      standalone operator. D5.0 is the clean two-stage pipeline (classify
+      → route or drop); D5.1 adds the mark-then-route checksum interaction
+      and ECMP flow consistency; D5.2 adds the redirect-overrides-FIB
+      stage-ordering contract.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The packet flows ACL-stage → FIB-stage:
+# the ACL classifier yields a verdict (permit | deny | mark | redirect, or the
+# acl_default_action on miss); deny / redirect terminate, {permit, mark}
+# proceed to the FIB. Validity / TTL / broadcast / martian guards are hoisted
+# above the ACL because every guarded packet drops regardless of ACL verdict,
+# so hoisting is behaviourally equivalent and keeps the rule set first-match.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP, any non-IPv4 ether-type — dropped. The routing
+      stage is IPv4-only and the ACL's canonical key is the IPv4 5-tuple,
+      so non-IPv4 frames are out of the composition's match domain. Lifted
+      from P-IPv4Routing R0. G3 parser-edge / conditional-deparser anchor.
+
+  - id: R1_invalid_header_drop
+    when: |
+      header_present(ipv4) ∧ (
+        hdr.ipv4.version ≠ 4
+        ∨ hdr.ipv4.ihl < 5
+        ∨ hdr.ipv4.totalLen < (hdr.ipv4.ihl * 4)
+        ∨ ¬checksum_valid(ipv4)
+      )
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.2.2 IP header validation — lifted from P-IPv4Routing R1.
+      Hoisted above the ACL: a malformed header cannot be reliably
+      classified or routed.
+
+  - id: R2_ttl_exhausted_drop
+    when: "header_present(ipv4) ∧ hdr.ipv4.ttl ≤ 1"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.1 — TTL-exhausted discard, lifted from P-IPv4Routing
+      R2. Hoisted above the ACL: a TTL≤1 packet drops whatever the ACL
+      verdict would have been (deny ⇒ drop; permit/mark ⇒ TTL drop;
+      redirect ⇒ cannot forward an expired datagram). Hoisting is
+      behaviourally equivalent and the observable outcome (drop) is
+      identical regardless of which stage "owns" the drop.
+
+  - id: R3_limited_broadcast_dst_drop
+    when: "header_present(ipv4) ∧ hdr.ipv4.dst == 255.255.255.255"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.1 — limited-broadcast destination MUST be discarded.
+      Lifted from P-IPv4Routing R5, hoisted above the ACL for the same
+      reason as R2.
+
+  - id: R4_martian_src_drop
+    when: |
+      header_present(ipv4) ∧
+      (  match(hdr.ipv4.src, 127.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 0.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 224.0.0.0/4)
+       ∨ hdr.ipv4.src == 255.255.255.255
+      )
+    enforced_when: "${martian_filter_enabled}"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.7 — source-address filtering on the routed path,
+      lifted from P-IPv4Routing R6 (guard-gated). Dropped before
+      classification because a martian-source packet is never routed.
+
+  - id: R5_acl_deny
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      ( ( exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth}))
+            ∧ value(acl_verdict, ==, deny) )
+        ∨ ( ¬exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth}))
+            ∧ ${acl_default_action} == deny ) )
+    given:
+      acl_verdict: by_highest_priority(acl_rules, packet, ${match_field_breadth}).action
+    then:
+      - drop
+    notes: |
+      Deny verdict — explicit deny rule (highest-priority match) OR a
+      classifier miss under ${acl_default_action} == deny. The packet is
+      dropped at the ACL stage and the FIB is NEVER consulted. Anchors the
+      composition's master invariant `acl_precedes_routing` and (on the
+      miss branch) `default_action_correctness`. Subsumes P-ACL R2 + R5.
+
+  - id: R6_acl_redirect
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth})) ∧
+      value(acl_verdict, ==, redirect)
+    enforced_when: "${action_breadth} == permit_deny_mark_redirect"
+    given:
+      acl_rule:    by_highest_priority(acl_rules, packet, ${match_field_breadth})
+      acl_verdict: acl_rule.action
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(acl_rule.action_args.egress_port)
+    notes: |
+      Redirect verdict — the matched ACL rule forwards the packet out its
+      control-plane-supplied policy port, OVERRIDING the FIB's egress
+      decision (the packet is NOT submitted to the LPM lookup). TTL is
+      decremented (loop safety, RFC 1812 §5.3.1) but the FIB's L2 rewrite
+      is NOT applied — the redirect target is a policy waypoint (IDS,
+      scrubber, service-chain hop) that performs its own L2 handling. This
+      is the composition's signature rule: anchors `redirect_overrides_fib`.
+      Subsumes P-ACL R4. Active only at action_breadth
+      permit_deny_mark_redirect (faithfulness D5.2).
+
+  - id: R7_acl_mark_then_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      hdr.ipv4.dst ≠ 255.255.255.255 ∧
+      ¬is_directed_broadcast(hdr.ipv4.dst) ∧
+      exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth})) ∧
+      value(acl_verdict, ==, mark) ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    given:
+      acl_rule:       by_highest_priority(acl_rules, packet, ${match_field_breadth})
+      acl_verdict:    acl_rule.action
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - set(hdr.ipv4.diffserv, acl_rule.action_args.dscp)
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Mark verdict THEN route — the matched ACL rule rewrites DSCP
+      (hdr.ipv4.diffserv) and the packet THEN proceeds through the full
+      FIB forwarding step (LPM → ECMP pick → TTL decrement → L2 rewrite →
+      forward). The composition's load-bearing checksum interaction: the
+      IPv4 header checksum MUST be recomputed exactly once over BOTH the
+      DSCP rewrite AND the TTL decrement (mark_then_route_single_checksum).
+      `nexthop_index_for` collapses to i=0 when multipath_mode == none.
+      Subsumes P-ACL R3 fused with P-IPv4Routing R3. Active at
+      action_breadth ∈ {permit_deny_mark, permit_deny_mark_redirect}.
+
+  - id: R8_acl_permit_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      hdr.ipv4.dst ≠ 255.255.255.255 ∧
+      ¬is_directed_broadcast(hdr.ipv4.dst) ∧
+      ( ( exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth}))
+            ∧ value(acl_verdict, ==, permit) )
+        ∨ ( ¬exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth}))
+            ∧ ${acl_default_action} == permit ) ) ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    given:
+      acl_verdict:    by_highest_priority(acl_rules, packet, ${match_field_breadth}).action
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Permit verdict (explicit permit rule OR classifier miss under
+      ${acl_default_action} == permit) → the canonical RFC 1812 §5.2.1
+      forwarding step with NO header modification beyond TTL + L2 rewrite.
+      The permit path MUST NOT touch DSCP (permit ≠ mark —
+      ip_addr_preservation + the distinction the mark_only_modifies_dscp
+      invariant pins). Subsumes P-ACL R1 fused with P-IPv4Routing R3.
+
+  - id: R9_directed_broadcast_dst_drop
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      is_directed_broadcast(hdr.ipv4.dst) ∧
+      ( value(acl_verdict, ∈, {permit, mark}) ∨
+        (¬exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth})) ∧ ${acl_default_action} == permit) )
+    given:
+      acl_verdict: by_highest_priority(acl_rules, packet, ${match_field_breadth}).action
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.2 — directed broadcasts SHOULD NOT be forwarded by
+      default. Fires only for ACL-admitted packets (denied / redirected
+      directed-broadcasts already terminated at R5 / R6). Lifted from
+      P-IPv4Routing R7.
+
+  - id: R10_no_route_drop
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      hdr.ipv4.dst ≠ 255.255.255.255 ∧
+      ( value(acl_verdict, ∈, {permit, mark}) ∨
+        (¬exists(acl_rule, highest_priority_match(acl_rules, packet, ${match_field_breadth})) ∧ ${acl_default_action} == permit) ) ∧
+      ¬exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    given:
+      acl_verdict: by_highest_priority(acl_rules, packet, ${match_field_breadth}).action
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.4 — an ACL-admitted packet with no matching FIB route
+      (including no 0.0.0.0/0 default) is dropped at the routing stage.
+      Distinct from R5 (ACL deny) — the packet was *admitted* by policy
+      but is *unroutable*. The two drop reasons are behaviourally identical
+      (drop) but semantically distinct, and the test suite probes both.
+      Lifted from P-IPv4Routing R4.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  # ── Composition-specific (the stage-ordering contract) ──────────────────
+
+  - id: acl_precedes_routing
+    clause: stability
+    target: forward_decision
+    while: "R5 fires (ACL deny verdict)"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      The composition's MASTER invariant. A packet the ACL denies MUST be
+      dropped WITHOUT any FIB consultation — no LPM lookup, no L2 rewrite,
+      no TTL decrement, no egress assignment. Catches the dominant
+      composition bug: wiring the FIB forwarder BEFORE the ACL (so
+      egress_spec is already set when the ACL fires) or treating the ACL
+      verdict as an advisory the forwarder may ignore. RFC 1812 §5.3.8.
+      G3 / G1 tests anchor on it (`deny_not_routed`).
+
+  - id: redirect_overrides_fib
+    clause: stability
+    target: egress_port
+    while: "R6 fires (ACL redirect verdict)"
+    enforced_when: "${action_breadth} == permit_deny_mark_redirect"
+    notes: |
+      A redirect verdict MUST drive the packet out the rule's
+      `action_args.egress_port`, NOT the FIB's longest-prefix-match egress
+      decision — even when a matching route exists that would send the
+      packet elsewhere. Catches the stage-ordering bug of computing the
+      LPM egress first and letting it win, or applying the FIB L2 rewrite
+      on the redirected packet. The composed analogue of P-ACL's
+      `redirect_routes_to_named_port`, sharpened by the presence of a real
+      FIB that disagrees.
+
+  - id: mark_then_route_single_checksum
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ R7 fires (ACL mark verdict, routed)"
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    notes: |
+      On the mark-then-route path the packet's IPv4 header changes in TWO
+      places in one pass — DSCP (hdr.ipv4.diffserv) at the ACL stage and
+      TTL (hdr.ipv4.ttl) at the routing stage. The egress header checksum
+      MUST be valid over BOTH changes. This is the common v1model #1-silent-failure
+      "checksum after modification" pattern in its hardest composed form:
+      an implementation that recomputes the checksum after the TTL decrement but
+      before the DSCP write (or vice versa, in two separate
+      MyComputeChecksum-style updates that clobber each other) emits a
+      stale checksum that BMv2 forwards but real peers reject. The single
+      most valuable invariant this composition adds over its constituents.
+
+  - id: permit_does_not_mark
+    clause: persistence
+    target: "hdr.ipv4.diffserv"
+    while: "R8 fires (permit verdict, routed)"
+    free_under: []
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    notes: |
+      A permit verdict routes the packet WITHOUT touching DSCP — only a
+      `mark` verdict rewrites diffserv. Catches the implementation bug of folding
+      a DSCP rewrite into a shared "admit_and_route" action used for both
+      permit and mark. The composed analogue of P-ACL's
+      `permit_header_preservation`.
+
+  # ── ACL-stage invariants (from P-ACL) ───────────────────────────────────
+
+  - id: priority_correctness
+    clause: stability
+    target: chosen_acl_rule
+    while: "R5..R8 fires via an explicit ACL match"
+    notes: |
+      P4Runtime §9.1 — among all ACL entries whose match_spec admits the
+      packet, the entry with the largest priority MUST win. Catches
+      treating priority as list-order. Lifted from P-ACL.
+
+  - id: no_priority_ambiguity
+    clause: stability
+    target: chosen_acl_rule
+    while: "R5..R8 fires via an explicit ACL match"
+    notes: |
+      No two ACL rules with the same priority match the same packet
+      (P4Runtime §9.1 ties are non-deterministic). The seed validator
+      rejects same-priority overlapping masks;
+      `inject_overlapping_priority_rules` deliberately violates this.
+      Lifted from P-ACL.
+
+  - id: default_action_correctness
+    clause: stability
+    target: acl_verdict
+    while: "ACL classifier miss (no rule matches)"
+    notes: |
+      On a classifier miss the verdict MUST equal ${acl_default_action} —
+      permit ⇒ route (R8), deny ⇒ drop (R5). Catches a default-deny ACL
+      compiled with a `NoAction` default (a silent default-permit that
+      routes traffic the policy meant to drop). Lifted from P-ACL.
+
+  - id: mark_only_modifies_dscp
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.totalLen)"
+    while: "R7 fires (mark verdict, routed)"
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    free_under: ["hdr.ipv4.diffserv", "hdr.ipv4.ttl", "hdr.ethernet.src", "hdr.ethernet.dst"]
+    notes: |
+      The mark verdict modifies ONLY hdr.ipv4.diffserv at the ACL stage
+      (the routed-path TTL decrement + L2 rewrite are the FIB stage's, not
+      the mark's). src/dst IP and total length are preserved. Catches a
+      mark action that reaches into a generic header-rewrite touching more
+      fields than DSCP. Lifted from P-ACL and re-scoped for the routed
+      path (TTL / Ethernet are free_under because R7 routes after marking).
+
+  # ── Routing-stage invariants (from P-IPv4Routing) ───────────────────────
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "R6 ∨ R7 ∨ R8 fires (any forwarded path)"
+    notes: |
+      RFC 1812 §5.3.1 — TTL decremented by EXACTLY one per forward, on
+      EVERY forwarded path (permit-route, mark-route, AND redirect).
+      Catches double-decrement (e.g., TTL-- in both the ACL redirect
+      action and an inherited router block). Lifted from P-IPv4Routing.
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "R7 ∨ R8 fires ∧ exists(route, lpm(hdr.ipv4.dst, ${routes}))"
+    notes: |
+      RFC 1812 §5.2.1 / §5.3.4 — the chosen next-hop belongs to the
+      LONGEST matching prefix. Catches keying the FIB with a ternary table
+      lacking prefix-length priorities. Lifted from P-IPv4Routing.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "R7 ∨ R8 fires (routed paths)"
+    free_under: []
+    notes: |
+      RFC 1812 §5.2.1 — IP src/dst MUST NOT be modified during unicast
+      forwarding. Distinguishes the router from NAT / tunnels. Lifted from
+      P-IPv4Routing.
+
+  - id: ip_checksum_validity
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ (R7 ∨ R8) fires"
+    notes: |
+      RFC 1812 §5.2.2.5 — header checksum MUST be valid on egress after
+      the TTL change (and, on R7, the DSCP change — see
+      mark_then_route_single_checksum). Lifted from P-IPv4Routing.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ (R7 ∨ R8) fires"
+    notes: |
+      RFC 1812 §5.2.1 — on every FIB-routed forward, egress Ethernet src
+      MUST be the egress port's MAC and dst MUST be the next-hop's MAC.
+      Does NOT apply to the redirect path (R6), which targets a policy
+      waypoint and leaves L2 to it. Lifted from P-IPv4Routing.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "(R7 ∨ R8) fires ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — every packet of one flow lands on the same next-hop
+      index within its group. Catches hashing on a per-packet-varying
+      field (IP id, TTL). Lifted from P-IPv4Routing.
+
+  - id: ecmp_traffic_distribution
+    clause: fairness
+    target: traffic_per_nexthop_within_group
+    while: "(R7 ∨ R8) fires ∧ ${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2 — under a uniform hash, flows distribute uniformly
+      across the K next-hops (per-nexthop share within ±20% of 1/K over
+      1000 random flows). Lifted from P-IPv4Routing.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No recirculation: neither the ACL stage nor the FIB re-enters
+      ingress. Every packet egresses on a definite port or is dropped; TTL
+      decrement on every forward bounds any path. An implementation that
+      recirculates a redirected packet to re-apply the ACL introduces a
+      loop the bounded-step trace cap surfaces.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ─────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The v1model bug
+# taxonomy guides what to probe. The composition's
+# distinctive entries are the STAGE-ORDERING probes (deny_not_routed,
+# redirect_overrides_fib, mark_then_route_checksum) that neither standalone
+# pattern can express.
+
+test_scaffolding:
+
+  G1:
+    - id: permit_routes_golden_path
+      generate: |
+        Install a permit ACL rule (or rely on default-permit) for a flow
+        whose dst is covered by exactly one FIB prefix. Send the matching
+        packet (TTL=64); assert forward on the matched nexthop's
+        egress_port with Ethernet src ← port_mac, dst ← next_hop_mac, TTL
+        decremented by 1, IP src/dst unchanged, DSCP unchanged, and the
+        IPv4 checksum valid on egress. The composed golden path (G1-P1-T1
+        + G1-P1-T3): ACL permit → FIB route.
+
+    - id: deny_not_routed
+      generate: |
+        Install a deny ACL rule matching a flow whose dst IS covered by a
+        FIB prefix (so a routing-only implementation WOULD forward it).
+        Send the matching packet; assert drop. The composition's master
+        stage-ordering probe — a routing-before-ACL implementation forwards this
+        packet. Anchors `acl_precedes_routing` (common v1model path/rule deviation).
+
+    - id: default_permit_routes_on_acl_miss
+      generate: |
+        With ${acl_default_action} == permit, send a packet matching NO
+        ACL rule but covered by a FIB prefix. Assert forward (routed
+        normally). Tests `default_action_correctness` (permit branch) and
+        that a classifier miss falls through to the FIB rather than
+        dropping. (G1-P3-T1.)
+
+    - id: redirect_overrides_fib
+      requires: "${action_breadth} == permit_deny_mark_redirect"
+      generate: |
+        Install a redirect ACL rule mapping a flow to policy egress port
+        X; install a FIB route for that same dst whose nexthop egress is
+        Y ≠ X. Send the matching packet; assert it exits on X (NOT Y), TTL
+        decremented by 1. Anchors `redirect_overrides_fib` — the
+        composition's signature stage-ordering invariant.
+
+    - id: mark_then_route_dscp_and_forward
+      requires: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+      generate: |
+        Install a mark ACL rule (DSCP ← C) for a flow covered by a FIB
+        prefix. Send the matching packet; assert forward on the routed
+        egress_port AND hdr.ipv4.diffserv == C AND TTL decremented by 1
+        AND Ethernet rewritten AND the IPv4 checksum valid on egress.
+        Tests R7 end-to-end; pairs with the G3 checksum probe.
+
+    - id: longest_prefix_priority_on_routed_path
+      generate: |
+        Install overlapping FIB prefixes (10.0.0.0/8 → port A, 10.0.2.0/24
+        → port B) both reachable through a permit verdict. Send a packet
+        to 10.0.2.x; assert forward to port B. Tests
+        `lpm_longest_match_correctness` through the composed pipeline
+        (G1-P3-T3).
+
+    - id: ecmp_flow_consistency_routed
+      requires: "${multipath_mode} != none"
+      generate: |
+        Install a permit verdict + a FIB route to a K≥2 nexthop group.
+        Send 10 packets of the same 5-tuple; assert all 10 exit on the
+        same egress_port. Tests `ecmp_flow_consistency` (G1-P2-T8 inverse).
+
+  G2:
+    - id: drop_ttl_zero_pre_classification
+      generate: |
+        Send a packet with TTL=0 (or TTL=1, asserting forward-with-TTL=0
+        per the chosen convention; pin BOTH the TTL=1 forward and TTL=0
+        drop). Use a flow the ACL would permit and the FIB would route, so
+        the test isolates the TTL guard (R2) from the ACL/FIB stages.
+        (G2-P1-T2 / T3.)
+
+    - id: no_route_drop_after_permit
+      generate: |
+        With a permit verdict (or default-permit), send a packet whose dst
+        matches NO FIB prefix and no 0.0.0.0/0 default. Assert drop (R10).
+        Distinguishes "admitted but unroutable" from "denied" — both drop,
+        but via different stages. (G3-P1-T4 framing.)
+
+    - id: acl_capacity_overflow
+      requires: "${acl_capacity} != unbounded"
+      generate: |
+        Install ${acl_capacity} ACL rules successfully; attempt one more.
+        Assert the install is rejected (or the impl-defined eviction is
+        observable through a packet whose verdict flips). (G2-P2-T3.)
+
+    - id: fib_capacity_overflow
+      requires: "${fib_capacity} != unbounded"
+      generate: |
+        Install ${fib_capacity} FIB routes successfully; attempt one more.
+        Assert reject (or observable eviction: a permitted packet to the
+        evicted prefix now drops). Mirrors P-IPv4Routing fib overflow.
+
+    - id: priority_depth_stress
+      requires: "${priority_depth} >= 16"
+      generate: |
+        Install ${priority_depth} ACL rules across distinct priority
+        levels with overlapping masks, each routed differently. Send
+        packets each hitting a different priority stratum; assert each
+        takes its highest-priority verdict's path. Probes TCAM
+        priority-encoder correctness through the composed pipeline.
+
+  G3:
+    - id: default_deny_no_route_leak
+      requires: "${acl_default_action} == deny"
+      generate: |
+        With ${acl_default_action} == deny, install a small permit
+        allow-list. Send a packet covered by a FIB prefix but matching NO
+        allow-list rule. Assert drop — the routable packet MUST NOT leak
+        through the FIB on a classifier miss. Fail-closed audit
+        (G3-P2-T4); anchors `default_action_correctness` (deny branch) +
+        `acl_precedes_routing`.
+
+    - id: overlapping_mask_priority_inversion
+      generate: |
+        Install ACL rules with overlapping ternary masks at non-equal
+        priorities, constructed so a list-order-wins implementation fires the
+        WRONG verdict — e.g., priority 10 deny on src /16, priority 100
+        permit-to-route on (src /32, dport 443). Send a packet matching
+        both; assert it is permitted and routed (priority 100 wins).
+        common v1model bug "priority inversion (ternary)"; anchors `priority_correctness`.
+
+    - id: non_ipv4_drop
+      generate: |
+        Send a non-IPv4 frame (ARP 0x0806, IPv6 0x86DD, raw ether-type).
+        Assert drop (R0). Parser-edge anchor; targets the common v1model
+        conditional-deparser bug pattern (an implementation that emits a degenerate
+        header on the drop path breaks the parser↔deparser boundary).
+
+    - id: mark_then_route_checksum
+      requires: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+      generate: |
+        Install a mark rule (DSCP ← C) for a routable flow. Send the
+        matching packet; assert the egress IPv4 header checksum is VALID
+        over BOTH the DSCP rewrite AND the TTL decrement, AND that src,
+        dst, totalLen are unchanged. The common v1model #1-silent-failure probe in
+        its composed form — anchors `mark_then_route_single_checksum` and
+        `mark_only_modifies_dscp`. An implementation with two separate checksum
+        updates (one per stage) that clobber each other fails here.
+
+    - id: redirect_does_not_route_or_rewrite_l2
+      requires: "${action_breadth} == permit_deny_mark_redirect"
+      generate: |
+        Install a redirect rule to port X for a dst that ALSO has a FIB
+        route to port Y with a known next_hop_mac. Send the packet; assert
+        it exits on X AND that the Ethernet dst is NOT the FIB next-hop's
+        MAC (the redirect bypasses the FIB L2 rewrite). Catches an implementation
+        that applies the FIB rewrite before honouring the redirect.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease so parameter rebinding can move
+# difficulty in either direction. Operators move exactly one axis
+# (single-axis displacement); faithfulness is DERIVED and bumped as a
+# side-effect of the action-breadth / ECMP operators rather than by a standalone
+# operator.
+
+mutation_operators:
+
+  # ── ACL capacity ────────────────────────────────────────────────────────
+  - id: shrink_acl_capacity_4x
+    applicable_when: "${acl_capacity} ≠ unbounded ∧ ${acl_capacity} > 64"
+    effect: "${acl_capacity} ← ${acl_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${acl_capacity} ≥ 16 ∧ |${acl_rules}| ≤ ${acl_capacity}"
+    notes: "Tighten the ACL rule budget. Pairs with enlarge_acl_capacity_2x."
+
+  - id: enlarge_acl_capacity_2x
+    applicable_when: "${acl_capacity} ≠ unbounded ∧ ${acl_capacity} < 32768"
+    effect: "${acl_capacity} ← ${acl_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${acl_capacity} ≤ 65536"
+    notes: "Loosen the ACL rule budget. Pairs with shrink_acl_capacity_4x."
+
+  # ── FIB capacity ─────────────────────────────────────────────────────────
+  - id: shrink_fib_capacity_4x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 16 ∧ |${routes}| ≤ ${fib_capacity}"
+    notes: "Tighten the FIB budget (Contra-realistic 10⁴ → 256). Pairs with enlarge_fib_capacity_2x."
+
+  - id: enlarge_fib_capacity_2x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} < 524288"
+    effect: "${fib_capacity} ← ${fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${fib_capacity} ≤ 1048576"
+    notes: "Loosen the FIB budget. Pairs with shrink_fib_capacity_4x."
+
+  # ── ACL match-field breadth ───────────────────────────────────────────────
+  - id: expand_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5_vrf_vlan_dscp"
+    effect: "${match_field_breadth} ← next of {tuple5 → tuple5_vrf → tuple5_vrf_vlan → tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${acl_rules} has match_spec well-formed over the new breadth"
+    notes: "Widen the ACL ternary key one step (parser depth + TCAM bit-width). Pairs with shrink_match_field_breadth."
+
+  - id: shrink_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5"
+    effect: "${match_field_breadth} ← previous of {tuple5 ← tuple5_vrf ← tuple5_vrf_vlan ← tuple5_vrf_vlan_dscp}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${acl_rules} has match_spec well-formed over the new breadth"
+    notes: "Narrow the ACL ternary key one step. Pairs with expand_match_field_breadth."
+
+  # ── ACL priority depth ─────────────────────────────────────────────────────
+  - id: inflate_priority_depth
+    applicable_when: "${priority_depth} < 1024"
+    effect: "${priority_depth} ← min(${priority_depth} * 4, 4096)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${priority_depth} ≥ 1 ∧ ${priority_depth} ≤ 4096"
+    notes: "Lift ACL priority depth (TCAM priority-encoder cost). Pairs with flatten_priority_depth."
+
+  - id: flatten_priority_depth
+    applicable_when: "${priority_depth} > 2"
+    effect: "${priority_depth} ← max(${priority_depth} / 4, 1)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${priority_depth} ≥ 1"
+    notes: "Collapse ACL priority depth. Pairs with inflate_priority_depth."
+
+  # ── ACL action breadth (drives the composition's faithfulness ladder) ──────
+  - id: expand_action_breadth
+    applicable_when: "${action_breadth} ≠ permit_deny_mark_redirect"
+    effect: |
+      ${action_breadth} ← next of {permit_deny → permit_deny_mark → permit_deny_mark_redirect} ∧
+      ${faithfulness} ← (permit_deny_mark ⇒ max(${faithfulness}, D5.1_acl_mark_ecmp_route);
+                          permit_deny_mark_redirect ⇒ D5.2_acl_redirect_override)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${acl_rules} has action ∈ allowed-by-new-action_breadth"
+    notes: |
+      Widen the ACL action set. +mark activates the
+      mark_then_route_single_checksum + mark_only_modifies_dscp +
+      permit_does_not_mark interactions (D5.1); +redirect activates
+      redirect_overrides_fib (D5.2) — the composition's strongest
+      stage-ordering harden. Bumps faithfulness as a side-effect. Pairs
+      with contract_action_breadth.
+
+  - id: contract_action_breadth
+    applicable_when: "${action_breadth} ≠ permit_deny"
+    effect: |
+      ${action_breadth} ← previous of {permit_deny ← permit_deny_mark ← permit_deny_mark_redirect} ∧
+      ${faithfulness} ← recompute_from(action_breadth, multipath_mode)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${acl_rules} has action ∈ allowed-by-new-action_breadth"
+    notes: "Narrow the ACL action set; recompute the derived faithfulness. Pairs with expand_action_breadth."
+
+  # ── Routing multipath (also bumps faithfulness) ────────────────────────────
+  - id: enable_ecmp_5tuple
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4) ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_acl_mark_ecmp_route)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Activate ECMP on the routed path — ecmp_flow_consistency +
+      ecmp_traffic_distribution. Pairs with disable_ecmp.
+
+  - id: disable_ecmp
+    applicable_when: "${multipath_mode} != none"
+    effect: |
+      ${multipath_mode} ← none ∧
+      ${faithfulness} ← recompute_from(action_breadth, multipath_mode)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every nexthop_group is a singleton OR the harness collapses to i=0"
+    notes: "Collapse the routed path to single-next-hop. Pairs with enable_ecmp_5tuple."
+
+  # ── ACL default policy ─────────────────────────────────────────────────────
+  - id: flip_acl_default_to_deny
+    applicable_when: "${acl_default_action} == permit"
+    effect: "${acl_default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${acl_rules} contains ≥ 1 permit entry"
+    notes: |
+      Flip the ACL miss policy to default-deny (zero-trust router: a packet
+      must be explicitly admitted to be routed). Forces the implementation to
+      declare the classifier table's default action. Pairs with
+      flip_acl_default_to_permit.
+
+  - id: flip_acl_default_to_permit
+    applicable_when: "${acl_default_action} == deny"
+    effect: "${acl_default_action} ← permit"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${acl_rules} contains ≥ 1 deny entry"
+    notes: "Flip the ACL miss policy back to default-permit. Pairs with flip_acl_default_to_deny."
+
+  # ── Routing martian filter ─────────────────────────────────────────────────
+  - id: enable_martian_filter
+    applicable_when: "${martian_filter_enabled} == false"
+    effect: "${martian_filter_enabled} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Activate R4 + the drop_martian_src probe on the routed path. Pairs with disable_martian_filter."
+
+  - id: disable_martian_filter
+    applicable_when: "${martian_filter_enabled} == true"
+    effect: "${martian_filter_enabled} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Deactivate martian filtering. Pairs with enable_martian_filter."
+
+  # ── ECMP hash family ───────────────────────────────────────────────────────
+  - id: swap_hash_to_xor_fold
+    applicable_when: "${multipath_mode} != none ∧ ${hash_algo} ∈ {crc16, crc32}"
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "ecmp_traffic_distribution still observable within ±25% over 1000 random flows"
+    notes: "Weaker hash → worse uniformity, stresses copy-the-textbook implementations. Pairs with swap_hash_to_crc16."
+
+  - id: swap_hash_to_crc16
+    applicable_when: "${multipath_mode} != none ∧ ${hash_algo} ≠ crc16"
+    effect: "${hash_algo} ← crc16"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Restore the canonical RFC 2992 hash. Pairs with swap_hash_to_xor_fold."
+
+  # ── Workload: ACL overlap stress ───────────────────────────────────────────
+  - id: inject_overlapping_priority_rules
+    applicable_when: "'overlapping_mask_priority_inversion' ∉ test_scaffolding.G3 ∨ |${acl_rules}| < 4"
+    effect: |
+      Generate ≥ 4 ACL rules whose ternary masks overlap pairwise at
+      non-equal priorities, constructed to be confusable for out-of-order
+      installation. Add the G3 test overlapping_mask_priority_inversion if
+      absent.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${acl_capacity} ≥ 16"
+    notes: "Test-rigor harden on priority_correctness. Pairs with simplify_to_disjoint_rules."
+
+  - id: simplify_to_disjoint_rules
+    applicable_when: "|${acl_rules}| > 4"
+    effect: |
+      Regenerate ${acl_rules} so no two entries' ternary masks overlap
+      (priority becomes irrelevant). Remove overlapping_mask_priority_inversion
+      if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${acl_rules}| ≥ 1"
+    notes: "Test-rigor ease. Pairs with inject_overlapping_priority_rules."
+
+  # ── Workload: FIB overlap stress ───────────────────────────────────────────
+  - id: inflate_fib_with_overlapping_prefixes
+    applicable_when: "'longest_prefix_priority_stress' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${routes} so ≥ 30% of installed prefixes overlap (a /16
+      plus several /24s and /32s within it). Add G2 test
+      longest_prefix_priority_stress requiring 3 levels of LPM tie-break
+      through the composed pipeline.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 64 ∨ ${fib_capacity} == unbounded"
+    notes: "Test-rigor harden on lpm_longest_match_correctness. Pairs with aggregate_fib_prefixes."
+
+  - id: aggregate_fib_prefixes
+    applicable_when: "'longest_prefix_priority_stress' ∈ test_scaffolding.G2 ∨ overlap-fraction(${routes}) > 0"
+    effect: |
+      Aggregate ${routes} into disjoint prefixes (route summarisation),
+      removing overlaps; remove longest_prefix_priority_stress if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${routes}| ≥ 1"
+    notes: "Test-rigor ease. Pairs with inflate_fib_with_overlapping_prefixes."
+
+  # ── Algebra-breadth: multi-switch chain ────────────────────────────────────
+  - id: expand_topology_multi_switch
+    applicable_when: "'multi_switch' ∉ topology"
+    effect: |
+      Expand to 2 switches in a chain (h1 — s1 — s2 — h2), each running the
+      same router+ACL program. Add G1 test transit_through_two_switches
+      asserting cumulative TTL decrement of 2, per-hop L2 rewrite, and that
+      the ACL fires on each hop.
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "the harness supports multi-switch topologies"
+    notes: "Lift single-switch → multi-hop. Pairs with collapse_topology_single_switch."
+
+  - id: collapse_topology_single_switch
+    applicable_when: "'multi_switch' ∈ topology"
+    effect: "Collapse to a single switch; remove transit_through_two_switches."
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Return to single-switch. Pairs with expand_topology_multi_switch."
+
+  # ── Input-form: spec noise ─────────────────────────────────────────────────
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the noisify_spec_low protocol shared with the constituent patterns:
+        • 1 distractor clause about deployment / out-of-scope behaviour that
+          is true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, subnet,
+          table) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Presentation-noise harden. Pairs with denoisify_spec."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Presentation-noise ease. Pairs with noisify_spec_low / _medium / _high."
+
+  - id: noisify_spec_medium
+    applicable_when: "spec_noise.intensity ∈ {none, low}"
+    effect: |
+      Apply noisify_spec_low, then additionally:
+        • 1 misleading implementation hint — plausible "common practice"
+          framing that, if followed, violates a stated rule of THIS task
+          (e.g., suggesting the FIB lookup should run before the ACL "for
+          efficiency" — which would break acl_precedes_routing);
+        • 1 restate-with-drift — paraphrase one rule using different
+          vocabulary / framing; do not mark as a restatement.
+      Same hard constraints as noisify_spec_low.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Stronger presentation-noise harden. Pairs with denoisify_spec."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4:
+
+    Anchor (faithfulness=D5.0_acl_then_static_route, action_breadth=
+            permit_deny, multipath_mode=none, acl_default_action=permit,
+            acl_capacity 256, fib_capacity unbounded, no martians):
+      - Stage 1, ACL: one ternary table on the 5-tuple key
+          key = { hdr.ipv4.srcAddr: ternary; hdr.ipv4.dstAddr: ternary;
+                  hdr.ipv4.protocol: ternary; meta.l4_srcPort: ternary;
+                  meta.l4_dstPort: ternary; }
+          actions = { acl_permit; acl_deny; @defaultonly NoAction; }
+          default_action = acl_permit;     // or acl_deny per acl_default_action
+        acl_deny → mark_to_drop(standard_metadata); acl_permit → set a
+        metadata flag meta.acl_pass = 1 (do NOT assign egress here).
+      - Stage 2, FIB: one LPM table on hdr.ipv4.dstAddr applied ONLY when
+        meta.acl_pass == 1, action ipv4_forward(port, port_mac,
+        next_hop_mac) doing the TTL decrement + L2 rewrite + egress.
+      - STAGE ORDERING is the load-bearing structure: apply the ACL table
+        FIRST; gate the FIB apply on the permit flag. A program that
+        applies the LPM table unconditionally and lets acl_deny only
+        mark_to_drop afterwards still "works" in BMv2 (drop wins) but
+        fails acl_precedes_routing's intent the moment a redirect or a
+        stage-ordering test is added, and is the canonical composition
+        anti-pattern.
+      - Pre-stage gate: if (hdr.ipv4.isValid() && hdr.ipv4.ttl > 1). Non-
+        IPv4 and TTL≤1 drop before either table.
+      - MyComputeChecksum: incremental update for the TTL change. Forgetting
+        it is the #1 silent bug.
+
+    +mark (action_breadth permit_deny_mark, faithfulness D5.1):
+      - Add acl_mark(bit<6> dscp) action setting meta.acl_pass=1 AND
+        hdr.ipv4.diffserv = dscp. The packet still flows to the FIB.
+      - CRITICAL: a SINGLE MyComputeChecksum block recomputes the IPv4
+        checksum over the final header (post-DSCP, post-TTL). Do NOT write
+        two separate checksum updates — they clobber each other and emit a
+        stale checksum (mark_then_route_single_checksum). This is the
+        composition's sharpest v1model trap.
+
+    +ECMP (multipath_mode ecmp_hash_5tuple, faithfulness D5.1):
+      - On the permit/mark path: ecmp_group LPM table → sets
+        meta.ecmp_group_id + size; ecmp_select on (group_id, hash_index)
+        → L2 rewrite + forward. hash_index = hash(5-tuple) % size via the
+        BMv2 `hash` extern (crc16/crc32). Hash only flow-stable fields.
+
+    +redirect (action_breadth permit_deny_mark_redirect, faithfulness D5.2):
+      - Add acl_redirect(bit<9> egress_port) action that sets
+        standard_metadata.egress_spec = egress_port directly AND a flag
+        meta.acl_redirected=1 the FIB stage consults to SKIP its own apply.
+      - The redirect must OVERRIDE the FIB: gate the FIB apply on
+        (meta.acl_pass == 1 && meta.acl_redirected == 0). An implementation that
+        applies the FIB first and lets redirect overwrite egress_spec
+        afterwards passes the happy path but fails
+        redirect_does_not_route_or_rewrite_l2 (the FIB L2 rewrite already
+        ran). Decrement TTL on the redirect path; do NOT apply the FIB
+        next-hop MAC.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Applying the FIB (LPM) table BEFORE the ACL, so egress_spec is set
+      and L2 rewritten before the ACL verdict is known — deny then relies
+      on mark_to_drop winning. Breaks acl_precedes_routing /
+      redirect_overrides_fib the moment a redirect or stage-ordering test
+      fires. THE dominant composition bug.
+    * Two separate IPv4 checksum recomputations on the mark+route path
+      (one after DSCP, one after TTL) — the second clobbers the first.
+      mark_then_route_checksum catches it.
+    * Folding the DSCP rewrite into a shared admit-and-route action used
+      for both permit and mark — colours every permitted packet.
+      permit_does_not_mark catches it.
+    * Letting a redirect packet fall through to the FIB L2 rewrite (so
+      Ethernet dst becomes the FIB next-hop MAC instead of being left for
+      the policy waypoint). redirect_does_not_route_or_rewrite_l2 catches it.
+    * Decrementing TTL twice (once in the ACL redirect action, once in the
+      FIB forward) — ttl_quantum_one catches it.
+    * Treating the ACL permit/deny decision as a bit<1> read back later via
+      `if (meta.acl_decision == 0)` on the default-action path — the common v1model
+      bit<1>-vs-bool boundary; the bit is unspecified on the miss path
+      unless explicitly initialised.
+    * Omitting the classifier table's default_action — a default-deny seed
+      silently becomes default-permit and routes traffic the policy meant
+      to drop. default_action_correctness catches it.
+    * Reading standard_metadata.drop after mark_to_drop() to "check whether
+      this packet is denied" — v1model conditional-deparser bug; behaviour
+      is unspecified after mark_to_drop().
+
+  v2 deferrals (out of scope for this v1.0 composition):
+    * WCMP weighted multipath (kept on standalone P-IPv4Routing).
+    * ICMP error origination on TTL exhaustion / no-route (would add
+      packet origination — pairs better as a separate composition with a
+      P16 pattern).
+    * Stateful ACL (connection tracking) — that is P-StatefulFW, not the
+      stateless P4 policy this composition layers; a router ∘ stateful-FW
+      composition is a distinct candidate.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must all
+       pass validation.
+
+    2. For anchor instances (permit_deny, multipath none,
+       acl_default permit, D5.0_acl_then_static_route), the resulting task
+       SHOULD be behaviourally a "drop a small deny-list, then LPM-forward
+       the rest" edge router. Cross-check by hand-running the public test
+       set through the oracle for the seed; in particular verify the
+       deny_not_routed stage-ordering test fails a routing-only reference
+       (this is the composition's reason for existing).
+
+    3. The composed oracle reuses the audited P-IPv4Routing and P-ACL
+       oracles for the routed-path and classification ground truth
+       respectively (content-addressed oracle reuse). When the composed
+       oracle is synthesised, the new audited surface is ONLY the stage-ordering
+       glue (verdict → {drop | redirect-port | route} dispatch); the
+       per-stage logic is inherited. Confirm the oracle audit exercises
+       redirect_overrides_fib and mark_then_route_single_checksum at their
+       extremes — these are the behaviours absent from either constituent.
+
+    4. This composite occupies the (D5:routing ∪ D7:security,
+       P1:forwarding ∪ P4:policy) cell and is the simplest composition
+       oracle (two stateless stages). A harder variant is most
+       naturally reached by expand_action_breadth → redirect + the
+       stage-ordering G3 tests, the hardest by stacking redirect + ECMP +
+       tight capacities + spec noise.

@@ -1,0 +1,156 @@
+{
+  "oracle_hash": "bdc9d057a14c5e27938ff2f14a1c86ab2707b04d65e8ce005d8353dd011ce01c",
+  "instance": "ddos_policer_disc-default",
+  "ran_at": "2026-06-15T22:37:46.512111Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "benign_below_threshold_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "below_threshold_boundary_7th",
+        "status": "pass"
+      },
+      {
+        "example_id": "heavy_crossing_recolor_8th",
+        "status": "pass"
+      },
+      {
+        "example_id": "blocklist_drop_low_rate",
+        "status": "pass"
+      },
+      {
+        "example_id": "blocklist_beats_heavy",
+        "status": "pass"
+      },
+      {
+        "example_id": "allowlist_exempts_heavy",
+        "status": "pass"
+      },
+      {
+        "example_id": "collision_no_false_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "allowlist_bypass_off_polices_heavy",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "detect_before_police": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "policy_combination_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_recolor_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_false_positive_under_collision": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_persistence_within_epoch": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "heavy_storage_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "priority_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_priority_ambiguity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "default_action_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mark_only_modifies_dscp": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "detect_before_police",
+      "policy_combination_consistency",
+      "compound_recolor_checksum_validity",
+      "no_false_positive_under_collision",
+      "counter_persistence_within_epoch",
+      "heavy_storage_no_orphan",
+      "priority_correctness",
+      "no_priority_ambiguity",
+      "default_action_correctness",
+      "mark_only_modifies_dscp",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "poseidon_ndss20",
+      "jaqen_usenixsec21",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

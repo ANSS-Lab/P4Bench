@@ -1,0 +1,92 @@
+{
+  "oracle_hash": "e2a7def21d65845fb53197d57f17a9286502726298f1fd845ea9db0ce3bcf4c0",
+  "instance": "diffserv_classifier_anchor-default",
+  "ran_at": "2026-06-17T04:03:07.232036Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "classify_ef_match",
+        "status": "pass"
+      },
+      {
+        "example_id": "classify_af_match",
+        "status": "pass"
+      },
+      {
+        "example_id": "classify_ef_preserve_ecn",
+        "status": "pass"
+      },
+      {
+        "example_id": "unmatched_default_be",
+        "status": "pass"
+      },
+      {
+        "example_id": "mf_specificity_falls_to_be",
+        "status": "pass"
+      },
+      {
+        "example_id": "empty_table_ef_falls_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "alt_table_classify",
+        "status": "pass"
+      },
+      {
+        "example_id": "ecn_not_preserved_full_ds_rewrite",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "ecn_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "dscp_set_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "addr_ttl_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      }
+    },
+    "uncovered": [
+      "ecn_preserved",
+      "dscp_set_correctness"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2474",
+      "RFC2597",
+      "RFC3246"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

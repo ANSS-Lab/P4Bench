@@ -1,0 +1,9 @@
+results/
+pcaps/
+logs/
+*.p4i
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/

@@ -1,0 +1,398 @@
+task_name: decision_tree_infer_anchor
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-DecisionTreeInfer
+pattern_version: '1.0'
+seed:
+  model_artifact:
+  - tree_id: 0
+    root:
+      feature: 0
+      threshold: 64
+      tie_break: le
+      left:
+        feature: 1
+        threshold: 16
+        tie_break: le
+        left: {leaf_class: 0}
+        right: {leaf_class: 1}
+      right:
+        feature: 0
+        threshold: 128
+        tie_break: le
+        left: {leaf_class: 1}
+        right: {leaf_class: 0}
+    default_leaf_class: 0
+  class_action_entries:
+  - leaf_class: 0
+    verdict: forward
+    egress_port: 2
+    mark_value: none
+  - leaf_class: 1
+    verdict: forward
+    egress_port: 3
+    mark_value: none
+  feature_set: [ipv4.ttl, ipv4.diffserv]
+  feature_count: 2
+  feature_bit_width: 8
+  num_classes: 2
+  tree_depth: 3
+  ensemble_size: 1
+  action_breadth: forward_only
+  unclassified_action: forward_default
+  default_egress_port: 4
+  model_capacity: unbounded
+  workload_skew: uniform
+  faithfulness: D5.0_anchor_single_tree
+description: |
+  A switch s1 acts as an in-network traffic classifier: it evaluates a
+  small, pre-trained decision-tree model on every packet and steers the
+  packet to an egress port chosen by the model's predicted class, in the
+  spirit of running a trained classifier directly in the switch pipeline
+  at line rate (IIsy / Planter, in-network ML inference). Clients reach s1
+  on port s1.p1; three downstream ports s1.p2, s1.p3, s1.p4 lead to the
+  per-class destinations.
+
+  The switch is a STATELESS function: every decision follows only from the
+  current packet's header fields and the fixed model + class-to-port
+  mapping given below — no per-flow or cross-packet state is kept. The same
+  feature values always yield the same class and the same egress port.
+
+  ## Features
+
+  The classifier reads two 8-bit features from each IPv4 packet:
+
+    - feature 0 = the IPv4 TTL field (`ttl`), an 8-bit value 0–255.
+    - feature 1 = the IPv4 DSCP/ToS field (`tos`/`diffserv`), the 8-bit
+      type-of-service byte.
+
+  Both features are already 8 bits wide, so they are used as-is (no
+  scaling or rounding).
+
+  ## The model (a single decision tree)
+
+  Classify each packet by walking this binary decision tree from the root.
+  At each decision node, compare the named feature to the node's threshold:
+  if the feature value is **less than or equal to** the threshold, take the
+  left branch; otherwise take the right branch. A leaf gives the predicted
+  class.
+
+    node A (root):  feature 0 (ttl)  <= 64 ?
+        left  (ttl <= 64):  node B
+        right (ttl >  64):  node C
+
+    node B:  feature 1 (tos)  <= 16 ?
+        left  (tos <= 16):  class 0
+        right (tos >  16):  class 1
+
+    node C:  feature 0 (ttl)  <= 128 ?
+        left  (ttl <= 128):  class 1
+        right (ttl >  128):  class 0
+
+  Equivalently, the regions are:
+
+    | ttl        | tos     | class |
+    |------------|---------|-------|
+    | ttl <= 64  | tos<=16 | 0     |
+    | ttl <= 64  | tos>16  | 1     |
+    | 64<ttl<=128| any     | 1     |
+    | ttl > 128  | any     | 0     |
+
+  The boundary comparisons are inclusive on the left exactly as written
+  (a feature value equal to a threshold takes the left/low branch).
+
+  ## Per-packet behaviour
+
+  Process every ingress packet by the first matching rule below.
+
+   1. **Not classifiable → default port.** If the packet is not an IPv4
+      packet (so the TTL and DSCP feature fields are not present), it
+      cannot be classified; forward it unchanged to the default port
+      s1.p4. Do not attempt to read feature fields that are not present.
+
+   2. **Classify and steer.** For an IPv4 packet, evaluate the tree above
+      to get the predicted class, then forward the packet — unchanged — to
+      the port mapped to that class:
+
+        - class 0 → forward to s1.p2
+        - class 1 → forward to s1.p3
+
+      The packet is delivered byte-for-byte identical to what arrived
+      (every header and the payload unchanged); only the egress port
+      differs by class. No field is rewritten and the TTL is not
+      decremented.
+
+  ## Class-to-port mapping (install as control-plane entries)
+
+  | Predicted class | Egress port |
+  |-----------------|-------------|
+  | 0               | s1.p2       |
+  | 1               | s1.p3       |
+
+  A packet that is not IPv4 goes to the default port s1.p4 unchanged.
+
+  Grounding: in-network ML inference (IIsy / Planter; "Automating
+  In-Network Machine Learning"), decision-tree-on-switch.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: class0_low_ttl_low_tos
+  visibility: public
+  description: |
+    ttl=50 (<=64) and tos=8 (<=16) → class 0 → steered to s1.p2, packet
+    unchanged. The golden left-left path of the tree.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 50, tos: 8, proto: 6}
+    - TCP: {sport: 40001, dport: 80}
+    - Raw: {load: hello-flow-0}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.tos: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: class1_low_ttl_high_tos
+  visibility: public
+  description: |
+    ttl=50 (<=64) but tos=40 (>16) → class 1 → steered to s1.p3. The
+    SAME ttl region as class0_low_ttl_low_tos but a different tos: the
+    classifier must read BOTH features, not just the TTL.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 50, tos: 40, proto: 6}
+    - TCP: {sport: 40002, dport: 80}
+    - Raw: {load: hello-flow-1}
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.tos: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: unclassifiable_arp_to_default
+  visibility: public
+  description: |
+    A non-IPv4 packet (ARP) carries no TTL/DSCP features and cannot be
+    classified; it is forwarded unchanged to the default port s1.p4.
+    Catches a classifier that reads feature fields from a packet that
+    does not have them.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: 'ff:ff:ff:ff:ff:ff', type: 2054}
+    - ARP: {op: 1, psrc: 10.0.1.1, pdst: 10.0.2.2}
+  expected:
+    behavior: forward
+    output_port: s1.p4
+- name: class1_mid_ttl
+  visibility: hidden
+  description: |
+    ttl=100 (64<ttl<=128) → class 1 regardless of tos → s1.p3. Exercises
+    node C's left branch.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 100, tos: 0, proto: 6}
+    - TCP: {sport: 40003, dport: 443}
+    - Raw: {load: mid-ttl}
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: class0_high_ttl
+  visibility: hidden
+  description: |
+    ttl=200 (>128) → class 0 regardless of tos → s1.p2. Node C's right
+    branch.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 200, tos: 0, proto: 6}
+    - TCP: {sport: 40004, dport: 443}
+    - Raw: {load: high-ttl}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: boundary_ttl_eq_64_tos_eq_16
+  visibility: hidden
+  description: |
+    Both features sit EXACTLY on their thresholds: ttl=64 (<=64, left)
+    and tos=16 (<=16, left) → class 0 → s1.p2. The inclusive-left
+    tie-break must be reproduced exactly; an off-by-one (treating <= as
+    <) would mis-steer this packet to s1.p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 64, tos: 16, proto: 6}
+    - TCP: {sport: 40005, dport: 80}
+    - Raw: {load: boundary-a}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: boundary_ttl_eq_128
+  visibility: hidden
+  description: |
+    ttl=128 sits exactly on node C's threshold (<=128, left) → class 1 →
+    s1.p3. The high-side boundary tie-break.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 128, tos: 50, proto: 6}
+    - TCP: {sport: 40006, dport: 80}
+    - Raw: {load: boundary-b}
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: boundary_tos_eq_17
+  visibility: hidden
+  description: |
+    ttl=60 (<=64) and tos=17 (just above the 16 threshold, right) →
+    class 1 → s1.p3. The just-above-boundary partner of
+    boundary_ttl_eq_64_tos_eq_16.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 60, tos: 17, proto: 6}
+    - TCP: {sport: 40007, dport: 80}
+    - Raw: {load: boundary-c}
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: feature_all_ones
+  visibility: hidden
+  description: |
+    Maximum representable feature values (ttl=255, tos=255). ttl=255>128
+    → class 0 → s1.p2. Confirms no overflow/wrap on the 8-bit feature
+    boundary.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 255, tos: 255, proto: 6}
+    - TCP: {sport: 40008, dport: 80}
+    - Raw: {load: max-feats}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: boundary_ttl_129_high_class0
+  visibility: hidden
+  description: |
+    ttl=129 (just above node C's 128 threshold, right) → class 0 →
+    s1.p2. The just-above partner of boundary_ttl_eq_128.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 129, tos: 200, proto: 6}
+    - TCP: {sport: 40009, dport: 80}
+    - Raw: {load: boundary-d}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: determinism_same_features_noise_payload
+  visibility: hidden
+  description: |
+    Identical feature values to class0_low_ttl_low_tos (ttl=50, tos=8)
+    but a different payload and L4 source port (non-feature fields) →
+    still class 0 → s1.p2. The decision must not depend on any
+    non-feature field.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 50, tos: 8, proto: 6}
+    - TCP: {sport: 51234, dport: 8080}
+    - Raw: {load: a-completely-different-payload}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+- name: payload_roundtrip_class0
+  visibility: hidden
+  description: |
+    A class-0 packet (ttl=50, tos=8) with a distinctive payload is
+    forwarded to s1.p2 with the payload delivered byte-for-byte
+    unchanged — the classifier steers, it does not rewrite the packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether: {src: '08:00:00:00:01:01', dst: '08:00:00:00:00:01'}
+    - IP: {src: 10.0.1.1, dst: 10.0.2.2, ttl: 50, tos: 8, proto: 6}
+    - TCP: {sport: 40011, dport: 80}
+    - Raw: {load: DISTINCT-PAYLOAD-PRESERVED-0xDEADBEEF}
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl: {action: unchanged}
+      IP.dst: {action: unchanged}
+      IP.tos: {action: unchanged}
+      TCP.dport: {action: unchanged}
+      TCP.seq: {action: unchanged}

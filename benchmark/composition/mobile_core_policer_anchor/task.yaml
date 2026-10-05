@@ -1,0 +1,910 @@
+task_name: mobile_core_policer_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-MobileCorePolicer
+pattern_version: '1.0'
+seed:
+  gtpu_udp_port: 2152
+  sketch_depth: 2
+  sketch_width: 64
+  heavy_threshold: 8
+  counter_max: 4294967295
+  epoch_packets: 4096
+  nat_pool_ip: 203.0.113.1
+  nat_pool_port_base: 20000
+  nat_capacity: 256
+  nat_eviction: none
+  fib_capacity: 1024
+  pipeline_order: decap_detect_nat_route
+  access_port: 1
+  internet_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: access
+    to: s1.p1
+  - from: s1.p2
+    to: internet
+hosts:
+  access:
+    note: gNB / access side; GTP-U uplink tunnels arrive on s1.p1
+  internet:
+    note: data network; plain IPv4 egress on s1.p2; NAT pool 203.0.113.1
+description: |-
+  Implement the uplink data plane of a mobile-core gateway for BMv2 (v1model)
+  that terminates subscriber tunnels, rate-limits each subscriber, performs
+  source network address translation, and forwards the traffic — all in a single
+  pass.
+
+  Topology: port 1 faces the access network — subscriber traffic arrives
+  tunnelled (an outer IPv4/UDP carrier on UDP port 2152, wrapping a GTP-U header
+  and the subscriber's own IPv4 packet). Port 2 faces the internet. This is
+  uplink only (access -> internet). The gateway presents a single public address
+  203.0.113.1 to the internet.
+
+  Required behaviour, per access-side packet:
+
+  - Tunnel termination. Remove the tunnel encapsulation to recover the
+    subscriber's original IPv4 packet; everything that follows concerns that
+    recovered packet. An access frame that is not a properly tunnelled subscriber
+    IPv4 packet is dropped.
+
+  - Per-subscriber rate limiting. Each subscriber (identified by the source
+    address of its recovered packet) is metered. A subscriber whose traffic rate
+    reaches the policing threshold has its packets dropped while it remains over
+    the limit. Subscribers are metered independently of one another, even when
+    they share the same access tunnel carrier. The metering and drop decision are
+    made before any translation state is created, so a rate-limited subscriber
+    leaves no translation binding behind.
+
+  - Address translation. A surviving subscriber packet has its private source
+    replaced by the gateway's public address 203.0.113.1 and by a public source
+    port the gateway assigns. Ports are assigned in ascending order starting at
+    20000: the first new subscriber flow receives source port 20000, the next new
+    flow 20001, and so on; the same subscriber flow keeps its assigned port across
+    all of its packets. The destination is unchanged.
+
+  - Forwarding. A packet that survives the previous steps is delivered toward its
+    destination on the internet side: it leaves on the correct port toward the
+    correct next hop, with its hop count decremented and its L2/L3 integrity
+    preserved. A packet with an expired hop count, or with no known route, is
+    dropped.
+
+  Both the P4 program and its table entries are yours to author. The ordering is
+  load bearing: rate limiting is keyed on the recovered subscriber identity (only
+  available after tunnel termination), and a rate-limited subscriber is dropped
+  before any translation binding is allocated.
+test_cases:
+- name: uplink_decap_nat_forward
+  visibility: public
+  goal_class: G1
+  description: 'A benign subscriber''s tunnelled uplink packet (inner 10.45.0.5:5000 -> 198.51.100.9:80) is recovered from its tunnel, source-translated, and forwarded to the internet side: the inner source becomes the public address with an assigned source port, the hop count is decremented, and the L2 next hop is rewritten. The destination is unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+- name: heavy_ue_policed
+  visibility: public
+  goal_class: G1
+  description: A subscriber whose traffic rate reaches the policing threshold (its eighth packet within the window) is dropped — rate-limited.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: non_gtpu_drop
+  visibility: public
+  goal_class: G1
+  description: A bare, non-tunnelled IPv4 frame on the access side is dropped — the uplink expects tunnelled subscriber traffic.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.45.0.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: nat_binding_reuse
+  visibility: hidden
+  goal_class: G2
+  description: 'The second uplink packet of an already-established subscriber flow reuses the SAME public source port (no new binding is allocated): inner 10.45.0.5:5000 maps to the same assigned port again.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: second_flow_distinct_port
+  visibility: hidden
+  goal_class: G2
+  description: A second distinct subscriber flow (inner 10.45.0.6:5000) opened after the first is assigned a DIFFERENT public source port, so the two flows remain distinguishable on the internet side.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.6
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20001
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.5
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: inner_ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: An uplink packet whose INNER hop count is 1 is forwarded with egress inner hop count 0 (decremented exactly once); the hop-count gate keys on the recovered inner packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.9
+        dst: 198.51.100.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+- name: policed_ue_leaves_no_binding
+  visibility: hidden
+  goal_class: G3
+  description: 'After a subscriber is rate-limited (dropped at the threshold), no translation binding exists for it: the very next packet from that subscriber is still dropped (the policing decision precedes and short-circuits translation).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id003
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id004
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id005
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id006
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id007
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: &id008
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.7
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: inner_keyed_detection
+  visibility: hidden
+  goal_class: G3
+  description: After subscriber 10.45.0.7 is rate-limited, a DIFFERENT subscriber 10.45.0.8 carried inside the SAME access tunnel is still admitted and forwarded — metering keys on the recovered subscriber identity, not on the shared tunnel carrier.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.8
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20001
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+  - port: s1.p1
+    layers: *id004
+  - port: s1.p1
+    layers: *id005
+  - port: s1.p1
+    layers: *id006
+  - port: s1.p1
+    layers: *id007
+  - port: s1.p1
+    layers: *id008
+- name: udp_subscriber_flow
+  visibility: hidden
+  goal_class: G3
+  description: A UDP subscriber flow is recovered, source-translated, and forwarded exactly like TCP — translation keys on the inner (ip, port, proto) triple, not the L4 type.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.10
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      UDP.sport:
+        action: change_to
+        value: 20000
+      UDP.dport:
+        action: unchanged
+- name: inner_no_route_drop
+  visibility: hidden
+  goal_class: G3
+  description: A recovered subscriber packet whose inner destination has no known route is dropped after tunnel termination — forwarding keys on the recovered inner destination.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.0.2.10
+        dst: 192.0.2.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+    - GTP_U_Header:
+        teid: 100
+    - IP:
+        src: 10.45.0.11
+        dst: 10.99.99.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) on the access side is dropped before any processing.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.45.0.7
+        pdst: 198.51.100.9
+  expected:
+    behavior: drop

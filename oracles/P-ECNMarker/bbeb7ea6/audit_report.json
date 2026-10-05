@@ -1,0 +1,208 @@
+{
+  "oracle_hash": "630f547a549d6f78a56473d4696c305038b89e26b12ac1968dfb1e7b5335a2df",
+  "instance": "ecn_marker_disc_mut4-enable-two-priority-queues",
+  "ran_at": "2026-05-30T11:45:01.028485Z",
+  "canonical_examples": {
+    "passed": 32,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_wrong_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_non_ipv4_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_tcp_only_drops_udp",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_tcp_only_admits_tcp",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_below_threshold_ect_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_at_threshold_ect0_marked",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_above_threshold_ect1_marked",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_rebound_threshold32_marked_at_depth40",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_above_threshold_not_ect_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_not_ect_passthrough_relaxed",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_above_threshold_ce_preserve",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_below_threshold_ce_preserve",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_dscp_preserved_under_mark",
+        "status": "pass"
+      },
+      {
+        "example_id": "d53_tail_drop_above_threshold_ect",
+        "status": "pass"
+      },
+      {
+        "example_id": "d53_tail_drop_below_threshold_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "mixed_drop_mark_passthrough_sequence",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_ce_persistence_relaxed_unmark",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_min_th_low_marks_midband",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_min_th_high_passes_midband",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_pmax_high_marks_midband",
+        "status": "pass"
+      },
+      {
+        "example_id": "red_pmax_low_passes_midband",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_class0_below_threshold",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_class1_marks_lower_depth",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_count1_collapses_to_single",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_classifier_none_collapses",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_class1_K50_passes",
+        "status": "pass"
+      },
+      {
+        "example_id": "pq_class0_K32_marks",
+        "status": "pass"
+      },
+      {
+        "example_id": "pqred_class1_min16_passes",
+        "status": "pass"
+      },
+      {
+        "example_id": "pqred_class1_min4_marks",
+        "status": "pass"
+      },
+      {
+        "example_id": "pqred_class0_min32_passes",
+        "status": "pass"
+      },
+      {
+        "example_id": "pqred_class0_min8_marks",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "ce_persistence_no_unmark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "not_ect_never_marked": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "dscp_preserved_under_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ipv4_checksum_validity_after_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stable_marking_decision": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_pipeline_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "ce_persistence_no_unmark",
+      "not_ect_never_marked",
+      "dscp_preserved_under_mark",
+      "ipv4_checksum_validity_after_mark",
+      "stable_marking_decision",
+      "no_pipeline_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc3168",
+      "rfc8257",
+      "rfc8087"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

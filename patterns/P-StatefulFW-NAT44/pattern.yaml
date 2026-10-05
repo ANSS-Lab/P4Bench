@@ -1,0 +1,1204 @@
+# P-StatefulFW-NAT44 — Edge: Stateful Firewall ∘ NAPT (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-StatefulFW (zone-based stateful packet
+# filter) with P-NAT44 (IPv4 NAPT, RFC 3022) into a single edge NF — the
+# canonical residential-/enterprise-edge deployment where a single switch
+# both polices inbound traffic against established outbound sessions AND
+# hides the internal subnet behind a public address.
+#
+# The value of this *chained* pattern (versus instantiating P-StatefulFW
+# and P-NAT44 independently) is the shared 5-tuple connection-tracking
+# table: one entity carries BOTH the firewall verdict (established,
+# tcp_state, last_seen) AND the NAT mapping (public_ip, ext_port). A
+# correct implementation must (a) install both halves atomically on the
+# first outbound packet, (b) preserve mapping symmetry under eviction, and
+# (c) order classification-then-translation on every packet — three
+# properties whose interactions are invisible when the components are
+# tested in isolation. See `bridging_notes:` for the v1model failure modes
+# this composition exposes.
+#
+# The cross-axis
+# `composition` target_capability tag is used because
+# this NF chains a P-NAT44 (scale_up) primitive with a P-StatefulFW
+# (scale_up) primitive into a single composed NF whose structural failure
+# modes are neither pure-scale_up nor pure-redesign.
+
+pattern_id: P-StatefulFW-NAT44
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking, D7:security]   # composed NF straddles flow-tracking (NAT mapping) and security (firewall policy)
+  prescriptive: [P2:address-translation, P3:flow-tracking, P8:security]   # NAPT + per-conn state + scaled DPI gate
+target_capability: composition                          # chained composition of two scale_up primitives; failure modes are cross-cutting
+summary: >
+  Edge-gateway composition of a zone-based stateful firewall with IPv4
+  NAPT, sharing a single 5-tuple connection-tracking table that records
+  both the firewall verdict (established, tcp_state, last_seen) and the
+  NAT mapping (public_ip, ext_port). Classifies and translates in a single
+  pipeline pass: on the outbound path a new connection is admitted by
+  default and an external port is allocated from the public pool; on the
+  inbound path only return packets matching an established outbound
+  session are DNAT-ed and forwarded — all other inbound traffic falls to
+  default-deny. Faithfulness ladder: D5.0 static ACL + static NAT
+  mapping → D5.1 reflexive admission with dynamic port allocation → D5.2
+  RFC 5382 TCP-state-machine enforcement.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: tea_sigcomm20
+      role: canonical_implementation
+      relevance: |
+        TEA's connection-tracker design — 5-tuple key, per-connection
+        attribute record, RDMA-backed slow-path for the long tail —
+        is the reference for the unified `connection` entity this
+        pattern uses. TEA's key/attrs schema is the terminology
+        adopted at D5.1+ where a single conntrack table simultaneously
+        services the firewall's reflexive-admission gate and NAT's
+        bidirectional-mapping lookup.
+
+    - cite: sailfish_sigcomm21
+      role: scaling_approach
+      relevance: |
+        Sailfish documents the composed-edge-NF deployment
+        (SNAT + ACL + VPC) on Tofino at Alibaba scale and informs the
+        "stateless-on-chip / stateful-off-chip" partition motivating
+        the D5.2_partition extension path for instances whose
+        `conntrack_capacity` exceeds switch SRAM. Provides the working
+        vocabulary for chained-NF reasoning: a single egress / ingress
+        traversal must cover both NAT rewrites and firewall verdicts
+        without recirculation.
+
+    - cite: sirius_nsdi24
+      role: scaling_approach
+      relevance: |
+        Sirius composes ~10 business NFs (NAT + stateful FW among them)
+        into a single P4 edge-gateway program with explicit
+        ASIC↔CPU partitioning when the chain exceeds chip resources.
+        Informs Tier-3 implementation guidance: which conntrack entries live
+        in TCAM (hot, recently-installed), which spill to a register-
+        array slow path, and how to ladder the input-form parameter
+        without breaking pair_symmetry across the fast/slow boundary.
+
+    - cite: mantis_sigcomm20
+      role: failure_mode
+      relevance: |
+        Mantis demonstrates sub-RTT reactive policy enforcement against
+        SYN-flood DDoS at table-rewrite cadence. Informs both the
+        `add_syn_flood_test` mutation operator and the master
+        invariant `state_only_installed_from_internal` — adversarial
+        inbound SYNs MUST NOT create conntrack entries, otherwise the
+        attacker fills the table and starves legitimate outbound
+        flows.
+
+  rfcs:
+    - id: RFC2979
+      sections: ["3", "4"]
+      role: normative_behaviour
+      relevance: |
+        "Behavior of and Requirements for Internet Firewalls" — the
+        zone-based default-deny model this pattern realises on the
+        external side, the requirement that the firewall MUST be
+        transparent (TTL-decrement and L3-forward) on permitted
+        traffic, and the "reflexive admission" rule lifted at D5.1.
+        Anchors the master security invariant
+        `default_deny_external`.
+
+    - id: RFC3022
+      sections: ["2", "3", "4"]
+      role: canonical_spec
+      quote: >-
+        Network Address Port Translation, or NAPT is a method by which many
+        network addresses and their TCP/UDP (Transmission Control Protocol/User
+        Datagram Protocol) ports are translated into a single network address
+        and its TCP/UDP ports.
+      quote_source: patterns/P-StatefulFW-NAT44/grounding/RFC3022.txt
+      relevance: |
+        Traditional NAT (Basic NAT and NAPT) — the NAT half of the
+        composition. Defines (a) the static-vs-dynamic mapping
+        distinction (D5.0 vs D5.1+); (b) the address-pool / port-pool
+        model bounded by `port_pool_range`; (c) NAPT scope restricted
+        to TCP/UDP and the requirement to drop non-L4 / non-IPv4
+        traffic; (d) the bidirectional-mapping symmetry invariant
+        (pair_symmetry below); and (e) the choice to drop (rather
+        than ICMP-respond) on inbound-with-no-mapping, which this
+        pattern fixes deterministically.
+
+    - id: RFC4787
+      sections: ["4", "5"]
+      role: normative_behaviour
+      relevance: |
+        UDP NAT behavioural requirements — used to pin ambiguous
+        behaviour at D5.1+: endpoint-independent mapping
+        (REQ-1 / REQ-2 — same internal `(ip, port, proto)` MUST map
+        to the same `ext_port` regardless of destination) and the
+        address-pooling constraint. Drives the
+        `endpoint_independent_mapping` parameter and the
+        `endpoint_independent_mapping_check` G3 test.
+
+    - id: RFC5382
+      sections: ["4", "5", "7"]
+      role: normative_behaviour
+      relevance: |
+        TCP-state-tracking requirements for a NAT or stateful firewall:
+        the SYN / SYN-ACK / ESTABLISHED / closing transitions the data
+        plane MUST observe (REQ-1 through REQ-5), the partial-open
+        timeout (4 min), the established timeout (2 h 4 min), and the
+        rule that out-of-order or invalid handshake sequences MUST be
+        dropped rather than silently advanced. Ground truth for the
+        `tcp_handshake_order_enforced` test in G1 and the
+        `idle_timeout_s` parameter range at D5.2.
+
+    - id: RFC6092
+      sections: ["3", "4"]
+      role: normative_behaviour
+      relevance: |
+        Recommended residential-firewall behaviour for IPv6 — adapted
+        here to the IPv4 NAPT setting because the policy intent is
+        identical: outbound flows establish state and admit their
+        return; inbound-only flows are default-denied; established
+        sessions survive churn. REC-30 ("an outbound-initiated
+        session SHOULD continue to receive its return traffic until
+        idle-timeout regardless of intervening packets") drives the
+        `persistence_strict` mode and its `state_consistency_under_
+        eviction` invariant.
+
+    - id: RFC3704
+      sections: ["2", "3"]
+      role: threat_model
+      relevance: |
+        BCP 84 (strict reverse-path forwarding) — the source of the
+        Tier-3 anti-spoofing rule `R2_outbound_urpf_drop`. A packet
+        on the internal-zone port whose `IP.src` is not in
+        `${internal_subnet}` is dropped at ingress regardless of
+        whether a matching outbound conn exists.
+
+  tutorials:
+    - path: tutorials/exercises/firewall
+      role: baseline_topology
+      relevance: |
+        The p4lang/tutorials firewall exercise's 2-host / 1-switch
+        internal-vs-external topology and the convention of expressing
+        explicit inbound permissions as control-plane-installed
+        connection-table entries — directly reused for D5.0 (static)
+        instantiations of this composed pattern. The exercise's
+        connection-table is renamed to `acl_rule` here to make room
+        for the dynamically-populated `connection` entity at D5.1+.
+
+    - path: tutorials/exercises/basic_routing
+      role: baseline_topology
+      relevance: |
+        Two-host single-switch topology (one internal port + one
+        external port) and the IPv4 forwarding / TTL conventions
+        reused here for the L3 forwarding stage that the firewall +
+        NAT chain layers on top of. Same baseline used by P-NAT44 —
+        the chain is realised by adding a `connection` register
+        between parse and the LPM-style forwarder.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    notes: |
+      Per-packet 5-tuple identity. As in P-StatefulFW / P-NAT44,
+      `meta.l4_srcPort` / `meta.l4_dstPort` are extracted into metadata
+      after the L4 parser so downstream rules are protocol-agnostic
+      between TCP and UDP.
+
+  acl_rule:
+    keyed_by: flow
+    attrs:
+      verdict: enum            # permit | drop
+      internal_ip:   address   # for static-mode pairs, the de-NAT-ed dst
+      internal_port: port
+    capacity: unbounded
+    eviction: none
+    notes: |
+      Control-plane-installed explicit-permit / explicit-drop rules. At
+      D5.0_static_acl_static_nat (Tier-1) the control plane preinstalls
+      symmetric (outbound, inbound) `acl_rule` pairs to realise the
+      composition without any data-plane state; at D5.1+ this table is
+      consulted ONLY for explicit-permit overrides that should survive
+      conntrack eviction. The optional `internal_ip` / `internal_port`
+      attrs let the control plane preload static NAT mappings.
+
+  connection:
+    keyed_by: flow             # keyed by the OUTBOUND 5-tuple
+    attrs:
+      established: bool        # FW verdict: was this conn admitted?
+      last_seen:   timestamp
+      tcp_state:   enum        # NEW | SYN_SENT | SYN_RECV | ESTABLISHED | CLOSING
+      public_ip:   address     # NAT mapping (always == ${public_ip} under single-public-IP designs)
+      ext_port:    port        # allocated external L4 port
+    capacity: ${conntrack_capacity}
+    eviction: ${eviction_policy}
+    decay:    ${idle_timeout_s}
+    notes: |
+      The KEY composition entity. A single per-connection record holds
+      BOTH the firewall verdict (`established`, `tcp_state`,
+      `last_seen`) AND the NAT mapping (`public_ip`, `ext_port`). At
+      D5.0 the control plane installs entries statically via paired
+      acl_rule entries (so this table is unused); at D5.1+ R5 installs
+      it on the first outbound packet of every flow. At D5.2 the
+      `tcp_state` attribute is also tracked.
+
+  connection_inbound:
+    keyed_by_tuple:
+      - "${public_ip}"
+      - meta.l4_dstPort         # the allocated ext_port from the outbound bind
+      - hdr.ipv4.proto
+    attrs:
+      conn_key:        flow     # reverse pointer back to the connection entry
+    capacity: ${conntrack_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Mirror of `connection` for the inbound DNAT lookup. The
+      `pair_symmetry` invariant ties the two together: every connection
+      bind installs both halves, every eviction removes both halves.
+      Realised structurally by R5 (the only data-plane rule that
+      creates connection entries — both halves bound together).
+
+  port_pool:
+    attrs:
+      free_ports: list[port]
+      range:      "[${port_pool_range}.low, ${port_pool_range}.high]"
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      Free-list of external L4 ports for dynamic allocation under
+      D5.1+. At D5.0 (static) this is not materialised — the control
+      plane chose ext_port at provisioning time.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  internal_subnet:
+    type: address
+    constraint: ipv4_cidr
+
+  public_ip:
+    type: address
+    constraint: ipv4
+    notes: |
+      The single public address the internal subnet is masqueraded
+      behind. Multi-IP pools are out of scope for v1.0; an operator
+      `enlarge_to_public_ip_pool` is reserved for v2.
+
+  mode:
+    type: enum
+    values: [static, dynamic]
+    default: static
+    notes: |
+      static  → D5.0: control plane installs both halves of every
+                conn via paired acl_rule entries (no data-plane
+                allocator). Matches the Tier-1 baseline that mirrors
+                the standalone P-StatefulFW + P-NAT44 twins.
+      dynamic → D5.1+: data plane allocates `ext_port` from
+                port_pool on the first outbound packet of an unseen
+                flow.
+
+  port_pool_range:
+    type: tuple[int, int]
+    constraint: "low ≥ 1024 ∧ high ≤ 65535 ∧ low < high"
+    default: [10000, 65535]
+
+  conntrack_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO, LRU, timeout]
+    default: none
+
+  idle_timeout_s:
+    type: int
+    range: "[30, 7440]"
+    default: 300
+    enforced_when: "${eviction_policy} == timeout ∨ ${faithfulness} == D5.2_tcp_state_tracking"
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_static_acl_static_nat      # Tier-1 — control-plane-only chain
+      - D5.1_reflexive_dynamic_nat      # Tier-2 — admit return + dynamic alloc
+      - D5.2_tcp_state_tracking         # Tier-3 — enforce TCP handshake + hardening
+    default: D5.0_static_acl_static_nat
+
+  endpoint_independent_mapping:
+    type: bool
+    default: true
+    notes: |
+      RFC 4787 REQ-1: same internal `(ip, port, proto)` MUST map to the
+      same `ext_port` regardless of destination. When true (default),
+      the implementation cannot key the port-pool allocator on the destination.
+      Defaults true; loosened only by the explicit
+      `relax_endpoint_independent_mapping` operator.
+
+  persistence_strict:
+    type: bool
+    default: false
+    notes: |
+      RFC 6092 REC-30 mode. When true, the spec demands that established
+      outbound sessions survive specific churn events (idle-eviction
+      with live-flow refresh, conntrack-table near-overflow). Mirrors
+      P-StatefulFW's `reflexive_strict` and P-StatefulLB's
+      `persistence_strict`.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# Order matters: first matching `when` fires.
+
+rules:
+
+  - id: R1_non_ipv4_drop
+    when: |
+      ¬header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP — anything that isn't IPv4 is dropped on both
+      zones. G3 parser-edge anchor, lifted verbatim from
+      P-StatefulFW R1 and P-NAT44 R6 (non-IPv4 half).
+
+  - id: R2_non_tcp_udp_drop
+    when: |
+      header_present(ipv4) ∧
+      ¬header_present(tcp) ∧ ¬header_present(udp)
+    then:
+      - drop
+    notes: |
+      NAPT scope is TCP/UDP only (RFC 3022 §4). ICMP from either zone
+      is dropped — this preserves NAT's invariant that every translated
+      packet has L4 ports to rewrite. Tier-3 instances MAY relax this
+      via the `allow_icmp_echo` operator (reserved for v2).
+
+  - id: R3_outbound_urpf_drop
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      ¬match(hdr.ipv4.src, ${internal_subnet})
+    then:
+      - drop
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: BCP 84 / RFC 3704 strict-reverse-path-forwarding on the
+      trusted side. Drops outbound spoofed-source traffic before any
+      NAT or forwarding step. Anchors invariant `no_spoofed_outbound`.
+
+  - id: R4_ipv4_fragment_drop
+    when: |
+      header_present(ipv4) ∧
+      (value(hdr.ipv4.flags.MF, ==, 1) ∨ value(hdr.ipv4.fragOffset, ≠, 0))
+    then:
+      - drop
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3 hardening on BOTH directions: IP fragments cannot be
+      reliably L4-inspected, so admitting them allows an attacker
+      to bypass the FW classification by fragmenting their TCP header.
+      Anchors invariant `no_fragment_inspection`.
+
+  - id: R5_outbound_known_conn
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      match(hdr.ipv4.src, ${internal_subnet}) ∧
+      exists(connection, flow.key)
+    given:
+      flow:       deduce_from_packet
+      connection: by_key(flow)
+    then:
+      - "bind(connection, flow.key, {last_seen: now()})"
+      - rewrite(hdr.ipv4.src, connection[*].public_ip)
+      - rewrite(meta.l4_srcPort, connection[*].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external)
+    notes: |
+      Outbound HIT path: known conn → refresh last_seen, apply stored
+      SNAT mapping, decrement TTL, forward. Subsumes P-NAT44 R1.
+      The `connection.public_ip` will equal `${public_ip}` under the
+      single-public-IP design but is stored per-entry so a future
+      multi-public-IP pool extension does not re-author this rule.
+
+  - id: R6_outbound_new_conn_dynamic
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      match(hdr.ipv4.src, ${internal_subnet}) ∧
+      ¬exists(connection, flow.key) ∧
+      ${mode} == dynamic ∧
+      ¬empty(port_pool.free_ports)
+    given:
+      flow:      deduce_from_packet
+      port_pool: singleton
+    then:
+      - "bind(connection, flow.key, {established: true, last_seen: now(), tcp_state: NEW, public_ip: ${public_ip}, ext_port: alloc(port_pool)})"
+      - "bind(connection_inbound, (${public_ip}, connection[flow.key].ext_port, hdr.ipv4.proto), {conn_key: flow.key})"
+      - rewrite(hdr.ipv4.src, ${public_ip})
+      - rewrite(meta.l4_srcPort, connection[flow.key].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external)
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      Outbound MISS path under D5.1+: admit (firewall verdict) AND
+      allocate `ext_port` (NAT) AND install both halves of the
+      conntrack pair atomically. This is the load-bearing chain rule
+      — pair_symmetry is a structural consequence of binding both
+      `connection` and `connection_inbound` from the same firing.
+      Subsumes P-StatefulFW R3 + P-NAT44 R2 merged.
+
+  - id: R7_outbound_miss_drop
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      match(hdr.ipv4.src, ${internal_subnet}) ∧
+      ¬exists(connection, flow.key) ∧
+      (${mode} == static ∨ empty(port_pool.free_ports))
+    then:
+      - drop
+    notes: |
+      Outbound miss under D5.0 (no preinstalled static mapping)
+      or D5.1+ with pool exhaustion. Deterministic drop (RFC 3022
+      §4.1 permits drop or blackhole; this pattern fixes the choice).
+      Subsumes P-NAT44 R3.
+
+  - id: R8_outbound_urpf_drop_fallthrough
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      ¬match(hdr.ipv4.src, ${internal_subnet})
+    then:
+      - drop
+    enforced_when: "${faithfulness} ≠ D5.2_tcp_state_tracking"
+    notes: |
+      Below Tier-3, an internal-port packet whose src is not in
+      `${internal_subnet}` is still dropped — but as a fall-through
+      from R5/R6/R7 (whose `when:` clauses require the match) rather
+      than as a dedicated rule. The `enforced_when` toggle keeps this
+      rule active at D5.0/D5.1 (a fallthrough rule) and superseded
+      by R3 at D5.2 (an explicit, prioritised rule).
+
+  - id: R9_inbound_wrong_dst_drop
+    when: |
+      ingress(external) ∧ header_present(ipv4) ∧
+      ¬match(hdr.ipv4.dst, ${public_ip})
+    then:
+      - drop
+    notes: |
+      Inbound packet not destined for the public IP — drop. Confirms
+      that the public-IP gate sits before any conntrack lookup.
+      Subsumes the `dst ≠ public_ip` half of P-NAT44 R5.
+
+  - id: R10_inbound_known_mapping
+    when: |
+      ingress(external) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      match(hdr.ipv4.dst, ${public_ip}) ∧
+      exists(connection_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto)) ∧
+      exists(connection, connection_inbound[*].conn_key) ∧
+      value(connection[*].established, ==, true) ∧
+      (¬header_present(tcp) ∨ ${faithfulness} ≠ D5.2_tcp_state_tracking ∨
+       valid_tcp_transition(connection[*].tcp_state, hdr.tcp.flags))
+    given:
+      connection_inbound: by_key((hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+      connection:         by_key(connection_inbound[*].conn_key)
+    then:
+      - "bind(connection, connection_inbound[*].conn_key, {last_seen: now()})"
+      - transition(connection, next_tcp_state(hdr.tcp.flags))
+      - rewrite(hdr.ipv4.dst, connection_inbound[*].conn_key.src)
+      - rewrite(meta.l4_dstPort, connection_inbound[*].conn_key.srcPort)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(internal)
+    notes: |
+      Inbound RETURN path: lookup `connection_inbound` by
+      `(public_ip, dport, proto)`; if it resolves to an `established`
+      connection (and the TCP transition is legal at D5.2), refresh
+      last_seen, advance tcp_state, DNAT the dst back to the
+      stored internal `(ip, port)` (recovered from
+      `connection_inbound[*].conn_key.src` — i.e., the outbound
+      5-tuple's src half), decrement TTL, and forward. This is the
+      fused (P-StatefulFW R5 reflexive-admit + P-NAT44 R4 DNAT) rule.
+
+  - id: R11_inbound_acl_static
+    when: |
+      ingress(external) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      match(hdr.ipv4.dst, ${public_ip}) ∧
+      exists(acl_rule, flow.key) ∧
+      value(acl_rule[flow.key].verdict, ==, permit)
+    given:
+      flow:     deduce_from_packet
+      acl_rule: by_key(flow)
+    then:
+      - rewrite(hdr.ipv4.dst, acl_rule[flow.key].internal_ip)
+      - rewrite(meta.l4_dstPort, acl_rule[flow.key].internal_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(internal)
+    enforced_when: "${mode} == static ∨ ${faithfulness} == D5.0_static_acl_static_nat"
+    notes: |
+      Static-mode inbound admission: an explicit-permit acl_rule
+      with its de-NAT-ed (internal_ip, internal_port) preinstalled
+      by the control plane. This rule supplies the D5.0 path that
+      sidesteps the conntrack allocator entirely. At D5.1+ it is
+      retained as a fallback for explicit-permit overrides that
+      should survive conntrack eviction (e.g., port-forwards to a
+      well-known server in the internal subnet).
+
+  - id: R12_inbound_default_deny
+    when: |
+      ingress(external) ∧ header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Default-deny for any inbound IPv4 packet that did not match an
+      established `connection_inbound` (R10) or an explicit-permit
+      acl_rule (R11). Includes unsolicited inbound TCP/UDP, inbound
+      with stale tcp_state under D5.2, and inbound for a mapping
+      that has been evicted. Master security anchor. RFC 2979 §3.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: default_deny_external
+    clause: stability
+    target: forward_decision
+    while: "ingress(external) ∧ ¬exists(connection_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto)) ∧ ¬exists(acl_rule, flow.key)"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      Inbound packet without either a matching connection_inbound or
+      an explicit-permit acl_rule MUST drop — regardless of rule
+      ordering or conntrack table contents. The composed pattern's
+      master security invariant; G3 tests anchor on it.
+
+  - id: pair_symmetry
+    clause: no_orphan
+    target: connection
+    while: "true"
+    free_under: ["paired_bind(_)", "paired_evict(_)"]
+    notes: |
+      Every `connection` entry has a complementary `connection_inbound`
+      entry installed in the SAME rule firing (R5), and every eviction
+      removes both halves. The structural pairing is what makes the
+      composed pattern safe under concurrent state pressure: a half-
+      installed entry would either leak inbound traffic (orphan inbound)
+      or silently blackhole legitimate return traffic (orphan outbound).
+
+  - id: port_uniqueness
+    clause: stability
+    target: "(public_ip, ext_port, proto) → connection"
+    while: "true"
+    notes: |
+      At any instant, no two distinct connection entries share the
+      same `(public_ip, ext_port, proto)` triple. R6 (the allocator)
+      must respect this — port_pool.alloc returns a port not currently
+      in use. Without this, R10 cannot uniquely reverse the mapping.
+      Lifted from P-NAT44.
+
+  - id: bidirectional_translation
+    clause: stability
+    target: "rewrite-pair-of(connection)"
+    while: "connection ∈ live_entries"
+    notes: |
+      For every live `connection`, the outbound rewrite (R5: src ←
+      public_ip, sport ← ext_port) is exactly inverted on the return
+      packet (R10: dst ← internal_ip, dport ← internal_port). R5 and
+      R10 are inverse transforms. Lifted from P-NAT44 and extended
+      to the composed pattern.
+
+  - id: endpoint_independent_mapping
+    clause: persistence
+    target: connection[*].ext_port
+    while: "(connection.key.src, connection.key.srcPort, connection.key.proto) fixed"
+    free_under: ["evict(connection, _)"]
+    enforced_when: "${endpoint_independent_mapping}"
+    notes: |
+      RFC 4787 REQ-1: `ext_port` is a function of (internal_ip,
+      internal_port, proto) only — destination MUST NOT participate.
+      The allocator (R6) keys only on the outbound 3-tuple
+      (src, srcPort, proto).
+
+  - id: state_only_installed_from_internal
+    clause: stability
+    target: "membership(connection)"
+    while: "ingress(external)"
+    free_under: ["paired_evict(_)"]
+    notes: |
+      No data-plane rule installs a `connection` entry from an
+      inbound-port firing. This is the structural defence against
+      adversarial inbound SYNs filling the conntrack table and
+      evicting legitimate flows (Mantis-style failure mode). R5 is
+      gated by `ingress(internal)`; R10 only refreshes `last_seen`
+      and advances `tcp_state` on existing entries — never binds new
+      ones. Anchors the `syn_flood_resilience` G3 test.
+
+  - id: state_consistency_under_eviction
+    clause: stability
+    target: forward_decision
+    while: "ingress(external) ∧ flow.key was evicted from connection"
+    free_under: ["paired_evict(_)"]
+    enforced_when: "${eviction_policy} ≠ none ∧ ${faithfulness} ≥ D5.1_reflexive_dynamic_nat"
+    notes: |
+      Once an outbound conn has been evicted (capacity pressure or
+      idle-timeout), the inbound return packet MUST NOT be admitted
+      by R10 — it falls through to R12 default-deny. Without this,
+      eviction creates a stale-permit window an adversary can exploit.
+
+  - id: no_orphan_connection
+    clause: no_orphan
+    target: connection
+    enforced_when: "${conntrack_capacity} ≠ unbounded ∧ ${mode} == dynamic"
+    notes: |
+      Bounded conntrack under dynamic allocation MUST have an eviction
+      policy that eventually removes stale entries — otherwise the
+      port pool drains and new flows are blackholed (R7).
+
+  - id: no_spoofed_outbound
+    clause: stability
+    target: forward_decision
+    while: "ingress(internal) ∧ ¬match(hdr.ipv4.src, ${internal_subnet})"
+    free_under: []
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: outbound-zone packets with foreign source addresses
+      drop unconditionally, regardless of conntrack contents.
+
+  - id: no_fragment_inspection
+    clause: stability
+    target: forward_decision
+    while: "header_present(ipv4) ∧ (value(hdr.ipv4.flags.MF, ==, 1) ∨ value(hdr.ipv4.fragOffset, ≠, 0))"
+    free_under: []
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: fragmented IPv4 packets drop on both directions before
+      ANY conntrack / ACL / NAT consultation. Prevents fragmentation-
+      based bypass of the L4 classifier.
+
+  - id: persistence_under_idle_refresh
+    clause: persistence
+    target: connection[*].established
+    while: "connection.key live ∧ activity on key.flow within ${idle_timeout_s}"
+    free_under: []
+    enforced_when: "${persistence_strict}"
+    notes: |
+      RFC 6092 REC-30: an established outbound session survives until
+      idle-timeout regardless of intervening packets. With
+      `persistence_strict`, the spec demands the implementation
+      withstand conntrack near-overflow without evicting active
+      entries — i.e., an LRU/timeout policy must touch `last_seen` on
+      every match.
+
+  - id: no_loop
+    clause: no_loop
+    target: forward_decision
+    notes: |
+      Every packet egresses on a definite port or is dropped; no
+      recirculation is required by any rule.
+
+  - id: bounded_latency
+    clause: bounded_latency
+    target: packet
+    while: "header_present(ipv4)"
+    enforced_when: "true"
+    notes: |
+      Per-packet latency is bounded by the pipeline depth — both
+      directions of the chain (R5+R6 outbound, R10 inbound) complete
+      in a single ingress pass.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: outbound_first_packet_allocates_and_snat
+      generate: |
+        Send the first packet of a new outbound flow (src in
+        ${internal_subnet}, fresh internal sport, TTL=64). Assert:
+        IP.src ← ${public_ip}, L4 sport ← allocated ext_port (in
+        ${port_pool_range}), IP.ttl decremented by 1, output_port =
+        external, AND IP / L4 checksums recomputed. At Tier-1 (static),
+        the preinstalled mapping is used instead of dynamic allocation
+        and the same SNAT rewrite is asserted on the matching entry.
+        Anchors invariants `bidirectional_translation` (outbound half)
+        and `pair_symmetry` (entry-pair existence).
+
+    - id: inbound_return_path_dnat
+      generate: |
+        Warm-up: outbound packet from internal_ip:isport → installs
+        connection with ext_port=X (or Tier-1 preinstalled pair).
+        Test packet: inbound from external host, dst=${public_ip},
+        dport=X, sport=80, TTL=64. Assert: IP.dst ← internal_ip, L4
+        dport ← isport, IP.ttl decremented by 1, output_port =
+        internal, checksums recomputed. Anchors
+        `bidirectional_translation` (inbound half).
+
+    - id: outbound_subsequent_packet_reuses_mapping
+      generate: |
+        Warm-up: send one outbound packet to install conn with
+        ext_port=X. Test packet: second outbound packet on the SAME
+        5-tuple (TTL=64). Assert: same ext_port=X reused (no new
+        allocation), `last_seen` refreshed, SNAT applied, forward.
+        Confirms R5 (known-conn path) is distinct from R6
+        (new-conn install).
+
+    - id: bidirectional_consistency
+      generate: |
+        Warm-up: outbound flow F installs ext_port=X. Test sequence
+        (depends_on warm-up): one outbound + one inbound on the
+        same conn, in alternation. Assert both rewrites are mutual
+        inverses on every packet. Anchors invariant
+        `bidirectional_translation` end-to-end.
+
+    - id: reflexive_admit_only_after_outbound
+      requires: "${faithfulness} >= D5.1_reflexive_dynamic_nat"
+      generate: |
+        Send only an inbound packet (no warm-up) to
+        (${public_ip}, fresh_dport, proto=TCP). Assert drop. Then
+        warm-up with an outbound packet that installs ext_port=X.
+        Send the inbound return on (${public_ip}, X, TCP). Assert
+        forward + DNAT. Probes the "no inbound without outbound
+        first" semantics.
+
+    - id: tcp_handshake_order_enforced
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Warm-up: outbound SYN (TTL=64) installs conn in tcp_state =
+        SYN_SENT. Test packet: inbound ACK (NOT SYN-ACK, TTL=1).
+        Assert: drop — ACK in SYN_SENT is not a legal transition.
+        Anchors RFC 5382 REQ-1/REQ-2.
+
+    - id: second_outbound_flow_distinct_ext_port
+      requires: "${mode} == dynamic"
+      generate: |
+        Open two distinct outbound flows from the same internal
+        host (same src, different sport). Assert they receive
+        distinct ext_ports. Anchors invariant `port_uniqueness`.
+
+  G2:
+    - id: conntrack_capacity_eviction
+      requires: "${conntrack_capacity} != unbounded ∧ ${eviction_policy} != none ∧ ${mode} == dynamic"
+      generate: |
+        Warm-up: open ${conntrack_capacity}+1 distinct outbound flows
+        (TTL=64). Send a return packet for the oldest warm-up flow
+        (TTL=1). Under FIFO/LRU/timeout, that conn was evicted; the
+        inbound packet has no matching connection_inbound and no
+        acl_rule, so behavior=drop. Anchors invariant
+        `state_consistency_under_eviction` AND `pair_symmetry`
+        (eviction is paired).
+
+    - id: port_pool_exhaustion_drops
+      requires: "${mode} == dynamic"
+      generate: |
+        Open enough outbound flows to drain
+        port_pool.free_ports. Send one more new outbound flow.
+        Under ${eviction_policy} = none → assert drop (R7). Under
+        LRU/timeout → assert forward + a stale conn was evicted
+        and its ext_port reused.
+
+    - id: idle_timeout_releases_mapping
+      requires: "${eviction_policy} == timeout ∧ ${mode} == dynamic"
+      generate: |
+        Install a dynamic conn. Wait > ${idle_timeout_s}. Send a
+        different new outbound flow. Assert the evicted ext_port
+        is reusable; AND send a late inbound on the original
+        ext_port — assert drop (state consistent under eviction).
+
+    - id: ttl_one_decrements_to_zero_then_drops_at_tier3
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an outbound TCP packet with TTL=1. Assert drop (TTL
+        decrement would emit TTL=0). Distinguishes Tier-3 from
+        Tier-1/Tier-2, where the same packet forwards with TTL=0.
+
+  G3:
+    - id: inbound_unsolicited_drop
+      generate: |
+        Send an inbound TCP/UDP packet to ${public_ip}:dport whose
+        (public_ip, dport, proto) is NOT in connection_inbound AND
+        not in acl_rule. Assert drop. Anchors invariant
+        `default_deny_external`.
+
+    - id: inbound_wrong_dst_drop
+      generate: |
+        Send an inbound packet whose IP.dst ≠ ${public_ip}. Assert
+        drop, regardless of conn / ACL contents.
+
+    - id: icmp_dropped_both_zones
+      generate: |
+        Send ICMP echo requests from both internal and external
+        zones to ${public_ip}. Assert both dropped (NAPT scope is
+        TCP/UDP only; R2). Probes RFC 3022 §4 boundary.
+
+    - id: non_ipv4_drop
+      generate: |
+        Send ARP requests from either zone. Assert drop (R1
+        catches all non-IPv4). Parser-edge anchor — also targets
+        the v1model conditional-deparser bug pattern: if the SUT
+        emits a degenerate header on drop, the parser-deparser
+        boundary is broken.
+
+    - id: outbound_urpf_spoofed_drop
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an outbound TCP packet whose IP.src is OUTSIDE
+        ${internal_subnet} (e.g., src=192.0.2.99). Assert drop
+        regardless of whether a matching conn exists. Anchors
+        invariant `no_spoofed_outbound`.
+
+    - id: inbound_fragment_drop
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Pre-install a legitimate conn so the unfragmented packet
+        would forward. Send the test packet WITH fragOffset≠0 or
+        MF=1 on the (otherwise valid) inbound 5-tuple. Assert drop
+        — fragments bypass conntrack lookup. Anchors
+        `no_fragment_inspection`.
+
+    - id: syn_flood_resilience
+      requires: "${faithfulness} >= D5.1_reflexive_dynamic_nat ∧ ${conntrack_capacity} != unbounded"
+      generate: |
+        Send 2 × ${conntrack_capacity} inbound TCP SYNs to
+        ${public_ip} with distinct dports / sports (no warm-up,
+        no matching ACL). Concurrently warm-up one legitimate
+        outbound flow. Assert: every adversarial SYN is dropped
+        (no conn installed), AND the legitimate flow's return
+        packet is admitted (its conn survives). Anchors invariant
+        `state_only_installed_from_internal`.
+
+    - id: snat_checksum_correctness
+      generate: |
+        Send any outbound TCP packet that R5 / R6 will forward.
+        Assert: the output packet's IP checksum AND TCP/UDP
+        checksum recompute against the rewritten (src, sport).
+        Anchors the v1model bug-catalogue entry "checksum
+        after modification" — the #1 silent NAT failure mode.
+
+    - id: dnat_checksum_correctness
+      generate: |
+        Mirror of `snat_checksum_correctness` on the inbound side
+        after R10. Assert IP+L4 checksums recompute over the
+        rewritten (dst, dport).
+
+    - id: register_cold_start_first_packet
+      requires: "${mode} == dynamic"
+      generate: |
+        Send the very first packet to a freshly-booted switch (no
+        prior_inputs). Assert R6 fires, allocates a valid ext_port
+        (not 0, in ${port_pool_range}), installs the pair, and
+        forwards. Anchors the v1model bug-catalogue "register
+        cold-start (initial value = 0 vs 1)" pattern.
+
+    - id: endpoint_independent_mapping_check
+      requires: "${endpoint_independent_mapping} ∧ ${mode} == dynamic"
+      generate: |
+        Outbound flow F1 = (i_ip, i_port, proto) → dst1; observe
+        ext_port_a. Outbound flow F2 = (i_ip, i_port, proto) →
+        dst2 (SAME 3-tuple, different dst). Assert ext_port_b ==
+        ext_port_a (RFC 4787 REQ-1). Anchors invariant
+        `endpoint_independent_mapping`.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease so parameter rebinding can move
+# difficulty in either direction.
+
+mutation_operators:
+
+  - id: enable_reflexive_dynamic
+    applicable_when: "${faithfulness} == D5.0_static_acl_static_nat"
+    effect: "${faithfulness} ← D5.1_reflexive_dynamic_nat ∧ ${mode} ← dynamic"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "width(${port_pool_range}) ≥ 64 ∧ (${conntrack_capacity} == unbounded ∨ ${conntrack_capacity} ≥ 256)"
+
+  - id: disable_reflexive_dynamic
+    applicable_when: "${faithfulness} == D5.1_reflexive_dynamic_nat"
+    effect: "${faithfulness} ← D5.0_static_acl_static_nat ∧ ${mode} ← static"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: enable_tcp_state_tracking
+    applicable_when: "${faithfulness} == D5.1_reflexive_dynamic_nat"
+    effect: "${faithfulness} ← D5.2_tcp_state_tracking"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${conntrack_capacity} == unbounded ∨ ${conntrack_capacity} ≥ 1024"
+
+  - id: disable_tcp_state_tracking
+    applicable_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    effect: "${faithfulness} ← D5.1_reflexive_dynamic_nat"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: shrink_conntrack_capacity_4x
+    applicable_when: "${conntrack_capacity} ≠ unbounded ∧ ${conntrack_capacity} > 256 ∧ ${faithfulness} ≥ D5.1_reflexive_dynamic_nat"
+    effect: "${conntrack_capacity} ← ${conntrack_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${conntrack_capacity} ≥ 64"
+
+  - id: enlarge_conntrack_capacity_2x
+    applicable_when: "${conntrack_capacity} ≠ unbounded ∧ ${conntrack_capacity} < 524288"
+    effect: "${conntrack_capacity} ← ${conntrack_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${conntrack_capacity} ≤ 1048576"
+
+  - id: shrink_port_pool_4x
+    applicable_when: "${mode} == dynamic ∧ width(${port_pool_range}) > 256"
+    effect: "${port_pool_range} ← shrink_to_quarter_around_midpoint(${port_pool_range})"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: |
+      width(${port_pool_range}) ≥ max(${conntrack_capacity}, 64) ∧
+      ${port_pool_range}.low ≥ 1024 ∧ ${port_pool_range}.high ≤ 65535
+
+  - id: enlarge_port_pool_2x
+    applicable_when: "${mode} == dynamic ∧ width(${port_pool_range}) < 32768"
+    effect: "${port_pool_range} ← enlarge_to_double_around_midpoint(${port_pool_range})"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${port_pool_range}.low ≥ 1024 ∧ ${port_pool_range}.high ≤ 65535"
+
+  - id: enable_timeout_eviction
+    applicable_when: "${mode} == dynamic ∧ ${eviction_policy} ≠ timeout"
+    effect: "${eviction_policy} ← timeout"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${idle_timeout_s} ≥ 30"
+
+  - id: disable_timeout_eviction
+    applicable_when: "${eviction_policy} == timeout"
+    effect: "${eviction_policy} ← none"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${conntrack_capacity} == unbounded"
+
+  - id: swap_eviction_to_LRU
+    applicable_when: "${mode} == dynamic ∧ ${eviction_policy} ∉ {LRU} ∧ ${conntrack_capacity} ≠ unbounded"
+    effect: "${eviction_policy} ← LRU"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: swap_eviction_to_FIFO
+    applicable_when: "${eviction_policy} == LRU"
+    effect: "${eviction_policy} ← FIFO"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: enable_persistence_strict
+    applicable_when: "${persistence_strict} == false ∧ ${faithfulness} ≥ D5.1_reflexive_dynamic_nat"
+    effect: "${persistence_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${eviction_policy} ∈ {LRU, timeout}"
+
+  - id: disable_persistence_strict
+    applicable_when: "${persistence_strict} == true"
+    effect: "${persistence_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: relax_endpoint_independent_mapping
+    applicable_when: "${endpoint_independent_mapping} == true"
+    effect: "${endpoint_independent_mapping} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: enforce_endpoint_independent_mapping
+    applicable_when: "${endpoint_independent_mapping} == false"
+    effect: "${endpoint_independent_mapping} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the noisify_spec_low protocol shared with P-StatefulFW / P-NAT44:
+        • 1 distractor clause about deployment / environment / out-of-scope
+          behaviour that is true and bears on no rule;
+        • 1 irrelevant-field claim that names a real artefact (a port name,
+          subnet, table) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus
+      are byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description text, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+
+  - id: noisify_spec_medium
+    applicable_when: "spec_noise.intensity ∈ {none, low}"
+    effect: |
+      Apply noisify_spec_low, then additionally:
+        • 1 misleading implementation hint — plausible "common practice"
+          framing that, if followed, violates at least one stated rule of
+          THIS task (e.g., suggesting the conn lookup should key on the
+          DESTINATION address — which would break
+          endpoint_independent_mapping).
+        • 1 restate-with-drift — paraphrase one rule using different
+          vocabulary / units / framing; do not mark as a restatement.
+      Same hard constraints as noisify_spec_low.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: noisify_spec_high
+    applicable_when: "spec_noise.intensity ∈ {none, low, medium}"
+    effect: |
+      Apply noisify_spec_medium, then additionally:
+        • 1 additional restate-with-drift on a different rule;
+        • 1 red-herring section — well-formed, declarative, but
+          non-behavioural (telemetry, ops, capacity-planning prose).
+      Same hard constraints.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: compose_with_rate_limiter
+    applicable_when: "'rate_limiter' ∉ rules"
+    effect: |
+      Compose this pattern with a per-source-IP token-bucket meter on
+      external ingress: pre-R10 conjoin a `rate_exceeds(meter, threshold)`
+      predicate. Adds parameters `rate_limit_bps`, `burst_bytes` and a
+      G3 test `inbound_burst_throttled`.
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Pattern-augmenting — composes the chain with an
+      implicit P-RateLimiter on the inbound side. Re-validation of the
+      reference template is required after applying this operator.
+
+  - id: decompose_rate_limiter
+    applicable_when: "'rate_limiter' ∈ rules"
+    effect: |
+      Remove the rate-limiter clause introduced by compose_with_rate_limiter
+      and its associated parameters / G3 test.
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4:
+
+    Tier-1 (faithfulness=D5.0_static_acl_static_nat, mode=static):
+      - Two exact-match tables: snat_table (key: src_ip, src_port,
+        proto; action: do_snat(public_ip, ext_port)) and dnat_table
+        (key: dst_ip, dst_port, proto; action: do_dnat(internal_ip,
+        internal_port)). Default action = drop().
+      - Control plane installs symmetric pairs in the entries file.
+      - Zone routing via `if (standard_metadata.ingress_port ==
+        INTERNAL_PORT)` — the same baseline as the standalone
+        P-StatefulFW / P-NAT44 twins.
+      - Re-compute IPv4 + TCP/UDP checksums in MyComputeChecksum after
+        the rewrite — the most common silent NAT failure mode in v1model.
+
+    Tier-2 (faithfulness=D5.1_reflexive_dynamic_nat, mode=dynamic,
+            conntrack_capacity bounded):
+      - register<bit<W>>(N) conn_state with W ≥ 96 (last_seen +
+        established + ext_port + spare) indexed by hash(outbound 5-tuple).
+      - register<bit<W2>>(N) conn_inbound_state for the reverse lookup,
+        indexed by hash(public_ip, ext_port, proto) — its slot stores
+        the outbound 5-tuple's (src_ip, src_port) so DNAT can recover
+        them on the return path.
+      - Port-pool allocation: a 16-bit register storing the next-free
+        port plus an in-use bitmap (or a free-list).
+      - Pair-symmetry implementation: on outbound miss, write BOTH registers in
+        the SAME ingress pipeline pass — recirculation is not required
+        and would break pair_symmetry under reorder.
+      - Anti-pattern: hashing on the FORWARD 5-tuple from both directions.
+        Inbound packets must key the reverse lookup on
+        (public_ip, dport, proto), not on (src, sport, proto).
+
+    Tier-3 (faithfulness=D5.2_tcp_state_tracking):
+      - Add tcp_state (3 bits) to the conn_state register.
+      - Per-direction transition table: outbound SYN → SYN_SENT;
+        inbound SYN-ACK in SYN_SENT → SYN_RECV; outbound ACK in
+        SYN_RECV → ESTABLISHED. Anything else → drop.
+      - Anti-spoofing (uRPF): check `hdr.ipv4.srcAddr` against
+        `${internal_subnet}` via a direct ternary table BEFORE the
+        conn lookup.
+      - Fragment check: drop on `hdr.ipv4.flags.MF == 1 ||
+        hdr.ipv4.fragOffset != 0` at the very top of MyIngress.
+      - For conntrack_capacity > on-chip SRAM
+        (D5.2_partition path, reserved for v2): Sailfish-style hot-on-
+        chip / cold-off-chip partition; the slow path is mocked by
+        the harness via a designated egress port.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Installing `connection` from an inbound packet (R6 firing on
+      ingress(external)) — a SYN-flood trivially evicts legitimate
+      state. This is the most insidious failure of the chain: a
+      naive "install on first packet of either direction" reading of
+      a generic spec produces a working-looking design that fails
+      `state_only_installed_from_internal`.
+    * Installing `connection` but NOT `connection_inbound` (or vice
+      versa) in R6 — half-installed pair. Inbound return packets
+      silently drop OR a stale-half inbound entry leaks adversarial
+      traffic. Anchors `pair_symmetry`.
+    * Using the static `acl_rule` table for return-traffic admission
+      at D5.1+ (re-installing entries from the data plane on every
+      outbound packet) — collapses Tier-2 back to Tier-1 with churn
+      and breaks `no_orphan_connection`.
+    * Decrementing TTL twice (once in MyIngress and once via an
+      inherited "router" library) — easy to miss when chaining FW +
+      NAT + L3-forward. Test suite catches this via the
+      TTL=2 → TTL=1 boundary.
+    * Forgetting to recompute IPv4 / TCP / UDP checksums after R5 / R6
+      (SNAT) or R10 (DNAT) — the #1 silent failure. Especially
+      sneaky in the chain because the rewrite spans both src+sport
+      AND dst+dport across packets, so a "I forgot one direction"
+      bug shows up as one-way reachability.
+    * Keying R6's port allocator on the destination — violates
+      `endpoint_independent_mapping` (RFC 4787 REQ-1).
+    * At D5.2: advancing `tcp_state` on any TCP flag rather than
+      validating the legal transition — the same Tier-3 anti-pattern
+      as P-StatefulFW. Defeats state tracking; only the
+      `tcp_handshake_order_enforced` G1 test catches it.
+    * Reading from `standard_metadata.drop` after `mark_to_drop()` to
+      "check whether this packet is being dropped" — v1model
+      conditional-deparser bug pattern; behaviour is unspecified
+      after `mark_to_drop()`.
+
+  v2 deferrals (out of scope for this v1.0 pattern):
+    * Multi-public-IP pools (`enlarge_to_public_ip_pool`).
+    * Cross-switch conntrack synchronisation for ECMP-distributed
+      edge NFs.
+    * Hairpinning (RFC 4787 REQ-9) — internal→internal-via-public-IP.
+    * ICMP echo-tracking — allowing internal-initiated ICMP and the
+      matching reply through the chain.

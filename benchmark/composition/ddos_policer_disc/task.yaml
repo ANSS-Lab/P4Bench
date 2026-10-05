@@ -1,0 +1,1593 @@
+task_name: ddos_policer_disc
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-DDoSPolicer
+pattern_version: '1.0'
+seed:
+  flowkey_fields:
+  - hdr.ipv4.srcAddr
+  sketch_type: count_min
+  sketch_depth: 2
+  sketch_width: 64
+  counter_width_bits: 32
+  max_register_cells: 4096
+  hash_polynomial: crc32
+  hash_independence: pairwise
+  heavy_threshold: 8
+  heavy_capacity: 64
+  epoch_packets: 4096
+  epoch_seconds: 60
+  epoch_trigger: both
+  workload_skew: zipfian
+  rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 10.0.1.66/32
+  - priority: 100
+    action: permit
+    ipv4_src: 10.0.1.10/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_action: permit
+  policy_trigger: static_and_heavy
+  allowlist_bypass: true
+  mitigation_action: recolor
+  scavenger_dscp: 8
+  mitigation_onset: from_crossing_packet
+  faithfulness: D5.1_static_combination_recolor
+  access_port: 1
+  core_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: access
+    to: s1.p1
+  - from: s1.p2
+    to: core
+hosts:
+  access:
+    note: subscriber/client side; IPv4 sources in 10.0.1.0/24
+  core:
+    mac: 08:00:00:00:02:02
+    note: server side (10.0.2.0/24); admitted traffic egresses here
+description: |-
+  An edge switch s1 polices volumetric traffic from clients toward a server
+  network. It combines a data-plane heavy-hitter detector with a control-plane
+  allow/block policy: high-rate sources are mitigated, but a static block list
+  always drops and a static allow list always exempts. Inspired by data-plane
+  DDoS-defense designs (Poseidon, NDSS 2020; Jaqen, USENIX Security 2021).
+
+  ## Topology and roles
+
+    - s1 has two external connection points: an ACCESS connection (s1.p1) facing
+      clients (source addresses in 10.0.1.0/24), and a CORE connection (s1.p2)
+      facing the server network (10.0.2.0/24). All test traffic arrives on the
+      ACCESS connection destined for the server network.
+    - On a forward, the packet egresses the CORE connection (s1.p2), its TTL is
+      decremented by 1, and its destination Ethernet address is rewritten to the
+      server-side next hop 08:00:00:00:02:02.
+
+  ## What the switch tracks
+
+    - For each source IP, the switch maintains a running packet count over a
+      measurement window. A source is a HEAVY HITTER once its count reaches 8
+      within the window. The count is updated on arrival, BEFORE the packet's
+      fate is decided, so the packet that brings a source's count to 8 is itself
+      treated as heavy.
+    - The control plane installs a static policy list of source-based rules,
+      each either ALLOW or BLOCK. In this deployment the block list contains
+      source 10.0.1.66 and the allow list contains source 10.0.1.10. A source
+      matching no static rule has no static opinion.
+
+  ## Per-packet behaviour (MUST), in priority order
+
+    1. A frame that is not IPv4 MUST be dropped (it has no source-IP to track).
+    2. A packet whose source matches a static BLOCK rule MUST be dropped,
+       regardless of its rate (the block list has the highest priority).
+    3. A packet whose source matches a static ALLOW rule MUST be forwarded
+       normally and MUST NOT be mitigated, even if that source is a heavy hitter
+       (the allow list exempts a source from rate mitigation). "Forwarded
+       normally" means the DSCP is preserved.
+    4. A packet whose source is a heavy hitter (count >= 8) and is neither
+       blocked nor allowed MUST be MITIGATED by recolor: its DSCP (the high six
+       bits of the IPv4 type-of-service byte) is rewritten to the scavenger value
+       8, and the packet is still forwarded on the CORE connection. The IPv4
+       header checksum MUST be valid on egress after both the DSCP rewrite and
+       the TTL decrement.
+    5. Any other packet (source below the heavy threshold, or above it but not
+       selected for mitigation by the rules above) MUST be forwarded normally
+       with its DSCP preserved.
+
+  ## Invariants (MUST)
+
+    - The count update and heavy check MUST happen before the forwarding/drop/
+      recolor decision for that packet (so the count-of-8 packet is mitigated).
+    - The combined verdict MUST follow the fixed priority: block > allow-exempt
+      > heavy-mitigate > forward. A source that is both allowed and heavy is
+      forwarded (allow wins); a source that is both blocked and heavy is dropped
+      (block wins).
+    - Detection MUST isolate sources: one source's volume MUST NOT cause a
+      different, low-rate source to be mitigated.
+    - On a recolor, ONLY the DSCP and the TTL change; source/destination
+      addresses, total length, and protocol are preserved.
+
+  ## Joint control-plane / data-plane
+
+  You produce both the P4 program and the table entries. The static allow/block
+  list and any forwarding state are installed as entries; choose your own
+  internal table and field names.
+test_cases:
+- name: benign_below_threshold_forward
+  visibility: public
+  goal_class: G1
+  description: 'A single low-rate packet from an unlisted source (estimate 1 < 8) is forwarded unchanged on the core port: TTL-1, Ether.dst rewritten to the server-side next hop, IP.tos and addresses preserved.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: heavy_source_recolored
+  visibility: public
+  goal_class: G1
+  description: 'The 8th packet of an unlisted source crosses the heavy-hitter threshold (count reaches 8). Because the source is neither blocklisted nor allowlisted, it is mitigated by RECOLOR: its DSCP is rewritten to the scavenger class and it is still forwarded on the core port (TTL-1). The crossing packet itself is mitigated.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 8
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+- name: blocklist_drop_low_rate
+  visibility: public
+  goal_class: G1
+  description: A single low-rate packet from the blocklisted source (10.0.1.66) is dropped — a statically denied source is dropped regardless of its rate.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: allowlist_exempts_heavy
+  visibility: public
+  goal_class: G1
+  description: 'An explicitly allowlisted source (10.0.1.10) driven over the threshold is EXEMPT from rate mitigation: even though its count reaches 8, it is forwarded UNRECOLORED (DSCP preserved) on the core port. The allowlist overrides the heavy-hitter detection.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+- name: continuing_heavy_recolored
+  visibility: hidden
+  goal_class: G1
+  description: A source already over threshold (9th packet, count 9) continues to be recolored — mitigation persists for the rest of the window, not just on the crossing packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 8
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5007
+        dport: 80
+- name: cross_flow_isolation
+  visibility: hidden
+  goal_class: G1
+  description: A heavy source (10.0.1.55, 8 packets) is followed by a single packet from a DIFFERENT fresh source (10.0.1.99). The fresh source's count is 1, so it is forwarded benign — one source's volume must not contaminate another's detection.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.55
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5007
+        dport: 80
+- name: allowlisted_low_rate_forward
+  visibility: hidden
+  goal_class: G1
+  description: The allowlisted source (10.0.1.10) at low rate (1 packet) is forwarded unchanged — allowlisted-and-not-heavy is an ordinary forward.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+- name: udp_heavy_recolored
+  visibility: hidden
+  goal_class: G1
+  description: A UDP source driven over the threshold is recolored just like TCP — detection keys on the source, not the L4 protocol.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 8
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.56
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 17
+    - UDP:
+        sport: 5006
+        dport: 80
+- name: detection_boundary_7th_benign
+  visibility: hidden
+  goal_class: G2
+  description: The 7th packet of an unlisted source (count 7 < 8) is still below the heavy-hitter threshold and is forwarded benign. Pairs with the 8th-packet recolor to enclose the strict detection boundary.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+- name: detection_boundary_8th_recolor
+  visibility: hidden
+  goal_class: G2
+  description: The 8th packet of an unlisted source (count 8 == threshold) crosses and is recolored — the upper side of the strict detection boundary.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 8
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+- name: blocklist_beats_heavy
+  visibility: hidden
+  goal_class: G3
+  description: The blocklisted source (10.0.1.66) driven over the threshold is STILL dropped by the blocklist — the static block takes priority over the heavy-hitter mitigation (a recolor would be wrong here).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+- name: non_ipv4_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) carries no source-IP flowkey and is dropped before detection.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.2.2
+  expected:
+    behavior: drop
+- name: collision_no_false_drop
+  visibility: hidden
+  goal_class: G3
+  description: After a heavy source (10.0.1.50, 8 packets) is detected, an INNOCENT low-rate source (10.0.1.83) arrives. The innocent source's true count is 1, so it MUST be forwarded benign — a rate estimator must not over-block an innocent flow that happens to share internal counter state with a heavy flow. (A degenerate single-counter estimator would falsely mitigate it.)
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.83
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5007
+        dport: 80
+- name: recolor_preserves_addresses
+  visibility: hidden
+  goal_class: G3
+  description: 'A recolored heavy flow has ONLY its DSCP and TTL changed: source/destination addresses and length are preserved and the IPv4 checksum is valid over both the DSCP rewrite and the TTL decrement (one recompute covering both).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 1
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 8
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.57
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 0
+        proto: 6
+    - TCP:
+        sport: 5006
+        dport: 80

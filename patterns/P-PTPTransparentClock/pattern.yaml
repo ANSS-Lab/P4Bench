@@ -1,0 +1,1126 @@
+# P-PTPTransparentClock — PTP transparent-clock residence-time correction
+#                          (IEEE 1588-2008/2019; RFC 8173 PTPv2 MIB; DPTP SOSR'19)
+#
+# TPL v1.0 task pattern. Fills the previously empty
+# (D4:telemetry × P14:time-synchronisation) cell of the NF design-space map.
+# P14 is one of the five publication-record-gap rows: no
+# paper in the surveyed corpus ships PTP, so the pattern's descriptive home is
+# assigned by *mechanism* — like P-INTMetadata it performs per-packet metadata
+# stamping driven by switch timestamps, which is the D4:telemetry surface.
+# target_capability = redesign: PTP residence-time correction is a fixed-function
+# timestamping-ASIC primitive being moved into programmable match-action logic.
+#
+# This is the first corpus pattern that reads `egress_global_timestamp` and the
+# first whose core action is an arithmetic accumulation into a 64-bit packet
+# field (correctionField += residence). Diagnostically it probes three common v1model
+# bug families at once: ingress-vs-egress metadata mapping (residence
+# can only be measured in egress), the conditional-deparser / checksum-recompute
+# surface (correctionField rewrite over UDP), and width/scaling arithmetic
+# (2^-16-ns scaling + 64-bit add with carry).
+
+pattern_id: P-PTPTransparentClock
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry]                                # per-packet metadata stamping driven by switch timestamps (mechanism-assigned; P14 has no native descriptive family)
+  prescriptive: [P14:time-synchronisation]                    # PTP, clock distribution, time-aware shaping — previously unfilled
+
+target_capability: redesign                                   # PTP residence correction moves an ASIC timestamping primitive into programmable logic
+
+summary: >
+  A PTP (IEEE 1588) transparent clock that corrects for the time a PTP event
+  message spends inside the switch. On each event message the switch measures
+  the residence time — egress timestamp minus ingress timestamp — and *adds*
+  it to the 64-bit correctionField carried in the PTP common header, so that
+  downstream ordinary/boundary clocks can subtract the switch's queuing delay
+  from their offset computation. Non-PTP traffic and PTP general messages
+  (Announce, Signaling, Management, Delay_Resp) pass through untouched.
+  The headline behaviour is *additive correction*: the correctionField is
+  read, the measured residence is added, and the result is written back —
+  a transparent clock never overwrites the field, because it may already
+  carry the accumulated correction of upstream transparent clocks. Anchor
+  faithfulness (D5.0) is a one-step, end-to-end transparent clock over
+  Ethernet (EtherType 0x88F7) that corrects the Sync message only, updating
+  the low 32 bits of the correctionField in nanoseconds. Higher rungs ladder
+  to PTP-over-UDP/IPv4 with UDP-checksum recompute and full RFC 64-bit
+  2^-16-ns scaling (D5.1), a two-step transparent clock that accumulates
+  residence keyed by (sourcePortIdentity, sequenceId) and applies it to the
+  paired Follow_Up message (D5.2), and a peer-to-peer transparent clock that
+  additionally folds the per-port mean link delay into the correctionField
+  with multi-domain filtering (D5.3). The pattern's mutation operators move
+  the step mode, the delay mechanism, the correction-field width/scaling, the
+  transport encapsulation, the corrected-message breadth, the domain filter,
+  and the two-step correlation-table capacity.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: dptp_sosr19
+      title: "DPTP: Data-Plane Time-Synchronization Protocol"
+      venue: "SOSR 2019"
+      doi: "10.1145/3314148.3314353"
+      sections: ["data-plane time-sync logic", "P4/Tofino implementation", "64-bit global timing in the pipeline"]
+      role: canonical_implementation
+      relevance: |
+        The closest published P4 grounding for in-pipeline PTP-style time
+        handling. DPTP implements the core time-synchronisation logic in the
+        data plane of a programmable (Barefoot Tofino) switch in P4, carrying
+        64-bit global timing context through the pipeline and synchronising
+        switches to IEEE-1588-compatible NICs. It establishes the two facts
+        the pattern's implementation rests on: (1) a programmable switch can read
+        its own ingress/egress timestamps in the pipeline and write a
+        timing value into a passing packet's header without leaving the data
+        plane, and (2) the correction quantity is a 64-bit value, matching
+        the PTP correctionField width the pattern manipulates. SOSR is
+        out-of-corpus relative to the SIGCOMM/NSDI/CoNEXT survey, so it
+        is cited as the secondary canonical-implementation source rather than
+        a corpus paper; the normative behaviour itself is grounded on IEEE
+        1588 (see bridging_notes) and corroborated by the read RFC and vendor
+        sources below.
+
+  rfcs:
+    - cite: rfc8173
+      title: "Precision Time Protocol Version 2 (PTPv2) Management Information Base"
+      sections: ["PtpClockMechanismType (E2E vs P2P)", "ptpbaseClockDefaultDSTwoStepFlag", "transparent-clock dataset objects", "clock domain definition"]
+      role: domain_concepts
+      quote: "The Clock Domain is a logical group of clocks and devices that synchronize with each other using the PTP protocol."   # verbatim RFC 8173; cached under grounding/rfc8173_excerpts.txt (grounds the ${domain_handling}/${active_domains} axis)
+      relevance: |
+        RFC 8173 is the PTPv2 MIB — a read-only management/monitoring module,
+        not a data-plane behaviour specification — so it does not define the
+        residence-time / correctionField rewrite itself. It is cited for the
+        normative *concept* vocabulary the pattern's parameters key on, every
+        item below confirmed against the retrieved RFC text:
+          - PtpClockMechanismType distinguishes the end-to-end and
+            peer-to-peer delay mechanisms ("the mechanism used to calculate
+            the Mean Path Delay") — the pattern's ${delay_mechanism} axis.
+          - ptpbaseClockDefaultDSTwoStepFlag indicates whether the two-step
+            process is used — the pattern's ${step_mode} axis.
+          - the Clock Domain is "a logical group of clocks and devices that
+            synchronize with each other", domainNumber 0 default / 1-127
+            user-defined — the pattern's ${domain_handling} / ${active_domains}
+            axis.
+        The MIB defines a distinct transparent-clock dataset, confirming the
+        transparent clock as a first-class IEEE-1588 device type the pattern
+        models.
+
+  tutorials: []                                               # no p4lang/tutorials PTP exercise
+
+  posts:
+    - url: "https://www.juniper.net/documentation/us/en/software/junos/time-mgmt/topics/concept/ptp-transparent-clocks.html"
+      title: "PTP Transparent Clocks (Junos OS)"
+      role: normative_behaviour
+      quote: "adds the residence time into the correction field of the PTP packet"   # verbatim Juniper; cached under grounding/juniper_ptp_transparent_clocks.txt (grounds the additive-correction rule + correction_is_accumulated invariant)
+      relevance: |
+        Retrieved vendor description of the data-plane behaviour RFC 8173
+        omits. Confirms verbatim the two semantics the pattern's core rule
+        and headline invariant encode:
+          - residence time is "the time that the packet spends passing
+            through the switch or the router", and the transparent clock
+            "adds the residence time into the correction field of the PTP
+            packet" — i.e. the correction is ADDITIVE, not an overwrite
+            (the correction_is_accumulated invariant).
+          - an end-to-end transparent clock includes "only the residence
+            time" in the correctionField — distinguishing it from the
+            peer-to-peer clock that additionally folds in link delay
+            (corroborated by the retrieved Microchip / ALE application
+            notes: a P2P TC updates the field "cumulatively ... the
+            residence time ... and the link delay").
+          - one-step vs two-step: "residence timestamps are sent in one
+            packet as a one-step process. In a two-step process, estimated
+            timestamps are sent in one packet, and additional packets
+            contain updated timestamps" — the pattern's ${step_mode} axis
+            and the R3/R4 two-step correlation split.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic. The pattern classifies each packet into three buckets by the
+      PTP common-header messageType (low nibble of byte 0) and the transport
+      demux (EtherType 0x88F7, or UDP dst port 319=event / 320=general):
+        - non-PTP                       → R0 pass-through;
+        - PTP general, non-Follow_Up    → R1 pass-through (Announce 0xB,
+                                          Signaling 0xC, Management 0xD,
+                                          Delay_Resp 0x9 — never corrected);
+        - PTP event (Sync 0x0, Delay_Req 0x1, Pdelay_Req 0x2,
+          Pdelay_Resp 0x3) → R2 (one-step correct) or R3 (two-step store);
+        - PTP Follow_Up 0x8 / Pdelay_Resp_Follow_Up 0xA → R4 (two-step apply).
+      The residence time is read from per-packet metadata
+      (egress_global_timestamp − ingress_global_timestamp); the pattern keeps
+      no per-packet persistent state in one-step mode.
+
+  link:                                                       # per-ingress-port peer link delay — only the P2P transparent clock uses it
+    keyed_by: ingress_port
+    attrs:
+      mean_link_delay: int                                    # measured/installed peer link delay, nanoseconds (the Pdelay mechanism's meanLinkDelay)
+    capacity: ${link_delay_capacity}
+    enforced_when: "${delay_mechanism} == p2p"
+    notes: |
+      A peer-to-peer transparent clock folds the ingress link's mean delay
+      into the correctionField in addition to residence time (the
+      cumulative-update semantics the Juniper/Microchip sources describe).
+      The pattern models the peer-delay (Pdelay_Req/Resp) measurement
+      exchange itself as out of scope: ${link_delays} is control-plane
+      installed per ingress port. enforced_when keeps this entity dormant
+      for the E2E anchor.
+
+  flow:                                                       # two-step residence-correlation state — only the two-step clock uses it
+    name: residence_correlation
+    keyed_by: "(ptp.sourcePortIdentity, ptp.sequenceId, message_class)"
+    attrs:
+      stored_correction: int                                  # residence (+ link delay for P2P) measured on the event message, units per ${correction_field_faithfulness}
+    capacity: ${correlation_capacity}
+    enforced_when: "${step_mode} ∈ {two_step, flag_dispatched}"
+    notes: |
+      A two-step transparent clock does not modify the event message in
+      transit; it measures the event message's residence (R3), stores it
+      keyed by (sourcePortIdentity, sequenceId) where message_class pairs
+      Sync↔Follow_Up and Pdelay_Resp↔Pdelay_Resp_Follow_Up, then adds the
+      stored value to the correctionField of the paired general message
+      when it arrives (R4) and evicts the entry. This is the cross-packet
+      state burden that the ${step_mode}=two_step harden introduces;
+      ${correlation_capacity} bounds the table. Dormant for one-step
+      instances (enforced_when).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  faithfulness:                                               # conventional master ladder; the per-axis params below are its components
+    type: enum
+    values: [D5.0_onestep_e2e, D5.1_udp_checksum, D5.2_twostep, D5.3_p2p_asymmetry]
+    default: D5.0_onestep_e2e
+    notes: |
+      Faithfulness ladder. Each rung bundles a
+      coherent setting of the per-axis parameters; the tighten/relax_faithfulness
+      operators move the whole bundle, while the per-axis operators move a single
+      knob for finer difficulty calibration.
+        D5.0_onestep_e2e   → step_mode=one_step, delay_mechanism=e2e,
+                             transport=eth_88f7, correction_field_faithfulness=
+                             low32_ns, domain_handling=single_domain_any,
+                             corrected_message_types=sync_only. The anchor: a
+                             ~150-line P4 program that reads two timestamps,
+                             subtracts, and adds to the low word of one field.
+        D5.1_udp_checksum  → transport=udp_ipv4 (UDP-checksum recompute),
+                             correction_field_faithfulness=full64_scaled_ns
+                             (RFC 2^-16-ns scaling + 64-bit carry),
+                             corrected_message_types=all_event.
+        D5.2_twostep       → step_mode=two_step (cross-packet correlation
+                             state via the residence_correlation flow).
+        D5.3_p2p_asymmetry → delay_mechanism=p2p (per-port link-delay fold-in,
+                             activates the link entity) + domain_handling=
+                             multi_domain_filtered.
+      Seed-only parameter; not an nf_categories design-space tag.
+
+  step_mode:
+    type: enum
+    values: [one_step, two_step, flag_dispatched]
+    default: one_step
+    notes: |
+      one_step → the transparent clock writes the residence correction into
+          the event message's own correctionField in transit (R2). No
+          cross-packet state. The anchor.
+      two_step → the event message is forwarded unmodified; its residence is
+          stored keyed by (sourcePortIdentity, sequenceId) (R3) and added to
+          the correctionField of the paired Follow_Up / Pdelay_Resp_Follow_Up
+          when it arrives (R4). Introduces the residence_correlation flow and
+          its cold-start / capacity / eviction surface.
+      flag_dispatched → a SINGLE switch that serves BOTH mechanisms on the same
+          path, selected PER EVENT MESSAGE by the PTP twoStepFlag (flagField
+          bit 0x0200, IEEE 1588-2008 §13.3.2.6): an event whose twoStepFlag is
+          CLEAR is corrected in transit (R2, one-step); an event whose
+          twoStepFlag is SET is forwarded unmodified and its residence stored
+          (R3, two-step), to be applied to its Follow_Up (R4). This is how a
+          transparent clock behaves in a mixed deployment where one-step and
+          two-step masters share a segment — the clock cannot assume a global
+          step mode and must branch the entire correction mechanism on a header
+          bit. Activates BOTH the in-transit-correction path AND the
+          residence_correlation flow simultaneously, plus the
+          correction_applied_exactly_once_across_exchange dispatch invariant.
+
+  delay_mechanism:
+    type: enum
+    values: [e2e, p2p]
+    default: e2e
+    notes: |
+      e2e (end-to-end) → the correctionField receives ONLY the residence
+          time. The anchor; matches the Juniper/RFC-8173 E2E mechanism type.
+      p2p (peer-to-peer) → the correctionField is updated cumulatively with
+          residence time PLUS the ingress link's mean delay
+          (link[ingress_port].mean_link_delay). Activates the link entity and
+          the ${link_delays} config; the peer-delay measurement exchange
+          itself is out of scope (link delays are control-plane installed).
+
+  correction_field_faithfulness:                              # the "correction-field width" mutation axis
+    type: enum
+    values: [low32_ns, full64_scaled_ns]
+    default: low32_ns
+    notes: |
+      How faithfully the 64-bit correctionField is manipulated:
+        low32_ns → treat the correctionField as a plain nanosecond integer
+            and update only its low 32 bits (residence_ns added to the low
+            word, no scaling). Anchor-only simplification: residence fits in
+            32 bits and BMv2's microsecond timestamps map cleanly. Easy P4.
+        full64_scaled_ns → the RFC-faithful representation: correctionField
+            is in units of 2^-16 ns across the full 64 bits, so the implementation
+            must (a) convert measured residence to nanoseconds, (b) shift left
+            16 to scale, and (c) perform a 64-bit add with carry propagation
+            into the high word. Exposes the width/scaling arithmetic bug
+            family (Cross-Cutting #4) — truncating to 32 bits, forgetting the
+            <<16 scale, or dropping the carry all diverge.
+
+  transport:
+    type: enum
+    values: [eth_88f7, udp_ipv4, udp_ipv6]
+    default: eth_88f7
+    notes: |
+      How PTP is encapsulated, which decides the checksum surface:
+        eth_88f7 → PTP directly over Ethernet (EtherType 0x88F7, IEEE 1588
+            Annex F). No L3/L4 checksum to maintain — the anchor.
+        udp_ipv4 → PTP over UDP/IPv4 (event messages to dst port 319, general
+            to 320; IEEE 1588 Annex D). Rewriting correctionField changes
+            bytes the UDP checksum covers, so the implementation MUST recompute the
+            UDP checksum (or use the Annex-D checksum-neutral reserved-field
+            trick). The #1 silent-failure surface (bug taxonomy Cross-Cutting
+            #1).
+        udp_ipv6 → PTP over UDP/IPv6 (Annex E). Like udp_ipv4 but the UDP
+            checksum is mandatory (cannot be 0) and the pseudo-header differs.
+
+  domain_handling:
+    type: enum
+    values: [single_domain_any, multi_domain_filtered]
+    default: single_domain_any
+    notes: |
+      single_domain_any → correct every PTP event message regardless of its
+          domainNumber. Anchor.
+      multi_domain_filtered → correct only messages whose ptp.domainNumber is
+          in ${active_domains}; messages of other domains pass through
+          unmodified (treated like general traffic). Forces the implementation to read
+          and branch on domainNumber before applying any correction.
+
+  active_domains:
+    type: list[int]
+    constraint: "every entry ∈ [0, 127]; non-empty when ${domain_handling} == multi_domain_filtered"
+    default: [0]
+    notes: |
+      The PTP domains this transparent clock corrects (domainNumber, RFC 8173
+      clock-domain definition: 0 default, 1-127 user-defined). Config data for
+      the ${domain_handling} axis; ignored when single_domain_any.
+
+  corrected_message_types:
+    type: enum
+    values: [sync_only, all_event]
+    default: sync_only
+    notes: |
+      sync_only → correct only the Sync event message (messageType 0x0). The
+          anchor: a single message branch.
+      all_event → correct all four event messages (Sync 0x0, Delay_Req 0x1,
+          Pdelay_Req 0x2, Pdelay_Resp 0x3). Forces per-message-type branching
+          and, in two-step mode, two correlation classes (Sync↔Follow_Up and
+          Pdelay_Resp↔Pdelay_Resp_Follow_Up).
+
+  correlation_capacity:
+    type: int | unbounded
+    range: "[8, 65536]"
+    default: unbounded
+    notes: |
+      Capacity of the residence_correlation flow table (two-step mode only).
+      A real transparent clock buffers a bounded number of in-flight
+      event↔follow-up correlations; shrinking this forces the implementation to
+      handle eviction / overflow of pending corrections. Enforced only when
+      ${step_mode} == two_step.
+
+  link_delays:
+    type: list[port_delay_entry]
+    constraint: "every entry has ingress_port ∈ valid port ids, mean_link_delay ∈ [0, 1e9] ns; required non-empty when ${delay_mechanism} == p2p"
+    default: []
+    notes: |
+      Control-plane-installed per-ingress-port mean link delay (nanoseconds)
+      for the peer-to-peer transparent clock. Config data for the
+      ${delay_mechanism} axis; ignored when e2e.
+
+  link_delay_capacity:
+    type: int
+    range: "[2, 512]"
+    default: 64
+    notes: |
+      Number of slots in the link.mean_link_delay table. ${delay_mechanism} ==
+      p2p requires at least one slot per ingress port the topology uses; the
+      constraint |unique(link_delays.ingress_port)| ≤ link_delay_capacity is
+      checked at instantiation.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. R0 catches non-PTP; R1 catches PTP
+# general (non-Follow_Up); R2/R3 split the event-message path on step_mode;
+# R4 handles the two-step Follow_Up apply. residence and the scaled correction
+# are computed from per-packet egress/ingress timestamp metadata.
+
+rules:
+
+  - id: R0_non_ptp_passthrough
+    when: |
+      ¬(
+          (header_present(eth) ∧ match(eth.ethertype, 0x88F7))
+        ∨ (header_present(udp) ∧ (match(udp.dst_port, 319) ∨ match(udp.dst_port, 320)))
+      )
+    then:
+      - forward(downstream_pipeline)
+    notes: |
+      Any frame that is not a PTP message (neither PTP-over-Ethernet 0x88F7
+      nor PTP-over-UDP on the event/general ports) bypasses the transparent
+      clock and continues through the downstream pipeline unmodified. The
+      transparent clock is transparent to non-PTP traffic; R0 exists so the
+      first-match cascade does not consume regular forwarding-path packets.
+
+  - id: R1_ptp_general_passthrough
+    when: |
+      (
+          (header_present(eth) ∧ match(eth.ethertype, 0x88F7))
+        ∨ (header_present(udp) ∧ (match(udp.dst_port, 319) ∨ match(udp.dst_port, 320)))
+      )
+      ∧ value(ptp.messageType, ∈, {0x9, 0xB, 0xC, 0xD})         # Delay_Resp, Announce, Signaling, Management
+    then:
+      - forward(downstream_pipeline)
+    notes: |
+      PTP general messages that are NOT follow-ups carry a correctionField but
+      a transparent clock never modifies it: Delay_Resp (0x9), Announce (0xB),
+      Signaling (0xC), Management (0xD) pass through untouched. This rule
+      protects them from R2/R3 and asserts the transparency invariant on the
+      general-message class. (Follow_Up 0x8 and Pdelay_Resp_Follow_Up 0xA are
+      handled by R4 in two-step mode.)
+
+  - id: R2_onestep_event_residence_correction
+    when: |
+      (
+          (header_present(eth) ∧ match(eth.ethertype, 0x88F7))
+        ∨ (header_present(udp) ∧ match(udp.dst_port, 319))
+      )
+      ∧ value(ptp.messageType, ∈, (${corrected_message_types} == sync_only ? {0x0} : {0x0,0x1,0x2,0x3}))
+      ∧ (
+            ${step_mode} == one_step
+          ∨ (${step_mode} == flag_dispatched ∧ ¬bit_set(ptp.flagField, 0x0200))   # twoStepFlag clear → correct in transit
+        )
+      ∧ (
+            ${domain_handling} == single_domain_any
+          ∨ value(ptp.domainNumber, ∈, ${active_domains})
+        )
+    then:
+      - "inc(ptp.correctionField, by: scaled_residence(
+              residence_ns = (std.egress_global_timestamp - std.ingress_global_timestamp) * 1000,
+              link_delay_ns = (${delay_mechanism} == p2p ? link[std.ingress_port].mean_link_delay : 0),
+              mode = ${correction_field_faithfulness}))"
+      - "set(ptp.reserved_after_correction, 0)"                  # IEEE 1588 §11.5.3 — clear the reserved/messageTypeSpecific bytes after correcting
+      - "set(udp.checksum, recomputed_over_modified_payload) IF ${transport} ∈ {udp_ipv4, udp_ipv6}"
+      - forward(downstream_pipeline)
+    notes: |
+      The one-step transparent-clock core. Measures residence as
+      egress_global_timestamp − ingress_global_timestamp (BMv2 microseconds,
+      ×1000 → ns), folds in the ingress link delay when delay_mechanism=p2p,
+      scales per ${correction_field_faithfulness}, and ADDS the result to the
+      existing correctionField (inc, not set — the field may already carry an
+      upstream TC's accumulated correction). The reserved bytes are cleared
+      and, over UDP, the checksum is recomputed. residence MUST be measured
+      with the egress timestamp, so an implementation that subtracts in the ingress
+      pipeline (where egress_global_timestamp is not yet populated) reads
+      garbage — the common v1model ingress-vs-egress bug.
+
+  - id: R3_twostep_event_store_residence
+    when: |
+      (
+          (header_present(eth) ∧ match(eth.ethertype, 0x88F7))
+        ∨ (header_present(udp) ∧ match(udp.dst_port, 319))
+      )
+      ∧ value(ptp.messageType, ∈, (${corrected_message_types} == sync_only ? {0x0} : {0x0,0x1,0x2,0x3}))
+      ∧ (
+            ${step_mode} == two_step
+          ∨ (${step_mode} == flag_dispatched ∧ bit_set(ptp.flagField, 0x0200))     # twoStepFlag set → store, apply on Follow_Up
+        )
+      ∧ (
+            ${domain_handling} == single_domain_any
+          ∨ value(ptp.domainNumber, ∈, ${active_domains})
+        )
+    given:
+      flow: by_key(ptp.sourcePortIdentity, ptp.sequenceId, message_class(ptp.messageType))
+    then:
+      - "bind(flow, flow.key, attrs: {stored_correction: scaled_residence(
+              residence_ns = (std.egress_global_timestamp - std.ingress_global_timestamp) * 1000,
+              link_delay_ns = (${delay_mechanism} == p2p ? link[std.ingress_port].mean_link_delay : 0),
+              mode = ${correction_field_faithfulness})})"
+      - forward(downstream_pipeline)                            # the event message itself is forwarded UNMODIFIED in two-step mode
+    enforced_when: "${step_mode} ∈ {two_step, flag_dispatched}"
+    notes: |
+      The two-step transparent clock does not touch the event message's
+      correctionField; it stores the measured residence keyed by
+      (sourcePortIdentity, sequenceId, message_class) so the paired Follow_Up
+      can carry the correction, and forwards the event message verbatim. The
+      cold-start case (flow register initialised to 0) and the capacity-overflow
+      case are the reachable robustness surfaces this rule adds.
+
+  - id: R4_twostep_followup_apply_residence
+    when: |
+      (
+          (header_present(eth) ∧ match(eth.ethertype, 0x88F7))
+        ∨ (header_present(udp) ∧ match(udp.dst_port, 320))
+      )
+      ∧ value(ptp.messageType, ∈, {0x8, 0xA})                   # Follow_Up, Pdelay_Resp_Follow_Up
+      ∧ ${step_mode} ∈ {two_step, flag_dispatched}              # follow-ups exist only in two-step exchanges; under flag_dispatched they pair with the twoStepFlag-set events stored by R3
+      ∧ exists(flow, by_key(ptp.sourcePortIdentity, ptp.sequenceId, message_class(ptp.messageType)))
+    given:
+      flow: by_key(ptp.sourcePortIdentity, ptp.sequenceId, message_class(ptp.messageType))
+    then:
+      - "inc(ptp.correctionField, by: flow.stored_correction)"
+      - "set(ptp.reserved_after_correction, 0)"
+      - "set(udp.checksum, recomputed_over_modified_payload) IF ${transport} ∈ {udp_ipv4, udp_ipv6}"
+      - "evict(flow, flow.key)"                                 # the pending correction is consumed exactly once
+      - forward(downstream_pipeline)
+    enforced_when: "${step_mode} ∈ {two_step, flag_dispatched}"
+    notes: |
+      The two-step apply step. The Follow_Up (0x8) pairs with its Sync, and
+      Pdelay_Resp_Follow_Up (0xA) with its Pdelay_Resp, by
+      (sourcePortIdentity, sequenceId). The stored residence is added to the
+      Follow_Up's correctionField, the correlation entry is evicted so it
+      cannot be applied twice, and the checksum is recomputed over UDP. A
+      Follow_Up that finds no matching stored entry (lost Sync, capacity
+      eviction) is forwarded unmodified by R1's general-message fallthrough —
+      tested in the two-step orphan case.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: correction_is_accumulated
+    clause: stability
+    target: ptp.correctionField
+    notes: |
+      The headline transparent-clock property (Juniper/RFC source: residence
+      is ADDED to the correctionField). The correction MUST be added to the
+      field's existing value, never overwritten with the residence alone — the
+      field may carry an upstream transparent clock's accumulated correction,
+      and overwriting it destroys the end-to-end residence sum. The implementation
+      anti-pattern `hdr.ptp.correctionField = residence` (assignment) instead
+      of `+= residence` fails this invariant; the additive-assertion G1 test
+      below pre-loads a nonzero correctionField to catch it.
+
+  - id: residence_correction_equals_measured
+    clause: bounded_latency
+    target: correctionField_delta
+    bound: "(egress_global_timestamp - ingress_global_timestamp) [+ link.mean_link_delay if p2p], scaled per ${correction_field_faithfulness}"
+    notes: |
+      The value added to the correctionField MUST equal the measured residence
+      time (egress − ingress), plus the ingress link delay in P2P mode, after
+      the ${correction_field_faithfulness} scaling. Implementations that read the
+      ingress timestamp twice (residence = 0), subtract in the wrong pipeline
+      stage, or drop the 2^-16-ns scaling diverge. The bound is exact up to the
+      BMv2 timestamp granularity (microseconds).
+
+  - id: general_and_non_ptp_unmodified
+    clause: stability
+    target: "packet headers for messageType ∈ {0x9,0xB,0xC,0xD} and non-PTP frames"
+    notes: |
+      Transparency: non-PTP frames (R0) and PTP general non-follow-up messages
+      (R1) leave the switch byte-identical except for any downstream-pipeline
+      forwarding rewrite. In particular their correctionField is never touched.
+      An implementation whose correction branch is reachable for Announce/Signaling
+      (e.g. matching on the UDP port without checking messageType) fails this.
+
+  - id: no_orphan_correlation_entries
+    clause: no_orphan
+    target: flow
+    enforced_when: "${step_mode} ∈ {two_step, flag_dispatched}"
+    notes: |
+      In two-step mode every stored residence entry is either consumed by
+      exactly one Follow_Up (R4 evict) or removed by capacity eviction; no
+      entry is read twice (double-correction) and none persists indefinitely.
+      Tests the evict-on-apply discipline of R4.
+
+  - id: correction_applied_exactly_once_across_exchange
+    clause: stability
+    target: ptp.correctionField
+    enforced_when: "${step_mode} == flag_dispatched"
+    notes: |
+      The flag_dispatched dispatch invariant. Across one timing event's
+      exchange the switch's residence contribution MUST be folded into the
+      correctionField EXACTLY ONCE: for a twoStepFlag-CLEAR event, once in
+      transit on the event itself (R2) and NOT again on any later message; for
+      a twoStepFlag-SET event, once on its Follow_Up (R3 store → R4 apply) and
+      NOT on the event in transit. The two failure modes this binds are (a)
+      DOUBLE correction — a switch that both corrects a two-step event in
+      transit AND stores+applies it on the Follow_Up, and (b) DROPPED
+      correction — a switch that stores a one-step event (whose Follow_Up never
+      comes) and so never corrects it, or that corrects a one-step event in
+      transit while ALSO storing it. A switch that applies a single global step
+      mode (ignoring the per-packet twoStepFlag) fails this on the half of the
+      traffic whose flag disagrees with its assumption.
+
+  - id: stored_correction_persistence
+    clause: persistence
+    target: flow.stored_correction
+    while: "the correlation entry is bound (between R3 store and R4 apply)"
+    free_under: ["capacity eviction"]
+    enforced_when: "${step_mode} ∈ {two_step, flag_dispatched}"
+    notes: |
+      The residence stored on the event message MUST NOT be mutated between R3
+      and the paired R4 apply. An implementation that recomputes the correction at apply
+      time from the Follow_Up's own (later, larger) timestamps reports the
+      wrong residence — the Follow_Up's residence is not the Sync's residence.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      The transparent clock forwards each packet exactly once and never
+      originates or recirculates traffic; no packet can loop. Stated for
+      completeness — the pattern has no origination path (unlike P-BFDLiveness).
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Every entry maps to
+# a G{1,2,3}-P{n}-T{m} rule from test_case_generation_guide.md.
+
+test_scaffolding:
+
+  G1:                                                         # functional correctness
+    - id: sync_residence_correction_additive
+      rule_ref: G1-P1-T5                                       # explicit transformation assertion
+      generate: |
+        Send a PTP Sync (messageType 0x0) into the switch with a known,
+        NONZERO incoming correctionField (e.g. 0x0000_0000_0001_0000 — an
+        upstream TC's accumulation). Assert the output Sync is forwarded and
+        its correctionField equals incoming + scaled_residence, where
+        residence = egress − ingress measured by the harness. Use a tolerant
+        match (change_to_range) sized to the BMv2 timestamp granularity. The
+        nonzero preload is the key: it distinguishes the correct `+=` from the
+        bug `=` (overwrite). Tests correction_is_accumulated +
+        residence_correction_equals_measured.
+
+    - id: non_ptp_passthrough_unmodified
+      rule_ref: G1-P1-T1                                       # one test per forwarding path
+      generate: |
+        Send a plain IPv4/TCP packet (not PTP). Assert it is forwarded to the
+        downstream pipeline unmodified by the transparent clock (no
+        correctionField exists to touch; headers preserved modulo any composed
+        downstream forwarding rewrite). Confirms R0 does not consume regular
+        traffic.
+
+    - id: general_message_correction_field_untouched
+      rule_ref: G1-P1-T2                                       # one test per protocol branch
+      generate: |
+        Send a PTP Announce (messageType 0xB) and a PTP Signaling (0xC), each
+        with a nonzero correctionField, on the general transport (Eth 0x88F7,
+        or UDP port 320). Assert each is forwarded with its correctionField
+        BYTE-IDENTICAL to the input. Tests general_and_non_ptp_unmodified —
+        catches an implementation that matches on transport alone and corrects
+        non-event messages.
+
+    - id: all_event_types_corrected
+      rule_ref: G1-P1-T3                                       # one test per table action / message branch
+      requires: "${corrected_message_types} == all_event"
+      generate: |
+        Send one of each event message — Sync 0x0, Delay_Req 0x1, Pdelay_Req
+        0x2, Pdelay_Resp 0x3 — each with a known incoming correctionField.
+        Assert every one has residence added. A sync_only implementation would correct
+        only the Sync; this entry is active only when corrected_message_types
+        == all_event and proves the per-message-type branch coverage.
+
+    - id: twostep_followup_carries_residence
+      rule_ref: G1-P2-T5                                       # bidirectional / paired-message consistency
+      requires: "${step_mode} == two_step"
+      generate: |
+        Two-message sequence with depends_on. (1) Send a Sync (0x0); assert it
+        is forwarded with its correctionField UNMODIFIED (two-step does not
+        correct the event message). (2) Send the paired Follow_Up (0x8) with
+        the same sourcePortIdentity + sequenceId; assert its correctionField
+        equals incoming + the Sync's stored residence. Tests R3→R4 and
+        stored_correction_persistence.
+
+    - id: flag_dispatched_mixed_step_mode
+      rule_ref: G1-P1-T3                                       # one test per message branch — here the dispatch branch
+      requires: "${step_mode} == flag_dispatched"
+      generate: |
+        On the SAME switch and message class, exercise both dispatch arms with
+        otherwise-identical packets that differ only in the twoStepFlag
+        (flagField bit 0x0200):
+          (a) a twoStepFlag-CLEAR Sync → assert it is CORRECTED IN TRANSIT
+              (correctionField = incoming + scaled_residence, reserved cleared,
+              checksum recomputed) and that no later message carries its
+              residence;
+          (b) a twoStepFlag-SET Sync → assert it is forwarded UNMODIFIED, and
+              its paired Follow_Up carries the residence (R3→R4).
+        Tests correction_applied_exactly_once_across_exchange. A switch that
+        applies one global step mode fails arm (a) or arm (b). Pair with a
+        cross-arm probe: a CLEAR Sync followed by a (spurious) Follow_Up for the
+        same key — the Follow_Up must be forwarded unmodified (no stored entry,
+        because the CLEAR event was corrected in transit, not stored), catching
+        a switch that both corrects in transit and stores.
+
+  G2:                                                         # resource robustness / boundary
+    - id: twostep_correlation_capacity_overflow
+      rule_ref: G2-P2-T3                                       # state exhaustion
+      requires: "${step_mode} == two_step ∧ ${correlation_capacity} != unbounded"
+      generate: |
+        Send ${correlation_capacity} distinct Sync messages (distinct
+        sequenceId) without their Follow_Ups, filling the correlation table.
+        Send one more Sync, then its Follow_Up. Assert the system degrades per
+        spec — either the overflow Sync's correlation is dropped (its Follow_Up
+        is forwarded unmodified via R1 fallthrough) or an existing entry is
+        evicted — and in NO case is a wrong (stale) residence applied to the
+        overflow Follow_Up.
+
+    - id: residence_arithmetic_width_no_truncation
+      rule_ref: G2-P1-T4                                       # boundary / maximum-size field
+      requires: "${correction_field_faithfulness} == full64_scaled_ns"
+      generate: |
+        Engineer (via harness queuing / delay control) a residence large
+        enough that residence_ns << 16 overflows 32 bits, and preload a
+        correctionField high enough that the add carries into the high word.
+        Assert the full 64-bit correctionField result is correct (carry
+        propagated, no 32-bit truncation, <<16 scale applied). Tests the
+        Cross-Cutting #4 arithmetic-width bug family for the
+        full64_scaled_ns rung.
+
+  G3:                                                         # security / regression for v1model bug patterns
+    - id: regression_udp_checksum_recompute_after_correction
+      rule_ref: G1-P4-T1                                       # bug-driven: checksum after modification (Cross-Cutting #1)
+      requires: "${transport} ∈ {udp_ipv4, udp_ipv6}"
+      generate: |
+        Send a PTP Sync over UDP/IPv4 (dst port 319) with a valid input UDP
+        checksum. Capture the corrected output. Recompute the expected UDP
+        checksum over the modified PTP payload + pseudo-header and assert it
+        bit-equals the output udp.checksum. Catches an implementation that rewrites
+        correctionField but leaves the stale UDP checksum (the #1 silent
+        failure) — peers drop such packets. For udp_ipv6 the checksum is
+        mandatory and MUST NOT be left 0.
+
+    - id: regression_residence_measured_in_egress
+      rule_ref: G3-P2-T2                                       # bug-driven: ingress-vs-egress backend mapping
+      generate: |
+        Send a Sync that the harness holds in the switch long enough to incur a
+        measurable residence (nonzero egress − ingress). Assert the applied
+        correction is NONZERO and matches the measured residence. An implementation that
+        computes residence in the ingress pipeline — where
+        egress_global_timestamp is not yet populated (reads 0 or garbage) —
+        produces a zero or nonsensical correction and fails. First-corpus probe
+        of the egress-timestamp metadata surface.
+
+    - id: regression_conditional_deparser_on_correction
+      rule_ref: G3-P2-T2                                       # bug-driven: conditional deparser
+      generate: |
+        Send a corrected Sync and a pass-through Announce back to back. Capture
+        both outputs and assert each has the EXACT, complete header structure
+        (Eth[/IPv4/UDP]/PTP with all fields present and the reserved bytes
+        cleared on the Sync, preserved on the Announce). Catches an implementation that
+        conditionally emits the PTP/UDP header inside the deparser (so the
+        correction branch corrupts the emit when the condition mis-evaluates),
+        the "deparse of conditionally-modified valid header" surface from the
+        v1model bug taxonomy.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pair every harden with an ease on the same axis. Sixteen operators across
+# eight paired axes (faithfulness-ladder, step-mode, delay-mechanism,
+# correction-width, transport, domain, message-breadth, correlation-capacity).
+
+mutation_operators:
+
+  - id: tighten_faithfulness
+    applicable_when: "${faithfulness} ≠ D5.3_p2p_asymmetry"
+    effect: |
+      ${faithfulness} ← next_ladder_step(${faithfulness}) ∧
+      rebind the per-axis parameters to the new rung's bundle (see faithfulness param notes)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      the new rung's required config is present (D5.1 needs no extra config;
+      D5.3 needs ${link_delays} non-empty and ${active_domains} non-empty)
+    notes: |
+      Lift D5.0 → D5.1 → D5.2 → D5.3, moving the whole per-axis bundle one rung
+      (adds UDP+checksum+64-bit scaling, then two-step state, then P2P link
+      delay + multi-domain). The coarse master lever; pairs with
+      relax_faithfulness.
+
+  - id: relax_faithfulness
+    applicable_when: "${faithfulness} ≠ D5.0_onestep_e2e"
+    effect: |
+      ${faithfulness} ← prev_ladder_step(${faithfulness}) ∧
+      rebind the per-axis parameters to the new rung's bundle
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no seed config requires a feature deactivated by the lower rung"
+    notes: |
+      Drop one rung on the faithfulness ladder. Pairs with tighten_faithfulness.
+
+  - id: tighten_to_two_step
+    applicable_when: "${step_mode} == one_step"
+    effect: "${step_mode} ← two_step"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${correlation_capacity} ≥ expected in-flight event↔follow-up pairs in the test sequences"
+    notes: |
+      Switch from in-transit one-step correction (R2) to the cross-packet
+      two-step correlation (R3 store + R4 apply on the Follow_Up). Introduces
+      the residence_correlation flow, its cold-start, capacity, and
+      apply-exactly-once surfaces. Pairs with relax_to_one_step.
+
+  - id: relax_to_one_step
+    applicable_when: "${step_mode} == two_step"
+    effect: "${step_mode} ← one_step"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the residence_correlation flow is removed from the active state set"
+    notes: |
+      Drop back to one-step in-transit correction. Pairs with tighten_to_two_step.
+
+  - id: tighten_to_p2p_asymmetry
+    applicable_when: "${delay_mechanism} == e2e"
+    effect: "${delay_mechanism} ← p2p"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${link_delays} is non-empty ∧ ${link_delay_capacity} ≥ |unique(${link_delays}.ingress_port)|"
+    notes: |
+      Move from end-to-end (residence only) to peer-to-peer (residence PLUS
+      ingress link delay). Activates the link entity and the per-port
+      mean_link_delay fold-in. Pairs with relax_to_e2e.
+
+  - id: relax_to_e2e
+    applicable_when: "${delay_mechanism} == p2p"
+    effect: "${delay_mechanism} ← e2e"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the link entity is removed from the active state set"
+    notes: |
+      Drop the link-delay fold-in; correct residence only. Pairs with
+      tighten_to_p2p_asymmetry.
+
+  - id: widen_to_full64_scaled
+    applicable_when: "${correction_field_faithfulness} == low32_ns"
+    effect: "${correction_field_faithfulness} ← full64_scaled_ns"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "the oracle's correction arithmetic uses the 2^-16-ns scaling and 64-bit carry"
+    notes: |
+      Lift the correction-field width/scaling axis from a plain-ns low-32-bit
+      update to the RFC-faithful full-64-bit 2^-16-ns representation (<<16
+      scale + carry into the high word). Activates the arithmetic-width bug
+      family. Pairs with narrow_to_low32_ns.
+
+  - id: narrow_to_low32_ns
+    applicable_when: "${correction_field_faithfulness} == full64_scaled_ns"
+    effect: "${correction_field_faithfulness} ← low32_ns"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "measured residence fits in 32 bits at the chosen ns units"
+    notes: |
+      Drop back to the simplified low-32-bit nanosecond update. Pairs with
+      widen_to_full64_scaled.
+
+  - id: tighten_transport_to_udp
+    applicable_when: "${transport} == eth_88f7"
+    effect: "${transport} ← udp_ipv4"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "the parser path for UDP ports 319/320 is active ∧ the checksum-recompute G3 entry is in the floor"
+    notes: |
+      Move PTP from over-Ethernet (no L4 checksum) to over-UDP/IPv4, adding the
+      UDP-checksum-recompute requirement on every correction — the #1 silent
+      failure surface. Pairs with relax_transport_to_eth.
+
+  - id: relax_transport_to_eth
+    applicable_when: "${transport} ∈ {udp_ipv4, udp_ipv6}"
+    effect: "${transport} ← eth_88f7"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no seed test asserts a UDP/IP layer on the PTP packet"
+    notes: |
+      Drop back to PTP-over-Ethernet, removing the checksum surface. Pairs with
+      tighten_transport_to_udp.
+
+  - id: tighten_to_multi_domain_filter
+    applicable_when: "${domain_handling} == single_domain_any"
+    effect: |
+      ${domain_handling} ← multi_domain_filtered ∧
+      ${active_domains} ← (${active_domains} non-empty ? ${active_domains} : [0])
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${active_domains} is non-empty ∧ every entry ∈ [0,127]"
+    notes: |
+      Require the implementation to read ptp.domainNumber and correct only the
+      configured domains, passing others through. Adds a precondition branch
+      to R2/R3. Pairs with relax_to_single_domain.
+
+  - id: relax_to_single_domain
+    applicable_when: "${domain_handling} == multi_domain_filtered"
+    effect: "${domain_handling} ← single_domain_any"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "no seed test relies on a domainNumber-based pass-through"
+    notes: |
+      Correct every domain regardless of domainNumber. Pairs with
+      tighten_to_multi_domain_filter.
+
+  - id: broaden_corrected_message_types
+    applicable_when: "${corrected_message_types} == sync_only"
+    effect: "${corrected_message_types} ← all_event"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "the all_event G1 entry is in the floor"
+    notes: |
+      Widen correction from Sync only to all four event messages, forcing
+      per-message-type branching (and two correlation classes in two-step
+      mode). Pairs with narrow_to_sync_only.
+
+  - id: narrow_to_sync_only
+    applicable_when: "${corrected_message_types} == all_event"
+    effect: "${corrected_message_types} ← sync_only"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no seed test asserts correction on a non-Sync event message"
+    notes: |
+      Correct only the Sync message. Pairs with broaden_corrected_message_types.
+
+  - id: shrink_correlation_capacity_4x
+    applicable_when: "${step_mode} == two_step ∧ ${correlation_capacity} ≠ unbounded ∧ ${correlation_capacity} > 32"
+    effect: "${correlation_capacity} ← ${correlation_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${correlation_capacity} ≥ 8"
+    notes: |
+      Tighten the two-step correlation-table capacity, forcing the implementation to
+      handle eviction/overflow of pending corrections. Pairs with
+      enlarge_correlation_capacity_2x.
+
+  - id: enlarge_correlation_capacity_2x
+    applicable_when: "${step_mode} == two_step ∧ ${correlation_capacity} ≠ unbounded"
+    effect: "${correlation_capacity} ← ${correlation_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${correlation_capacity} ≤ 65536"
+    notes: |
+      Loosen the correlation-table capacity. Pairs with
+      shrink_correlation_capacity_4x so difficulty recalibration can recover
+      from over-tightening.
+
+  # ── Added operator: rule addition. Added to ──────────────────────────────────
+  #    reach a harder difficulty than the parameter-level harden ladder could
+  #    (the baseline functionally saturates every single-mechanism variant at
+  #    r≥0.815). Grounded in IEEE 1588-2008 §13.3.2.6 twoStepFlag semantics +
+  #    RFC 8173 ptpbaseClockDefaultDSTwoStepFlag; mixed one-step/two-step
+  #    masters on one segment are a real deployment, not a contrived knob.
+  #    Adds the per-packet dispatch to R2/R3/R4 (when-clauses) and the
+  #    correction_applied_exactly_once_across_exchange invariant → regenerated
+  #    oracle (new content hash) + full oracle re-audit.
+  - id: dispatch_correction_by_two_step_flag
+    applicable_when: "${step_mode} ∈ {one_step, two_step}"
+    effect: "${step_mode} ← flag_dispatched"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      the oracle selects R2 (in-transit) vs R3/R4 (store/apply) PER EVENT
+      MESSAGE from the twoStepFlag (flagField bit 0x0200) rather than from a
+      global config constant; ${correlation_capacity} ≥ the in-flight
+      twoStepFlag-SET event↔follow-up pairs in the test sequences; the test
+      suite exercises BOTH dispatch arms (≥1 flag-clear in-transit correction
+      AND ≥1 flag-set store→apply) so a global-step-mode implementation cannot pass.
+    notes: |
+      Collapse the global one-step/two-step choice into a per-packet decision
+      keyed on the PTP twoStepFlag, so a SINGLE program must implement BOTH the
+      in-transit correction path (R2) and the store/apply correlation path
+      (R3/R4) and route each event message by its header bit. This is the only
+      harden lever that forces two distinct correction mechanisms to coexist in
+      one pipeline — every other operator selects exactly one mechanism. The
+      sharp new failure modes are double-correction (correct in transit AND on
+      the follow-up) and dropped-correction (store a flag-clear event that has
+      no follow-up), bound by correction_applied_exactly_once_across_exchange.
+      Pairs with collapse_to_uniform_step_mode.
+
+  - id: collapse_to_uniform_step_mode
+    applicable_when: "${step_mode} == flag_dispatched"
+    effect: "${step_mode} ← two_step"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no seed test relies on a per-packet twoStepFlag dispatch (every event in the suite uses the same step mode)"
+    notes: |
+      Drop the per-packet dispatch back to a single uniform step mode (defaults
+      to two_step, the richer of the two arms; relax_to_one_step can then drop
+      further). Pairs with dispatch_correction_by_two_step_flag so the
+      difficulty recalibration can back out of this harden if it over-shoots.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4. Items marked
+  [common-knowledge baseline] are synthesised from internalised P4 / IEEE-1588
+  knowledge rather than retrieved from a cited source; the IEEE 1588-2008/2019
+  standard is the originating normative authority for the residence-time /
+  correctionField semantics (it is paywalled and was not retrieved verbatim —
+  the specific clause behaviour below is corroborated by the read RFC 8173
+  concept definitions, the Juniper transparent-clock description, and the DPTP
+  paper).
+
+    PTP common header (the implementation defines a `ptp_t` header, 34 bytes for the
+    common header, parsed after Eth 0x88F7 or UDP 319/320):
+      - byte 0: majorSdoId(4) ++ messageType(4)  — messageType is the low nibble
+      - byte 1: minorVersionPTP(4) ++ versionPTP(4)
+      - bytes 2-3: messageLength
+      - byte 4: domainNumber
+      - byte 5: minorSdoId
+      - bytes 6-7: flagField (twoStepFlag = bit 9 overall, i.e. byte 6 bit 1)
+      - bytes 8-15: correctionField (bit<64>, units of 2^-16 ns)
+      - bytes 16-19: messageTypeSpecific / reserved  ← cleared after correction
+      - bytes 20-29: sourcePortIdentity (clockIdentity[8] ++ portNumber[2])
+      - bytes 30-31: sequenceId
+      - byte 32: controlField
+      - byte 33: logMessageInterval
+
+    D5.0 anchor (one_step, e2e, eth_88f7, low32_ns, single_domain_any,
+                 sync_only):
+      - No table at all on the core path — pure metadata arithmetic. In
+        MyEgress (NOT MyIngress — see below):
+          if (hdr.ptp.isValid() && hdr.ptp.messageType == 0x0) {
+            bit<32> residence_ns =
+              (bit<32>)(standard_metadata.egress_global_timestamp
+                        - standard_metadata.ingress_global_timestamp) * 1000;
+            hdr.ptp.correctionField = hdr.ptp.correctionField
+                                      + (bit<64>)residence_ns;   // ADD, not assign
+            hdr.ptp.reserved = 0;
+          }
+      - The correction MUST be done in egress: standard_metadata.
+        egress_global_timestamp is only valid in the egress pipeline (it is the
+        time the packet was dequeued). Computing residence in ingress yields 0
+        or garbage. [common-knowledge baseline — the v1model.p4 header documents
+        ingress_global_timestamp set at ingress and egress_global_timestamp set
+        in egress.]
+
+    D5.1 (transport=udp_ipv4, correction_field_faithfulness=full64_scaled_ns,
+          corrected_message_types=all_event):
+      - The 2^-16-ns scaling: correctionField += ((bit<64>)residence_ns) << 16.
+        Use 64-bit arithmetic throughout; truncating residence to 32 bits
+        before the shift loses the high bits. [common-knowledge baseline.]
+      - UDP-checksum recompute: PTP-over-UDP carries the PTP payload inside UDP,
+        so modifying correctionField invalidates the UDP checksum. Either
+        recompute via the v1model `update_checksum` extern over the UDP
+        pseudo-header + payload, or use the IEEE 1588 Annex-D checksum-neutral
+        trick (adjust the 2-byte reserved field so the one's-complement sum is
+        unchanged). The clean v1model implementation recomputes. For IPv4 a 0 UDP
+        checksum is permitted; for IPv6 it is mandatory and MUST be nonzero.
+      - all_event: branch messageType ∈ {0x0,0x1,0x2,0x3}. Note Delay_Req /
+        Pdelay_Req travel upstream (toward the master); a transparent clock
+        still corrects them on whichever port they egress.
+
+    D5.2 (step_mode=two_step):
+      - Register array `stored_correction<bit<64>>(${correlation_capacity})`
+        indexed by hash(sourcePortIdentity, sequenceId, message_class). On the
+        event message (R3) write the residence and forward the message
+        UNMODIFIED; on the paired Follow_Up (R4) read the slot, add to its
+        correctionField, and clear/evict the slot. message_class folds Sync↔
+        Follow_Up and Pdelay_Resp↔Pdelay_Resp_Follow_Up. [common-knowledge
+        baseline — the cross-packet correlation is the canonical two-step-TC
+        implementation but the slot-eviction discipline is convention.]
+      - Cold start: BMv2 initialises registers to 0; a Follow_Up that arrives
+        before its Sync (or after eviction) reads 0 — the implementation must NOT apply
+        a 0 correction silently as if it were valid; the orphan Follow_Up is
+        forwarded unmodified.
+
+    D5.3 (delay_mechanism=p2p, domain_handling=multi_domain_filtered):
+      - Per-port link-delay table `link_delay` (key: standard_metadata.
+        ingress_port, exact) → action sets meta.mean_link_delay. Add it to the
+        residence before the scale: correction = (residence_ns +
+        mean_link_delay_ns) << 16. [common-knowledge baseline — the Pdelay
+        measurement exchange that *populates* mean_link_delay is out of scope;
+        it is control-plane installed.]
+      - domain filter: read hdr.ptp.domainNumber and gate the correction on a
+        small `active_domain` table (or a constant set match) before applying.
+
+    flag_dispatched (step_mode=flag_dispatched, the L3b mixed-mode rung):
+      - The dispatch is a single bit test on the parsed flagField. The implementation
+        must read `hdr.ptp.flagField` and branch the WHOLE mechanism per event:
+          bit<16> TWO_STEP = 0x0200;   // IEEE 1588 §13.3.2.6 twoStepFlag
+          if (is_event_message) {
+            if ((hdr.ptp.flagField & TWO_STEP) == 0) {
+              // one-step arm: correct in transit (the R2 body, egress)
+            } else {
+              // two-step arm: store residence keyed by (id,seq,class) (R3);
+              //               do NOT modify the event in transit
+            }
+          } else if (is_followup) {
+            // R4: look up + add + evict (fires regardless of the event's flag —
+            //     a follow-up only exists for a two-step exchange)
+          }
+        [common-knowledge baseline — the flag is standard; the requirement that
+        ONE program carry both arms is the difficulty this rung adds.]
+      - The two reachable bugs are double-correction (running R2 AND R3 on a
+        flag-set event) and dropped-correction (running R3 on a flag-CLEAR
+        event whose Follow_Up never arrives, so it is never corrected). A
+        common shortcut — picking one global step mode and ignoring the bit —
+        fails half the traffic. The flag_dispatched_mixed_step_mode scaffolding
+        and correction_applied_exactly_once_across_exchange invariant bind both.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Overwriting the correctionField (`= residence`) instead of accumulating
+      (`+= residence`). Destroys upstream TCs' accumulated correction. The
+      `sync_residence_correction_additive` G1 case preloads a nonzero
+      correctionField to catch this; the `correction_is_accumulated` invariant
+      binds it.
+
+    * Computing residence in the ingress pipeline. egress_global_timestamp is
+      not populated until egress; ingress subtraction yields 0/garbage. The
+      `regression_residence_measured_in_egress` G3 case catches it (bug
+      taxonomy: backend ingress/egress mapping).
+
+    * Rewriting correctionField over UDP without recomputing the UDP checksum.
+      The `regression_udp_checksum_recompute_after_correction` G3 case catches
+      it (cross-cutting checksum bug, the #1 silent failure).
+
+    * Conditionally emitting hdr.ptp / hdr.udp inside MyDeparser. The
+      `regression_conditional_deparser_on_correction` G3 case asserts the full
+      header structure on both a corrected and a pass-through PTP message (bug
+      taxonomy: conditional deparser).
+
+    * Truncating the correctionField add to 32 bits or dropping the <<16 scale
+      at the full64_scaled_ns rung. The `residence_arithmetic_width_no_truncation`
+      G2 case catches it (cross-cutting maximum-size/overflow bug).
+
+    * Correcting PTP general messages (Announce/Signaling/Management/Delay_Resp)
+      by matching on the UDP/Ether transport without checking messageType. The
+      `general_message_correction_field_untouched` G1 case and the
+      `general_and_non_ptp_unmodified` invariant bind this.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and (once the oracle exists)
+       the oracle audit must all pass validation.
+
+    2. The pattern's oracle MUST model residence time from a harness-supplied
+       residence input rather than wall-clock: BMv2 timestamps are not
+       reproducible across runs, so the harness injects a deterministic
+       residence (e.g. via a per-test `residence_us` field or controlled
+       queuing delay) and the oracle computes the expected correctionField from
+       it. The oracle audit's canonical examples MUST include (a) a nonzero
+       residence on a preloaded-correctionField Sync (exercises +=), (b) a
+       residence large enough to carry into the high word at full64_scaled_ns,
+       and (c) a two-step Sync→Follow_Up pair, so a constant-baked oracle that
+       hardcodes a single residence or ignores the preload diverges.
+
+    3. For anchor instances (D5.0, default seed) the behaviour reduces to
+       a ~150-line P4 program: parse Eth+PTP, in egress add residence to the
+       low word of one Sync field, deparse. Higher rungs grow the parser
+       (UDP/IPv4), the arithmetic (64-bit scaled), the state (two-step
+       register), and the tables (P2P link delay + domain filter).
+
+    4. Composition: P-PTPTransparentClock composes naturally downstream of
+       P-IPv4Routing (correct residence, then route) — a candidate
+       P-TelemetryRouter-style composite. The correction must run in egress
+       after the forwarding decision so residence captures the full pipeline +
+       queuing time; flag the ingress-route / egress-correct ordering for the
+       composite harness.

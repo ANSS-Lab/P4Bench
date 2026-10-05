@@ -1,0 +1,794 @@
+# P-RateFeedback — Explicit Rate / Congestion Feedback Stamping (RCP / XCP style)
+#
+# TPL v1.0 task pattern. A scale_up transport-assistance NF:
+# the switch maintains a per-class/per-port congestion signal in a register,
+# computes its locally-advertised feedback value from that signal, and writes
+# it into a packet-carried feedback field as the PATH MINIMUM —
+# field ← MIN(current-field, switch-value) — so the most-congested switch on
+# the path determines the rate the sender ultimately learns. This is the
+# data-plane heart of RCP (Dukkipati & McKeown, "Rate Control Protocol") and
+# XCP (Katabi, Handley, Rohrs, SIGCOMM 2002): a single per-class rate/feedback
+# register, computed from an aggregate congestion signal, stamped per packet
+# under a min-fold. Closes the basic-layer in-pipeline-rate-feedback gap (no
+# RCP/XCP feedback stamper existed in the corpus).
+
+pattern_id:        P-RateFeedback
+version:           "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D8:transport-assistance]               # switch assists the transport's rate-control loop
+  prescriptive: [P6:congestion-control-assistance]      # in-pipeline rate computation + header stamping
+target_capability: scale_up                             # programmability moves CC computation that hit the ASIC's fixed-function feedback wall into a per-class register aggregate
+
+summary: >
+  Explicit rate / congestion feedback stamping on a PISA pipeline. The switch
+  maintains a per-class (or per-egress-port) congestion signal as a packet/byte
+  counter or a bounded-window aggregate in a register, derives a locally
+  advertised feedback value from that signal, and — for every packet carrying a
+  feedback field (an RCP rate field or an XCP-style congestion-header field) —
+  rewrites the field to MIN(current-field, switch-value) before forwarding, so
+  the bottleneck switch along the path wins (RCP §3, XCP §3.2). The canonical
+  instance is a single per-port signal with a static target rate; mutation
+  lifts to per-class signals, a sliding-window aggregate instead of a raw
+  counter, an XCP positive/negative feedback split, and tighter strictness on
+  the path-minimum invariant. Difficulty moves primarily along feature-breadth
+  (RCP single field → XCP feedback split) and capacity (per-class signal table
+  size, aggregation window length).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+
+    - cite: rcp_dukkipati_stanford
+      role: canonical_implementation
+      relevance: |
+        Rate Control Protocol (RCP) — Dukkipati's Stanford PhD thesis and the
+        Dukkipati & McKeown formulation. RCP carries a single rate field R in
+        the packet header; every router on the path overwrites R with its own
+        locally-computed fair-share rate ONLY IF the router's rate is smaller
+        than the value already in the field — i.e. the field carries the
+        path-minimum advertised rate, and the sender paces to R on the ACK.
+        This is the direct source of:
+          - R2's `rewrite(feedback_field, MIN(current, switch-value))`
+            path-minimum fold (the defining RCP semantic);
+          - the `path_minimum_monotone` invariant (the field never INCREASES
+            as it transits a more-congested switch);
+          - the `${feedback_semantics} == rcp_rate` mode and the
+            `${aggregate_lower_better}` orientation (a smaller rate is the
+            more-congested signal, so MIN keeps the bottleneck).
+        RCP computes R from an aggregate of recent load, NOT from instantaneous
+        queue occupancy — the basis for the deterministic counter/window
+        congestion signal this pattern uses (see bridging_notes).
+
+    - cite: xcp_katabi_sigcomm02
+      role: normative_behaviour
+      relevance: |
+        XCP — Katabi, Handley, Rohrs, "Congestion Control for High
+        Bandwidth-Delay Product Networks", SIGCOMM 2002. XCP packets carry a
+        congestion header (H_cwnd, H_rtt, H_feedback); each router's efficiency
+        + fairness controller writes per-packet feedback into H_feedback, and a
+        router only OVERWRITES the field when its own feedback is more
+        restrictive than the value already present (the most bottlenecked hop
+        on the path determines the delta the sender applies). This is the
+        source of:
+          - the `${feedback_semantics} == xcp_feedback` mode with a signed
+            positive/negative feedback split (R3);
+          - the feature-breadth `lift_to_xcp_feedback_split` operator
+            (RCP's single MIN-fold → XCP's separate efficiency/fairness
+            controllers folded by the same path-restrictiveness rule);
+          - the decoupling of the per-class congestion *signal* (an aggregate,
+            §3.2) from the per-packet *stamp* (the fold), which the pattern's
+            two-rule R1 (update signal) / R2 (compute + stamp) split mirrors.
+        XCP §4.3 explicitly computes its control signal from aggregate input
+        traffic and spare bandwidth over a control interval — again an
+        aggregate, not an instantaneous queue read.
+
+    - cite: hpcc_sigcomm19
+      role: scaling_approach
+      relevance: |
+        HPCC ("High Precision Congestion Control", SIGCOMM '19) is the modern
+        switch-assisted-CC reference: the switch stamps in-band telemetry
+        (inflight/txBytes aggregates) that the sender turns into a precise
+        window. HPCC's use of a per-link aggregate (txBytes accumulator over a
+        time/byte interval) rather than instantaneous queue depth is the
+        production justification for this pattern's deterministic
+        counter/window congestion signal, and motivates the `byte_count`
+        aggregation mode and the `${aggregation_window}` capacity axis. HPCC's
+        signal is producer-side in-band telemetry rather than a path-min field
+        fold, so it informs the scaling/aggregation surface only and is not the
+        rule-level canonical (RCP/XCP are).
+
+  # No IETF RFC normatively defines RCP or XCP data-plane behaviour (both are
+  # research transports, not standardised), and the upstream p4lang/tutorials
+  # repository ships no rate-feedback exercise — both lists are intentionally
+  # empty (nothing is cited
+  # without being read).
+  rfcs:
+    # The RCP/XCP papers (above) motivate the explicit-rate stamping; the IETF
+    # standardises the on-path router rate-feedback semantics this pattern's
+    # path_min_strict rule realises as Quick-Start (RFC 4782 §3.3): each router
+    # reduces the in-band rate request to the rate it can approve — exactly the
+    # path-minimum fold (R2/R3, path_minimum_monotone invariant).
+    - id: RFC4782
+      sections: ["3.3"]
+      role: normative_behaviour
+      quote: >-
+        A router MUST only approve a Quick-Start Request if the output link is
+        underutilized, and if the router judges that the output link will
+        continue to be underutilized if this and earlier approved requests are
+        used by the senders. Otherwise, the router reduces or terminates the
+        Quick-Start Request.
+      quote_source: patterns/P-RateFeedback/grounding/RFC4782.txt
+      relevance: |
+        Quick-Start for TCP and IP — the IETF in-band explicit-rate request
+        mechanism. §3.3 (Processing the Quick-Start Request at Routers) defines
+        the on-path rate-reduction semantics: a router approves the in-band rate
+        only if its output link is underutilised, otherwise it REDUCES the rate
+        request. This is the normative basis for the pattern's path-minimum fold
+        (R2/R3 stamp-down under path_min_strict) and the path_minimum_monotone
+        invariant — a switch never raises the advertised rate above what it can
+        sustain.
+  tutorials: []
+
+# ─── Entities (pick from the 8 entity types) ────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The feedback decision derives from the
+      packet's feedback field (hdr.fb.value), std.ingress_port / the resolved
+      egress class, and the control-plane-installed per-class target rate.
+
+  bucket:                                 # per-class / per-port congestion signal
+    key:
+      - signal_class                      # 0 .. ${n_signal_classes}-1; derived from egress port or DSCP per ${signal_keying}
+    attrs:
+      load_count: int                     # packets (or bytes) accumulated in the current window — the DETERMINISTIC congestion signal
+      window_pos: int                     # position within the current ${aggregation_window}; rolls over at the boundary
+    capacity: ${n_signal_classes}
+    notes: |
+      The per-class congestion signal. load_count is a packet OR byte counter
+      (per ${aggregation_mode}) — NOT a queue-depth read. The switch's
+      advertised feedback value is a deterministic function of load_count and
+      the class's ${target_rate}; see R1 (update) and R2 (compute + stamp).
+      load_count is reset / decayed at each ${aggregation_window} boundary so a
+      cold pipeline yields the uncongested (maximal) advertised value.
+
+  window:                                 # bounded-history aggregate over a packet-count window
+    key:
+      - signal_class
+    attrs:
+      n_packets:   int
+      accum:       int                    # running aggregate (sum of bytes or packet count) over the window
+    capacity: ${n_signal_classes}
+    enforced_when: "${aggregation_mode} == window_aggregate"
+    notes: |
+      Bounded-history accumulator used when ${aggregation_mode} ==
+      window_aggregate: instead of a free-running counter, the signal is an
+      aggregate over the last ${aggregation_window} packets of the class. The
+      window advances deterministically by packet count (NOT wall-clock), so
+      it is reproducible under the harness's one-packet-at-a-time --use-files
+      execution.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  feedback_header:
+    type: enum
+    values: [rcp_rate, xcp_cwnd_header]
+    default: rcp_rate
+    notes: |
+      Which feedback header the SUT parses. rcp_rate: a single 32-bit rate
+      field (hdr.fb.value). xcp_cwnd_header: an XCP congestion header carrying
+      (cwnd, rtt, feedback) — only `feedback` is rewritten.
+
+  feedback_semantics:
+    type: enum
+    values: [rcp_rate, xcp_feedback]
+    default: rcp_rate
+    notes: |
+      rcp_rate     → single path-minimum rate fold (R2 only; RCP §3).
+      xcp_feedback → signed efficiency/fairness feedback with a
+                     positive/negative split (R2 + R3; XCP §3.2/§4.3).
+
+  signal_keying:
+    type: enum
+    values: [per_egress_port, per_dscp_class]
+    default: per_egress_port
+    notes: |
+      How a packet maps to a congestion-signal class. Canonical instance keys
+      on the resolved egress port; per_dscp_class keys on the DiffServ class.
+
+  n_signal_classes:
+    type: int
+    range: "[1, 4096]"
+    default: 8
+    notes: |
+      Number of distinct congestion-signal classes (bucket / window capacity).
+      shrink_signal_classes_4x / enlarge_signal_classes_2x exercise the
+      capacity axis: with too few classes the SUT cannot keep an independent
+      signal per egress port and must collapse classes, changing the stamped
+      value.
+
+  target_rate:
+    type: int | unbounded
+    range: "[1, 4294967295]"
+    default: 1000000
+    notes: |
+      The class's nominal fair-share / link target (RCP R0 in the RCP equation,
+      or the XCP per-interval capacity). The advertised value is derived from
+      target_rate and the load_count signal; a larger target_rate ⇒ a larger
+      (less restrictive) advertised value at a given load.
+
+  aggregation_mode:
+    type: enum
+    values: [packet_count, byte_count, window_aggregate]
+    default: packet_count
+    notes: |
+      How the congestion signal is accumulated. packet_count / byte_count: a
+      free-running counter reset at the window boundary. window_aggregate: a
+      bounded-history accumulator over ${aggregation_window} packets (engages
+      the `window` entity). ALL THREE are deterministic under --use-files; none
+      reads standard_metadata.enq_qdepth / deq_qdepth (see bridging_notes).
+
+  aggregation_window:
+    type: int
+    range: "[1, 1048576]"
+    default: 64
+    notes: |
+      Length (in packets, or window slots) over which load_count / accum is
+      maintained before reset/decay. Capacity axis: a shorter window makes the
+      advertised value react faster and is harder to track exactly.
+
+  aggregate_lower_better:
+    type: bool
+    default: true
+    notes: |
+      Orientation of the fold. true (RCP rate / XCP cwnd headroom): a SMALLER
+      advertised value is MORE congested, so the path keeps the MINIMUM (R2).
+      false would orient the fold the other way; v1.0 fixes the canonical RCP
+      orientation, but the flag documents the semantic for the
+      path_minimum_monotone invariant.
+
+  path_min_strict:
+    type: bool
+    default: true
+    notes: |
+      When true (default), the `path_minimum_monotone` invariant is enforced:
+      the SUT MUST overwrite the field ONLY when its own value is more
+      restrictive (strictly less, when aggregate_lower_better), never
+      increasing the field. relax_path_min_strict downgrades it to advisory
+      (an always-overwrite stamper passes), an easing.
+
+  default_action:
+    type: enum
+    values: [forward, drop]
+    default: forward
+    notes: |
+      Behaviour on a packet with NO feedback header. v1.0: forward unmodified
+      (the NF only stamps feedback-carrying packets; ordinary traffic transits).
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_rcp_single_rate       # single rate field, path-min fold, free-running counter signal
+      - D5.1_window_aggregate      # signal is a bounded-window aggregate rather than a raw counter
+      - D5.2_xcp_feedback_split    # XCP signed efficiency/fairness feedback split
+    default: D5.0_rcp_single_rate
+
+# ─── Rules (first-match priority) ───────────────────────────────────────────
+# First-match semantics; order matters. State writes inside `then` are visible
+# to subsequent rules on subsequent packets only.
+
+rules:
+
+  - id: R0_no_feedback_header
+    when: "¬header_present(feedback)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - "${default_action}"
+    notes: |
+      Packets that do not carry the feedback header are not part of the
+      rate-control loop; v1.0 forwards them unmodified (default_action). The
+      switch only stamps feedback-carrying packets.
+
+  - id: R1_update_congestion_signal
+    when: "header_present(feedback)"
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(class_of(packet, ${signal_keying}))
+      window: by_key(class_of(packet, ${signal_keying}))   IF ${aggregation_mode} == window_aggregate
+    then:
+      - "inc(bucket.load_count)"
+    notes: |
+      Accumulate the DETERMINISTIC congestion signal for the packet's class.
+      Under packet_count this is one inc per feedback packet; under byte_count
+      the implementation adds the packet length; under window_aggregate the inc lands
+      in the current window slot (R6-style boundary roll handled by the implementation
+      at ${aggregation_window}). CRITICAL: load_count is a packet/byte
+      accumulator, NOT standard_metadata.enq_qdepth / deq_qdepth — see the
+      gradability note in bridging_notes. The signal MUST be reproducible under
+      one-packet-at-a-time --use-files execution.
+
+  - id: R2_stamp_path_minimum
+    when: |
+      header_present(feedback) ∧
+      value(hdr.fb.value, >, switch_advertised_value(bucket.load_count, ${target_rate}, ${aggregation_mode}))
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(class_of(packet, ${signal_keying}))
+    then:
+      - "rewrite(hdr.fb.value, MIN(hdr.fb.value, switch_advertised_value(bucket.load_count, ${target_rate}, ${aggregation_mode})))"
+      - forward(lookup_egress(packet))
+    enforced_when: "${aggregate_lower_better}"
+    notes: |
+      The defining RCP/XCP path-minimum fold. `switch_advertised_value(...)` is
+      the switch's locally-computed feedback (a monotone function of the class
+      signal and ${target_rate}): the heavier the accumulated load_count, the
+      SMALLER the advertised value. The field is overwritten ONLY when the
+      switch value is more restrictive than the value already present, so the
+      bottleneck switch on the path wins (RCP §3, XCP §3.2). When the field is
+      already more restrictive than this switch, the field is left unchanged
+      and the packet is forwarded (covered by R4). MIN keeps the smaller value
+      under the canonical aggregate_lower_better orientation.
+
+  - id: R3_xcp_feedback_split
+    when: |
+      header_present(feedback) ∧
+      value(hdr.fb.value, >, switch_advertised_value(bucket.load_count, ${target_rate}, ${aggregation_mode}))
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(class_of(packet, ${signal_keying}))
+    then:
+      - "rewrite(hdr.fb.feedback, MIN(hdr.fb.feedback, xcp_signed_feedback(bucket.load_count, ${target_rate})))"
+      - forward(lookup_egress(packet))
+    enforced_when: "${feedback_semantics} == xcp_feedback"
+    notes: |
+      XCP-mode extension (XCP §3.2/§4.3): the stamped value is a SIGNED
+      efficiency+fairness feedback (positive when the link is under-utilised,
+      negative when congested). The same "most-restrictive-hop wins" fold
+      applies — a more-negative feedback overwrites a less-negative one. Only
+      fires in xcp_feedback mode; in rcp_rate mode R2 alone realises the NF.
+
+  - id: R4_forward_unchanged
+    when: |
+      header_present(feedback) ∧
+      value(hdr.fb.value, <=, switch_advertised_value(bucket.load_count, ${target_rate}, ${aggregation_mode}))
+    given:
+      packet: deduce_from_packet
+    then:
+      - forward(lookup_egress(packet))
+    notes: |
+      The field already carries a more-restrictive value from an upstream
+      bottleneck (≤ this switch's advertised value). The field is PRESERVED —
+      this switch does NOT raise it — and the packet is forwarded. This is the
+      path-minimum monotonicity guarantee in rule form.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: path_minimum_monotone
+    clause: stability
+    binds: [packet]
+    statement: |
+      The feedback field MUST NOT increase as the packet transits the switch:
+      egress hdr.fb.value ≤ ingress hdr.fb.value (under
+      ${aggregate_lower_better} == true). A switch may only lower the field to
+      its own more-restrictive advertised value; an upstream bottleneck's value
+      survives. The classic implementation bug — unconditionally overwriting the field
+      with the switch's value — violates this whenever the switch is less
+      congested than an upstream hop.
+    enforced_when: "${path_min_strict}"
+
+  - id: signal_persistence_within_window
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      load_count is monotonically non-decreasing across consecutive R1 firings
+      within a single ${aggregation_window}; the only free_under operation is
+      the window-boundary reset/decay. (Under window_aggregate the bound is on
+      `window.accum` instead.) This is what makes the advertised value a
+      deterministic function of the packet train rather than of nondeterministic
+      queue state.
+    enforced_when: "true"
+
+  - id: feedback_field_value_correctness
+    clause: stability
+    binds: [packet, bucket]
+    statement: |
+      For a packet of class c whose ingress field exceeds the switch's
+      advertised value, the egress field equals exactly
+      switch_advertised_value(load_count(c), ${target_rate}, ${aggregation_mode})
+      — not a stale, doubled, or off-by-one-window value. Reading the signal
+      AFTER vs BEFORE the R1 inc must be consistent across the test train
+      (register read-after-write ordering).
+    enforced_when: "true"
+
+  - id: forwarding_independence
+    clause: stability
+    binds: [packet]
+    statement: |
+      The congestion signal and the feedback-field rewrite MUST NOT change the
+      packet's egress port relative to an identical no-feedback baseline. The
+      NF stamps a header field and forwards on the normal forwarding decision;
+      it does not drop, reroute, or mirror feedback-carrying packets on account
+      of congestion (v1.0 — rate enforcement is the sender's job, not the
+      switch's).
+    enforced_when: "true"
+
+  - id: no_packet_loop
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every feedback packet traverses the pipeline at most twice (one optional
+      recirculation if the signal computation is split across stages). No
+      infinite recirculation.
+    enforced_when: "true"
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Authored against the G1/G2/G3 test-goal framework and the v1model bug
+# taxonomy.
+
+test_scaffolding:
+
+  G1:                                  # functional correctness
+
+    - id: stamp_switch_value_on_uncongested_field
+      generate: |
+        Cold pipeline (load_count = 0 for the class). Send ONE feedback packet
+        whose ingress hdr.fb.value is the maximal/least-restrictive value
+        (larger than the switch's advertised value at zero load). Assert the
+        egress field == switch_advertised_value(load_after_R1, ${target_rate},
+        ${aggregation_mode}), the packet is forwarded on its normal egress, and
+        no other header field changes. Maps to G1-P1-T1 (forwarding-path) +
+        G1-P1-T5 (explicit transformation) + G1-P2-T2 (state accumulation).
+
+    - id: preserve_more_restrictive_upstream_value
+      generate: |
+        Cold pipeline. Send ONE feedback packet whose ingress hdr.fb.value is
+        STRICTLY MORE restrictive (smaller, under aggregate_lower_better) than
+        this switch's advertised value. Assert the egress field == the
+        unchanged ingress value (R4: the upstream bottleneck survives) and the
+        packet is forwarded. Probes path_minimum_monotone. Maps to G1-P1-T5.
+
+    - id: signal_grows_lowers_advertised_value
+      generate: |
+        Warm the class via prior_inputs: send W feedback packets (TTL=64) of
+        class c so load_count climbs. Test packet: one more feedback packet of
+        c with a least-restrictive ingress field. Assert the egress field is
+        SMALLER (more restrictive) than the value a cold pipeline would stamp —
+        i.e. the advertised value tracks the accumulated signal monotonically.
+        Maps to G1-P2-T2 (state accumulation) + G1-P2-T7 (read-after-write).
+
+    - id: per_class_signal_isolation
+      generate: |
+        prior_inputs: warm class A (e.g. egress port 1) with W feedback
+        packets. Test packet: a feedback packet of a DIFFERENT class B (egress
+        port 2) with a least-restrictive field. Assert B's egress field
+        reflects ONLY B's load (≈ the cold value), not A's accumulated load —
+        the per-class signal must be independent. Maps to G1-P2-T3 (cross-flow
+        independence). requires: "${n_signal_classes} >= 2".
+
+    - id: xcp_signed_feedback_fold
+      requires: "${feedback_semantics} == xcp_feedback"
+      generate: |
+        Send a feedback packet whose ingress hdr.fb.feedback is a positive
+        (under-utilised) value while the class is congested (warmed via
+        prior_inputs). Assert the egress feedback is overwritten with the
+        switch's more-restrictive (more-negative) signed value (R3), and that a
+        packet arriving with an ALREADY-more-negative feedback is preserved.
+        Maps to G1-P2-T2 on the signed fold.
+
+  G2:                                  # robustness / boundary
+
+    - id: window_boundary_resets_signal
+      generate: |
+        prior_inputs: warm the class right up to the ${aggregation_window}
+        boundary so load_count is near its reset. Test packet: the first
+        feedback packet AFTER the boundary. Assert the stamped value reflects
+        the post-boundary (near-cold) signal, not the pre-boundary peak — the
+        window reset/decay happened. Maps to G1-P2-T4 (state after reset) +
+        the window-boundary G2 rule. requires:
+        "${aggregation_mode} == window_aggregate ∨ ${aggregation_window} >= 1".
+
+    - id: advertised_value_no_underflow_at_max_load
+      generate: |
+        prior_inputs: drive load_count far past what the advertised-value
+        formula expects (saturate the signal register). Test packet: one more
+        feedback packet. Assert the advertised value SATURATES at its minimum
+        legal rate (does not wrap to a huge value via unsigned underflow) and
+        the field is rewritten to that floor, not to 0xFFFFFFFF. Maps to the
+        counter/arithmetic-overflow G2 rule + bug-taxonomy "counter overflow".
+
+    - id: capacity_pressure_class_collapse
+      requires: "${n_signal_classes} <= 4"
+      generate: |
+        With a tight ${n_signal_classes}, send feedback packets across MORE
+        distinct egress ports than there are signal classes. Assert the SUT's
+        class-mapping is well-defined (deterministic collapse) and the stamped
+        value for each packet is consistent with its mapped class — no
+        out-of-bounds register index. Maps to the G2 capacity-boundary rule.
+
+  G3:                                  # security / bypass
+
+    - id: adversary_cannot_raise_field
+      generate: |
+        Adversarial sender presents a feedback packet whose ingress field is
+        ALREADY more restrictive (smaller) than the switch's value, attempting
+        to coerce the switch into RAISING it to a larger (faster) rate. Assert
+        the switch PRESERVES the smaller value (never increases the field) —
+        path_minimum_monotone holds even against a crafted field. Maps to the
+        G3 adversarial-probe rule. Probes the most-common logic bug
+        (unconditional overwrite).
+
+    - id: no_queue_depth_nondeterminism
+      generate: |
+        Send the SAME feedback packet twice in two independent harness runs
+        (cold pipeline each time). Assert the stamped egress value is BIT-IDENTICAL
+        across runs. A SUT that derived its advertised value from
+        standard_metadata.enq_qdepth / deq_qdepth would stamp a
+        nondeterministic (≈0, run-varying) value and FAIL this. Pins the
+        gradability substitution; maps to the v1model bug
+        taxonomy's "standard_metadata read" pattern.
+
+    - id: conditional_rewrite_deparser_well_formed
+      generate: |
+        On the R4 branch (field preserved, no rewrite) AND the R2 branch (field
+        rewritten), assert the deparsed packet is bit-exact and the feedback
+        header is emitted on BOTH branches (no conditional-deparser corruption
+        when the rewrite branch is skipped). Probes the v1model bug
+        taxonomy's "conditional deparser" pattern.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators (5 required fields each) ───────────────────────────
+
+mutation_operators:
+
+  # === Feature-breadth axis: RCP single rate ↔ XCP feedback split ==========
+  - id: lift_to_xcp_feedback_split
+    applicable_when: "${feedback_semantics} == rcp_rate ∧ ${faithfulness} != D5.2_xcp_feedback_split"
+    effect: |
+      ${feedback_semantics} ← xcp_feedback ∧
+      ${feedback_header}    ← xcp_cwnd_header ∧
+      ${faithfulness}       ← D5.2_xcp_feedback_split
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${feedback_header} == xcp_cwnd_header"
+    notes: |
+      Lifts the single RCP MIN-fold to the XCP signed efficiency/fairness
+      feedback split (activates R3). Adds the signed-fold and the
+      xcp_signed_feedback G1 case. Pairs with revert_to_rcp_single_rate.
+
+  - id: revert_to_rcp_single_rate
+    applicable_when: "${feedback_semantics} == xcp_feedback"
+    effect: |
+      ${feedback_semantics} ← rcp_rate ∧
+      ${feedback_header}    ← rcp_rate ∧
+      ${faithfulness}       ← D5.0_rcp_single_rate
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${feedback_header} == rcp_rate"
+
+  # === Faithfulness ladder: raw counter ↔ window aggregate =================
+  - id: lift_to_window_aggregate
+    applicable_when: "${aggregation_mode} ∈ {packet_count, byte_count} ∧ ${faithfulness} == D5.0_rcp_single_rate"
+    effect: |
+      ${aggregation_mode} ← window_aggregate ∧
+      ${faithfulness}     ← D5.1_window_aggregate
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${aggregation_window} >= 1"
+    notes: |
+      Replaces the free-running counter signal with a bounded sliding-window
+      aggregate (engages the `window` entity). Harder: the SUT must maintain a
+      decaying/rolling accumulator deterministically. Pairs with
+      revert_to_raw_counter.
+
+  - id: revert_to_raw_counter
+    applicable_when: "${aggregation_mode} == window_aggregate"
+    effect: |
+      ${aggregation_mode} ← packet_count ∧
+      ${faithfulness}     ← D5.0_rcp_single_rate
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${aggregation_mode} ∈ {packet_count, byte_count, window_aggregate}"
+
+  # === Capacity axis: per-class signal table size ==========================
+  - id: shrink_signal_classes_4x
+    applicable_when: "${n_signal_classes} >= 16"
+    effect: "${n_signal_classes} ← ${n_signal_classes} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${n_signal_classes} >= 1"
+    notes: |
+      Forces fewer independent congestion signals than egress ports, so the
+      implementation must collapse classes — changing the stamped value. Pairs with
+      enlarge_signal_classes_2x.
+
+  - id: enlarge_signal_classes_2x
+    applicable_when: "${n_signal_classes} <= 2048"
+    effect: "${n_signal_classes} ← ${n_signal_classes} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${n_signal_classes} <= 4096"
+
+  # === Capacity axis: aggregation window length ============================
+  - id: shrink_aggregation_window_4x
+    applicable_when: "${aggregation_window} >= 4"
+    effect: "${aggregation_window} ← ${aggregation_window} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${aggregation_window} >= 1"
+    notes: |
+      A shorter window makes the advertised value react faster and harder to
+      track exactly across the test train. Pairs with enlarge_aggregation_window_2x.
+
+  - id: enlarge_aggregation_window_2x
+    applicable_when: "${aggregation_window} <= 524288"
+    effect: "${aggregation_window} ← ${aggregation_window} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${aggregation_window} <= 1048576"
+
+  # === Strictness axis: path-minimum monotonicity ==========================
+  - id: enforce_path_min_strict
+    applicable_when: "${path_min_strict} == false"
+    effect: "${path_min_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Promotes path_minimum_monotone from advisory to enforced: the SUT MUST
+      fold with MIN and never raise the field. A wrong always-overwrite stamper
+      now fails. Pairs with relax_path_min_strict.
+
+  - id: relax_path_min_strict
+    applicable_when: "${path_min_strict} == true"
+    effect: "${path_min_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Downgrades path_minimum_monotone to advisory; an always-overwrite stamper
+      (no MIN comparison) passes. Removes the adversary_cannot_raise_field
+      discrimination.
+
+  # === Signal-keying axis: per-port ↔ per-DSCP =============================
+  - id: switch_to_per_dscp_keying
+    applicable_when: "${signal_keying} == per_egress_port"
+    effect: "${signal_keying} ← per_dscp_class"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${n_signal_classes} >= 1"
+    notes: |
+      Keys the congestion signal on the DiffServ class rather than the resolved
+      egress port, forcing the implementation to parse and classify on DSCP before the
+      signal lookup. Pairs with switch_to_per_port_keying.
+
+  - id: switch_to_per_port_keying
+    applicable_when: "${signal_keying} == per_dscp_class"
+    effect: "${signal_keying} ← per_egress_port"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Workload axis: target-rate tightening ===============================
+  - id: tighten_target_rate_4x
+    applicable_when: "${target_rate} != unbounded ∧ ${target_rate} >= 4"
+    effect: "${target_rate} ← ${target_rate} / 4"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${target_rate} >= 1"
+    notes: |
+      A lower target_rate makes the switch advertised value more restrictive at
+      a given load, so the path-min fold bites sooner and the value arithmetic
+      is exercised harder. Pairs with relax_target_rate_2x.
+
+  - id: relax_target_rate_2x
+    applicable_when: "${target_rate} != unbounded ∧ ${target_rate} <= 2147483647"
+    effect: "${target_rate} ← ${target_rate} * 2"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${target_rate} <= 4294967295"
+
+# ─── Bridging notes (advisory; not visible to the SUT) ─────────────────────
+
+bridging_notes: |
+  GRADABILITY SUBSTITUTION (the central authoring decision — analogous to the
+  harness "no time_tick / no wall-clock" limitation):
+
+    RCP/XCP/HPCC compute their congestion signal from queue occupancy and/or
+    aggregate load over a control interval. In BMv2 `simple_switch --use-files`
+    mode, packets are processed ONE AT A TIME, so the real egress queue depth
+    (standard_metadata.enq_qdepth / deq_qdepth) is ~always 0 and is
+    NON-DETERMINISTIC across runs — it cannot be the gradable signal.
+
+    SUBSTITUTION: the congestion signal is derived DETERMINISTICALLY from a
+    per-class PACKET/BYTE COUNTER (aggregation_mode ∈ {packet_count,
+    byte_count}) or a bounded PACKET-COUNT WINDOW AGGREGATE
+    (window_aggregate). load_count is incremented per feedback packet (R1) and
+    reset/decayed at the ${aggregation_window} boundary (by packet count, NOT
+    wall-clock). The switch's advertised value is a fixed, monotone function of
+    load_count and ${target_rate}. Because the signal is a function of the
+    packet TRAIN (which the harness controls exactly via prior_inputs), the
+    stamped feedback value is reproducible run-to-run. The
+    `no_queue_depth_nondeterminism` G3 test pins this: a SUT that reads
+    enq_qdepth/deq_qdepth stamps a run-varying value and fails. This mirrors
+    RCP's own use of an aggregate-of-recent-load and XCP §4.3's control-interval
+    aggregate (neither uses instantaneous queue depth either).
+
+  Common implementations from this pattern to v1model P4:
+
+    Default seed (feedback_semantics=rcp_rate, aggregation_mode=packet_count,
+                  signal_keying=per_egress_port, n_signal_classes=8):
+      - Parse a feedback header (custom EtherType / UDP-port-demuxed shim)
+        carrying a 32-bit value field; R0 forwards packets without it.
+      - load_count per class as `register<bit<32>>(${n_signal_classes})`,
+        indexed by the resolved egress port. R1: read-modify-write +1.
+      - switch_advertised_value: a monotone-decreasing function of load_count,
+        e.g. advertised = target_rate / (1 + load_count) or
+        target_rate - k·load_count saturated at a floor — implemented in the
+        SALU; the SPEC requires monotonicity + saturation, the exact curve is
+        implementation surface as long as it is deterministic.
+      - R2: `if (hdr.fb.value > advertised) hdr.fb.value = advertised;`
+        — this single conditional IS the path-min fold (MIN).
+      - Forward on the normal IPv4/L2 forwarding decision, independent of the
+        signal (forwarding_independence).
+
+    aggregation_mode=window_aggregate (D5.1):
+      - Maintain a rolling accumulator: a per-class register pair
+        (accum, n_packets); on R1, accum += contribution; when n_packets hits
+        ${aggregation_window}, snapshot+reset (deterministic, packet-counted).
+
+    feedback_semantics=xcp_feedback (D5.2):
+      - Parse the XCP congestion header (cwnd, rtt, feedback); R3 folds a
+        SIGNED feedback (two's-complement bit<32>); the MIN-fold becomes
+        "keep the more-negative" — sign-aware comparison.
+
+  Anti-pattern implementations to reject:
+    * Deriving the advertised value from standard_metadata.enq_qdepth /
+      deq_qdepth — nondeterministic under --use-files; caught by
+      no_queue_depth_nondeterminism. THE central anti-pattern.
+    * Unconditionally overwriting the field with the switch value (no MIN /
+      no comparison) — raises the field above an upstream bottleneck; caught by
+      adversary_cannot_raise_field + path_minimum_monotone.
+    * Unsigned underflow in advertised = target_rate - k·load_count wrapping to
+      ~0xFFFFFFFF at high load; caught by advertised_value_no_underflow_at_max_load.
+    * Out-of-bounds register index when more egress ports than n_signal_classes;
+      caught by capacity_pressure_class_collapse.
+    * Conditional deparser dropping the feedback header on the R4 (no-rewrite)
+      branch; caught by conditional_rewrite_deparser_well_formed.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - The exact switch_advertised_value curve (the RCP rate equation has a
+      proportional+integral form; XCP's is an efficiency+fairness controller).
+      v1.0 fixes only the MONOTONICITY + SATURATION contract and leaves the
+      curve as implementation surface, because the gradable observable is the path-min
+      FOLD and the per-class relative ordering, not the precise control law —
+      reproducing the full RCP/XCP control equation per-packet is out of scope
+      for the single-switch --use-files harness.
+    - The per-class packet/byte counter signal is the common-knowledge data
+      plane realisation; RCP/XCP describe the control-interval aggregate
+      abstractly, HPCC its txBytes accumulator — the packet-count window is the
+      harness-deterministic stand-in motivated by all three.
+
+  v2 deferral notes (not enforceable at v1.0):
+    - True queue-occupancy-driven feedback — needs a deterministic queue model
+      the --use-files harness does not provide.
+    - Wall-clock control intervals (RCP's RTT-scaled update period) — needs the
+      time_tick entity, which the v1.0 harness injects no events for.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance and
+  hand-run the public tests through the oracle for the seed. Verify the
+  no_queue_depth_nondeterminism case: stamp value must be bit-identical across
+  two independent harness runs of the same packet.

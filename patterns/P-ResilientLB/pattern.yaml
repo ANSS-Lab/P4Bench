@@ -1,0 +1,232 @@
+# P-ResilientLB — Health-checked load balancer: BFD liveness ∘ stateful LB ∘ fast reroute
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into a single-pass health-checked L4 load balancer: a BFD-driven
+# per-backend liveness signal (P-BFDLiveness, P16), a stateful 5-tuple-pinned
+# VIP load balancer (P-StatefulLB, P3), and a ring-order fast reroute that
+# skips dead backends (P-PURRFastReroute, P7). The value of the *chained*
+# pattern over instantiating the three apart is the cross-stage data
+# dependence between the liveness register, the per-flow pin table, and the
+# ring-skip selection — invisible when each half is tested alone:
+#   (a) LIVENESS-GATED SELECTION — the LB never selects a backend whose
+#       BFD-maintained liveness bit is down. A standalone P-StatefulLB hashes
+#       to a backend unconditionally; only the composite consults the liveness
+#       register that a prior BFD control packet wrote.
+#   (b) FAILOVER RE-PIN — an established flow whose pinned backend transitions
+#       down re-pins to the next live backend in ring order (persistence WITH
+#       failover). Standalone P-StatefulLB binds for life; standalone
+#       P-PURRFastReroute has no per-flow pin to migrate.
+#   (c) ALL-DEAD DROP — when no backend is live the packet is dropped, not
+#       hashed to a dead target. The ring-skip terminates.
+#   (d) ORDERING — BFD liveness update must precede LB selection on a
+#       per-packet basis: a BFD-down packet for backend B observed before a
+#       client packet hashing to B forces the failover path on that same
+#       client packet.
+
+pattern_id: P-ResilientLB
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D1:stateful-flow-tracking"
+    - "D5:routing"
+  prescriptive:
+    - "P3:flow-tracking"
+    - "P7:fast-reroute"
+    - "P16:packet-origination"
+
+target_capability: composition   # chains a scale_up (P-StatefulLB) and two redesign (P-BFDLiveness/P-PURRFastReroute) primitives; failure modes are cross-cutting
+
+summary: >
+  Single-pass health-checked L4 load balancer. A BFD control packet from a
+  backend updates that backend's liveness bit in a per-backend register. A
+  client TCP flow to the virtual IP is mapped by a deterministic 5-tuple hash
+  to a primary backend in a fixed ring; if that backend is down the selection
+  rings forward to the next live backend, and if no backend is live the packet
+  is dropped. An established flow is pinned to its chosen backend and reuses it
+  while live, but re-pins to the next live backend on failover. The chosen
+  backend's address is written into IP.dst, the packet is routed to the backend
+  egress port with TTL decrement. The pipeline order BFD-update -> select ->
+  reroute and the liveness/pin/ring-skip data dependence are the load-bearing
+  composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC5880
+      quote: "If the Detect Mult field is zero, the packet MUST be discarded."
+      title: "Bidirectional Forwarding Detection (BFD)"
+      sections: ["6.1", "6.8.1", "6.8.6"]
+      role: per-session liveness state (Up/Down) driven by control packets
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: forward to the selected next hop + TTL decrement + checksum recompute
+  papers:
+    - cite: "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer, NSDI 2016"
+      role: consistent-hash VIP->backend selection + per-connection stickiness
+    - cite: "Chiesa et al., PURR: a primitive for reconfigurable fast reroute, CoNEXT 2019"
+      role: ring-order skip-the-dead-nexthop fast reroute semantics
+
+entities:
+  liveness_table:
+    type: link
+    key: [backend_ip]
+    attrs: {state: "up|down"}
+    capacity: ${backend_count}
+    eviction: none
+    notes: per-backend liveness bit, written by BFD control packets, read by the LB selector.
+  pin_table:
+    type: flow
+    keyed_by_tuple: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {backend_index: int}
+    capacity: ${pin_capacity}
+    eviction: ${pin_eviction}
+    notes: per-flow pinned backend index; reused while the backend is up, re-pinned on failover.
+  backend_pool:
+    type: bucket
+    key: [backend_index]
+    attrs: {backend_ip: ipv4, egress_port: int, next_hop_mac: mac}
+    capacity: ${backend_count}
+    eviction: none
+    notes: fixed ring of backends in index order; ring-skip walks this in modular order.
+
+parameters:
+  virtual_ip:        {type: ipv4,   default: "10.0.9.9"}
+  backend_pool:      {type: list,   default: ["10.0.2.11", "10.0.2.12", "10.0.2.13"]}
+  backend_count:     {type: int,    default: 3,   constraint: "backend_count >= 1"}
+  bfd_udp_port:      {type: int,    default: 3784, constraint: "1 <= bfd_udp_port <= 65535"}
+  pin_capacity:      {type: int,    default: 256, constraint: "pin_capacity >= 1"}
+  pin_eviction:      {type: enum,   values: [none, LRU, FIFO], default: none}
+  hash_modulus:      {type: int,    default: 3,   constraint: "hash_modulus >= 1"}
+  client_port:       {type: int,    default: 1}
+  backend_port:      {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable header.
+
+  - id: R1_bfd_liveness_update
+    when: "header_present(IPv4) and UDP.dport == bfd_udp_port and ingress on backend_port"
+    given: {match: "liveness_table by source backend_ip"}
+    then:
+      - "set(liveness_table[src_backend].state -> up if UDP.sport encodes up else down)"
+      - "consume(pkt)"
+    notes: a BFD control packet from a backend updates that backend's liveness bit; the packet is consumed (decision bfd_liveness_update, behavior drop).
+
+  - id: R2_lb_select
+    when: "header_present(IPv4) and IP.dst == virtual_ip and ingress on client_port"
+    given: {match: "pin_table by 5-tuple; backend_pool ring by hash"}
+    then:
+      - "primary_index = hash5tuple(pkt) mod hash_modulus"
+      - "if pin exists and pinned backend is up: chosen = pinned backend"
+      - "else: chosen = first live backend in ring order starting at primary_index"
+      - "drop(pkt) if no backend is live"
+      - "bind(pin_table, 5-tuple -> chosen) (install or re-pin on failover)"
+    notes: deterministic hash picks the primary; ring-skip walks live backends; all-dead drops; established flows re-pin on failover.
+
+  - id: R3_route_forward
+    when: "selected a live backend in R2"
+    given: {match: "backend_pool entry for the chosen backend"}
+    then:
+      - "rewrite(IP.dst -> chosen backend_ip)"
+      - "drop(pkt) if IP.ttl == 0"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> chosen next_hop_mac)"
+      - "forward(pkt, backend_port)"
+    notes: rewrite to the chosen backend and route out the backend egress port; one checksum recompute covers the dst rewrite and the TTL decrement.
+
+invariants:
+  - id: liveness_gated_selection
+    clause: stability
+    target: "a backend whose liveness bit is down is never selected"
+    notes: the LB selector reads the BFD-maintained liveness_table before pinning.
+  - id: flow_pin_persistence
+    clause: persistence
+    target: "an established flow reuses its pinned backend while that backend is up"
+    free_under: [pin_eviction]
+  - id: failover_repin
+    clause: stability
+    target: "a flow whose pinned backend goes down re-pins to the next live backend in ring order"
+  - id: all_dead_drop
+    clause: no_orphan
+    target: "when no backend is live the client packet is dropped, not forwarded to a dead backend"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases on the forwarded path; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: lb_primary_forward
+      generate: "client flow to the VIP whose hash primary is up: pinned + dst rewritten to that backend, routed out backend_port, TTL-1"
+    - id: lb_failover_forward
+      generate: "client flow whose hash primary was marked down by a prior BFD packet: rerouted to the next live backend in ring order"
+    - id: bfd_down_update
+      generate: "a BFD control packet from a backend encoding down updates that backend's liveness bit (consumed)"
+  G2:
+    - id: flow_pin_reuse
+      generate: "second packet of an established flow reuses the same pinned backend (no re-hash)"
+    - id: all_backends_down_drop
+      generate: "client flow when every backend is down is dropped"
+    - id: ttl_one_forwards_zero
+      generate: "ttl==1 client packet forwards with egress ttl==0; ttl==0 drops"
+  G3:
+    - id: established_failover_repin
+      generate: "an established pinned flow whose backend later goes down re-pins to the next live backend on its next packet"
+    - id: bfd_up_restores
+      generate: "a backend marked down then back up by BFD is selectable again"
+    - id: non_ipv4_drop
+      generate: "ARP frame dropped before any stage"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: shrink_backend_pool
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "${backend_count}: 3 -> 2 (fewer live targets; ring-skip exhausts sooner)"
+    feasibility_postcondition: "backend_count >= 1"
+  - id: enable_pin_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "pin_eviction: none -> LRU (a re-arriving evicted flow is re-hashed)"
+  - id: widen_pool
+    direction: ease
+    kind: parameter
+    axis: state_capacity
+    effect: "backend_count: 3 -> 5 (more live targets; failover almost always finds one)"
+  - id: disable_failover
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "drop instead of ring-skip when the primary is down (no reroute; LB+BFD only); oracle regenerated"
+    feasibility_postcondition: "the primary backend is up in the common case"
+  - id: static_liveness_only
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "liveness is control-plane static (no BFD update path); oracle regenerated"
+    feasibility_postcondition: "every backend has a pre-installed liveness bit"
+
+bridging_notes: |
+  - A BFD control packet is a UDP packet to bfd_udp_port (3784) arriving on the
+    backend_port, sourced from a backend address. up=1/down=0 is encoded in
+    UDP.sport (sport != 0 => up, sport == 0 => down). It updates that backend's
+    liveness bit and is consumed (decision bfd_liveness_update, behavior drop).
+  - The LB key is the client 5-tuple. The primary backend index is
+    hash5tuple(pkt) mod hash_modulus, where hash5tuple is the sum of the
+    5-tuple integer fields (src/dst as 32-bit ints, proto, sport, dport). This
+    makes the primary observable and unit-testable.
+  - Ring-skip: starting at primary_index, walk indices (i+k) mod backend_count
+    for k=0..backend_count-1 and choose the first live backend. If none is
+    live, drop (all_dead_drop).
+  - Pinning: the first packet of a flow installs pin_table[5-tuple] -> chosen
+    index. A subsequent packet reuses the pinned backend IF it is still up;
+    otherwise it re-pins to the next live backend (failover_repin) and updates
+    the pin.
+  - Route forward: rewrite IP.dst to the chosen backend, route out backend_port,
+    decrement TTL once (ttl==0 drops), rewrite Ether.dst to the chosen next hop.
+    One checksum recompute covers the dst rewrite and the TTL decrement.

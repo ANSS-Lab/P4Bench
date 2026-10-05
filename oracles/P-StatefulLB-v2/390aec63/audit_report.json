@@ -1,0 +1,108 @@
+{
+  "oracle_hash": "fe1a51edac2445f2cfea925b03e16cca6cd116f4b010585d8cc542fdc4a94ceb",
+  "instance": "stateful_l4_lb_bounded_v2-default",
+  "ran_at": "2026-05-30T02:18:55.022011Z",
+  "canonical_examples": {
+    "passed": 13,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "drop_non_ipv4",
+        "status": "pass"
+      },
+      {
+        "example_id": "drop_non_vip",
+        "status": "pass"
+      },
+      {
+        "example_id": "drop_non_tcp_to_vip",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_backend0",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_backend1",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_backend2",
+        "status": "pass"
+      },
+      {
+        "example_id": "new_flow_backend3",
+        "status": "pass"
+      },
+      {
+        "example_id": "established_flow_sticky",
+        "status": "pass"
+      },
+      {
+        "example_id": "collision_displaces_resident",
+        "status": "pass"
+      },
+      {
+        "example_id": "displaced_flow_reinserted_as_new",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_vip_rebind_drops_nonvip",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_observe_bind_none_no_monitor",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_persistence_eviction_faithfulness_assign_admit",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "persistence_under_pool_addition": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_flow_state": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop_under_recirc": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "persistence_under_pool_addition",
+      "no_orphan_flow_state",
+      "no_loop_under_recirc"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "silkroad_sigcomm17",
+      "tiara_nsdi22",
+      "cetus_nsdi22"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

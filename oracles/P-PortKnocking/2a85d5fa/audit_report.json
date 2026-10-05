@@ -1,0 +1,168 @@
+{
+  "oracle_hash": "43a58751162346c6e8fb00ce6fb80e0b39c940c8631c25873d15c341bd4a6dad",
+  "instance": "port_knocking_anchor-default",
+  "ran_at": "2026-06-17T14:08:41.577615Z",
+  "canonical_examples": {
+    "passed": 19,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "cold_service_packet_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "partial_sequence_service_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "full_sequence_then_service_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "out_of_order_knock_no_advance",
+        "status": "pass"
+      },
+      {
+        "example_id": "reset_on_wrong_knock_then_recover",
+        "status": "pass"
+      },
+      {
+        "example_id": "lenient_noise_does_not_reset",
+        "status": "pass"
+      },
+      {
+        "example_id": "strict_reset_noise_aborts",
+        "status": "pass"
+      },
+      {
+        "example_id": "expiry_boundary_no_reset",
+        "status": "pass"
+      },
+      {
+        "example_id": "expiry_window_resets_partial",
+        "status": "pass"
+      },
+      {
+        "example_id": "sticky_grant_second_service_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "single_use_grant_second_service_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "two_sources_interleaved_isolation",
+        "status": "pass"
+      },
+      {
+        "example_id": "knock_packet_never_forwarded",
+        "status": "pass"
+      },
+      {
+        "example_id": "wrong_dst_same_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "short_sequence_single_knock_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "capacity_eviction_evicted_source_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "protected_port_rebind_443_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "knock_set_widened_stray_resets_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "default_deny_protected": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "sequence_order_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "wrong_knock_resets": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "per_source_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "knock_state_expiry": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "authorized_grant_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_knock_state": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "default_deny_protected",
+      "sequence_order_correctness",
+      "wrong_knock_resets",
+      "per_source_isolation",
+      "knock_state_expiry",
+      "authorized_grant_persistence",
+      "no_orphan_knock_state",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,113 @@
+{
+  "oracle_hash": "88a81b8538d34bd7d295e164078c2693351c39a6802e26b3f37dc252dbd6fbcd",
+  "instance": "telemetry_frr_anchor-default",
+  "ran_at": "2026-06-17T14:06:22.823815Z",
+  "canonical_examples": {
+    "passed": 10,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_lpm_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "forward_primary_stamped",
+        "status": "pass"
+      },
+      {
+        "example_id": "liveness_update_consumed",
+        "status": "pass"
+      },
+      {
+        "example_id": "forward_backup_stamped",
+        "status": "pass"
+      },
+      {
+        "example_id": "drop_on_down_policy",
+        "status": "pass"
+      },
+      {
+        "example_id": "start_down_reroutes",
+        "status": "pass"
+      },
+      {
+        "example_id": "maintenance_proto_rebound_253_is_data",
+        "status": "pass"
+      },
+      {
+        "example_id": "ports_rebound_primary",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "stamp_reflects_reroute": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "liveness_driven_demux": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "stamp_after_demux": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "stamp_reflects_reroute",
+      "liveness_driven_demux",
+      "stamp_after_demux",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Chiesa et al., PURR: a Primitive for Reconfigurable Fast Reroute, CoNEXT 2019",
+      "In-band Network Telemetry (INT) Dataplane Specification v2.1, P4.org Applications WG",
+      "RFC1812",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

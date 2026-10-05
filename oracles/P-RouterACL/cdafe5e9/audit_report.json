@@ -1,0 +1,237 @@
+{
+  "oracle_hash": "69177b4d029b20427edfdb5f5e52255a891c905561969182230c2544fdcc8432",
+  "instance": "router_acl_anchor-default",
+  "ran_at": "2026-06-09T00:41:07.536958Z",
+  "canonical_examples": {
+    "passed": 19,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_invalid_header_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_ttl_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_ttl_one_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_limited_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_martian_off_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_martian_on_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_acl_deny_not_routed",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_permit_routes_on_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_deny_drops_on_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_permit_routes_golden_path",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_lpm_longest_prefix_wins",
+        "status": "pass"
+      },
+      {
+        "example_id": "priority_inversion_higher_wins",
+        "status": "pass"
+      },
+      {
+        "example_id": "r7_mark_then_route_enabled",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_redirect_overrides_fib",
+        "status": "pass"
+      },
+      {
+        "example_id": "redirect_inactive_falls_through_to_fib",
+        "status": "pass"
+      },
+      {
+        "example_id": "r9_directed_broadcast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r10_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_routes_rebound_egress",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "acl_precedes_routing": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "redirect_overrides_fib": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mark_then_route_single_checksum": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "permit_does_not_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "priority_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_priority_ambiguity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "default_action_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mark_only_modifies_dscp": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_traffic_distribution": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "acl_precedes_routing",
+      "redirect_overrides_fib",
+      "mark_then_route_single_checksum",
+      "permit_does_not_mark",
+      "priority_correctness",
+      "no_priority_ambiguity",
+      "default_action_correctness",
+      "mark_only_modifies_dscp",
+      "ttl_quantum_one",
+      "lpm_longest_match_correctness",
+      "ip_addr_preservation",
+      "ip_checksum_validity",
+      "ether_rewrite_correctness",
+      "ecmp_flow_consistency",
+      "ecmp_traffic_distribution",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "contra_nsdi20",
+      "RFC1812",
+      "RFC3198",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

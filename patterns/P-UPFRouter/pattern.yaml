@@ -1,0 +1,1820 @@
+# P-UPFRouter — GTP-U UPF tunnel endpoint ∘ IPv4 underlay router (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-GTPUEncap
+# (3GPP TS 29.281 GTP-U user-plane encap/decap at the UPF boundary) with
+# P-IPv4Routing (RFC 1812 LPM unicast forwarding) into a single
+# UPF/mobile-gateway edge NF — the "mobile tunnel endpoint then route"
+# composition (P1 ∪ P13).
+#
+# P-GTPUEncap's own post-instantiation hook #4 already flags this exact
+# chain: "a P-GTPUEncap instance whose egress packets are then forwarded
+# by a P-IPv4Routing instance is the P-UPFRouter composite
+# (P1 ∪ P13). Within the v1 corpus the
+# composition is implicit (the nexthop tables encode static forwarding
+# directly); the composite layer chains a real multi-pattern pipeline."
+# P-UPFRouter IS that future work: it DISSOLVES P-GTPUEncap's static
+# `n3_nexthop_fib` singleton lookup into P-IPv4Routing's real LPM FIB
+# (`route` + `nexthop_group`), and adds the genuinely new composite
+# behaviour the two patterns cannot exhibit in isolation.
+#
+# The chained pattern's value (versus instantiating P-GTPUEncap and
+# P-IPv4Routing independently) is FOUR interactions invisible when the
+# components are tested apart:
+#   (a) decap-then-route-inner — after the outer GTP-U/UDP/IPv4 stack is
+#       stripped, the exposed inner T-PDU is ROUTED toward the data
+#       network by a real LPM lookup on the INNER destination (inner TTL
+#       decremented by one, inner checksum recomputed, inner L2 rewrite),
+#       NOT delivered to a static TEID FAR egress port. This is the
+#       relocate twist P-GTPUEncap explicitly DEFERRED to the composite
+#       ("full inner-IP routing is P-IPv4Routing's job; the composition
+#       is the P-UPFRouter composite, not this pattern");
+#   (b) the inner-TTL asymmetry — the inner T-PDU's TTL is PRESERVED on
+#       encap (the switch ORIGINATES the tunnel; the inner is opaque
+#       transport) but DECREMENTED on decap (the switch is the first-hop
+#       IP router for the decapsulated datagram on N6). The inverse of
+#       P-VXLANRouter, whose inner is never touched — GTP-U's IP-T-PDU
+#       payload (vs VXLAN's inner L2 frame) is exactly what makes the
+#       decapsulated packet routable;
+#   (c) origination-vs-transit OUTER TTL — the encap-originate path
+#       stamps the outer TTL at its initial value and does NOT decrement
+#       (RFC 1812 only decrements *forwarded* datagrams), while the
+#       transit path (a GTP-U packet bound for ANOTHER UPF/gNB, or plain
+#       underlay IPv4) DOES decrement the outer TTL by exactly one;
+#   (d) the UPF/transit dichotomy — a GTP-U packet on the N3 underlay is
+#       decapped iff outer.dst == ${upf_n3_ip}, else transit-forwarded;
+#       an implementation that decaps every GTP-U-looking packet breaks transit,
+#       and one that transit-forwards everything never terminates its own
+#       tunnels.
+# See `bridging_notes:` for the v1model failure modes this exposes.
+#
+# Reuses the two audited halves' oracles under the content-addressed oracle
+# convention
+# (recorded at instantiation as the composed oracle's provenance), the
+# same convention the shipped composites P-StatefulFW-NAT44 and
+# P-VXLANRouter follow. target_capability = composition
+# because the chain's failure modes are cross-cutting and neither
+# pure-relocate (P-GTPUEncap) nor pure-redesign (P-IPv4Routing) and not
+# reducible to either half.
+
+pattern_id: P-UPFRouter
+version: "1.0"
+
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                          # both halves are destination-based forwarding (tunnel delivery ∪ underlay/inner LPM)
+  prescriptive: [P1:forwarding, P13:mobile-data-plane-functions]   # P1 (LPM forwarding) ∪ P13 (GTP-U UPF)
+
+target_capability: composition                          # chained composition; the mobile-tunnel ∘ underlay-forward failure modes are cross-cutting
+
+summary: >
+  UPF / mobile-gateway edge composition of a GTP-U user-plane tunnel
+  endpoint (3GPP TS 29.281) with an IPv4 unicast router (RFC 1812). On
+  the downlink path (N6, data-network-facing) the switch matches a bare
+  IP packet's destination against the per-UE bearer table, builds the
+  outer IPv4 + UDP(2152) + GTP-U(egress TEID) stack — optionally a 5G
+  PDU Session Container carrying the QFI — with the outer source =
+  ${upf_n3_ip} and the outer TTL stamped at its origination value and
+  NOT decremented, then hands the freshly-encapsulated packet to the
+  underlay FIB: a real LPM lookup on the OUTER destination (the gNB's
+  GTP-U endpoint IP) that picks the egress port and the outer Ethernet
+  rewrite (replacing P-GTPUEncap's static n3_nexthop_fib singleton);
+  the inner T-PDU is preserved byte-for-byte (tunnel transport). On the
+  uplink path (N3, gNB/transport-facing) the switch is dual-role: a
+  GTP-U G-PDU whose outer destination equals ${upf_n3_ip} is validated,
+  the outer stack stripped, and the exposed inner T-PDU ROUTED toward
+  the data network by a real LPM lookup on its INNER destination (inner
+  TTL decremented by one, inner checksum recomputed, inner Ethernet
+  rewritten) — the switch is the first-hop router for the decapsulated
+  datagram; any other packet on N3 — a GTP-U packet for a DIFFERENT UPF,
+  or plain underlay IPv4 — is transit RFC-1812-forwarded on its OUTER
+  header (LPM, decrement-by-one, Ethernet rewrite, checksum recompute)
+  with the inner payload treated as opaque transport. The chain's
+  load-bearing invariants are the decap-then-route-inner discipline, the
+  inner-TTL asymmetry (preserved on encap, decremented on decap), the
+  origination-vs-transit outer-TTL distinction, and the UPF/transit
+  dichotomy. Faithfulness anchors at D5.0 (single bearer/TEID, no
+  extension headers, lax validation, fixed outer src port, zero UDP
+  checksum, singleton underlay next-hops, End Marker drop) and ladders
+  through D5.1 (real LPM with overlapping prefixes + the transit-forward
+  path with outer-TTL decrement and checksum recompute), D5.2 (5G PDU
+  Session Container + QFI + strict header validation + DSCP copy + ECMP
+  underlay + martian filtering + MTU enforcement), and D5.3 (multi-bearer
+  scale: many TEIDs/UE-IPs, scaled FIB, weighted-multipath underlay,
+  bounded table capacities).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+# The composite inherits its normative grounding from the two audited
+# halves; the clauses below are reused verbatim from the constituent
+# patterns (P-GTPUEncap for 3GPP TS 29.281, P-IPv4Routing for RFC 1812 /
+# RFC 2992) rather than re-derived. The constituents are cited as
+# domain-concepts entries — the same convention P-VXLANRouter uses for
+# P-VXLANTunnel + P-IPv4Routing.
+
+grounding:
+
+  papers:
+    - cite: contra_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-IPv4Routing: documents the realistic underlay
+        FIB scales (10²–10⁴ prefixes per switch) that motivate the
+        composite's `fib_capacity` axis and the D5.3 scaled-underlay
+        rung. Cited as the engineering ceiling for the underlay half's
+        scaled-FIB instances, not as an anchor reference.
+
+  rfcs:
+    - cite: 3gpp_ts_29281
+      title: "3GPP TS 29.281 — GPRS Tunnelling Protocol User Plane (GTPv1-U)"
+      sections: ["§4.1 transmission order / addressing", "§5 GTP-U header", "§5.1 general format", "§5.2 GTP-U extension headers", "§7 GTP-U messages (G-PDU §7.3.1, End Marker §7.3.4)"]
+      role: normative_behaviour
+      relevance: |
+        The mobile-tunnel half. Reused verbatim from P-GTPUEncap: §5
+        mandatory 8-octet header (Version 1, Protocol Type 1, the E/S/PN
+        flags, Message Type, Length, 32-bit TEID); §5 Length field — "the
+        rest of the packet following the mandatory part (the first 8
+        octets) ... the Sequence Number, the N-PDU Number or any
+        Extension headers shall be considered part of the payload, i.e.
+        included in the length count" (the `gtpu_length_field_correct`
+        invariant); §5 TEID — the receiver assigns the TEID the sender
+        must use (the `ul_session` decap-gate key and the `dl_bearer`
+        encap-stamp source); §5.1/§5.2 flags + the 5G PDU Session
+        Container extension header (Next Extension Header Type 0x85)
+        carrying the QFI (the `qfi_set_on_tx` invariant); §7.3.1 G-PDU
+        (message type 255) vs §7.3.4 End Marker (254 — signalling, NOT
+        a T-PDU, MUST NOT be delivered to the data network); §4.2.1/IANA
+        UDP destination port 2152. In the composite, §4.1's decap is
+        gated by the additional `outer.dst == ${upf_n3_ip}` ownership
+        test that distinguishes termination from transit, and the
+        decapsulated inner T-PDU is then ROUTED rather than delivered to
+        a static FAR.
+
+    - id: RFC1812
+      sections: ["5.2.1", "5.2.2", "5.2.2.5", "5.3.1", "5.3.4", "5.3.7", "5.2.7"]
+      role: canonical_spec
+      quote: "When a router forwards a packet, it MUST reduce the TTL by at least one."
+      quote_source: patterns/P-UPFRouter/grounding/RFC1812.txt
+      relevance: |
+        The underlay/router half. Reused verbatim from P-IPv4Routing, but
+        in the composite the RFC-1812 forwarding algorithm runs on THREE
+        distinct paths over different headers: §5.2.1 forwarding
+        (validate → forward decision → TTL → checksum → L2 rewrite)
+        drives (1) the decap-route over the INNER IPv4 header (the switch
+        is the first-hop router for the decapsulated datagram —
+        decrement-by-one), (2) the encap-originate underlay forward over
+        the OUTER header (no decrement — the switch is the source), and
+        (3) the transit forward over the OUTER header (decrement-by-one —
+        the switch forwards a received datagram); §5.3.1 TTL ("MUST
+        decrement by one when forwarding"; "MUST be discarded if the TTL
+        becomes zero") binds the decap-route and transit paths and the
+        `inner_ttl_decremented_on_decap` / `origination_vs_transit_outer_ttl`
+        invariants; §5.2.2.5 checksum recompute binds
+        `inner_ipv4_checksum_validity` (decap-route) and
+        `outer_ipv4_checksum_validity` (encap + transit); §5.3.4
+        longest-prefix-match / no-route ⇒ drop binds the LPM rules and
+        `lpm_longest_match_correctness`; §5.3.7 martian source filtering
+        is the `martian_filter_enabled` axis on the transit outer src;
+        §5.2.7 ICMP error origination is the Tier-3 `emit_transit_icmp_errors`
+        axis.
+
+    - id: RFC2992
+      sections: ["1", "2.2", "3"]
+      role: normative_behaviour
+      quote: "The router first selects a key by performing a hash (e.g., CRC16) over the packet header fields that identify a flow."
+      quote_source: patterns/P-UPFRouter/grounding/RFC2992.txt
+      relevance: |
+        Inherited from P-IPv4Routing: governs the underlay ECMP path the
+        composite lifts to at D5.2. §2.2 flow-consistency ("as long as
+        the region boundaries remain unchanged the same next-hop will be
+        chosen for a given flow") binds `ecmp_flow_consistency` on the
+        underlay group selection. The RECOMMENDED GTP-U outer-source-port
+        hash (TS 29.281 / inner-flow entropy for N3 ECMP) and the
+        underlay 5-tuple ECMP hash are the two entropy surfaces the
+        composite's `hash_algo` / `multipath_mode` axes exercise jointly.
+
+  posts:
+    - url: "https://opennetworking.org/news-and-events/blog/using-p4-and-programmable-switches-to-implement-a-4g-5g-upf-in-aether/"
+      title: "Using P4 and Programmable Switches to Implement a 4G/5G UPF in Aether (ONF)"
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-GTPUEncap: the production write-up of the
+        relocate target. Establishes that P4-UPF implements GTP-U tunnel
+        encap/decap with 5G PDU Session Container / QFI and tens of
+        thousands of uplink/downlink tunnels, that the decapsulated
+        downlink-data path routes the inner packet toward the data
+        network, and that the control plane is the PFCP PDR/FAR
+        abstraction. Grounds the `relocate`-flavoured GTP-U half, the
+        decap-then-route-inner composition, and the QFI feature ladder.
+
+    - url: "https://docs.sd-fabric.org/master/advanced/p4-upf.html"
+      title: "P4-based User Plane Function (P4-UPF) — SD-Fabric documentation"
+      role: optimisation
+      relevance: |
+        Inherited from P-GTPUEncap: documents the TEID-keyed uplink vs
+        UE-IP-keyed downlink split this composite's decap/encap paths
+        realise, and the integration of GTP-U termination with the
+        switch's underlay routing — the production analogue of the
+        chained pipeline P-UPFRouter models.
+
+  tutorials:
+    - url: https://github.com/p4lang/tutorials/tree/master/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        Inherited from P-GTPUEncap: the access/uplink port partitioning
+        and the inner-in-outer parse-graph shape the composite's
+        anchor topology reuses, with the GTP-U/UDP/outer-IPv4 stack
+        in place of the MyTunnel header and an IP T-PDU (NOT an inner
+        Ethernet frame) as the inner payload. The composite differs by
+        adding a real LPM underlay/inner FIB and the transit-forward path.
+
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        Inherited from P-IPv4Routing: the canonical single-LPM-table
+        forwarding topology. In the composite this `route` table is keyed
+        on the ACTIVE IPv4 destination — the OUTER dst on the encap and
+        transit paths, the INNER dst on the decap-route path — the same
+        LPM + L2-rewrite + TTL/checksum action applied to whichever IPv4
+        header is being forwarded.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The pattern is stateless — every
+      decision is derived from header fields (outer and inner), the
+      ingress port role, and the control-plane-installed (PFCP-provisioned)
+      mapping + FIB tables. Inherited unchanged from both halves
+      (P-GTPUEncap is stateless `relocate`; P-IPv4Routing is stateless
+      `redesign`). "Session" here is the 3GPP PDU session, modelled as a
+      control-plane table row, not a TPL `session` entity.
+
+  link:                                                       # `link` — port-keyed N3 (gNB/transport-facing) / N6 (data-network-facing) role
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      role:  "enum {access_n3, core_n6}"                      # access_n3 ports face the gNB/transport underlay (GTP-U + transit IPv4); core_n6 ports face the data network (bare inner IP)
+    populated_from:
+      n3_rows: ${n3_ports}
+      n6_rows: ${n6_ports}
+    notes: |
+      Reused from P-GTPUEncap. N3 ports face the gNB/transport fabric and
+      carry BOTH GTP-U-encapped traffic (to decap-route if for this UPF,
+      else transit) AND plain underlay IPv4 (to transit); N6 ports face
+      the data network and carry bare inner IP (to encap). The per-port
+      role gates which rules can fire: decap/transit on N3 (R1–R10),
+      encap on N6 (R11–R14).
+
+  ul_session:                                                 # `bucket` — TEID → uplink-decap admission gate (PFCP PDR ∘ FAR; from P-GTPUEncap)
+    type: bucket
+    keyed_by_tuple: [teid]
+    attrs:
+      qfi: "int | none"                                       # carried for metadata / QoS only; egress is by inner LPM in the composite
+    capacity: ${ul_session_capacity}
+    populated_from: ${ul_session_entries}
+    notes: |
+      Reused from P-GTPUEncap, but its ROLE changes in the composite. In
+      the standalone pattern `ul_session` carried the static decap FAR
+      (n6_egress_port + L2 rewrite). In the composite the decap egress is
+      determined by routing the exposed inner T-PDU via the `route` LPM
+      FIB, so `ul_session` reduces to the ADMISSION GATE: a received
+      G-PDU's 32-bit TEID MUST resolve here (else R5 drops — an unknown
+      TEID has no tunnel endpoint). It may still carry the QFI for QoS
+      metadata. Keyed on `teid` per TS 29.281 §5.
+
+  dl_bearer:                                                  # `bucket` — UE IP → downlink-encap bearer (egress TEID, gNB IP, QFI; from P-GTPUEncap)
+    type: bucket
+    keyed_by_tuple: [ue_ip]
+    attrs:
+      egress_teid: int                                        # the downlink TEID the gNB assigned for this bearer
+      gnb_ip:      address                                    # the gNB's GTP-U endpoint IP — the OUTER destination on encap, then resolved by the underlay LPM FIB
+      qfi:         int                                        # 5G QoS Flow Identifier (0..63); stamped into the PDU Session Container when ${qfi_policy} != none
+    capacity: ${dl_bearer_capacity}
+    populated_from: ${dl_bearer_entries}
+    notes: |
+      Reused from P-GTPUEncap. Drives R11's encap-path lookup. The key
+      change in the composite: `gnb_ip` is no longer resolved by a paired
+      static `n3_nexthop_fib` singleton — it becomes the OUTER
+      destination address that the underlay `route` LPM table then
+      forwards. Every `gnb_ip` MUST resolve in `route` (the composite's
+      `underlay_route_for_every_gnb` integrity constraint; a known bearer
+      whose gNB has no underlay route drops at R12).
+
+  route:                                                      # `bucket` — LPM FIB on the ACTIVE IPv4 dst (from P-IPv4Routing)
+    keyed_by_lpm: active_ipv4.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int                                   # tie-break diagnostics; the LPM primitive selects longest
+    capacity: ${fib_capacity}
+    populated_from: ${routes}
+    notes: |
+      Reused from P-IPv4Routing, REPLACING P-GTPUEncap's static
+      `n3_nexthop_fib`. Keyed on the ACTIVE IPv4 destination (longest-prefix
+      match, not list order): the OUTER dst on the encap-originate forward
+      (R11: LPM on the just-stamped outer.dst = dl_bearer.gnb_ip) and the
+      transit forward (R9: LPM on the received outer.dst), and the INNER
+      dst on the decap-route forward (R2: LPM on the now-exposed inner
+      T-PDU destination, toward the data network). A default route
+      (0.0.0.0/0) absorbs otherwise-unmatched traffic.
+
+  nexthop_group:                                              # `bucket` — underlay/inner multipath group (from P-IPv4Routing)
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops: "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac: "list[address]"                               # per-egress source MAC for the L2 rewrite
+    capacity: ${max_nexthop_group_size}
+    notes: |
+      Reused from P-IPv4Routing. Singletons (|nexthops| == 1) at the
+      anchor realise non-ECMP routes; |nexthops| > 1 enables
+      ECMP/WCMP multipath per `${multipath_mode}`. The chosen nexthop
+      supplies the L2 rewrite (ethernet.src = port_mac[i], ethernet.dst =
+      nexthops[i].next_hop_mac) on all three forwarding paths.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  # ── Structural seed bindings (no difficulty operator; populate entities) ──
+
+  n3_ports:
+    type: list[int]
+    constraint: "every entry ∈ [1, 511] (BMv2 simple_switch range); disjoint from n6_ports."
+    notes: |
+      Ingress ports configured as N3 (gNB/transport-facing). Populate the
+      `link` entity's role == access_n3 rows. R1–R10 fire only when
+      ingress(access_n3) holds. Structural; bound by the seed.
+
+  n6_ports:
+    type: list[int]
+    constraint: "every entry ∈ [1, 511]; disjoint from n3_ports."
+    notes: |
+      Ingress ports configured as N6 (data-network-facing). Populate the
+      `link` entity's role == core_n6 rows. R11–R14 fire only when
+      ingress(core_n6) holds. Structural; bound by the seed.
+
+  upf_n3_ip:
+    type: address
+    constraint: ipv4
+    notes: |
+      This UPF's GTP-U endpoint IP on the N3 interface — the outer SOURCE
+      IP on every encap-originated packet, AND the outer-destination
+      ownership test that distinguishes decap (outer.dst == ${upf_n3_ip})
+      from transit (outer.dst ≠ ${upf_n3_ip}) on the N3 path. The single
+      load-bearing parameter of the composition. Structural.
+
+  ul_session_entries:
+    type: list[ul_session_entry]
+    constraint: |
+      every entry has teid:int ∈ [0, 4294967295] (32-bit); qfi:int ∈ [0, 63]
+      or none; teid unique; |entries| ≤ ${ul_session_capacity} when bounded.
+    notes: |
+      The TEID admission-gate rows populating `ul_session`. Drives R2/R5's
+      existence test `ul_session by_key(gtpu.teid)`. Structural; bound by
+      the seed.
+
+  dl_bearer_entries:
+    type: list[dl_bearer_entry]
+    constraint: |
+      every entry has ue_ip:address; egress_teid:int ∈ [0, 4294967295];
+      gnb_ip:address; qfi:int ∈ [0, 63]; ue_ip unique; every gnb_ip MUST
+      resolve in ${routes} (underlay reachability);
+      |entries| ≤ ${dl_bearer_capacity} when bounded.
+    notes: |
+      The (ue_ip → egress_teid, gnb_ip, qfi) rows populating `dl_bearer`.
+      Drives R11's lookup `dl_bearer by_key(ipv4.dst)`. Structural; bound
+      by the seed.
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0, 32],
+      nexthop_group_id:int; LPM relation well-formed (no two entries share
+      both prefix AND prefix_len); ${upf_n3_ip} need NOT be in ${routes}
+      (locally-terminated, not forwarded).
+    notes: |
+      The LPM FIB populating `route`, keyed on the ACTIVE dst (outer for
+      encap/transit, inner for decap-route). Structural; bound by the
+      seed. Difficulty on this surface is moved by `shrink_fib_capacity_4x`
+      / `inflate_underlay_overlapping_prefixes`.
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights positive ints."
+    notes: "Nexthop groups populating `nexthop_group`. Structural."
+
+  # ── GTP-U / mobile-half difficulty knobs (paired operators below) ──
+
+  outer_udp_dst_port:
+    type: int
+    range: "[1, 65535]"
+    default: 2152
+    notes: "TS 29.281 / IANA assignment for GTP-U is UDP 2152; the decap path's R2 matcher tests outer udp.dst == this. Structural-with-default."
+
+  outer_udp_src_port_mode:
+    type: enum
+    values: [fixed, hash_inner_5tuple]
+    default: fixed
+    notes: "TS 29.281 RECOMMENDED inner-flow hash for N3 ECMP entropy. `fixed` is the anchor; hash mode ladders difficulty (paired with hash_algo)."
+
+  outer_udp_src_port_fixed_value:
+    type: int
+    range: "[1, 65535]"
+    default: 2152
+    enforced_when: "${outer_udp_src_port_mode} == fixed"
+
+  outer_udp_checksum_mode:
+    type: enum
+    values: [zero_on_tx, computed_on_tx]
+    default: zero_on_tx
+    notes: "IPv4-transported GTP-U MAY transmit a zero outer UDP checksum (anchor) vs the multi-layer MUST-cover variant. Moved by enable_outer_udp_checksum_compute."
+
+  gtpu_ext_header_handling:
+    type: enum
+    values: [none, pdu_session_container, strict_drop_unknown]
+    default: none
+    notes: "GTP-U extension-header handling. `none` (anchor) emits no extension header (E=0). `pdu_session_container` adds the 5G container (NEH type 0x85). `strict_drop_unknown` drops uplink G-PDUs with an unrecognised NEH type. Moved by the faithfulness ladder."
+
+  qfi_policy:
+    type: enum
+    values: [none, set_from_bearer]
+    default: none
+    enforced_when: "${gtpu_ext_header_handling} == pdu_session_container"
+    notes: "Whether the encap path stamps the bearer's QFI into the PDU Session Container (`set_from_bearer`) or omits it. `qfi_set_on_tx` is enforced only under set_from_bearer. Moved by the faithfulness ladder."
+
+  dscp_copy_policy:
+    type: enum
+    values: [none, copy_inner_to_outer]
+    default: none
+    notes: "TS 23.501 transport-level QoS marking: copy inner DSCP into the outer IPv4 DSCP (`copy_inner_to_outer`) or leave outer DSCP 0 (`none`, anchor). Moved by the faithfulness ladder."
+
+  teid_validation_strict:
+    type: bool
+    default: false
+    notes: "Whether the uplink path enforces the GTP-U header MUSTs (version == 1, PT == 1) as a drop condition (activates R6) or accepts on TEID lookup alone. `false` at anchor; hardened by enable_strict_teid_validation."
+
+  end_marker_handling:
+    type: enum
+    values: [drop, forward_to_n6]
+    default: drop
+    notes: "GTP-U End Marker (message type 254) on N3. `drop` (anchor, conformant — signalling, not user data) activates R7; `forward_to_n6` is a deliberately-wrong foil only used to widen the discriminating difficulty range (excluded from the anchor and hardest seeds). Moved by the faithfulness ladder."
+
+  mtu_enforcement:
+    type: enum
+    values: [ignore, strict_drop_oversize]
+    default: ignore
+    notes: "Encap-path post-encap-size guard. `ignore` (anchor) lets the underlay handle fragmentation; strict via enable_mtu_enforcement (activates R14)."
+
+  outer_mtu:
+    type: int
+    range: "[576, 9216]"
+    default: 1500
+    enforced_when: "${mtu_enforcement} == strict_drop_oversize"
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none"
+    notes: "Hash for the outer-source-port computation AND the underlay ECMP selection. Weakened by swap_hash_to_xor_fold."
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: "Inner/underlay flow-tuple distribution for the entropy tests. Raised by raise_workload_skew."
+
+  # ── Underlay / router-half difficulty knobs (paired operators below) ──
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Underlay FIB capacity (Contra-realistic 10⁴–10⁵). Tightened by shrink_fib_capacity_4x."
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+    notes: "Largest ECMP/WCMP group. 1 at anchor (singleton next-hops); raised by enable_ecmp_underlay."
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_3tuple, ecmp_hash_5tuple, wcmp]
+    default: none
+    notes: "Underlay multipath over the active 5-tuple. `none` at anchor; lifted by enable_ecmp_underlay / enable_wcmp_underlay."
+
+  ecmp_remap_algo:
+    type: enum
+    values: [modulo_n, hash_threshold, hrw]
+    default: hash_threshold
+    enforced_when: "${multipath_mode} != none"
+    notes: "Hash→index map for the multipath group (RFC 2992 §3). Hardened to HRW via swap_underlay_remap_to_hrw."
+
+  martian_filter_enabled:
+    type: bool
+    default: false
+    notes: "RFC 1812 §5.3.7 source filtering on the OUTER src of transit packets (R9 guard). `false` at anchor; enabled by enable_martian_filter."
+
+  emit_transit_icmp_errors:
+    type: bool
+    default: false
+    notes: "RFC 1812 §5.2.7 ICMP Time-Exceeded / Dest-Unreachable origination on the transit path. Adds `emit`; enabled by enable_transit_icmp_errors."
+
+  default_action:
+    type: enum
+    values: [drop, send_icmp_unreachable]
+    default: drop
+    notes: "Transit no-route behaviour (R10). `drop` at anchor; send_icmp_unreachable gated by ${emit_transit_icmp_errors}."
+
+  origination_ttl:
+    type: int
+    range: "[2, 255]"
+    default: 64
+    notes: |
+      The outer IPv4 TTL the encap-originate path (R11) stamps. NOT
+      decremented on origination (RFC 1812 decrements only forwarded
+      datagrams) — the `origination_vs_transit_outer_ttl` invariant.
+      Structural-with-default.
+
+  ul_session_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Uplink TEID-table capacity (production UPFs sit at 10⁴–10⁶ tunnels). Tightened by shrink_session_capacity_4x."
+
+  dl_bearer_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Downlink UE-IP bearer-table capacity. Mutated jointly with ul_session_capacity by the capacity operators."
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_decap_route_encap_route     # anchor — single bearer/TEID, no ext headers, lax validation, fixed src port, zero udp csum, singleton underlay, End Marker drop
+      - D5.1_underlay_lpm_transit        # real LPM overlapping prefixes + the transit-forward path (outer TTL decrement + csum)
+      - D5.2_full_validation_ecmp        # 5G PDU Session Container + QFI + strict validation + DSCP copy + ECMP underlay + martian + MTU
+      - D5.3_multibearer_scale           # many TEIDs/UE-IPs + scaled FIB + weighted-multipath underlay + bounded capacities
+    default: D5.0_decap_route_encap_route
+    notes: |
+      The composite feature ladder. D5.0 is the minimal happy-path
+      decap-route + encap-route. D5.1 introduces the genuinely-composite
+      transit path with full RFC 1812 forwarding on the outer header.
+      D5.2 lifts the full GTP-U 5G validation cascade and the underlay
+      ECMP/martian/MTU surfaces. D5.3 raises multi-bearer + scaled-underlay
+      fan-out under bounded table capacities. Feature-surface ladder
+      (the pattern is stateless — no exact↔approximate STATE fidelity to
+      vary), so its operators carry axis: feature-breadth.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true fires;
+# subsequent rules are not evaluated for that packet. N3-side rules (R0–R10)
+# precede N6 encap rules (R11–R14); within N3, the outer.dst-ownership gate
+# separates decap-route (R2–R7) from transit (R8–R10).
+
+rules:
+
+  - id: R0_non_handled_drop
+    when: |
+      ¬header_present(ethernet)
+      ∨ ¬header_present(ipv4)
+      ∨ ( ingress(access_n3) ∧ header_present(udp)
+          ∧ match(udp.dst, ${outer_udp_dst_port}) ∧ ¬header_present(gtpu) )
+    then:
+      - drop
+    notes: |
+      Non-IPv4 (ARP, IPv6, LLDP, …) is out of scope on both port roles;
+      a GTP-U-port UDP packet that fails to parse a GTP-U header is
+      malformed. `ipv4` here is the OUTER IPv4 on N3 and the only IPv4 on
+      N6. Reused from P-GTPUEncap R0 / P-IPv4Routing R0 (merged).
+
+  - id: R1_outer_header_invalid_drop
+    when: |
+      ingress(access_n3) ∧ header_present(ipv4) ∧ (
+        ipv4.version ≠ 4
+        ∨ ipv4.ihl < 5
+        ∨ value(ipv4.totalLen, <, ipv4.ihl * 4)
+        ∨ ¬checksum_valid(ipv4)
+      )
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.2.2 — outer IPv4 header validation on every N3 packet,
+      before decap or transit. Reused from P-IPv4Routing R1, applied to
+      the OUTER header.
+
+  - id: R2_decap_and_route_inner
+    when: |
+      ingress(access_n3)
+        ∧ header_present(udp) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(gtpu)
+        ∧ gtpu.message_type == 255                            # G-PDU (TS 29.281 §7.3.1)
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ ( ¬${teid_validation_strict}
+            ∨ ( gtpu.version == 1 ∧ gtpu.pt == 1 ) )
+        ∧ ( ${gtpu_ext_header_handling} != strict_drop_unknown
+            ∨ gtpu.next_ext_header_type ∈ {0x00, 0x85} )
+        ∧ exists(ul_session, gtpu.teid)
+        ∧ value(inner_ipv4.ttl, >, 1)
+        ∧ exists(route, lpm(inner_ipv4.dst, ${routes}))
+    given:
+      port_role:     by_key(standard_metadata.ingress_port)
+      ul_session:    by_key(gtpu.teid)
+      route:         by_lpm(inner_ipv4.dst, ${routes})
+      nexthop_group: by_key(${nexthop_groups}, route.nexthop_group_id)
+      flow:          deduce_from_inner_packet                 IF ${multipath_mode} != none
+    then:
+      - "set(ipv4.valid, false)"                              # strip the OUTER ipv4
+      - "set(udp.valid, false)"                               # strip the outer UDP
+      - "set(gtpu.valid, false)"                              # strip GTP-U (incl. any optional/ext fields)
+      - dec(inner_ipv4.ttl, 1)                                # the switch ROUTES the decapsulated datagram toward N6
+      - "set(inner_ethernet.src, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).port_mac)"
+      - "set(inner_ethernet.dst, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).next_hop_mac)"
+      - "set(inner_ipv4.header_checksum, inner_ipv4_checksum_recompute())"
+      - "forward(nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).egress_port)"
+    notes: |
+      THE composite signature rule — TS 29.281 §4.1 decap FUSED with
+      RFC 1812 §5.2.1 forwarding of the EXPOSED inner T-PDU. Reached only
+      when the OUTER destination is THIS UPF (`ipv4.dst == ${upf_n3_ip}`)
+      — the ownership gate that lets the same switch terminate its own
+      tunnels and transit everyone else's. Strip the three outer layers,
+      then ROUTE the inner IPv4 datagram by LPM on its INNER destination:
+      decrement the inner TTL by one (the switch is the first-hop router
+      on N6), rewrite the inner Ethernet from the chosen nexthop, and
+      recompute the inner IPv4 checksum. The inner payload BELOW IPv4 is
+      opaque. This REPLACES P-GTPUEncap's static TEID FAR egress — the
+      relocate composition the standalone pattern explicitly deferred
+      (`decap_routes_inner`). Note the inner IS an IP T-PDU, NOT an inner
+      Ethernet frame.
+
+  - id: R3_decap_inner_ttl_exhausted_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ gtpu.message_type == 255
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ exists(ul_session, gtpu.teid)
+        ∧ value(inner_ipv4.ttl, ≤, 1)
+    then:
+      - drop
+      - "emit(icmp_time_exceeded(src=${upf_n3_ip}, dst=inner_ipv4.src)) IF ${emit_transit_icmp_errors}"
+    notes: |
+      RFC 1812 §5.3.1 — the decapsulated inner datagram is being forwarded
+      by this switch; if its TTL ≤ 1 the post-decrement TTL would be 0, so
+      it is discarded (optionally with an ICMP Time-Exceeded toward the
+      inner source at Tier-3). Distinguishes the decap-ROUTE path from a
+      implementation that decaps and delivers without the RFC-1812 TTL check.
+
+  - id: R4_decap_inner_no_route_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ gtpu.message_type == 255
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ exists(ul_session, gtpu.teid)
+        ∧ value(inner_ipv4.ttl, >, 1)
+        ∧ ¬exists(route, lpm(inner_ipv4.dst, ${routes}))
+    then:
+      - drop                                                 # decap inner-dst unroutable → discard (no ICMP on the decap path)
+    notes: |
+      Composite-specific: the tunnel is known (TEID resolves) but the
+      decapsulated inner destination has no route toward the data network
+      — drop (or ICMP Dest-Unreachable at Tier-3). The standalone
+      P-GTPUEncap could not express this (its static FAR always resolved
+      by construction); the real LPM FIB on the inner dst can miss.
+
+  - id: R5_decap_unknown_teid_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ gtpu.message_type == 255
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ ¬exists(ul_session, gtpu.teid)
+    then:
+      - drop
+    notes: |
+      A G-PDU FOR THIS UPF whose TEID has no installed session is dropped
+      (TS 29.281 §5 — an unknown TEID has no tunnel endpoint at the
+      receiver). Reused from P-GTPUEncap R3 under the ownership gate.
+
+  - id: R6_decap_malformed_gtpu_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ ${teid_validation_strict}
+        ∧ ( gtpu.version ≠ 1 ∨ gtpu.pt ≠ 1 )
+    then:
+      - drop
+    notes: |
+      TS 29.281 §5 strict-validation path — a GTP-U packet FOR THIS UPF
+      whose Version ≠ 1 or PT ≠ 1 is malformed under
+      `${teid_validation_strict}` and dropped. Reused from P-GTPUEncap R4,
+      gated by the same outer.dst ownership test (a malformed GTP-U for
+      another UPF transits via R9, where it is forwarded opaquely).
+
+  - id: R7_decap_end_marker
+    when: |
+      ingress(access_n3)
+        ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ gtpu.message_type == 254                            # End Marker (TS 29.281 §7.3.4)
+        ∧ value(ipv4.dst, ==, ${upf_n3_ip})
+        ∧ ${end_marker_handling} == drop
+    then:
+      - drop
+    notes: |
+      TS 29.281 §7.3.4 End Marker — tunnel signalling, NOT user data. For
+      THIS UPF, under the conformant drop policy it is discarded; it MUST
+      NOT be decapsulated and routed to the data network as a T-PDU.
+      Reused from P-GTPUEncap R5 under the ownership gate.
+
+  - id: R8_transit_outer_ttl_exhausted_drop
+    when: |
+      ingress(access_n3) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${upf_n3_ip})
+        ∧ value(ipv4.ttl, ≤, 1)
+    then:
+      - drop
+      - "emit(icmp_time_exceeded(src=${upf_n3_ip}, dst=ipv4.src)) IF ${emit_transit_icmp_errors}"
+    notes: |
+      RFC 1812 §5.3.1 — a transit packet (outer.dst ≠ this UPF) with OUTER
+      TTL ≤ 1 is discarded. Reused from P-IPv4Routing R2 on the OUTER
+      header, transit path only. Distinguished from the decap TTL check
+      (R3, which acts on the INNER header).
+
+  - id: R9_transit_underlay_forward
+    when: |
+      ingress(access_n3) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${upf_n3_ip})
+        ∧ value(ipv4.ttl, >, 1)
+        ∧ ( ¬${martian_filter_enabled} ∨ ¬martian_src(ipv4.src) )
+        ∧ exists(route, lpm(ipv4.dst, ${routes}))
+    given:
+      route:         by_lpm(ipv4.dst, ${routes})
+      nexthop_group: by_key(${nexthop_groups}, route.nexthop_group_id)
+      flow:          deduce_from_outer_packet                 IF ${multipath_mode} != none
+    then:
+      - dec(ipv4.ttl, 1)                                      # OUTER ttl, decrement-by-one (this IS a forwarded datagram)
+      - "set(ethernet.src, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).port_mac)"
+      - "set(ethernet.dst, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).next_hop_mac)"
+      - "set(ipv4.header_checksum, outer_ipv4_checksum_recompute())"
+      - "forward(nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).egress_port)"
+    notes: |
+      RFC 1812 §5.2.1 transit forwarding on the OUTER IPv4 header — the
+      genuinely-composite path. A packet (GTP-U-for-another-UPF, or plain
+      underlay IPv4) is forwarded by LPM on outer.dst; the OUTER TTL is
+      decremented by exactly one, the OUTER Ethernet rewritten, and the
+      outer IPv4 checksum recomputed. If the packet is GTP-U the inner
+      T-PDU is OPAQUE TRANSPORT — inner TTL/addrs MUST NOT be touched
+      (`outer_inner_header_disjointness`). Reused from P-IPv4Routing R3.
+
+  - id: R10_transit_no_route_drop
+    when: |
+      ingress(access_n3) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${upf_n3_ip})
+        ∧ value(ipv4.ttl, >, 1)
+        ∧ ¬exists(route, lpm(ipv4.dst, ${routes}))
+    then:
+      - drop                                                 # transit no-route base action; superseded by the ICMP emit below when configured
+      - "emit(icmp_dest_unreachable(src=${upf_n3_ip}, dst=ipv4.src, code=0)) IF ${emit_transit_icmp_errors} ∧ ${default_action} == send_icmp_unreachable"
+    notes: |
+      RFC 1812 §5.3.4 — transit packet with no underlay route ⇒ drop (or
+      ICMP Destination Unreachable at Tier-3). Reused from P-IPv4Routing
+      R4 on the outer header.
+
+  - id: R11_encap_and_underlay_route
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)                               # N6 traffic is bare inner IP, not already tunnelled
+        ∧ exists(dl_bearer, ipv4.dst)
+        ∧ exists(route, lpm(dl_bearer.gnb_ip, ${routes}))
+        ∧ ( ${mtu_enforcement} == ignore
+            ∨ encapsulated_size(packet) ≤ ${outer_mtu} )
+    given:
+      dl_bearer:     by_key(ipv4.dst)
+      route:         by_lpm(dl_bearer.gnb_ip, ${routes})
+      nexthop_group: by_key(${nexthop_groups}, route.nexthop_group_id)
+      flow:          deduce_from_outer_packet                 IF ${multipath_mode} != none
+    then:
+      # The arriving IPv4 packet becomes the inner T-PDU; outer headers are pushed in front of it. Inner is NOT modified.
+      # 1. Build the GTP-U header (TS 29.281 §5)
+      - "set(gtpu.valid, true)"
+      - "set(gtpu.version, 1)"                                # §5 MUST: GTPv1-U
+      - "set(gtpu.pt, 1)"                                     # §5 MUST: GTP (not GTP')
+      - "set(gtpu.spare, 0)"
+      - "set(gtpu.e_flag, ext_flag(${gtpu_ext_header_handling}))"   # 1 iff a PDU Session Container is added
+      - "set(gtpu.s_flag, 0)"
+      - "set(gtpu.pn_flag, 0)"
+      - "set(gtpu.message_type, 255)"                         # G-PDU
+      - "set(gtpu.teid, dl_bearer.egress_teid)"
+      - "set(gtpu.length, gtpu_length(packet, ${gtpu_ext_header_handling}))"   # §5: octets after the first 8 mandatory, incl optional/ext-header octets
+      - "set(pdu_session_container.valid, ${gtpu_ext_header_handling} == pdu_session_container)"
+      - "set(pdu_session_container.qfi, qfi_value(${qfi_policy}, dl_bearer.qfi))"
+      # 2. Build the outer UDP header
+      - "set(udp.valid, true)"
+      - "set(udp.dst, ${outer_udp_dst_port})"                 # 2152
+      - "set(udp.src, outer_udp_src(${outer_udp_src_port_mode}, ${outer_udp_src_port_fixed_value}, ${hash_algo}, inner_ipv4))"
+      - "set(udp.length, gtpu_udp_length(packet))"
+      - "set(udp.checksum, outer_udp_checksum(${outer_udp_checksum_mode}, packet))"
+      # 3. Build the outer IPv4 header — outer.dst = gNB endpoint, ttl = origination value (NOT decremented)
+      - "set(outer_ipv4.valid, true)"
+      - "set(outer_ipv4.version, 4)"
+      - "set(outer_ipv4.ihl, 5)"
+      - "set(outer_ipv4.dscp, outer_dscp(${dscp_copy_policy}, inner_ipv4.dscp))"
+      - "set(outer_ipv4.ecn, 0)"
+      - "set(outer_ipv4.total_length, outer_ipv4_total_length(packet))"
+      - "set(outer_ipv4.identification, 0)"
+      - "set(outer_ipv4.flags, df_bit_only)"                  # set DF — do not fragment the transport packet
+      - "set(outer_ipv4.frag_offset, 0)"
+      - "set(outer_ipv4.ttl, ${origination_ttl})"             # origination: stamp, do NOT decrement
+      - "set(outer_ipv4.protocol, 17)"                        # UDP
+      - "set(outer_ipv4.src, ${upf_n3_ip})"
+      - "set(outer_ipv4.dst, dl_bearer.gnb_ip)"
+      - "set(outer_ipv4.header_checksum, outer_ipv4_checksum_recompute())"
+      # 4. Underlay forward: LPM picked `route`/`nexthop_group` on outer.dst → OUTER L2 rewrite + egress
+      - set(outer_ethernet.valid, true)
+      - "set(outer_ethernet.src, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).port_mac)"
+      - "set(outer_ethernet.dst, nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).next_hop_mac)"
+      - "set(outer_ethernet.ether_type, 0x0800)"
+      - "forward(nexthop_select(nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo}, flow).egress_port)"
+    notes: |
+      THE load-bearing chain rule — TS 29.281 §5 encap FUSED with
+      RFC 1812 §5.2.1 underlay forwarding. The arriving IPv4 packet is
+      the inner T-PDU; build the full outer stack (every field explicitly
+      assigned — `outer_header_field_completeness`), then resolve the
+      egress port and outer Ethernet rewrite via the underlay LPM FIB on
+      outer.dst = dl_bearer.gnb_ip (NOT a static singleton). The outer
+      TTL is stamped at `${origination_ttl}` and NOT decremented (the
+      switch ORIGINATES this datagram — `origination_vs_transit_outer_ttl`);
+      the inner T-PDU's TTL/addrs/checksum are UNTOUCHED
+      (`encap_preserves_inner_ttl`). Three GTP-U traps live here: the
+      Length-field arithmetic (octets after the first 8 mandatory, incl.
+      ext-header octets — `gtpu_length_field_correct`), the
+      version/PT/message-type MUSTs (`gtpu_header_wellformed_on_tx`), and
+      the inner-is-IP-T-PDU (no inner Ethernet). Subsumes P-GTPUEncap R2
+      + the underlay-resolution half of P-IPv4Routing R3.
+
+  - id: R12_encap_no_underlay_route_drop
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)
+        ∧ exists(dl_bearer, ipv4.dst)
+        ∧ ¬exists(route, lpm(dl_bearer.gnb_ip, ${routes}))
+    given:
+      dl_bearer: by_key(ipv4.dst)
+    then:
+      - drop
+    notes: |
+      Composite-SPECIFIC rule with no standalone analogue: the bearer is
+      known in `dl_bearer` but the UNDERLAY has no route to its gNB (a
+      misconfiguration the chain can detect that neither half alone can).
+      The encapsulated frame cannot be delivered — drop. This is the
+      failure mode P-GTPUEncap's static `n3_nexthop_fib` made impossible
+      to express (its singleton always resolved by construction); the
+      real LPM FIB can miss. Pins `underlay_route_for_every_gnb`.
+
+  - id: R13_encap_unknown_ue_drop
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)
+        ∧ ¬exists(dl_bearer, ipv4.dst)
+    then:
+      - drop
+    notes: |
+      A downlink packet whose destination is not a provisioned UE bearer
+      is dropped. In a full UPF an unprovisioned downlink triggers a
+      Downlink Data Notification + host-side buffering (the Aether P4-UPF
+      buffering service); the anchor simplifies this to a drop.
+      Reused from P-GTPUEncap R6.
+
+  - id: R14_encap_oversize_drop
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)
+        ∧ exists(dl_bearer, ipv4.dst)
+        ∧ ${mtu_enforcement} == strict_drop_oversize
+        ∧ value(encapsulated_size(packet), >, ${outer_mtu})
+    then:
+      - drop
+    notes: |
+      Under strict MTU enforcement a downlink packet whose post-encap size
+      would exceed ${outer_mtu} is dropped rather than forwarded oversize.
+      Fires only when R11's MTU guard excludes the packet. Reused from
+      P-GTPUEncap R7. (3GPP's general practice is transport-network IP
+      fragmentation; this strict-drop variant is a ladder-rung boundary
+      check, not a protocol MUST.)
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  # ── Composite-specific (the chain's load-bearing properties) ──
+
+  - id: decap_routes_inner
+    clause: stability
+    target: "(decap_egress_port, inner_ipv4.dst)"
+    while: "rule R2 fires"
+    free_under: []
+    notes: |
+      The composite's #1 invariant and the relocate twist P-GTPUEncap
+      deferred. After the outer stack is stripped, the decap egress
+      decision is determined by an LPM lookup on the EXPOSED inner T-PDU
+      destination (toward the data network), NOT by a static TEID FAR
+      egress port. This REPLACES P-GTPUEncap's `teid_decap_routing_correctness`
+      (which fixed the egress by the TEID). Implementation anti-pattern: keeping
+      the standalone static-FAR egress, or routing on the TEID instead of
+      the inner dst. Pinned by `decap_then_route_inner`.
+
+  - id: encap_preserves_inner_ttl
+    clause: persistence
+    target: "(inner_ipv4.ttl, inner_ipv4.src, inner_ipv4.dst, inner_l4_payload)"
+    while: "rule R11 fires"
+    free_under: []
+    notes: |
+      On encap (R11) the switch ORIGINATES the tunnel — the inner T-PDU
+      is opaque transport and MUST be wrapped byte-for-byte unchanged;
+      its TTL is NOT decremented and its addresses/checksum NOT rewritten.
+      Reused from P-GTPUEncap `inner_payload_persistence`, but here it is
+      ENCAP-ONLY: on decap (R2) the inner IS routed and its TTL IS
+      decremented. The pairing with `inner_ttl_decremented_on_decap` is
+      the composite's signature asymmetry.
+
+  - id: inner_ttl_decremented_on_decap
+    clause: stability
+    target: inner_ipv4.ttl_decrement
+    while: "rule R2 fires"
+    notes: |
+      RFC 1812 §5.3.1 — on the decap-route path the INNER TTL is
+      decremented by EXACTLY one (the switch is the first-hop router for
+      the decapsulated datagram on N6). The inverse of `encap_preserves_inner_ttl`;
+      together they form the inner-TTL asymmetry that distinguishes
+      P-UPFRouter from both P-VXLANRouter (inner never touched) and
+      standalone P-GTPUEncap (inner preserved on both paths). Implementation
+      anti-pattern: a shared "ttl--" action that decrements the inner on
+      encap, or a decap path that delivers without decrementing.
+
+  - id: origination_vs_transit_outer_ttl
+    clause: stability
+    target: outer_ipv4.ttl
+    while: "egress(packet) ∧ (rule R9 fires ∨ rule R11 fires)"
+    notes: |
+      RFC 1812 §5.3.1 — a router decrements TTL when FORWARDING a received
+      datagram, not when ORIGINATING one. The encap path (R11, the switch
+      is the source) stamps `outer_ipv4.ttl = ${origination_ttl}` with NO
+      decrement; the transit path (R9, the switch forwards a received
+      datagram) decrements the outer TTL by exactly one. Implementation
+      anti-pattern: a shared encap+forward action that decrements on
+      origination, or a transit path that forgets to decrement.
+
+  - id: outer_inner_header_disjointness
+    clause: persistence
+    target: "(inner_ipv4.*, inner_l4_payload)"
+    while: "rule R9 fires"
+    free_under: []
+    notes: |
+      On the TRANSIT path (R9) the forwarder operates on the OUTER IPv4
+      header ONLY; if the packet is GTP-U the inner T-PDU (TTL, src, dst,
+      checksum) MUST be byte-for-byte preserved. Implementation anti-pattern:
+      running the L3 forwarder over the inner header of a transit GTP-U
+      packet, or reusing a single "ttl--" action that hits the inner. (On
+      R2 the inner IS the routed header — see `inner_ttl_decremented_on_decap`
+      — and on R11 the inner is preserved — see `encap_preserves_inner_ttl`;
+      this clause governs the transit path specifically.)
+
+  - id: upf_transit_dichotomy
+    clause: stability
+    target: forward_decision
+    while: "ingress(access_n3) ∧ header_present(gtpu) ∧ match(udp.dst, ${outer_udp_dst_port})"
+    free_under: []
+    notes: |
+      A GTP-U packet on N3 is DECAP-ROUTED iff its outer destination is
+      this UPF (`ipv4.dst == ${upf_n3_ip}`) and TRANSIT-FORWARDED
+      otherwise. Exactly one of the two paths fires; never both, never
+      neither (modulo the malformed/unknown/End-Marker drops). Implementation
+      anti-patterns: decapping every GTP-U-looking packet (breaks transit
+      of tunnels for other UPFs/gNBs) or transit-forwarding everything
+      (the switch never terminates its own tunnels). Pinned by the
+      `decap_then_route_inner` / `transit_preserves_gtpu` G1 pair.
+
+  - id: underlay_route_for_every_gnb
+    clause: no_orphan
+    target: "(dl_bearer.gnb_ip)"
+    while: "true"
+    notes: |
+      Every `gnb_ip` reachable through the bearer table MUST have a
+      matching underlay `route` (else R12 drops the encapsulated frame —
+      a delivered downlink packet would otherwise be a dangling encap).
+      The integrity tie between the two halves' tables.
+
+  # ── GTP-U-half invariants (reused from P-GTPUEncap, on the encap path R11) ──
+
+  - id: outer_header_field_completeness
+    clause: stability
+    target: "(outer_ethernet.*, outer_ipv4.*, udp.*, gtpu.*)"
+    while: "rule R11 fires ∧ egress(packet)"
+    notes: |
+      Every field of each newly-validated outer header on the encap path
+      is explicitly assigned (the common v1model cross-cutting setValid()-without-
+      assignment bug). Reused from P-GTPUEncap. NOTE: in the composite
+      `outer_ethernet.src/dst` are assigned from the UNDERLAY nexthop
+      (R11 step 4), not from a static n3_nexthop_fib — the completeness
+      check now spans the chained L2 rewrite. The GTP-U flags byte is the
+      easiest field to leave at the setValid() default.
+
+  - id: gtpu_length_field_correct
+    clause: stability
+    target: gtpu.length
+    while: "rule R11 fires ∧ egress(packet)"
+    notes: |
+      TS 29.281 §5 — the GTP-U Length field MUST equal the octets after
+      the first 8 mandatory octets: the inner T-PDU length PLUS any
+      optional 4-octet field (when E/S/PN set) PLUS any extension-header
+      octets (the PDU Session Container when present). Reused from
+      P-GTPUEncap; the pattern's signature mobile-half discriminating
+      surface. Implementation sets Length to the inner total length, the whole
+      packet, or omits the ext-header octets.
+
+  - id: gtpu_header_wellformed_on_tx
+    clause: stability
+    target: "(gtpu.version, gtpu.pt, gtpu.message_type, gtpu.e_flag)"
+    while: "rule R11 fires ∧ egress(packet)"
+    notes: |
+      TS 29.281 §5 transmit MUSTs (independent of `${teid_validation_strict}`,
+      which gates the RECEIVE side): every encapped G-PDU MUST carry
+      Version == 1, PT == 1, Message Type == 255, and an E flag consistent
+      with whether a PDU Session Container is present. Reused from
+      P-GTPUEncap.
+
+  - id: qfi_set_on_tx
+    clause: stability
+    target: pdu_session_container.qfi
+    while: "rule R11 fires ∧ egress(packet)"
+    enforced_when: "${qfi_policy} == set_from_bearer"
+    notes: |
+      Under `${qfi_policy} == set_from_bearer` the PDU Session Container's
+      QFI MUST equal the matched bearer's `dl_bearer.qfi`. Reused from
+      P-GTPUEncap; the `qfi_set_from_bearer` G3 test pins it.
+
+  # ── Underlay-half invariants (reused from P-IPv4Routing, on the active header) ──
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "exists(route, lpm(active_ipv4.dst, ${routes}))"
+    notes: |
+      RFC 1812 §5.3.4 — the chosen next-hop belongs to the LONGEST
+      matching prefix of the ACTIVE destination (OUTER on R9/R11, INNER on
+      R2). Reused from P-IPv4Routing; implementation bug is ternary-instead-of-LPM.
+
+  - id: outer_ipv4_checksum_validity
+    clause: stability
+    target: outer_ipv4.header_checksum
+    while: "egress(packet) ∧ (rule R9 fires ∨ rule R11 fires)"
+    notes: |
+      The outer IPv4 header MUST carry a valid checksum on egress —
+      computed from scratch on encap (R11, no prior valid value) and
+      recomputed after the TTL decrement on transit (R9, RFC 1812
+      §5.2.2.5). Fuses P-GTPUEncap's `outer_ipv4_checksum_validity` (encap)
+      with P-IPv4Routing's `ip_checksum_validity` (forward). Forgetting
+      `update_checksum` is the #1 silent failure on both.
+
+  - id: inner_ipv4_checksum_validity
+    clause: stability
+    target: inner_ipv4.header_checksum
+    while: "egress(packet) ∧ rule R2 fires"
+    notes: |
+      On the decap-route path the INNER IPv4 header is mutated (TTL
+      decrement) and so its checksum MUST be recomputed before egress
+      (RFC 1812 §5.2.2.5). This is a NEW surface the composite introduces
+      that neither half exercises in isolation — P-GTPUEncap never
+      mutated the inner header, and P-IPv4Routing never operated below a
+      tunnel. Forgetting it emits a stale inner checksum the data-network
+      receiver drops.
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: active_ipv4.ttl_decrement
+    while: "rule R2 fires ∨ rule R9 fires"
+    notes: |
+      RFC 1812 §5.3.1 — the active routed header's TTL is decremented by
+      EXACTLY one on both forwarding paths (INNER on R2, OUTER on R9).
+      Reused from P-IPv4Routing `ttl_quantum_one`; double-decrement
+      (ingress + egress) is the classic bug. Does NOT apply to R11
+      (origination) — see `origination_vs_transit_outer_ttl`.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(active_ethernet.src, active_ethernet.dst)"
+    while: "egress(packet) ∧ (rule R2 fires ∨ rule R9 fires ∨ rule R11 fires)"
+    notes: |
+      RFC 1812 §5.2.1 — on every forward the egress L2 src MUST be the
+      egress port's own MAC and the dst MUST be the chosen nexthop's MAC
+      (the INNER Ethernet on R2 after decap, the OUTER Ethernet on R9/R11).
+      Reused from P-IPv4Routing.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "(rule R2 fires ∨ rule R9 fires ∨ rule R11 fires) ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — every packet of one flow lands on the same next-hop
+      index. Reused from P-IPv4Routing. The hash MUST key on stable fields
+      of the active header (and, for encap, the GTP-U outer-source-port
+      that itself derives from stable inner fields) — never on a
+      per-packet-varying field.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Every packet egresses on a definite port or is dropped; the TTL
+      decrement on the decap-route and transit paths bounds hop count, and
+      the encap path is one-shot. No recirculation in this pattern.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Entries marked [composite] probe the chain interactions.
+
+test_scaffolding:
+
+  G1:
+    - id: decap_then_route_inner
+      generate: |
+        [composite] Send a G-PDU on an N3 port: outer Ether / outer
+        IPv4(dst = ${upf_n3_ip}, ttl = 64) / UDP(dst =
+        ${outer_udp_dst_port}) / GTP-U(version = 1, PT = 1, message_type
+        = 255, teid = T) wrapping an inner IPv4(dst = D, ttl = 10)+TCP
+        T-PDU. Pre-install teid T in `ul_session` and an underlay route
+        covering inner dst D → nexthop_group(egress_port P, src_mac,
+        dst_mac). Assert: (a) the egress packet on P has NO outer IPv4,
+        UDP, or GTP-U (all stripped); (b) the first IPv4 header IS the
+        inner T-PDU with inner dst == D; (c) inner ipv4.ttl == 9
+        (decremented by ONE — the switch routed it); (d) inner ipv4
+        checksum recomputed; (e) the (inner) Ethernet rewritten to
+        src_mac/dst_mac; (f) egress port P came from the inner-dst LPM
+        FIB, not a static TEID FAR. THE composite signature assertion
+        (R2). Anchors `decap_routes_inner`, `inner_ttl_decremented_on_decap`,
+        and `inner_ipv4_checksum_validity` jointly.
+
+    - id: encap_then_underlay_lpm_route
+      generate: |
+        [composite] Send a bare inner IPv4(ttl = 64)+TCP packet on an N6
+        port whose destination is a provisioned UE IP. Pre-install ue_ip
+        → (egress_teid = T, gnb_ip = G, qfi = Q) in `dl_bearer` and an
+        underlay route covering G → nexthop_group(egress_port P, src_mac,
+        dst_mac). Assert the egress packet on P is the inner frame wrapped
+        in outer Ether(src = src_mac, dst = dst_mac, type = 0x0800) /
+        IPv4(src = ${upf_n3_ip}, dst = G, ttl = ${origination_ttl}, proto
+        = 17, valid checksum) / UDP(dst = ${outer_udp_dst_port}) /
+        GTP-U(version = 1, PT = 1, message_type = 255, teid = T), that the
+        egress port P came from the LPM FIB (not a hard-coded uplink),
+        AND that the inner ipv4.ttl is STILL 64 (encap preserves the
+        inner). The load-bearing chain assertion (R11). Anchors
+        `outer_header_field_completeness`, `encap_preserves_inner_ttl`,
+        and `lpm_longest_match_correctness` jointly.
+
+    - id: transit_preserves_gtpu_and_decrements_outer_ttl
+      generate: |
+        [composite] Send a well-formed G-PDU on an N3 port with outer
+        IPv4 dst == a REMOTE UPF/gNB (≠ ${upf_n3_ip}), outer ttl = 64,
+        inner ipv4.ttl = 5, and an underlay route covering that outer
+        dst. Assert: (a) the egress packet STILL carries the full outer
+        GTP-U/UDP/IPv4 stack (NOT decapped); (b) outer ipv4.ttl == 63
+        (decremented by one); (c) outer ipv4 checksum recomputed; (d)
+        outer Ethernet rewritten from the nexthop; (e) the INNER ipv4.ttl
+        is STILL 5 and inner addrs UNCHANGED. Anchors the transit arm of
+        `upf_transit_dichotomy`, `outer_inner_header_disjointness`, and
+        `ttl_quantum_one`.
+
+    - id: gtpu_length_field_correct
+      generate: |
+        Run two encap cases against the same SUT: (a)
+        ${gtpu_ext_header_handling} == none and (b) (when the seed enables
+        it) ${gtpu_ext_header_handling} == pdu_session_container. In each,
+        parse the egress GTP-U Length field and assert it equals the octet
+        count of everything AFTER the first 8 mandatory octets — inner-
+        T-PDU length in case (a), inner-T-PDU length + 4 (optional field)
+        + 4 (PDU Session Container) in case (b). TS 29.281 §5 — the
+        pattern's signature mobile-half probe (reused from P-GTPUEncap).
+
+    - id: plain_underlay_ipv4_transit
+      generate: |
+        Send a plain (non-GTP-U) IPv4 packet on an N3 port whose dst ≠
+        ${upf_n3_ip}, with an underlay route. Assert it forwards like a
+        normal IPv4 router hop (LPM, ttl-1, L2 rewrite, checksum).
+        Confirms the underlay half works standalone (R9 with no tunnel).
+
+    - id: underlay_ecmp_flow_consistency
+      requires: "${multipath_mode} != none"
+      generate: |
+        Install a nexthop group with K ≥ 2 for one prefix. Send 10 packets
+        of the same flow (e.g., 10 encap packets for the same inner flow
+        → same outer src port, or 10 transit packets of the same outer
+        5-tuple). Assert all 10 exit on the same egress port. Tests
+        `ecmp_flow_consistency` (RFC 2992 §2.2).
+
+  G2:
+    - id: encap_unknown_underlay_route_drop
+      generate: |
+        [composite] Pre-install ue_ip → gnb_ip = G in `dl_bearer`, but
+        install NO underlay route covering G (and no default route). Send
+        the inner frame. Assert drop (R12) — the composite-specific "known
+        bearer, unreachable gNB" failure no single half can express.
+        Anchors `underlay_route_for_every_gnb`.
+
+    - id: decap_inner_no_route_drop
+      generate: |
+        [composite] Send a G-PDU for this UPF with a known TEID but an
+        inner dst that has NO underlay route (and no default route).
+        Assert drop (R4) — the tunnel is known but the decapsulated
+        datagram is unroutable toward the data network.
+
+    - id: transit_outer_ttl_one_drop
+      generate: |
+        [composite] Send a G-PDU on N3 with outer dst == a remote UPF/gNB
+        and outer ttl == 1. Assert drop (R8; post-decrement TTL would be
+        0). Distinguishes the transit path from decap (R3, which checks
+        the INNER TTL).
+
+    - id: decap_unknown_teid_drop
+      generate: |
+        Send a well-formed G-PDU on N3 with outer dst == ${upf_n3_ip}
+        whose teid is NOT present in `ul_session`. Assert drop (R5 — an
+        unknown TEID has no tunnel endpoint at this UPF).
+
+    - id: encap_unknown_ue_drop
+      generate: |
+        Send a bare downlink IPv4 packet on an N6 port whose destination
+        is NOT a provisioned UE bearer. Assert drop (R13).
+
+    - id: underlay_longest_prefix_priority
+      generate: |
+        Install overlapping prefixes (e.g., 10.0.0.0/8 → port A and
+        10.0.2.0/24 → port B). Send a packet whose active dst is 10.0.2.x
+        (a transit/encap outer dst, or a decap inner dst); assert it
+        forwards via port B. Tests `lpm_longest_match_correctness`.
+
+  G3:
+    - id: inner_ttl_asymmetry_encap_vs_decap
+      generate: |
+        [composite] THE signature G3 probe. Run TWO packets through the
+        same SUT: (1) a downlink encap (inner ipv4.ttl = 64 on N6) — assert
+        the egress inner ipv4.ttl is STILL 64 (encap preserves); (2) an
+        uplink decap-route for this UPF (inner ipv4.ttl = 64 inside the
+        G-PDU) — assert the egress inner ipv4.ttl is 63 (decap routes,
+        decrement by one). Catches the implementation that wires a single "ttl--"
+        action across both tunnel directions, or that decrements on encap
+        / preserves on decap. Anchors `encap_preserves_inner_ttl` +
+        `inner_ttl_decremented_on_decap`.
+
+    - id: decap_inner_is_ip_not_ethernet
+      generate: |
+        Send a G-PDU on N3 (for this UPF) whose inner T-PDU is an IPv4
+        packet directly after the GTP-U header (NO inner Ethernet — the
+        GTP-U wire format). Assert the routed egress packet's bytes
+        immediately after the (rewritten) Ethernet are the inner IPv4
+        header, with the inner addresses intact (modulo the routed TTL /
+        checksum). Catches the implementation that copies a VXLAN-style inner-
+        Ethernet parser. Reused from P-GTPUEncap (GTP-U-specific probe).
+
+    - id: outer_ipv4_checksum_recompute_on_both_paths
+      generate: |
+        [composite] Run one encap packet (R11) and one transit packet
+        (R9) through the same SUT. Recompute the outer IPv4 header
+        checksum from the egress bytes for each and assert it matches the
+        emitted value. Catches the common v1model bug where the SUT builds/forwards
+        the outer header but forgets `update_checksum` — especially likely
+        because there are two outer-IPv4-mutating paths (build vs ttl-
+        decrement). Anchors `outer_ipv4_checksum_validity`.
+
+    - id: inner_ipv4_checksum_recompute_on_decap
+      generate: |
+        [composite] Send a decap-route G-PDU (R2); recompute the egress
+        INNER IPv4 header checksum from the bytes and assert it matches.
+        Catches the implementation that decrements the inner TTL but forgets to
+        recompute the inner checksum — a surface NEITHER half exercises
+        alone (P-GTPUEncap never mutated the inner; P-IPv4Routing never
+        sat under a tunnel). Anchors `inner_ipv4_checksum_validity`.
+
+    - id: conditional_deparser_emit_order_chain
+      generate: |
+        [composite] In one run, exercise encap (bare-IP-on-N6), decap-
+        route (GTP-U-for-us-on-N3), and transit (GTP-U-for-other-on-N3).
+        Assert the egress layer order is: encap → Eth/outer-IPv4/UDP/
+        GTP-U/inner-IPv4…; decap → Eth/inner-IPv4… only (outer stripped);
+        transit → Eth/outer-IPv4/UDP/GTP-U/inner-IPv4… (outer intact).
+        Catches the common v1model conditional-deparser bug where `emit(hdr.X)` is
+        not guarded on `hdr.X.isValid()`, leaking or stripping the wrong
+        stack per path.
+
+    - id: qfi_set_from_bearer
+      requires: "${qfi_policy} == set_from_bearer"
+      generate: |
+        Send a downlink packet to a UE bearer with qfi = Q. Assert the
+        egress G-PDU carries a PDU Session Container (E flag = 1, Next
+        Extension Header Type = 0x85) whose QFI == Q, AND that gtpu.length
+        correctly includes the extra extension-header octets (cross-links
+        with `gtpu_length_field_correct`). Reused from P-GTPUEncap.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Every harden is paired with an ease on the same axis so parameter
+# rebinding can move difficulty in either direction. Operators are inherited from
+# the two halves (mobile: ext-header/QFI/DSCP/strict/checksum/hash/capacity;
+# underlay: ECMP/WCMP/martian/ICMP/FIB-capacity) plus the composite
+# faithfulness ladder.
+
+mutation_operators:
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_decap_route_encap_route,
+                         D5.1_underlay_lpm_transit,
+                         D5.2_full_validation_ecmp}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if post == D5.1_underlay_lpm_transit then
+          ${routes} ← add_overlapping_prefixes(${routes}) ) ∧
+      ( if post == D5.2_full_validation_ecmp then
+          ${gtpu_ext_header_handling} ← pdu_session_container ∧
+          ${qfi_policy} ← set_from_bearer ∧
+          ${dscp_copy_policy} ← copy_inner_to_outer ∧
+          ${teid_validation_strict} ← true ∧
+          ${outer_udp_src_port_mode} ← hash_inner_5tuple ∧
+          ${multipath_mode} ← ecmp_hash_5tuple ∧
+          ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4) ∧
+          ${martian_filter_enabled} ← true ∧
+          ${mtu_enforcement} ← strict_drop_oversize ) ∧
+      ( if post == D5.3_multibearer_scale then
+          ${multipath_mode} ← wcmp ∧
+          ${ul_session_capacity} ← bounded(${ul_session_entries}) ∧
+          ${dl_bearer_capacity} ← bounded(${dl_bearer_entries}) )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_decap_route_encap_route ∧
+      ( ${faithfulness} ≠ D5.2_full_validation_ecmp
+        ∨ ${gtpu_ext_header_handling} == pdu_session_container )
+    notes: |
+      Lift the composite ladder one rung. D5.0→D5.1 turns on the genuine
+      transit path with overlapping-prefix underlay LPM; D5.1→D5.2 the
+      full GTP-U 5G validation cascade (PDU Session Container + QFI + DSCP
+      copy + strict header validation + per-flow outer-source-port hash) +
+      underlay ECMP/martian/MTU; D5.2→D5.3 multi-bearer + weighted underlay
+      under bounded capacities.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_underlay_lpm_transit,
+                         D5.2_full_validation_ecmp,
+                         D5.3_multibearer_scale}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if post == D5.0_decap_route_encap_route then
+          ${gtpu_ext_header_handling} ← none ∧ ${qfi_policy} ← none ∧
+          ${dscp_copy_policy} ← none ∧ ${teid_validation_strict} ← false ∧
+          ${outer_udp_src_port_mode} ← fixed ∧ ${multipath_mode} ← none ∧
+          ${martian_filter_enabled} ← false ∧ ${mtu_enforcement} ← ignore ) ∧
+      ( if post == D5.2_full_validation_ecmp then
+          ${ul_session_capacity} ← unbounded ∧ ${dl_bearer_capacity} ← unbounded )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${faithfulness} ≠ D5.3_multibearer_scale"
+    notes: "Paired ease counterpart of tighten_faithfulness; steps the ladder back and reverts entailed bindings."
+
+  - id: enable_ecmp_underlay
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Lift the underlay from singleton next-hops to ECMP over the active
+      5-tuple. Activates `ecmp_flow_consistency`. Reused from P-IPv4Routing
+      `enable_ecmp_5tuple`, applied to the chained active header.
+
+  - id: disable_ecmp_underlay
+    applicable_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    effect: "${multipath_mode} ← none ∧ ${max_nexthop_group_size} ← 1"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${multipath_mode} == none"
+    notes: "Paired ease counterpart of enable_ecmp_underlay."
+
+  - id: enable_wcmp_underlay
+    applicable_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    effect: "${multipath_mode} ← wcmp"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every nexthop_group with size > 1 has ≥ 2 distinct weights"
+    notes: "Lift underlay ECMP → weighted multipath. Reused from P-IPv4Routing enable_wcmp."
+
+  - id: disable_wcmp_underlay
+    applicable_when: "${multipath_mode} == wcmp"
+    effect: "${multipath_mode} ← ecmp_hash_5tuple"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${multipath_mode} == ecmp_hash_5tuple"
+    notes: "Paired ease counterpart of enable_wcmp_underlay."
+
+  - id: enable_strict_teid_validation
+    applicable_when: "${teid_validation_strict} == false"
+    effect: "${teid_validation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${teid_validation_strict} == true"
+    notes: "Activates R6 + the malformed-version G2 case. Reused from P-GTPUEncap."
+
+  - id: disable_strict_teid_validation
+    applicable_when: "${teid_validation_strict} == true"
+    effect: "${teid_validation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${teid_validation_strict} == false"
+    notes: "Paired ease counterpart of enable_strict_teid_validation."
+
+  - id: enable_pdu_session_container
+    applicable_when: "${gtpu_ext_header_handling} == none"
+    effect: "${gtpu_ext_header_handling} ← pdu_session_container ∧ ${qfi_policy} ← set_from_bearer"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${gtpu_ext_header_handling} == pdu_session_container"
+    notes: |
+      Add the 5G PDU Session Container extension header (NEH 0x85) + QFI
+      on encap, forcing the Length-field arithmetic to account for the
+      extra octets and activating `qfi_set_on_tx` + the `qfi_set_from_bearer`
+      G3 test. Reused from P-GTPUEncap.
+
+  - id: disable_pdu_session_container
+    applicable_when: "${gtpu_ext_header_handling} ∈ {pdu_session_container, strict_drop_unknown}"
+    effect: "${gtpu_ext_header_handling} ← none ∧ ${qfi_policy} ← none"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${gtpu_ext_header_handling} == none"
+    notes: "Paired ease counterpart of enable_pdu_session_container."
+
+  - id: enable_outer_udp_checksum_compute
+    applicable_when: "${outer_udp_checksum_mode} == zero_on_tx"
+    effect: "${outer_udp_checksum_mode} ← computed_on_tx"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_udp_checksum_mode} == computed_on_tx"
+    notes: "Lift from MAY-be-zero to the multi-layer MUST-cover checksum. Reused from P-GTPUEncap."
+
+  - id: revert_outer_udp_checksum_to_zero
+    applicable_when: "${outer_udp_checksum_mode} == computed_on_tx"
+    effect: "${outer_udp_checksum_mode} ← zero_on_tx"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${outer_udp_checksum_mode} == zero_on_tx"
+    notes: "Paired ease counterpart of enable_outer_udp_checksum_compute."
+
+  - id: enable_martian_filter
+    applicable_when: "${martian_filter_enabled} == false"
+    effect: "${martian_filter_enabled} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${martian_filter_enabled} == true"
+    notes: "RFC 1812 §5.3.7 source filtering on the OUTER src of transit packets (R9 guard). Reused from P-IPv4Routing; common bug is gating on dst instead of src."
+
+  - id: disable_martian_filter
+    applicable_when: "${martian_filter_enabled} == true"
+    effect: "${martian_filter_enabled} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${martian_filter_enabled} == false"
+    notes: "Paired ease counterpart of enable_martian_filter."
+
+  - id: enable_mtu_enforcement
+    applicable_when: "${mtu_enforcement} == ignore"
+    effect: "${mtu_enforcement} ← strict_drop_oversize"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_mtu} ≥ 576"
+    notes: "Activates R14 + the encap_mtu_overflow_drop case. Reused from P-GTPUEncap."
+
+  - id: disable_mtu_enforcement
+    applicable_when: "${mtu_enforcement} == strict_drop_oversize"
+    effect: "${mtu_enforcement} ← ignore"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${mtu_enforcement} == ignore"
+    notes: "Paired ease counterpart of enable_mtu_enforcement."
+
+  - id: enable_transit_icmp_errors
+    applicable_when: "${emit_transit_icmp_errors} == false"
+    effect: "${emit_transit_icmp_errors} ← true ∧ ${default_action} ← send_icmp_unreachable"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${faithfulness} ≥ D5.1_underlay_lpm_transit"
+    notes: |
+      RFC 1812 §5.2.7 — origination of ICMP Time-Exceeded (R3/R8) /
+      Destination-Unreachable (R4/R10) on the transit and decap-route
+      paths. Adds the `emit` postcondition. Reused from P-IPv4Routing
+      enable_icmp_error_emission.
+
+  - id: disable_transit_icmp_errors
+    applicable_when: "${emit_transit_icmp_errors} == true"
+    effect: "${emit_transit_icmp_errors} ← false ∧ ${default_action} ← drop"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${emit_transit_icmp_errors} == false"
+    notes: "Paired ease counterpart of enable_transit_icmp_errors."
+
+  - id: swap_underlay_remap_to_hrw
+    applicable_when: "${multipath_mode} != none ∧ ${ecmp_remap_algo} ≠ hrw"
+    effect: "${ecmp_remap_algo} ← hrw"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${ecmp_remap_algo} == hrw"
+    notes: "Lift the underlay remap to Highest-Random-Weight (RFC 2992 §3) — arg-max over nexthops is hard in P4. Reused from P-IPv4Routing."
+
+  - id: swap_underlay_remap_to_hash_threshold
+    applicable_when: "${multipath_mode} != none ∧ ${ecmp_remap_algo} ∈ {hrw, modulo_n}"
+    effect: "${ecmp_remap_algo} ← hash_threshold"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${ecmp_remap_algo} == hash_threshold"
+    notes: "Paired ease counterpart of swap_underlay_remap_to_hrw."
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: |
+      (${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none) ∧
+      ${hash_algo} ∈ {crc16, crc32}
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    notes: "Weaker hash on both the outer-source-port and underlay ECMP selection. Reused from both halves."
+
+  - id: swap_hash_to_crc32
+    applicable_when: |
+      (${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none) ∧
+      ${hash_algo} ∈ {xor_fold, crc16}
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    notes: "Paired ease counterpart of swap_hash_to_xor_fold."
+
+  - id: shrink_fib_capacity_4x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 16"
+    notes: "Tighten the underlay FIB capacity (Contra-realistic). Reused from P-IPv4Routing."
+
+  - id: enlarge_fib_capacity_2x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} < 524288"
+    effect: "${fib_capacity} ← ${fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${fib_capacity} ≤ 1048576"
+    notes: "Paired ease counterpart of shrink_fib_capacity_4x (doubles, for a slow climb back after an over-shrink)."
+
+  - id: shrink_session_capacity_4x
+    applicable_when: "${dl_bearer_capacity} ≠ unbounded ∧ ${dl_bearer_capacity} > 64"
+    effect: |
+      ${dl_bearer_capacity} ← ${dl_bearer_capacity} / 4 ∧
+      ${ul_session_capacity} ← ${ul_session_capacity} / 4
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${dl_bearer_capacity} ≥ 16 ∧ ${ul_session_capacity} ≥ 16"
+    notes: "Tighten both the uplink-session and downlink-bearer table capacities by 4×. Reused from P-GTPUEncap."
+
+  - id: enlarge_session_capacity_2x
+    applicable_when: "${dl_bearer_capacity} ≠ unbounded ∧ ${dl_bearer_capacity} < 1048576"
+    effect: |
+      ${dl_bearer_capacity} ← ${dl_bearer_capacity} * 2 ∧
+      ${ul_session_capacity} ← ${ul_session_capacity} * 2
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${dl_bearer_capacity} ≤ 1048576 ∧ ${ul_session_capacity} ≤ 1048576"
+    notes: "Paired ease counterpart of shrink_session_capacity_4x."
+
+  - id: inflate_underlay_overlapping_prefixes
+    applicable_when: "'underlay_longest_prefix_stress' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${routes} so that ≥ 30% of prefixes overlap (a /16 plus
+      several /24s and /32s within it). Add G2 test
+      `underlay_longest_prefix_stress` exercising 3-level LPM tie-break on
+      the active dst.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 64 ∨ ${fib_capacity} == unbounded"
+    notes: "Pattern-augmenting: stresses `lpm_longest_match_correctness`. Reused from P-IPv4Routing."
+
+  - id: flatten_underlay_prefixes
+    applicable_when: "'underlay_longest_prefix_stress' ∈ test_scaffolding.G2"
+    effect: "Revert ${routes} to non-overlapping prefixes; remove the underlay_longest_prefix_stress G2 test."
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Paired ease counterpart of inflate_underlay_overlapping_prefixes."
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    notes: "Raise inner/underlay flow-tuple skew (uniform → zipfian → adversarial) to stress hash quality. Reused from both halves."
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    notes: "Paired ease counterpart of raise_workload_skew."
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: "Append the composed Python oracle source to task.description (heaviest ease lever — especially load-bearing for the relocate-flavoured GTP-U half)."
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    notes: "Starter-library operator — gives the SUT a host-side reference to transliterate. Reused from both halves."
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    notes: "Paired harden counterpart of ladder_input_form_to_python_ref."
+
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the shared noisify_spec_low protocol: 1 true-but-irrelevant deployment
+      distractor + 1 named-artefact "plays no role" disclaimer. Rule
+      truth-values, oracle output, and test corpus stay byte-identical;
+      append to provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Inherited noise protocol shared with the constituent patterns."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: "Revert the most recent noisify_spec_* operator (most-recent first); restore clean description; clear the provenance entries."
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Paired ease counterpart of the noisify_spec_* operators."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4 (every entry is
+  [common-knowledge baseline] unless RFC/TS-cited via a constituent):
+
+    Header layout: declare BOTH an outer and an inner stack —
+      `header ethernet_t outer_ethernet; header ipv4_t outer_ipv4;
+       header udp_t udp; header gtpu_t gtpu;
+       header pdu_session_ext_t pdu_session_container;   // D5.2+
+       header ethernet_t inner_ethernet; header ipv4_t inner_ipv4;`
+    On N3 the parser fills outer_* (+ gtpu/inner_ipv4 iff udp.dst == 2152
+    and a GTP-U header parses) — NOTE the inner is an IP T-PDU, so the
+    parser goes GTP-U → inner_ipv4 directly with NO inner Ethernet. On N6
+    it fills inner_* and the encap action setValid()s the outer_*. The
+    `gtpu_t` is the 8 mandatory octets: `bit<3> version; bit<1> pt;
+    bit<1> spare; bit<1> e; bit<1> s; bit<1> pn; bit<8> message_type;
+    bit<16> length; bit<32> teid;`.
+
+    Anchor (D5.0_decap_route_encap_route): single bearer/TEID, lax
+    validation, fixed outer src port, zero UDP checksum, End Marker drop,
+    MTU ignore, underlay multipath = none (singleton nexthop groups).
+    Tables:
+      - port_role (exact on ingress_port → role)
+      - ul_session (exact on gtpu.teid → admission gate; may carry qfi)
+      - dl_bearer (exact on inner_ipv4.dst → egress_teid, gnb_ip, qfi)
+      - route (LPM on the ACTIVE ipv4.dst → nexthop_group_id)
+      - nexthop group table (→ egress_port, port_mac, next_hop_mac)
+    Pipeline: if N3 ∧ gtpu ∧ outer.dst==upf → DECAP-ROUTE (strip outer,
+    LPM on INNER dst, inner ttl--, inner csum, inner L2 rewrite); elif N3
+    ∧ outer.dst≠upf → TRANSIT (LPM outer, outer ttl--, outer csum, outer
+    L2 rewrite, inner opaque); elif N6 → ENCAP (build outer toward
+    gnb_ip, LPM outer, NO outer ttl--, inner preserved).
+    MyComputeChecksum: update_checksum on outer_ipv4 for the encap
+    (fresh) and transit (ttl-mutated) paths, AND update_checksum on
+    inner_ipv4 for the DECAP-ROUTE path (ttl-mutated) — each guarded on
+    the respective header's isValid().
+
+    D5.1 (underlay LPM + transit): overlapping underlay prefixes; the
+    transit path becomes load-bearing. Implementation MUST split origination
+    (R11, no outer decrement) from transit (R9, outer decrement) AND from
+    decap-route (R2, inner decrement) — typically THREE distinct
+    forwarding actions, not one shared "forward".
+
+    D5.2 (full validation + ECMP): PDU Session Container (NEH 0x85) + QFI;
+    DSCP copy inner→outer; strict version/PT receive check; per-flow outer
+    source-port hash (hash over inner 5-tuple); underlay ECMP via
+    hash(active 5-tuple) % group_size; martian filter on outer src; MTU
+    drop. The outer-source-port hash and the underlay ECMP hash are
+    SEPARATE hash computations. Recompute gtpu.length to include the +8
+    ext-header octets.
+
+    D5.3 (multi-bearer scale): many TEIDs/UE-IPs (ul_session/dl_bearer
+    grow); scaled underlay FIB; WCMP; bounded table capacities.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Delivering the decapsulated inner T-PDU to a STATIC TEID FAR egress
+      (the standalone P-GTPUEncap behaviour) instead of ROUTING it by
+      LPM on the inner dst — the composite's signature. Or routing the
+      decapped packet by the TEID instead of the inner destination.
+      `decap_then_route_inner` catches it.
+    * The inner-TTL asymmetry inverted or collapsed: decrementing the
+      inner TTL on ENCAP (the switch originates — must NOT), or NOT
+      decrementing on DECAP (the switch routes — must). A single shared
+      "ttl--" action wired across both directions is the classic bug.
+      `inner_ttl_asymmetry_encap_vs_decap` catches it.
+    * Decrementing the OUTER TTL on the encap-originate path (R11) — a
+      router does not decrement when originating. Or forgetting to
+      decrement on transit (R9). `origination_vs_transit_outer_ttl` +
+      `transit_preserves_gtpu_and_decrements_outer_ttl` catch both.
+    * Running the L3 forwarder over the INNER ipv4 of a TRANSIT GTP-U
+      packet — breaks `outer_inner_header_disjointness`.
+    * Decapping every GTP-U-looking packet regardless of outer.dst —
+      breaks transit of tunnels for OTHER UPFs/gNBs. Or transit-forwarding
+      everything (never terminating its own). `upf_transit_dichotomy` /
+      the `decap_then_route_inner` + `transit_preserves_gtpu` G1 pair.
+    * Forgetting `update_checksum` for the OUTER IPv4 on encap/transit OR
+      for the INNER IPv4 on decap-route. The inner-checksum recompute is a
+      surface NEITHER half exercises alone.
+      `outer_ipv4_checksum_recompute_on_both_paths` +
+      `inner_ipv4_checksum_recompute_on_decap` catch them.
+    * Expecting/emitting an inner Ethernet on the GTP-U inner payload —
+      GTP-U carries an IP T-PDU. `decap_inner_is_ip_not_ethernet`.
+    * Setting gtpu.length to the inner total length, the whole packet, or
+      forgetting the extension-header octets — TS 29.281 §5 arithmetic.
+      `gtpu_length_field_correct`.
+    * Calling setValid() on the outer headers without assigning every
+      field (esp. the GTP-U flags byte → version 0 / PT 0). Reused from
+      P-GTPUEncap.
+    * Treating a known-bearer / unreachable-gNB packet as forwardable
+      (skipping R12) — emits a dangling encap. `encap_unknown_underlay_route_drop`.
+    * Decapsulating an End Marker (message_type 254) and routing it to N6
+      as user data — it is tunnel signalling. (R7.)
+    * Reading `standard_metadata.drop` after `mark_to_drop()` — v1model
+      conditional-deparser bug; behaviour is unspecified after
+      `mark_to_drop()`.
+
+  Oracle reuse: the composed oracle is assembled by
+  chaining the two halves' audited oracles — P-GTPUEncap's encap/decap
+  step feeding P-IPv4Routing's LPM-forward step over the ACTIVE header
+  (the inner on decap, the outer on encap/transit), with the UPF/transit
+  dichotomy, the inner-TTL asymmetry, and the origination/transit outer
+  TTL handled in the composition glue. Recorded at instantiation as the
+  composed oracle's content-addressed provenance (the same convention
+  P-VXLANRouter and P-StatefulFW-NAT44 follow).
+
+  v2 deferrals (out of scope for this v1.0 pattern):
+    * Stateful PFCP session establishment / usage reporting (the control
+      plane is static control-plane-installed here).
+    * GTP-U Error Indication / Echo Request-Response messages (only G-PDU
+      255 + End Marker 254 are handled).
+    * The optional sequence-number / N-PDU-number fields beyond a flag.
+    * Downlink Data Notification + host-side buffering for unprovisioned
+      UEs (simplified to a drop at R13).
+    * Inner-packet fragmentation / reassembly across the tunnel.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and the composed-oracle
+       audit must all pass validation.
+
+    2. The composed oracle MUST reuse the audited P-GTPUEncap and
+       P-IPv4Routing oracles (content-addressed oracle reuse) rather
+       than synthesise fresh ground truth — verify the provenance records
+       both parent oracle hashes.
+
+    3. Anchor instances (D5.0, single bearer/TEID, singleton
+       underlay) SHOULD behaviourally subsume a P-GTPUEncap anchor on the
+       encap cases and a P-IPv4Routing anchor on the plain-underlay-transit
+       cases. The decap-route cases are genuinely composite (NOT subsumed
+       by either parent — P-GTPUEncap delivered to a static FAR; here the
+       inner is routed) and need fresh oracle agreement.
+
+    4. This is a composite pattern. Its compile surface is likely
+       unstable (a recurring instability of composites), so expect a
+       compile-gate-bracketed difficulty profile and budget an
+       input-form / sketch-skeleton ease lever for a reachable difficulty.

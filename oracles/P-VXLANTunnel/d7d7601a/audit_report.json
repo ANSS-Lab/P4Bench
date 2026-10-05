@@ -1,0 +1,154 @@
+{
+  "oracle_hash": "111a0802fcbfd27834f79d025fcce3d28a7b195367a439a321d54ee8fc6c0c86",
+  "instance": "vxlan_vtep_ceiling-default",
+  "ran_at": "2026-06-17T14:22:50.124899Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "encap_known_unicast_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_oversize_drop_strict_mtu",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_oversize_forward_when_mtu_ignored",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_unknown_unicast_bum_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_unknown_unicast_head_end_replication",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_known_unicast_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_zero_i_flag_drop_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_zero_i_flag_forward_lax",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_reserved_bits_drop_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_unknown_vni_mac_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_vni_crosswire_blocked_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "access_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "uplink_wrong_udp_dst_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_outer_src_port_fixed",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_outer_src_port_hash3_crc32",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_outer_src_port_hash5_xor_fold",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_access_port_rebound_vni",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "vni_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_header_field_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_ipv4_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "vxlan_i_flag_set_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_vtep_fragmentation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "vni_isolation",
+      "inner_payload_persistence",
+      "outer_header_field_completeness",
+      "outer_ipv4_checksum_validity",
+      "vxlan_i_flag_set_on_tx",
+      "no_vtep_fragmentation"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc7348"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

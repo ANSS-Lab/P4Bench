@@ -1,0 +1,171 @@
+{
+  "oracle_hash": "749e33fa0b205d8b2adeac3519107ce96ffe8315a10cdf52dfa623febbe34838",
+  "instance": "syn_cookie_guard_disc_mut1-widen_whitelist",
+  "ran_at": "2026-06-17T02:50:27.232381Z",
+  "canonical_examples": {
+    "passed": 19,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r1_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_unprotected_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_non_tcp_to_protected_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_whitelist_bypass_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r7_syn_cookie_challenge",
+        "status": "pass"
+      },
+      {
+        "example_id": "r7_syn_allocates_no_state",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_valid_ack_admits",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_established_data_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_invalid_cookie_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r9_crafted_synack_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "cookie_binds_sport_no_cross_replay",
+        "status": "pass"
+      },
+      {
+        "example_id": "d51_mss_cookie_valid_ack",
+        "status": "pass"
+      },
+      {
+        "example_id": "bounded_capacity_admission_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "bounded_capacity_fifo_admits_with_eviction",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_whitelist_empty_challenges_formerly_bypassed",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_track_halfopen_on_syn_challenge",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_halfopen_capacity_zero_syn_challenge",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_syn_rate_activation_on_threshold_syn_challenge",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_cookie_validity_epochs_one_syn_challenge",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_state_on_unvalidated_syn": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "cookie_validation_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "emit_synack_structure_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "secret_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_connection": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "halfopen_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "no_state_on_unvalidated_syn",
+      "cookie_validation_determinism",
+      "emit_synack_structure_completeness",
+      "secret_persistence",
+      "no_orphan_connection",
+      "halfopen_no_orphan",
+      "bounded_latency",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "poseidon_ndss20",
+      "rfc4987"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

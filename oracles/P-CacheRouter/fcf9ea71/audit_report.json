@@ -1,0 +1,109 @@
+{
+  "oracle_hash": "6f8a489395d7c139a8055f6d67550cf189bdb0bdbfcf3aea839d4e95b1d1a479",
+  "instance": "cache_router_anchor-default",
+  "ran_at": "2026-06-17T04:17:30.130036Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "acl_deny_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "cache_hit_reply",
+        "status": "pass"
+      },
+      {
+        "example_id": "cache_miss_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "write_invalidate_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "write_then_read_misses",
+        "status": "pass"
+      },
+      {
+        "example_id": "deny_leaves_cache_intact",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_deny_drops_unlisted",
+        "status": "pass"
+      },
+      {
+        "example_id": "disabled_acl_permits_blocked_client",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "acl_precedes_cache": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "hit_served_locally": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "write_invalidation_coherence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "read_reply_endpoint_swap": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "acl_precedes_cache",
+      "hit_served_locally",
+      "write_invalidation_coherence",
+      "read_reply_endpoint_swap",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Jin et al., NetCache: Balancing Key-Value Stores with Fast In-Network Caching, SOSP 2017",
+      "RFC1812",
+      "RFC3198",
+      "RFC768"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

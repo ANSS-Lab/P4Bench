@@ -1,0 +1,556 @@
+# P-AckThinning — TCP ACK Filtering / Thinning for Asymmetric Links
+#
+# TPL v1.0 task pattern. A TCP performance-enhancing-proxy
+# (PEP) function for bandwidth-asymmetric links (e.g. satellite, DSL, cellular
+# uplinks): the reverse path carries a flood of pure-ACKs whose cumulative
+# acknowledgement is redundant. The proxy maintains per-flow the highest ACK
+# number already forwarded and DROPS any pure-ACK whose ack-number does not
+# advance that watermark — "ACK filtering / thinning" in RFC 3135 terms —
+# while forwarding every ACK that advances the cumulative ack, every data
+# segment, and every control segment (SYN/FIN/RST). The thinning is purely
+# ack-number-comparison driven by received packets: NO timer / time_tick is
+# involved, which is what makes it gradable in BMv2 `--use-files`. Closes the
+# transport-assistance / flow-tracking gap (no PEP-class NF existed in the
+# corpus). Instances are produced by binding the parameters below.
+
+pattern_id: P-AckThinning
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D8:transport-assistance]               # TCP PEP — reverse-path ACK load reduction
+  prescriptive: [P3:flow-tracking]                       # per-flow watermark register + eviction
+target_capability: scale_up                             # per-flow ACK watermark state must scale to the link's connection count (P3 row)
+summary: >
+  Per-flow TCP ACK thinning for bandwidth-asymmetric links: maintain, per
+  connection, the highest cumulative acknowledgement number already forwarded;
+  for a PURE ACK (ACK flag set, zero payload, no SYN/FIN/RST), DROP it when its
+  ack-number does not advance the stored watermark (a redundant/stale duplicate
+  ACK) and otherwise advance the watermark and FORWARD; ALWAYS forward data
+  segments and any segment carrying SYN, FIN, or RST or new payload (RFC 3135
+  §2.4.1 ACK filtering). The correctness contract is one-sided: the proxy MUST
+  NEVER drop an ACK that advances the cumulative ack (no false thinning would
+  stall the sender), so it errs toward forwarding. The canonical instance is a
+  single-direction exact-match watermark register on the 4-tuple; mutation
+  lifts to bounded flow-table capacity with eviction, dup-ACK budget (forward N
+  duplicates before thinning, for fast-retransmit safety), bidirectional
+  thinning, and approximate (hashed) watermark storage.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC3135
+      sections: ["3.1.4", "2.5", "4"]
+      role: normative_behaviour
+      quote: >-
+        On paths with highly asymmetric bandwidth the TCP ACKs flowing in the
+        low-speed direction may get congested if the asymmetry ratio is high
+        enough.  The ACK filtering and reconstruction mechanism addresses
+        this by filtering the ACKs on one side of the link and reconstructing
+        the deleted ACKs on the other side of the link.
+      quote_source: patterns/P-AckThinning/grounding/RFC3135.txt
+      relevance: |
+        Performance Enhancing Proxies Intended to Mitigate Link-Related
+        Degradations (Border, Kojo, Griner, Montenegro, Shelby) — the
+        normative clauses every rule realises:
+          - §3.1.4 "TCP ACK Filtering and Reconstruction": on a bandwidth-
+                 asymmetric link the low-speed reverse path is dominated by TCP
+                 ACKs; a PEP "filters" (thins) redundant ACKs to reduce the
+                 reverse-path load. Because TCP acknowledgements are CUMULATIVE,
+                 dropping an ACK that does not advance the cumulative ack number
+                 loses no information — basis for R3 (thinned-dup-ACK drop) and
+                 the ack_watermark_monotone invariant. The proxy must reconstruct
+                 / not lose the advancing-ack signal: an ACK that advances the
+                 cumulative ack carries new acknowledgement information the sender
+                 needs to open its window — basis for R4 (advancing-ACK forward +
+                 watermark update) and the no_false_thinning invariant. This
+                 one-sided contract is the gradable core.
+          - §2.5    Transparency: a transport-layer-transparent PEP preserves
+                 end-to-end TCP semantics; connection setup/teardown and reset
+                 must pass through unmodified — basis for R2 (SYN/FIN/RST always
+                 forward) so thinning never breaks the handshake or close.
+          - §4      Implications: filtering ACKs interacts with TCP fast
+                 retransmit (3 duplicate ACKs); a conservative proxy may pass a
+                 small budget of duplicate ACKs before thinning — basis for the
+                 ${dup_ack_budget} parameter and the dup-budget operators.
+
+  papers:
+    - cite: balakrishnan_snoop_mobicom1995
+      role: domain_concepts
+      relevance: |
+        Balakrishnan, Seshan, Amir, Katz — "Improving Reliable Transport and
+        Handoff Performance in Cellular Wireless Networks" (the Snoop protocol)
+        and the surrounding TCP-over-asymmetric-links literature. Establishes
+        the per-connection cached-state model a link-layer proxy keeps (last
+        acknowledged sequence number per flow) and the asymmetric-link reverse-
+        path ACK-congestion problem ACK thinning targets — domain grounding for
+        the per-flow watermark entity and the bidirectional-thinning operator.
+        Used for the connection-keyed state shape and the duplicate-ACK
+        semantics, NOT for any register layout (that is an implementation hint).
+
+  tutorials: []
+  posts: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; per-packet decision derives from hdr.tcp flags, the TCP
+      acknowledgement number, the segment's payload length (data vs pure ACK),
+      and the connection's stored watermark. No per-packet persistent state.
+
+  connection:                             # the TPL `connection` entity
+    key:
+      - hdr.ipv4.srcAddr
+      - hdr.ipv4.dstAddr
+      - hdr.tcp.srcPort
+      - hdr.tcp.dstPort
+    attrs:
+      ack_watermark: int                  # highest cumulative ack-number already FORWARDED for this flow
+      dup_seen:      int                   # duplicate-ACK count since the watermark last advanced
+    capacity: ${flow_table_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      One watermark per acknowledgement-direction flow (the 4-tuple of the ACK
+      packets travelling the asymmetric reverse path). ack_watermark is the
+      decision variable; dup_seen supports the fast-retransmit dup-ACK budget
+      and is unused when ${dup_ack_budget} == 0. The watermark advances
+      monotonically (ack_watermark_monotone). On first sight of a flow the
+      watermark is bound from the segment itself (bind), so the very first ACK
+      of a connection is always forwarded.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  thinning_direction:
+    type: enum
+    values: [reverse_only, bidirectional]
+    default: reverse_only
+    notes: |
+      reverse_only  → thin pure-ACKs on the acknowledgement-bearing reverse
+                      path only (the canonical asymmetric-link case).
+      bidirectional → maintain a watermark and thin pure-ACKs in BOTH
+                      directions (two connection halves per 4-tuple).
+
+  dup_ack_budget:
+    type: int
+    range: "[0, 8]"
+    default: 0
+    notes: |
+      RFC 3135 §4. Number of NON-advancing (duplicate) pure-ACKs to FORWARD
+      before thinning kicks in, preserving TCP fast retransmit (3 dup-ACKs).
+      0 = thin every non-advancing pure-ACK immediately (canonical, most
+      aggressive). >0 forwards the first ${dup_ack_budget} duplicates per
+      stall, then thins the rest; the count resets when the watermark advances.
+
+  flow_table_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Max tracked connections. shrink_flow_capacity_4x exercises this axis."
+
+  eviction_policy:
+    type: enum
+    values: [none, LRU, FIFO]
+    default: none
+    enforced_when: "${flow_table_capacity} != unbounded"
+    notes: |
+      What to do when the watermark table is full and a new flow arrives.
+      none is only well-defined under unbounded capacity; a finite table
+      requires LRU/FIFO. An evicted flow's watermark is lost, so its next ACK
+      is treated as first-sight and forwarded (fail-open — never false-thin).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_exact, D5.1_hashed]
+    default: D5.0_exact
+    notes: |
+      D5.0_exact  → exact per-4-tuple watermark (no collisions).
+      D5.1_hashed → watermark stored in a hash-indexed register array; two
+                    flows may collide on a cell. The thinning decision MUST
+                    stay fail-open under collision (forward on ambiguity) so
+                    no_false_thinning still holds.
+
+  default_action:
+    type: enum
+    values: [forward]
+    default: forward
+    notes: |
+      Behaviour for any TCP segment that is not a thinnable pure-ACK (data
+      segments, control segments, first-sight flows). v1.0: always forward —
+      thinning is a strict subset of the traffic; non-ACKs are never dropped.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_tcp_forward
+    when: "¬(header_present(ipv4) ∧ header_present(tcp))"
+    then:
+      - "${default_action}"
+    notes: |
+      The pattern operates on TCP over IPv4 only. Non-TCP traffic (ARP, UDP,
+      ICMP, bare IPv4) is out of scope for thinning and passes through
+      unmodified. ACK thinning MUST NOT drop non-TCP packets.
+
+  - id: R1_data_or_payload_forward
+    when: |
+      header_present(tcp) ∧ value(hdr.tcp.payload_len, ">", 0)
+    then:
+      - "${default_action}"
+    notes: |
+      A segment carrying payload (data, or a piggy-backed ACK with new data)
+      is NEVER thinnable — it carries information beyond the cumulative ack.
+      Forwarded unconditionally regardless of its ACK flag or ack-number.
+
+  - id: R2_control_segment_forward
+    when: |
+      header_present(tcp) ∧ value(hdr.tcp.payload_len, "==", 0)
+        ∧ (match(hdr.tcp.flags.syn, 1) ∨ match(hdr.tcp.flags.fin, 1)
+           ∨ match(hdr.tcp.flags.rst, 1))
+    then:
+      - "${default_action}"
+    notes: |
+      RFC 3135 §2.4 — connection setup (SYN), teardown (FIN), and reset (RST)
+      MUST pass end-to-end even when payload-empty, so the handshake/close is
+      never broken by thinning. These are forwarded before any pure-ACK test.
+
+  - id: R3_pure_ack_first_sight_forward
+    when: |
+      header_present(tcp) ∧ value(hdr.tcp.payload_len, "==", 0)
+        ∧ match(hdr.tcp.flags.ack, 1)
+        ∧ ¬(match(hdr.tcp.flags.syn, 1) ∨ match(hdr.tcp.flags.fin, 1)
+            ∨ match(hdr.tcp.flags.rst, 1))
+        ∧ ¬exists(connection, flow_key(hdr))
+    given:
+      flow_key: "deduce_from_packet(${thinning_direction})"
+    then:
+      - "bind(connection, flow_key(hdr), {ack_watermark: hdr.tcp.ackNo, dup_seen: 0})"
+      - "${default_action}"
+    notes: |
+      First pure-ACK seen for a flow (or a flow whose watermark was evicted):
+      no baseline to compare against, so bind the watermark to this ACK's
+      number and forward. This is the fail-open base case — a flow with no
+      stored state is never thinned.
+
+  - id: R4_pure_ack_advancing_forward
+    when: |
+      header_present(tcp) ∧ value(hdr.tcp.payload_len, "==", 0)
+        ∧ match(hdr.tcp.flags.ack, 1)
+        ∧ ¬(match(hdr.tcp.flags.syn, 1) ∨ match(hdr.tcp.flags.fin, 1)
+            ∨ match(hdr.tcp.flags.rst, 1))
+        ∧ exists(connection, flow_key(hdr))
+        ∧ value(connection.ack_watermark, "<", hdr.tcp.ackNo)
+    given:
+      flow_key:   "deduce_from_packet(${thinning_direction})"
+      connection: "by_key(flow_key(hdr))"
+    then:
+      - "bind(connection, flow_key(hdr), {ack_watermark: hdr.tcp.ackNo, dup_seen: 0})"
+      - "${default_action}"
+    notes: |
+      RFC 3135 §2.4.1 — the ACK ADVANCES the cumulative ack (ackNo > stored
+      watermark). It MUST be forwarded (no false thinning), and the watermark
+      is raised to its number; the duplicate counter resets. This is the
+      no_false_thinning core: an advancing ACK is never dropped.
+
+  - id: R5_pure_ack_redundant
+    when: |
+      header_present(tcp) ∧ value(hdr.tcp.payload_len, "==", 0)
+        ∧ match(hdr.tcp.flags.ack, 1)
+        ∧ ¬(match(hdr.tcp.flags.syn, 1) ∨ match(hdr.tcp.flags.fin, 1)
+            ∨ match(hdr.tcp.flags.rst, 1))
+        ∧ exists(connection, flow_key(hdr))
+        ∧ value(connection.ack_watermark, ">=", hdr.tcp.ackNo)
+    given:
+      flow_key:   "deduce_from_packet(${thinning_direction})"
+      connection: "by_key(flow_key(hdr))"
+    then:
+      - inc(connection.dup_seen)
+      - "decision ← (value(connection.dup_seen, \"<=\", ${dup_ack_budget})) ? forward : drop"
+    notes: |
+      A redundant / stale pure-ACK: its ackNo does NOT advance the watermark
+      (ackNo <= stored), so per RFC 3135 §2.4.1 it is a duplicate that may be
+      thinned. With ${dup_ack_budget}==0 it is DROPPED outright (the canonical
+      thinning). With a positive budget, the first ${dup_ack_budget}
+      non-advancing dup-ACKs per stall are FORWARDED (fast-retransmit safety)
+      and the rest dropped; the counter resets when R4 fires. The watermark is
+      NOT changed here — only advancing ACKs (R4) move it (ack_watermark_monotone).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: no_false_thinning
+    clause: stability
+    target: forward_decision
+    while: "match(hdr.tcp.flags.ack, 1) ∧ value(connection.ack_watermark, \"<\", hdr.tcp.ackNo)"
+    notes: |
+      THE correctness contract (RFC 3135 §2.4.1). Any ACK that advances the
+      cumulative ack (ackNo strictly greater than the stored watermark) MUST be
+      forwarded. The proxy is one-sided: dropping an advancing ACK would
+      withhold acknowledgement information and stall the sender. A SUT that
+      thins on ">=" instead of "<" (off-by-one) violates this on the first
+      advancing ACK — fwd_advancing_ack pins it.
+
+  - id: ack_watermark_monotone
+    clause: persistence
+    target: connection.ack_watermark
+    while: "exists(connection, flow_key(hdr))"
+    free_under: ["bind"]   # raised only by R3/R4 bind; never lowered
+    notes: |
+      The stored watermark never decreases for a live flow: it is set on first
+      sight (R3) and only ever raised by an advancing ACK (R4). A redundant ACK
+      (R5) leaves it unchanged. Lowering it would re-admit already-thinned ACKs.
+
+  - id: non_ack_pass_through
+    clause: stability
+    target: forward_decision
+    while: "value(hdr.tcp.payload_len, \">\", 0) ∨ match(hdr.tcp.flags.syn, 1) ∨ match(hdr.tcp.flags.fin, 1) ∨ match(hdr.tcp.flags.rst, 1)"
+    notes: |
+      Data segments and SYN/FIN/RST control segments are always forwarded
+      (R1/R2) regardless of watermark state — thinning touches pure-ACKs only.
+      Anti-pattern: thinning a FIN-ACK whose ackNo equals the watermark and
+      breaking connection teardown.
+
+  - id: flow_state_no_orphan
+    clause: no_orphan
+    target: connection
+    enforced_when: "${flow_table_capacity} != unbounded"
+    notes: |
+      Under bounded capacity every tracked flow is eventually evictable
+      (${eviction_policy} LRU/FIFO); an evicted flow fails open (its next ACK
+      hits R3 first-sight and is forwarded), so eviction never causes false
+      thinning.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_first_ack_binds_watermark
+      generate: |
+        Send the first pure-ACK of a fresh flow (ack=N, no prior state).
+        Assert: FORWARDED (R3 first-sight); the watermark is now N. Then send
+        an advancing ACK (ack=N+100); assert FORWARDED.
+    - id: drop_redundant_dup_ack
+      generate: |
+        Establish a flow's watermark at N (forward ack=N). Send a second pure-
+        ACK with the SAME ack=N (a redundant duplicate). With dup_ack_budget==0
+        assert DROPPED (thinned). Send a third ack=N; assert DROPPED.
+    - id: fwd_advancing_ack
+      generate: |
+        Watermark at N; send ack=N+200 (advances). Assert FORWARDED and the
+        watermark raised to N+200. Then send ack=N+100 (now stale, below the
+        new watermark); assert DROPPED.
+    - id: fwd_data_segment_regardless
+      generate: |
+        With watermark at N, send a TCP segment carrying payload whose
+        ackNo==N (would be a redundant ACK if pure). Assert FORWARDED (R1 —
+        payload is never thinnable) and the watermark unchanged.
+    - id: fwd_control_segments
+      generate: |
+        Send payload-empty SYN, FIN, and RST segments (each ACK-flagged with a
+        non-advancing ackNo). Assert ALL FORWARDED (R2) — handshake/teardown is
+        never thinned.
+
+  G2:
+    - id: dup_ack_budget_boundary
+      requires: "${dup_ack_budget} > 0"
+      generate: |
+        With dup_ack_budget==B, watermark at N: send B+2 redundant ack=N
+        packets. Assert the first B are FORWARDED (fast-retransmit safety) and
+        the remaining 2 DROPPED. Then send an advancing ack=N+1; assert
+        FORWARDED and the dup counter reset (a subsequent ack=N+1 dup is again
+        forwarded up to the budget).
+    - id: capacity_eviction_fail_open
+      requires: "${flow_table_capacity} != unbounded"
+      generate: |
+        Fill the watermark table to ${flow_table_capacity}, then drive a new
+        flow that evicts an existing one (LRU/FIFO). Send the evicted flow's
+        next redundant ACK; assert FORWARDED (fail-open R3 first-sight), NOT
+        thinned — eviction must never cause false thinning.
+    - id: wraparound_high_ackno
+      generate: |
+        Use a watermark near the 32-bit ack-number boundary and a following ACK
+        just above it; assert the advancing ACK forwards and a stale one drops
+        (exercises the comparison width, not sequence-wraparound semantics).
+
+  G3:
+    - id: bypass_zero_ack_flag
+      generate: |
+        Send a payload-empty segment with ACK flag CLEARED but a low "ackNo"
+        field set below the watermark. Assert FORWARDED (not a pure ACK — R5
+        requires ack flag set); a SUT that thins on the ackNo field alone
+        without checking the ACK flag wrongly drops it.
+    - id: bridge_conditional_deparser
+      generate: |
+        Send a pure-ACK that gets thinned (dropped) interleaved with one that
+        gets forwarded, in the same test sequence. Probes the conditional-
+        deparser bug class: a SUT that conditionally emits the TCP/IP headers
+        only on the forward path can corrupt the forwarded packet. Assert the
+        forwarded ACK egresses with intact, unmodified IPv4+TCP headers.
+    - id: bridge_drop_metadata_read
+      generate: |
+        Force a drop via R5 then a forward via R4 for the same flow. Probes the
+        standard_metadata drop-flag misuse bug class: assert the dropped ACK
+        produces NO egress packet and the subsequent forwarded ACK is unaffected
+        (no stale drop carried across packets).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Every harden ships a paired ease on the SAME axis.
+
+mutation_operators:
+
+  # ── axis: feature-breadth (dup-ACK fast-retransmit budget) ──────────────
+  - id: add_dup_ack_budget
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${dup_ack_budget} == 0"
+    effect: "${dup_ack_budget} ← 3"
+    feasibility_postcondition: "${dup_ack_budget} ∈ [1, 8]"
+    notes: |
+      Ease: forward the first 3 duplicate ACKs (TCP fast-retransmit threshold)
+      before thinning. Loosens R5's drop into a forward-then-thin, raising the
+      pass rate by tolerating the common-sense dup-ACK pass-through a SUT is
+      likely to implement. Activates the dup_ack_budget_boundary G2 case.
+
+  - id: remove_dup_ack_budget
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${dup_ack_budget} > 0"
+    effect: "${dup_ack_budget} ← 0"
+    feasibility_postcondition: "${dup_ack_budget} == 0"
+    notes: |
+      Harden: thin EVERY non-advancing pure-ACK immediately (most aggressive
+      filtering). Removes the budget-counter state; a SUT that forwards the
+      first few duplicates now fails. Drops the dup_ack_budget_boundary case.
+
+  # ── axis: feature-breadth (thinning direction / protocol surface) ───────
+  - id: enable_bidirectional_thinning
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${thinning_direction} == reverse_only"
+    effect: "${thinning_direction} ← bidirectional"
+    feasibility_postcondition: "${thinning_direction} == bidirectional"
+    notes: |
+      Harden: maintain and thin watermarks in BOTH directions (two connection
+      halves per 4-tuple). Doubles the per-flow state and forces correct
+      direction-keyed flow extraction; a SUT keying on a single direction
+      mis-thins the opposite half.
+
+  - id: restrict_to_reverse_only
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${thinning_direction} == bidirectional"
+    effect: "${thinning_direction} ← reverse_only"
+    feasibility_postcondition: "${thinning_direction} == reverse_only"
+    notes: |
+      Ease: thin only the single acknowledgement-bearing reverse path
+      (canonical asymmetric-link case). Halves the state and the keying surface.
+
+  # ── axis: capacity (watermark flow table) ───────────────────────────────
+  - id: shrink_flow_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${flow_table_capacity} != unbounded ∧ ${flow_table_capacity} > 64"
+    effect: "${flow_table_capacity} ← ${flow_table_capacity} / 4 ∧ ${eviction_policy} ← LRU"
+    feasibility_postcondition: "${flow_table_capacity} ≥ 16 ∧ ${eviction_policy} != none"
+    notes: |
+      Harden: shrink the watermark table 4x, forcing eviction under concurrent
+      flows. Activates flow_state_no_orphan and the capacity_eviction_fail_open
+      G2 case; a SUT with no eviction (or one that false-thins evicted flows)
+      fails.
+
+  - id: enlarge_flow_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${flow_table_capacity} != unbounded"
+    effect: "${flow_table_capacity} ← ${flow_table_capacity} * 2"
+    feasibility_postcondition: "${flow_table_capacity} ≤ 1048576"
+    notes: |
+      Ease: double the watermark table, relieving eviction pressure so more
+      flows keep exact state.
+
+  # ── axis: faithfulness (exact vs hashed watermark storage) ──────────────
+  - id: lift_to_hashed_watermark
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${faithfulness} == D5.0_exact"
+    effect: "${faithfulness} ← D5.1_hashed ∧ ${flow_table_capacity} ← min(${flow_table_capacity}, 4096)"
+    feasibility_postcondition: "${faithfulness} == D5.1_hashed"
+    notes: |
+      Harden: store watermarks in a hash-indexed register array (collisions
+      possible). The thinning decision MUST remain fail-open under collision —
+      no_false_thinning still binds — so a SUT must forward when the hashed
+      cell is ambiguous rather than thinning on a colliding flow's watermark.
+
+  - id: revert_to_exact_watermark
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${faithfulness} == D5.1_hashed"
+    effect: "${faithfulness} ← D5.0_exact"
+    feasibility_postcondition: "${faithfulness} == D5.0_exact"
+    notes: |
+      Ease: return to an exact per-4-tuple watermark (no collisions), removing
+      the fail-open-under-collision burden.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations in v1model P4:
+
+    Canonical (thinning_direction: reverse_only, dup_ack_budget: 0,
+               faithfulness: D5.0_exact, flow_table_capacity: unbounded):
+      - Parser: ethernet → ipv4 (proto==6) → tcp. Compute payload_len =
+        ipv4.totalLen - (ipv4.ihl*4) - (tcp.dataOffset*4) in the ingress
+        control; payload_len==0 distinguishes a pure ACK from a data segment.
+      - One register array `ack_watermark` indexed by hash(4-tuple) (or an
+        exact-match table for D5.0). On a pure ACK (tcp.ack==1, payload_len==0,
+        no syn/fin/rst):
+            read w = watermark[idx];
+            if (first_sight || tcp.ackNo > w) { watermark[idx] = tcp.ackNo; forward; }
+            else { drop; }       // dup_ack_budget==0
+      - First-sight detection: a `valid` companion register bit, or a sentinel
+        watermark value, so an unseen flow forwards (R3) rather than comparing
+        against 0.
+      - Everything that is NOT a thinnable pure-ACK forwards unchanged (R0/R1/
+        R2): test the ACK flag, payload_len, and SYN/FIN/RST BEFORE the
+        watermark compare.
+
+  Correctness caveat (HARD CONSTRAINT — gradability):
+    * The one-sided contract: NEVER drop an ACK that ADVANCES the cumulative
+      ack (ackNo > stored watermark). Thinning on ">=" instead of ">" drops the
+      first advancing ACK and stalls the sender — no_false_thinning catches it.
+      When in doubt (collision, eviction, first-sight) the proxy FORWARDS.
+    * Thinning is purely ack-number-comparison driven by RECEIVED packets —
+      there is NO timer / time_tick / periodic origination. Observability in
+      BMv2 `--use-files` is exactly drop-vs-forward of pure-ACKs plus the
+      per-flow watermark state advanced by the ACK sequence, so the suite is
+      fully gradable without injected ticks.
+
+  Anti-pattern implementations to reject:
+    * Thinning on the ackNo field without checking tcp.ack==1 (bypass_zero_ack_flag).
+    * Thinning a data segment or a FIN/RST whose ackNo <= watermark (breaks the
+      connection / loses data) — only pure ACKs are thinnable.
+    * Comparing with ">=" (off-by-one) so an advancing ACK is dropped.
+    * Lowering the stored watermark on a stale ACK (ack_watermark_monotone).
+    * Conditional deparser emitting TCP/IP only on the forward path.
+
+  v2-deferred gap:
+    * True ACK *reconstruction* (RFC 3135 §2.4.1 — the receiving PEP regenerates
+      the thinned ACKs) requires per-tick packet origination and is NOT in
+      scope: v1.0 grades only the thinning (sending) side. The harness injects
+      no time_tick, so reconstruction/origination is unobservable here.
+
+post_instantiation_hooks: |
+  After instantiation the instance must pass schema validation, and the
+  public tests should be hand-run through the oracle for the seed.

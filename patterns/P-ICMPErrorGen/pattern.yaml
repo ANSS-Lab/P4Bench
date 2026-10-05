@@ -1,0 +1,179 @@
+# P-ICMPErrorGen — Data-plane ICMP error origination on TTL expiry
+#
+# TPL v1.0 task pattern. A forwarding router that, on TTL
+# exhaustion, ORIGINATES an ICMP Time Exceeded message back toward the source
+# (data-plane packet origination — the corpus's first data-path origination
+# beyond BFD control packets). RFC 792 (ICMP), RFC 1812 §5.2.7 / §5.3.1.
+
+pattern_id: P-ICMPErrorGen
+version: "1.0"
+nf_categories:
+  descriptive:  [D5:routing]
+  prescriptive: [P1:forwarding]
+target_capability: redesign
+summary: >
+  An IPv4 forwarder with ICMP error origination. Packets with a live TTL are
+  forwarded normally (TTL decrement, Ethernet rewrite). A packet whose TTL is
+  exhausted (≤ 1) is NOT forwarded; instead the switch ORIGINATES an ICMP Time
+  Exceeded (type 11, code 0) message whose source is the router's own address
+  and whose destination is the original packet's source, routed back toward
+  that source via the FIB. Mutation adds Destination-Unreachable origination
+  on no-route and full RFC-792 payload quoting.
+
+grounding:
+  rfcs:
+    - id: RFC792
+      cite: "RFC 792, Time Exceeded Message"
+      sections: ["Time Exceeded Message"]
+      role: canonical_spec
+      quote: >-
+        If the gateway processing a datagram finds the time to live field is zero
+        it must discard the datagram. The gateway may also notify the source host
+        via the time exceeded message. The Internet header plus the first 64 bits
+        of the original datagram's data is returned to the sender. Code 0 = time
+        to live exceeded in transit.
+      grounds: [R2_originate_time_exceeded]
+      relevance: |
+        Internet Control Message Protocol — the Time Exceeded message: type 11,
+        code 0 (TTL exceeded in transit). The message carries the IP header
+        plus the first 64 bits of the original datagram. Basis for R2's
+        originated packet (type/code + quoted header).
+    - id: RFC1812
+      cite: "RFC 1812 §5.3.1 / §4.3.2.7"
+      sections: ["5.3.1", "5.2.7", "4.3.2.7"]
+      role: normative_behaviour
+      quote: >-
+        When a router forwards a packet, it MUST reduce the TTL by one. If the
+        TTL is reduced to zero, the packet MUST be discarded and, if the
+        destination is not a multicast address, the router SHOULD return an ICMP
+        Time Exceeded message to the source. An ICMP error message MUST NOT be
+        sent as the result of receiving an ICMP error message.
+      grounds: [R1_decrement_ttl, R2_originate_time_exceeded, R3_no_error_for_error]
+      relevance: |
+        Requirements for IPv4 Routers — §5.3.1: a datagram whose TTL reaches 0
+        MUST be discarded and an ICMP Time Exceeded SHOULD be sent to the
+        source. §4.3.2.7: an ICMP error MUST NOT be generated in response to an
+        ICMP error (loop prevention). Basis for R2 and R3.
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "Forwarded on live TTL; triggers an originated ICMP packet on expiry."
+  route:                                    # the TPL `bucket` role
+    keyed_by_lpm: hdr.ipv4.dst
+    attrs: {egress_port: port, next_hop_mac: address, port_mac: address}
+    notes: "FIB used both for normal forwarding and to route the ICMP error to the source."
+
+parameters:
+  routes:
+    type: list[route_entry]
+    constraint: "each has prefix, egress_port, MACs"
+  router_ip:
+    type: ipv4
+    default: "10.0.0.254"
+    notes: "The router's own source address for originated ICMP messages."
+  emit_dest_unreachable:
+    type: bool
+    default: false
+    notes: "When true, also originate ICMP Destination Unreachable on no-route (mutation)."
+  faithfulness:
+    type: enum
+    values: [D.time_exceeded, D.full_icmp]
+    default: D.time_exceeded
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then: [drop]
+  - id: R1_forward_live_ttl
+    when: "header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧ exists(route, lpm(hdr.ipv4.dst))"
+    given:
+      route: by_lpm(hdr.ipv4.dst, ${routes})
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, route.port_mac)
+      - set(hdr.ethernet.dst, route.next_hop_mac)
+      - forward(route.egress_port)
+    notes: "Normal forward: TTL decrement + L2 rewrite; addresses preserved."
+  - id: R2_ttl_expiry_icmp
+    when: "header_present(ipv4) ∧ hdr.ipv4.ttl ≤ 1 ∧ ¬is_icmp_error(packet)"
+    given:
+      route: by_lpm(hdr.ipv4.src, ${routes})    # route the error toward the original source
+    then:
+      - "emit(icmp_time_exceeded(eth.src=route.port_mac, eth.dst=route.next_hop_mac, ip.src=${router_ip}, ip.dst=orig.ip.src, type=11, code=0, quote=orig.header+8B))"
+      - "forward_originated(route.egress_port)"
+      - "drop(orig)"
+    notes: |
+      TTL exhausted → originate an ICMP Time Exceeded toward the source. The
+      originated packet's IP source is the router, its destination is the
+      original packet's source, protocol is 1 (ICMP), and it is routed out the
+      FIB port toward that source. The original packet is not forwarded.
+  - id: R3_no_route_drop
+    when: "header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧ ¬exists(route, lpm(hdr.ipv4.dst))"
+    then: [drop]
+    notes: "No route for a live packet → drop (Dest-Unreachable origination is a mutation)."
+
+invariants:
+  - id: icmp_type_code
+    clause: stability
+    target: "(originated.icmp.type, originated.icmp.code)"
+    while: "rule R2 fires"
+    notes: "RFC 792 — Time Exceeded is type 11, code 0."
+  - id: icmp_addressing
+    clause: stability
+    target: "(originated.ip.src, originated.ip.dst)"
+    while: "rule R2 fires"
+    notes: "Originated IP src = router_ip; dst = original packet's source."
+  - id: no_icmp_to_icmp
+    clause: no_loop
+    target: any_packet
+    while: "rule R2 fires"
+    notes: "RFC 1812 §4.3.2.7 — never originate an ICMP error for an ICMP error."
+
+test_scaffolding:
+  G1:
+    - id: ttl_expiry_originates_icmp
+      generate: "TTL==1 transit packet → ICMP Time Exceeded (type 11) to the source via the FIB port."
+    - id: normal_forward_live_ttl
+      generate: "TTL>1 packet → normal forward with TTL decrement + L2 rewrite."
+    - id: icmp_addressed_to_source
+      generate: "Assert the originated packet's dst == original src and src == router IP."
+  G2:
+    - id: ttl_zero_originates_icmp
+      generate: "TTL==0 → also originates ICMP Time Exceeded."
+    - id: drop_no_route_live
+      generate: "Live TTL but no route for the destination → drop."
+  G3:
+    - id: drop_non_ipv4
+      generate: "ARP / non-IPv4 → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_dest_unreachable
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${emit_dest_unreachable} == false"
+    effect: "${emit_dest_unreachable} ← true (originate Dest-Unreachable on no-route too)"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+  - id: require_full_quote
+    axis: strictness
+    direction: harden
+    applicable_when: "${faithfulness} == D.time_exceeded"
+    effect: "${faithfulness} ← D.full_icmp (verify the quoted original header + 8 bytes)"
+    d_axis_delta: {D7: +1, test_rigor: +1}
+
+bridging_notes: |
+  Canonical implementation:
+    - Normal path: LPM FIB on ipv4.dst → forward with TTL-- + L2 rewrite.
+    - On ttl<=1: the switch must EMIT a new packet. In BMv2 this is typically
+      done in-place (rewrite the IPv4 header into an ICMP Time Exceeded and
+      route it to the original source) or via clone3()+egress rewrite. The
+      originated packet: ether rewrite per the FIB entry for the ORIGINAL
+      SOURCE; ipv4.src=router_ip, ipv4.dst=orig.src, protocol=1; ICMP type=11
+      code=0; (optionally the quoted original header).
+    - The error is routed by looking up the ORIGINAL SOURCE in the FIB.
+  Anti-patterns:
+    * Forwarding the TTL-expired packet instead of dropping + originating.
+    * Routing the ICMP error by the original destination (it goes to the source).
+    * Generating an ICMP error for an inbound ICMP error (loop).

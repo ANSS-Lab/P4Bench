@@ -1,0 +1,253 @@
+{
+  "oracle_hash": "ec10f5359e8757b9bdeda0f07477a3c1c0328017da0e531a16d8ea6f2a5f792e",
+  "instance": "bfd_frr_anchor-default",
+  "ran_at": "2026-06-17T01:17:52.943650Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_detect_mult_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_ttl_not_255_single_hop_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_session_lookup_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_version_ne_1_drop_at_d5_1",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_valid_bfd_consumed",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_primary_down_forward_backup",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_recovery_then_primary_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_phantom_reroute_primary",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_frr_table_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_frr_miss_use_default_no_catchall_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_cascaded_double_down_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_exhausted_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "lpm_match_primary_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_ttl_relaxed_single_hop_accepts",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_frr_ttl_decrement_relaxed_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_detect_mult_nonzero_accepts",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "liveness_drives_reroute": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_phantom_reroute": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "recovery_restores_primary": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "detection_to_reroute_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "bfd_control_not_rerouted": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "detection_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "local_discriminator_persistence": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "session_state_advance_monotonic_in_normal_path": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "emit_packet_structure_completeness": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "ttl_255_on_emit_when_single_hop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "link_register_stability_under_no_state_change": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_primary": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness_on_backup": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "failover_decision_per_packet": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "failover_bounded_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_links": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "liveness_drives_reroute",
+      "no_phantom_reroute",
+      "recovery_restores_primary",
+      "detection_to_reroute_bounded_latency",
+      "bfd_control_not_rerouted",
+      "detection_bounded_latency",
+      "local_discriminator_persistence",
+      "session_state_advance_monotonic_in_normal_path",
+      "emit_packet_structure_completeness",
+      "ttl_255_on_emit_when_single_hop",
+      "link_register_stability_under_no_state_change",
+      "ttl_quantum_one",
+      "ip_addr_preservation",
+      "ether_rewrite_correctness_on_primary",
+      "ether_rewrite_correctness_on_backup",
+      "failover_decision_per_packet",
+      "failover_bounded_latency",
+      "no_orphan_links",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "purr_conext19",
+      "rfc5880",
+      "rfc5881",
+      "rfc5883"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,457 @@
+# P-DSCPConstTable — DiffServ BA classifier (DSCP → PHB class via const table)
+#
+# TPL v1.0 task pattern. A DiffServ Behaviour-Aggregate (BA)
+# classifier: read the 6-bit DSCP from the IPv4 DS field, map it through a
+# FIXED codepoint→class table to a per-hop-behaviour (PHB) class, and forward
+# to that class's egress port. No header rewrite, no per-flow state.
+#
+# Differentiation:
+#  - vs P-DiffServClassifier (D6:qos / P6:marking / scale_up): that is the
+#    MULTI-FIELD (MF) classifier keyed on the 5-tuple that REMARKS the DSCP.
+#    P-DSCPConstTable is the BA classifier — keyed on the DS field ALONE,
+#    classify-and-FORWARD, no remark (RFC 2475 §1.2 distinguishes BA from MF).
+#  - vs P-ACL / P-PortRangeClassifier (D7/P4): those are runtime-installed
+#    policy tables. Here the codepoint→PHB map is FIXED protocol semantics
+#    (RFC 2474: "the value of the field as a table index"), so the natural P4 is
+#    a compile-time `const entries` table on a `bit<6>` key with the codepoints
+#    as an `enum bit<6>`. This pattern is the vehicle for the `enum bit<W>` +
+#    `const entries` language-feature coverage gap.
+# Instances are produced by binding the parameters below.
+
+pattern_id: P-DSCPConstTable
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D6:qos]                                # DiffServ DSCP/PHB classification (QoS)
+  prescriptive: [P4:policy]                             # composite-condition match-action; "ACLs, classification" (Table 1 P4)
+target_capability: redesign                             # P4 row column — programmability redesigns the fixed-function DSCP classifier
+summary: >
+  A DiffServ Behaviour-Aggregate (BA) classifier (RFC 2475 §1.2): read the
+  6-bit DSCP from the IPv4 DS field (ignoring the low 2 CU/ECN bits), map the
+  codepoint through a FIXED codepoint→PHB-class table to a forwarding class, and
+  forward the packet UNCHANGED out that class's egress port. The map is fixed
+  protocol semantics (RFC 2474: select the PHB "by treating the value of the
+  field as a table index"), so the natural realisation is a compile-time
+  `const entries` table keyed `exact` on a `bit<6>` DSCP with the standardised
+  codepoints (EF, AF11..AF43, CS0..CS7, BE) named as an `enum bit<6>`. An
+  unmapped codepoint, or a frame with no IPv4 DS field, takes the default
+  (Best-Effort) class. Anchor instances map a handful of codepoints to distinct
+  egress ports; the parameter-rebinding surface lifts the codepoint set, the class
+  count, the table capacity, and the default-action policy independently.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                            # DiffServ classification is mature engineering — no research-publication slot.
+
+  rfcs:
+    - id: RFC2474
+      sections: ["3"]
+      role: normative_behaviour
+      grounds: const_codepoint_table
+      quote: >-
+        DS-compliant nodes MUST select PHBs by matching against the entire
+        6-bit DSCP field, e.g., by treating the value of the field as a table
+        index which is used to select a particular packet handling mechanism
+        which has been implemented in that device.
+      quote_source: patterns/P-DSCPConstTable/grounding/RFC2474.txt
+      relevance: |
+        Definition of the DS field. The DSCP is a 6-bit value whose
+        PHB is selected "by treating the value of the field as a table
+        index" — a FIXED, compile-time-known map from the finite set of
+        standardised codepoints to forwarding classes. That is exactly a
+        P4 table keyed `exact` on `bit<6>` with `const entries`, and the
+        named codepoints are an `enum bit<6>`. RFC 2474 §3 also requires
+        "the value of the CU field MUST be ignored by PHB selection",
+        grounding the cu_bits_ignored invariant (mask off the low 2 bits
+        of the DS octet before classifying).
+    - id: RFC2475
+      sections: ["1.2"]
+      role: domain_concepts
+      grounds: ba_classifier
+      quote: >-
+        a classifier that selects packets based only on the contents of the
+        DS field.
+      quote_source: patterns/P-DSCPConstTable/grounding/RFC2475.txt
+      relevance: |
+        Defines the Behaviour-Aggregate (BA) classifier — classification
+        on the DS field ALONE — the leaf this pattern occupies, distinct
+        from the multi-field (MF) classifier of P-DiffServClassifier
+        (which keys on the 5-tuple and remarks). The BA classifier steers
+        on the codepoint and FORWARDS without rewriting headers.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The decision is a pure function of the
+      6-bit DSCP (top 6 bits of hdr.ipv4.diffserv/TOS) and the fixed map.
+
+  bucket:                                  # plays the TPL `bucket` role — the fixed codepoint→class map
+    keyed_by_tuple: [dscp]
+    attrs:
+      class_port: "bit<9>"                 # egress port bound to the PHB class
+    capacity: ${rule_count_capacity}
+    notes: |
+      The codepoint→PHB-class table. Conceptually one entry per mapped
+      DSCP value; the map is FIXED (const entries), not runtime policy.
+      |mapped codepoints| ≤ ${rule_count_capacity}.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  dscp_class_map:
+    type: dict[dscp, class_port]
+    constraint: |
+      every key is a 6-bit DSCP ∈ [0,63] drawn from ${codepoint_set};
+      every value is one of the ${class_count} configured egress ports;
+      |dscp_class_map| ≤ ${rule_count_capacity}.
+    notes: |
+      The fixed codepoint→class-port map the data plane consults. For the
+      anchor: {EF(46)→p2, AF11(10)→p3, BE(0)→p4}.
+
+  codepoint_set:
+    type: enum
+    values: [core, af_full, all_standard]
+    default: core
+    notes: |
+      Which standardised codepoints the classifier knows. `core`: {BE,
+      EF, AF11} — three classes. `af_full`: + the full AFxy matrix
+      (AF11..AF43) and CS1..CS7. `all_standard`: every standardised
+      codepoint. Widening grows the const-entries table and the enum.
+
+  class_count:
+    type: int
+    range: "[2, 8]"
+    default: 3
+    notes: |
+      Number of distinct PHB classes (egress ports). The anchor's 3 map
+      EF/AF11/BE to ports {2,3,4}.
+
+  rule_count_capacity:
+    type: int | unbounded
+    range: "[4, 64]"
+    default: 64
+    notes: |
+      Capacity of the codepoint→class table (≤ 64, the DSCP space being
+      small). shrink_capacity exercises coalescing distinct codepoints
+      into shared classes.
+
+  default_action:
+    type: enum
+    values: [forward_default_class, deny]
+    default: forward_default_class
+    notes: |
+      Behaviour for a codepoint not in the map, or a frame with no IPv4
+      DS field. forward_default_class → the Best-Effort class port; deny
+      → drop. The implementation MUST declare the table's default_action.
+
+  default_class_port:
+    type: int
+    range: "[1, 511]"
+    default: 4
+    notes: |
+      Egress port of the default / Best-Effort class.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+
+rules:
+
+  - id: R0_no_ds_field_default
+    when: "¬header_present(ipv4)"
+    then:
+      - drop                                                       # when ${default_action} == deny; else forward to default_class_port (R0b)
+    notes: |
+      A frame with no IPv4 header has no DS field to classify on → the
+      ${default_action} branch. The implementation MUST NOT read a DSCP from a
+      non-IPv4 frame (the "Read from invalid header" bug).
+
+  - id: R1_dscp_mapped_forward
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, match(dscp(hdr.ipv4), dscp_class_map))
+    given:
+      bucket: dscp_class_map[dscp(hdr.ipv4)]
+    then:
+      - forward(bucket.class_port)
+    notes: |
+      The packet's DSCP (top 6 bits of the DS octet; the low 2 CU/ECN
+      bits are masked off and IGNORED, RFC 2474 §3) is a key of the fixed
+      map → forward UNCHANGED out the mapped class's egress port. No
+      header rewrite (BA classifier, not a marker).
+
+  - id: R2_dscp_unmapped_default_forward
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(bucket, match(dscp(hdr.ipv4), dscp_class_map))
+        ∧ ${default_action} == forward_default_class
+    then:
+      - forward(${default_class_port})
+    notes: |
+      A codepoint not in the map → the default / Best-Effort class.
+
+  - id: R2b_dscp_unmapped_default_deny
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(bucket, match(dscp(hdr.ipv4), dscp_class_map))
+        ∧ ${default_action} == deny
+    then:
+      - drop
+    notes: |
+      Default-deny variant: an unmapped codepoint is dropped. A P4 program
+      realises this via `default_action = drop;` — omission is the common
+      v1model missing-default_action bug.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: const_map_correctness
+    clause: stability
+    target: chosen_class
+    while: "R1 fires"
+    notes: |
+      A mapped codepoint MUST route to its map-assigned class port, and
+      the map is FIXED (const entries / immutable) — it does not depend on
+      runtime control-plane state. Catches an implementation that makes the map a
+      mutable runtime table seeded wrong, or that swaps two codepoints.
+
+  - id: cu_bits_ignored
+    clause: stability
+    target: chosen_class
+    while: "R1, R2 fire"
+    notes: |
+      Classification MUST use only the top 6 bits of the DS octet; the low
+      2 CU/ECN bits MUST be ignored (RFC 2474 §3). Catches an implementation that
+      keys on the whole 8-bit TOS byte, so the same codepoint with ECN set
+      mis-classifies. Witness: (tos, dscp=tos>>2, chosen_class) — two
+      packets with the same DSCP but different ECN bits route identically.
+
+  - id: default_class_correctness
+    clause: stability
+    target: decision
+    while: "R0, R2, R2b fire"
+    notes: |
+      An unmapped codepoint or a non-IPv4 frame MUST take ${default_action}.
+
+  - id: class_routes_to_named_port
+    clause: stability
+    target: egress_port
+    while: "R1 fires"
+    notes: |
+      A classified packet MUST egress its class's port, not a downstream
+      routing decision.
+
+  - id: ds_classify_header_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.diffserv, hdr.ipv4.ttl)"
+    while: "R1 fires"
+    free_under: []
+    notes: |
+      The BA classifier FORWARDS without rewriting — distinct from the MF
+      classifier/marker (P-DiffServClassifier), which rewrites the DSCP.
+      In particular hdr.ipv4.diffserv (incl. DSCP) is preserved on egress.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Single-pass, stateless: no recirculation of a classified packet.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: mapped_codepoint_to_class
+      generate: |
+        Send an IPv4 packet whose DSCP is a mapped codepoint (e.g. EF=46);
+        assert forward out that class's egress port, headers unchanged
+        (R1; class_routes_to_named_port + ds_classify_header_preservation).
+
+    - id: per_class_branch
+      requires: "${class_count} >= 2"
+      generate: |
+        Send one packet per mapped codepoint (EF, AF11, BE …); assert each
+        egresses its own class port. Mirrors G1-P1-T1 (one (in,out) path)
+        and G1-P1-T3 (one per action).
+
+    - id: cu_bits_ignored_same_class
+      generate: |
+        Send two packets with the SAME DSCP but different ECN/CU bits
+        (e.g. EF with ECN=00 and ECN=11, TOS 184 vs 187). Assert BOTH route
+        to the same class port (cu_bits_ignored). Catches keying on the
+        whole TOS byte.
+
+  G2:
+    - id: unmapped_codepoint_to_default
+      generate: |
+        Send an IPv4 packet with a codepoint NOT in the map (e.g. CS6=48);
+        assert the outcome equals ${default_action} (forward to default
+        class port, or drop). Tests default_class_correctness / "Missing
+        default_action".
+
+    - id: non_ipv4_to_default
+      generate: |
+        Send a non-IPv4 frame (ARP); assert the ${default_action} branch
+        and that no garbage DS field is read. "Read from invalid header".
+
+    - id: table_capacity
+      requires: "${rule_count_capacity} != unbounded"
+      generate: |
+        Map ${rule_count_capacity} codepoints; assert all classify
+        correctly (the const-entries table holds the full standardised set
+        at capacity).
+
+  G3:
+    - id: default_action_compile_gate
+      generate: |
+        Assert the solution declares an explicit default action: an
+        unmapped codepoint must NOT silently black-hole. (Missing
+        default_action is a common v1model compile/behaviour failure.)
+
+    - id: ecn_smuggle_no_reclassify
+      generate: |
+        Send a mapped codepoint with adversarial ECN bits set; assert the
+        ECN bits do not change the class AND are preserved on egress
+        (cu_bits_ignored + header preservation). Catches an implementation that
+        folds ECN into the key or rewrites the DS octet.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: expand_codepoint_set
+    applicable_when: "${codepoint_set} ≠ all_standard"
+    effect: "${codepoint_set} ← next of {core → af_full → all_standard}"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "|${dscp_class_map}| ≤ ${rule_count_capacity}"
+    notes: |
+      Grow the known codepoint set (and the const-entries table + enum).
+      Pairs with contract_codepoint_set.
+
+  - id: contract_codepoint_set
+    applicable_when: "${codepoint_set} ≠ core"
+    effect: "${codepoint_set} ← previous of {core ← af_full ← all_standard}"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Shrink the codepoint set. Pairs with expand_codepoint_set.
+
+  - id: expand_class_count
+    applicable_when: "${class_count} < 8"
+    effect: "${class_count} ← min(${class_count} * 2, 8)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${class_count} ≤ 8"
+    notes: |
+      Add PHB classes / egress ports. Pairs with contract_class_count.
+
+  - id: contract_class_count
+    applicable_when: "${class_count} > 2"
+    effect: "${class_count} ← max(${class_count} / 2, 2)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${class_count} ≥ 2"
+    notes: |
+      Collapse PHB classes (multiple codepoints share a class). Pairs with
+      expand_class_count.
+
+  - id: shrink_table_capacity
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} > 8"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} / 2"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 4 ∧ |${dscp_class_map}| ≤ ${rule_count_capacity}"
+    notes: |
+      Tighten the const-table capacity, forcing codepoint coalescing.
+      Pairs with enlarge_table_capacity.
+
+  - id: enlarge_table_capacity
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} < 64"
+    effect: "${rule_count_capacity} ← min(${rule_count_capacity} * 2, 64)"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${rule_count_capacity} ≤ 64"
+    notes: |
+      Loosen the const-table capacity. Pairs with shrink_table_capacity.
+
+  - id: flip_default_to_deny
+    applicable_when: "${default_action} == forward_default_class"
+    effect: "${default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "|${dscp_class_map}| ≥ 1"
+    notes: |
+      Drop unmapped codepoints instead of defaulting them to Best-Effort.
+      Pairs with flip_default_to_forward.
+
+  - id: flip_default_to_forward
+    applicable_when: "${default_action} == deny"
+    effect: "${default_action} ← forward_default_class"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Default unmapped codepoints to the Best-Effort class. Pairs with
+      flip_default_to_deny.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common v1model P4 implementations:
+
+    Anchor (core codepoint set, class_count 3, default forward):
+      - Named codepoints as a serializable enum:
+          enum bit<6> Dscp { BE = 0, AF11 = 10, EF = 46 }
+      - One table keyed exact on the DSCP with COMPILE-TIME const entries:
+          action set_class(bit<9> port){ standard_metadata.egress_spec = port; }
+          table dscp_phb {
+            key = { (hdr.ipv4.diffserv >> 2) : exact; }   // mask CU/ECN
+            actions = { set_class; }
+            const entries = {
+              (bit<6>)Dscp.EF   : set_class(2);
+              (bit<6>)Dscp.AF11 : set_class(3);
+              (bit<6>)Dscp.BE   : set_class(4);
+            }
+            default_action = set_class(4);   // default / Best-Effort class
+          }
+      - meta DSCP = hdr.ipv4.diffserv[7:2] (or >> 2). The low 2 bits
+        (ECN/CU) are NOT part of the key.
+      - No header rewrite on the forward path.
+
+  Anti-pattern implementations to reject:
+    * Keying on the full 8-bit hdr.ipv4.diffserv (TOS) — the same DSCP with
+      ECN set mis-classifies. cu_bits_ignored catches it.
+    * Using a runtime table_add instead of `const entries` for a FIXED map —
+      not wrong behaviourally, but defeats the pattern's purpose; the
+      sanitised spec describes a fixed protocol map, so a clean solution uses
+      const entries. (The harness grades behaviour, so this is a review note.)
+    * Omitting default_action — unmapped codepoints black-hole (a common v1model bug).
+    * Rewriting the DSCP (confusing the BA classifier with the MF marker).
+      ds_classify_header_preservation catches it.
+    * Reading the DS field from a non-IPv4 frame. non_ipv4_to_default catches it.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+    1. The instance must pass schema validation and the oracle audit.
+    2. The oracle reads dscp_class_map / default_action / default_class_port
+       from state["config"] (parametric source). A canonical_examples entry
+       must straddle default_action (mapped vs unmapped under forward vs deny)
+       and cu_bits_ignored (same DSCP, different ECN → same class).
+    3. P-DSCPConstTable shares the QoS space with P-DiffServClassifier but is
+       the BA (DS-field-only, forward, no remark) classifier; when a mutation
+       adds a remark action, prefer P-DiffServClassifier instead.

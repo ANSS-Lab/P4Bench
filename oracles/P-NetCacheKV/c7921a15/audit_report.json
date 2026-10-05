@@ -1,0 +1,159 @@
+{
+  "oracle_hash": "9fc8667834c24b1a50064836c6f151cb848e317b6791ca9470c5c0e62c40eb5f",
+  "instance": "netcache_kv_anchor-default",
+  "ran_at": "2026-06-17T15:50:58.747759Z",
+  "canonical_examples": {
+    "passed": 16,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_kv_client_to_backend",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_non_kv_backend_reply_to_client",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_get_hit_originate_response",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_get_miss_uncached_key",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_collision_distinct_key_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_put_invalidates_then_get_misses",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_put_invalidates_only_target_key",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_put_non_cached_key_forward_only",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_delete_under_get_put_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_put_under_get_only_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "delete_under_get_put_delete_invalidates_then_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_revalidate_cycle_miss_then_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_disabled_server_reply_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "cold_start_empty_cache_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "value_width_boundary_all_ones_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "param_coherence_write_through",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "cache_hit_value_correct": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_cross_key_contamination": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "write_invalidation_coherence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "revalidation_coherence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "request_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "hit_response_well_formed": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "bounded_origination_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "cache_hit_value_correct",
+      "no_cross_key_contamination",
+      "write_invalidation_coherence",
+      "revalidation_coherence",
+      "request_no_orphan",
+      "hit_response_well_formed",
+      "bounded_origination_latency"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "netcache_sosp17",
+      "distcache_fast19"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

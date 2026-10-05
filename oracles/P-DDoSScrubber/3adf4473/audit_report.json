@@ -1,0 +1,111 @@
+{
+  "oracle_hash": "4e3c20da264c207d6c70de5825a333d6dd22231de0fce359633448d6898c916b",
+  "instance": "ddos_scrubber_anchor-default",
+  "ran_at": "2026-06-15T23:14:39.295340Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "acl_deny_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "syn_cookie_challenge",
+        "status": "pass"
+      },
+      {
+        "example_id": "heavy_synflood_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "below_threshold_challenged",
+        "status": "pass"
+      },
+      {
+        "example_id": "validated_ack_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "deny_short_circuits_detection",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_deny_drops_unlisted_syn",
+        "status": "pass"
+      },
+      {
+        "example_id": "disabled_acl_challenges_blocklisted",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "acl_priority_over_both": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "detect_before_challenge": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "cookie_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_state_on_unvalidated_syn": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "acl_priority_over_both",
+      "detect_before_challenge",
+      "cookie_correctness",
+      "no_state_on_unvalidated_syn",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Liu et al., Jaqen: A High-Performance Switch-Native Approach for Detecting and Mitigating Volumetric DDoS Attacks, USENIX Security 2021",
+      "Zhang et al., Poseidon: Mitigating Volumetric DDoS Attacks with Programmable Switches, NDSS 2020",
+      "Yang et al., Elastic Sketch: Adaptive and Fast Network-wide Measurements, SIGCOMM 2018",
+      "RFC4987",
+      "RFC3198",
+      "RFC1812"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

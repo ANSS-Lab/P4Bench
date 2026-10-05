@@ -1,0 +1,140 @@
+{
+  "oracle_hash": "f2e4120b933733d300d2873edfd3a4a61093c58edcfa7d13b19518108e33be94",
+  "instance": "ipv6_router_anchor-default",
+  "ran_at": "2026-06-16T20:44:38.184201Z",
+  "canonical_examples": {
+    "passed": 15,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv6_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_hoplimit_one_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_hoplimit_zero_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_forward_hoplimit_two",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_forward_distinct_prefix",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_nextheader_agnostic_udp",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_longest_prefix_host_route",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_shorter_prefix_when_host_misses",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_routes_knob_injected_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "multipath_mode_ecmp_singleton_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_link_local_drop_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_link_local_filter_off_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_multicast_drop_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_multicast_filter_off_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "hoplimit_quantum_one": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip6_addr_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "lpm_longest_match_correctness",
+      "ether_rewrite_correctness",
+      "ecmp_flow_consistency"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC8200",
+      "RFC4291",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

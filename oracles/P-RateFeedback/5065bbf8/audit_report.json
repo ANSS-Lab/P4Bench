@@ -1,0 +1,117 @@
+{
+  "oracle_hash": "4b4220d910db191c65ab5a5ec8d2d4e0d928106d932f1c94703217f1db0b39d6",
+  "instance": "rate_feedback_anchor_mut1-xcp_perdscp_window",
+  "ran_at": "2026-06-17T16:05:56.789712Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "no_feedback_ipv4_class1_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_feedback_ipv4_class2_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_feedback_ipv4_class3_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "udp_non_feedback_port_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_default_action_drop_no_feedback",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_feedback_semantics_xcp_no_feedback_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_path_min_strict_off_no_feedback_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_aggregation_and_keying_no_feedback_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_target_rate_low_no_feedback_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "path_minimum_monotone": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "signal_persistence_within_window": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "feedback_field_value_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "forwarding_independence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_packet_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "path_minimum_monotone",
+      "signal_persistence_within_window",
+      "feedback_field_value_correctness",
+      "forwarding_independence",
+      "no_packet_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rcp_dukkipati_stanford",
+      "xcp_katabi_sigcomm02",
+      "hpcc_sigcomm19",
+      "RFC4782"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

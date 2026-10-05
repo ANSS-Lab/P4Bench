@@ -1,0 +1,591 @@
+task_name: vxlan_vtep_disc
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-VXLANTunnel
+pattern_version: '1.0'
+
+seed:
+  access_port_bindings:
+    - {port: 1, access_vni: 100}
+    - {port: 2, access_vni: 200}
+  uplink_ports: [3]
+  vni_mac_remote_fib_entries:
+    - {vni: 100, inner_dmac: "08:00:00:00:10:01", remote_vtep_ip: "192.168.20.1"}
+    - {vni: 200, inner_dmac: "08:00:00:00:20:01", remote_vtep_ip: "192.168.20.1"}
+  vni_mac_local_fib_entries:
+    - {vni: 100, inner_dmac: "08:00:00:00:01:01", access_egress_port: 1}
+    - {vni: 200, inner_dmac: "08:00:00:00:02:02", access_egress_port: 2}
+  underlay_fib_entries:
+    - {remote_vtep_ip: "192.168.20.1", uplink_egress_port: 3,
+       outer_dst_mac: "aa:bb:cc:00:00:01", outer_src_mac: "aa:bb:cc:00:01:01"}
+  local_vtep_ip: "192.168.10.1"
+  outer_udp_dst_port: 4789
+  outer_udp_src_port_mode: hash_inner_5tuple
+  flag_strictness: strict
+  vni_isolation_strict: true
+  bum_handling: drop
+  mtu_enforcement: ignore
+  outer_udp_checksum_mode: zero_on_tx
+
+description: |
+  A switch s1 sits between two tenant access ports and one underlay
+  uplink and acts as a Virtual eXtensible LAN (VXLAN) Tunnel Endpoint
+  per RFC 7348. The switch encapsulates inner Ethernet frames it
+  receives on a tenant access port into outer Ethernet + IPv4 + UDP +
+  VXLAN headers and forwards them out the underlay uplink toward the
+  remote VTEP that hosts the destination tenant VM; and it strips
+  the four outer headers off VXLAN-encapsulated frames it receives on
+  the underlay uplink and forwards the inner frame to the matching
+  tenant access port.
+
+  ## What a VXLAN-encapsulated packet looks like on the wire
+
+  An on-the-wire VXLAN frame is built as
+
+    outer Ethernet  /  outer IPv4  /  UDP  /  VXLAN  /  inner Ethernet  /  inner payload
+
+  with these requirements per RFC 7348 §5:
+
+    - Outer UDP destination port is 4789.
+    - The VXLAN header is 8 bytes. Its first byte is a flags byte
+      whose bit 0x08 — the "I" flag — MUST be set to 1 on
+      transmission and indicates that the VNI field is valid. The
+      other 7 bits of the flags byte are reserved and MUST be set
+      to zero on transmission.
+    - The VXLAN header carries a 24-bit VNI (VXLAN Network
+      Identifier) that identifies the tenant segment the inner
+      frame belongs to.
+    - Two reserved blocks (24 bits before the VNI and 8 bits after
+      the VNI) MUST be set to zero on transmission.
+    - The outer UDP source port SHOULD be drawn from the dynamic /
+      private range (49152..65535) and SHOULD be derived from a
+      hash of the inner frame's headers so that the underlay
+      fabric's ECMP can spread overlay flows.
+
+  ## Per-packet behaviour
+
+  Every ingress frame falls into exactly one of the cases below.
+  Each tenant access port is bound to a single tenant identifier
+  (its access VNI); the uplink port carries VXLAN-encapsulated
+  traffic only.
+
+   1. **Decap path** (frame arrives on the uplink port and is a
+      well-formed VXLAN packet):
+
+      a. Validate the outer UDP destination port equals 4789;
+         otherwise the frame is not a VXLAN frame and is dropped.
+
+      b. Validate the VXLAN flags and reserved fields per RFC 7348
+         §5: the I flag MUST be 1; all 7 reserved bits in the
+         flags byte MUST be 0; both reserved blocks (24-bit and
+         8-bit) MUST be 0. Any violation MUST cause the packet to
+         be dropped.
+
+      c. Look up the inner destination MAC under the received VNI
+         in a pre-installed local-delivery table. On miss, drop.
+
+      d. **Tenant-isolation safeguard.** Verify that the tenant
+         access port returned by the lookup is itself bound to
+         the SAME VNI as the one carried in the received VXLAN
+         header. If the lookup yields an access port bound to a
+         different tenant, the packet MUST be dropped — VXLAN
+         must isolate tenants even when the local-delivery table
+         is misconfigured.
+
+      e. Strip the outer Ethernet, outer IPv4, UDP, and VXLAN
+         headers — the deparser MUST emit the inner Ethernet
+         and everything beneath it AS-IS, without modification.
+         The inner Ethernet header, inner IPv4 fields (including
+         the TTL), and the L4 payload MUST be delivered to the
+         tenant access port byte-for-byte identical to what
+         arrived in the VXLAN payload. The output egress port is
+         the tenant access port resolved in (c)/(d).
+
+   2. **Encap path** (frame arrives on a tenant access port and
+      carries an inner Ethernet + IPv4 stack):
+
+      a. The ingress port's tenant identifier (its access VNI)
+         is known from a pre-installed port-binding table.
+
+      b. Look up the inner destination MAC under that VNI in a
+         pre-installed remote-MAC table. On miss, drop the frame.
+
+      c. The remote-MAC table yields the IPv4 address of the
+         remote VTEP that hosts the destination tenant VM. Look
+         that address up in a pre-installed underlay forwarding
+         table to obtain the uplink egress port and the outer
+         Ethernet rewrite (the underlay next-hop MAC and the
+         switch's own port MAC).
+
+      d. **Construct every field of the four new outer headers
+         explicitly.** The output frame's layer order MUST be
+         outer Ethernet / outer IPv4 / UDP / VXLAN / inner
+         Ethernet / inner IPv4 / ... and each new outer header
+         field MUST be assigned a defined value (no
+         uninitialised bytes):
+
+           - Outer Ethernet: source MAC = the switch's own port
+             MAC on the egress uplink; destination MAC = the
+             underlay next-hop MAC; ether-type = 0x0800 (IPv4).
+           - Outer IPv4: version=4, IHL=5, DSCP=0, ECN=0,
+             total-length is the outer IPv4 header length plus
+             the UDP/VXLAN/inner stack length; flags = DF bit
+             set; fragment-offset=0; TTL=64; protocol=17 (UDP);
+             source IPv4 = the local VTEP's IPv4 address (the
+             switch's configured local VTEP IP); destination
+             IPv4 = the remote VTEP IPv4 address. The outer
+             IPv4 header checksum MUST be correctly computed
+             from these new fields.
+           - UDP: destination port = 4789; UDP length covers
+             the UDP header plus payload; checksum = 0.
+           - UDP source port: derive it from a hash of the
+             inner frame's 5-tuple (inner source IPv4, inner
+             destination IPv4, inner protocol, inner L4 source
+             port, inner L4 destination port) so that the
+             underlay's ECMP can spread overlay flows; the
+             value MUST fall in the dynamic-port range
+             49152..65535.
+           - VXLAN: flags = 0x08 (I bit set, all other bits 0);
+             VNI = the ingress port's access VNI; both reserved
+             blocks (24-bit and 8-bit) = 0.
+
+      e. **Do not fragment.** A VTEP MUST NOT fragment VXLAN
+         packets (RFC 7348 §4.3). The outer IPv4 DF flag is set
+         on the wire to prevent the underlay from fragmenting.
+
+      f. **Inner frame is opaque.** The inner Ethernet header,
+         inner IPv4 header, and L4 payload MUST be carried
+         AS-IS. In particular, the inner IPv4 TTL MUST NOT be
+         decremented by the encap step — VXLAN is an L2 overlay
+         transport, not an L3 forwarding hop.
+
+      g. Forward the resulting encap frame on the uplink egress
+         port resolved in (c).
+
+      h. **BUM handling.** If the inner destination MAC has no
+         entry in the remote-MAC table under the ingress port's
+         VNI (broadcast / unknown-unicast / multicast), drop the
+         frame. (More elaborate BUM handling — head-end
+         replication or multicast — is out of scope for this
+         task.)
+
+   3. **Pass-through and out-of-scope drops.**
+
+      a. Non-IPv4 frames on a tenant access port are out of
+         scope and dropped.
+      b. Non-VXLAN UDP frames on the uplink port (UDP
+         destination port not 4789) are out of scope and
+         dropped.
+      c. Non-IPv4 / non-UDP frames on the uplink port are
+         dropped.
+      d. Frames arriving on a port that is bound to neither a
+         tenant access role nor the uplink role are dropped.
+
+  ## Topology
+
+  Three hosts on a single switch s1:
+    - h1 attaches at s1.p1. h1 represents a tenant VM in VNI 100;
+      h1's IPv4 address is 10.0.1.1; h1's MAC is 08:00:00:00:01:01.
+    - h2 attaches at s1.p2. h2 represents a tenant VM in VNI 200;
+      h2's IPv4 address is 10.0.2.2; h2's MAC is 08:00:00:00:02:02.
+    - h3 attaches at s1.p3. h3 plays the role of the underlay
+      fabric (i.e., the underlay-side peer through which the
+      remote VTEP at 192.168.20.1 is reached). h3's IPv4 address
+      is 192.168.20.1; h3's MAC is aa:bb:cc:00:00:01.
+  The local VTEP's IPv4 address (used as the outer source IPv4 on
+  every encap-path packet) is 192.168.10.1; the switch's own port
+  MAC on the uplink is aa:bb:cc:00:01:01.
+
+  ## Control plane (entries your submission must install)
+
+  Your switch program is accompanied by a control-plane entries
+  file; it MUST install exactly the following entries into its
+  tables. They are in place before any test packet arrives:
+
+   - Port s1.p1 is bound to access VNI 100; s1.p2 is bound to
+     access VNI 200; s1.p3 is the uplink.
+   - Remote-MAC table: (VNI 100, dmac 08:00:00:00:10:01) →
+     remote VTEP 192.168.20.1; (VNI 200, dmac 08:00:00:00:20:01)
+     → remote VTEP 192.168.20.1.
+   - Local-delivery table: (VNI 100, dmac 08:00:00:00:01:01) →
+     access egress port s1.p1; (VNI 200, dmac 08:00:00:00:02:02)
+     → access egress port s1.p2.
+   - Underlay forwarding table: remote VTEP 192.168.20.1 →
+     uplink port s1.p3, outer-source-MAC aa:bb:cc:00:01:01,
+     outer-destination-MAC aa:bb:cc:00:00:01.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+  h3:
+    ip: 192.168.20.1/24
+    mac: "aa:bb:cc:00:00:01"
+    port: s1.p3
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: vxlan_encap_basic_vni100
+    visibility: public
+    description: |
+      Encap path. h1 (port s1.p1, VNI 100) sends an inner IPv4/TCP
+      frame whose destination MAC matches a remote tenant in VNI
+      100. The switch MUST forward an outer Ethernet / IPv4 / UDP /
+      VXLAN-wrapped copy out the uplink (s1.p3) with the correct
+      outer src/dst IPv4, UDP dst port 4789, and VXLAN VNI = 100.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:10:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[0].Ether.src:    {action: change_to, value: "aa:bb:cc:00:01:01"}
+        layers[0].Ether.dst:    {action: change_to, value: "aa:bb:cc:00:00:01"}
+        layers[0].Ether.type:   {action: change_to, value: 2048}
+        layers[1].IP.src:       {action: change_to, value: "192.168.10.1"}
+        layers[1].IP.dst:       {action: change_to, value: "192.168.20.1"}
+        layers[1].IP.proto:     {action: change_to, value: 17}
+        layers[1].IP.ttl:       {action: change_to, value: 64}
+        layers[2].UDP.dport:    {action: change_to, value: 4789}
+        layers[3].VXLAN.vni:    {action: change_to, value: 100}
+
+  - name: vxlan_decap_basic_vni100
+    visibility: public
+    description: |
+      Decap path. A VXLAN frame arrives on the uplink (s1.p3) with
+      outer UDP dst port 4789, VXLAN VNI = 100, I flag set, all
+      reserved bits zero, and inner destination MAC matching h1's
+      MAC. The switch MUST strip the four outer headers and forward
+      the bare inner Ethernet / IPv4 / TCP frame to h1 (s1.p1)
+      unchanged.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.1.1", ttl: 64}
+        - TCP:   {sport: 80, dport: 5000, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:10:01"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.src:    {action: change_to, value: "10.0.5.5"}
+        IP.dst:    {action: change_to, value: "10.0.1.1"}
+        IP.ttl:    {action: change_to, value: 64}
+
+  - name: vxlan_encap_basic_vni200
+    visibility: public
+    description: |
+      Encap path on a different tenant. h2 (port s1.p2, VNI 200)
+      sends an inner frame to a remote VM in VNI 200. Same outer
+      header construction as VNI 100, but with VXLAN VNI = 200.
+      Verifies the encap action is correctly parameterised by the
+      ingress port's access VNI rather than baked in.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:20:01"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.6.6", ttl: 64}
+        - TCP:   {sport: 6000, dport: 443, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[1].IP.src:    {action: change_to, value: "192.168.10.1"}
+        layers[1].IP.dst:    {action: change_to, value: "192.168.20.1"}
+        layers[2].UDP.dport: {action: change_to, value: 4789}
+        layers[3].VXLAN.vni: {action: change_to, value: 200}
+
+  - name: vxlan_encap_all_outer_fields_set
+    visibility: hidden
+    description: |
+      Outer-header completeness check. After the encap action, EVERY
+      field of the four new outer headers must be a defined value —
+      none left as the uninitialised default that header-validity
+      tricks leave behind. Asserts on every outer field the spec
+      pins, plus the I flag and reserved bits explicitly. Catches
+      implementations that mark headers valid without per-field assignment.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:10:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 5001, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[0].Ether.src:       {action: change_to, value: "aa:bb:cc:00:01:01"}
+        layers[0].Ether.dst:       {action: change_to, value: "aa:bb:cc:00:00:01"}
+        layers[0].Ether.type:      {action: change_to, value: 2048}
+        layers[1].IP.version:      {action: change_to, value: 4}
+        layers[1].IP.ihl:          {action: change_to, value: 5}
+        layers[1].IP.proto:        {action: change_to, value: 17}
+        layers[1].IP.ttl:          {action: change_to, value: 64}
+        layers[1].IP.src:          {action: change_to, value: "192.168.10.1"}
+        layers[1].IP.dst:          {action: change_to, value: "192.168.20.1"}
+        layers[2].UDP.dport:       {action: change_to, value: 4789}
+        layers[2].UDP.sport:       {action: change_to_range, min: 49152, max: 65535}
+        layers[2].UDP.chksum:      {action: change_to, value: 0}
+        layers[3].VXLAN.flags:     {action: change_to, value: 8}
+        layers[3].VXLAN.vni:       {action: change_to, value: 100}
+        layers[3].VXLAN.reserved1: {action: change_to, value: 0}
+        layers[3].VXLAN.reserved2: {action: change_to, value: 0}
+
+  - name: decap_zero_udp_checksum_accepted
+    visibility: hidden
+    description: |
+      RFC 7348 §5: "When a packet is received with a UDP checksum
+      of zero, it MUST be accepted for decapsulation." Identical
+      to the basic decap test but with the outer UDP checksum set
+      explicitly to 0; the packet MUST still be decapsulated and
+      forwarded.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49200, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.7.7", dst: "10.0.1.1", ttl: 32}
+        - TCP:   {sport: 81, dport: 5001, flags: "A"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:10:01"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.src:    {action: change_to, value: "10.0.7.7"}
+        IP.dst:    {action: change_to, value: "10.0.1.1"}
+        IP.ttl:    {action: change_to, value: 32}
+
+# --- G2: robustness / boundary ---
+
+  - name: malformed_i_flag_zero_drops
+    visibility: hidden
+    description: |
+      RFC 7348 §5: "the I flag MUST be set to 1 for a valid VXLAN
+      Network ID (VNI)." Identical to the basic decap test but
+      with VXLAN flags byte = 0 (I flag NOT set). The switch MUST
+      drop.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 0, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.1.1", ttl: 64}
+        - TCP:   {sport: 80, dport: 5000, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: malformed_reserved_flag_bits_drops
+    visibility: hidden
+    description: |
+      RFC 7348 §5: the seven R bits of the VXLAN flags byte MUST be
+      zero on transmission. Identical to the basic decap test but
+      with flags byte = 0x09 (I set AND one R bit also set). The
+      switch MUST drop.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 9, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.1.1", ttl: 64}
+        - TCP:   {sport: 80, dport: 5000, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: malformed_reserved_24bit_block_drops
+    visibility: hidden
+    description: |
+      RFC 7348 §5: the 24-bit reserved block before the VNI MUST be
+      zero on transmission. The switch MUST drop a VXLAN frame with
+      that block non-zero.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 1, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:01:01"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.1.1", ttl: 64}
+        - TCP:   {sport: 80, dport: 5000, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: non_vxlan_udp_on_uplink_drops
+    visibility: hidden
+    description: |
+      A UDP frame arrives on the uplink with destination port 53
+      (DNS) — i.e., a non-VXLAN underlay packet. The uplink in this
+      task is VXLAN-only, so the switch MUST drop.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 33333, dport: 53}
+    expected:
+      behavior: drop
+
+  - name: encap_unknown_dst_bum_drops
+    visibility: hidden
+    description: |
+      Encap path with an inner destination MAC that is NOT present
+      in the remote-MAC table under the ingress port's VNI. BUM
+      handling in this task is `drop`, so the switch MUST drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:99:99"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+# --- G3: security / bypass / regression ---
+
+  - name: vni_crosswire_attempt_blocked
+    visibility: hidden
+    description: |
+      Tenant isolation. A VXLAN frame arrives on the uplink with
+      VNI = 100 and an inner destination MAC that — across the
+      whole control plane — belongs to h2 (which is in VNI 200, not
+      VNI 100). Because there is no (VNI 100, dmac h2) entry in
+      the local-delivery table, AND the strict-isolation
+      egress-side recheck would refuse the delivery anyway, the
+      switch MUST drop. The output MUST NOT appear on s1.p2.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:10:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.2.2", ttl: 64}
+        - TCP:   {sport: 80, dport: 5000, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: decap_outer_headers_truly_stripped
+    visibility: hidden
+    description: |
+      Information-leakage check. After decap, the output frame's
+      first Ethernet header MUST be the INNER Ethernet (not the
+      outer one); the outer Ethernet, outer IPv4, UDP, and VXLAN
+      MUST be absent. Verified by asserting the outer-Ethernet
+      source MAC does NOT appear in the output and the inner
+      Ethernet source MAC DOES.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "aa:bb:cc:00:00:01", dst: "aa:bb:cc:00:01:01"}
+        - IP:    {src: "192.168.20.1", dst: "192.168.10.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 200, reserved1: 0, reserved2: 0}
+        - Ether: {src: "08:00:00:00:20:01", dst: "08:00:00:00:02:02"}
+        - IP:    {src: "10.0.6.6", dst: "10.0.2.2", ttl: 64}
+        - TCP:   {sport: 443, dport: 6000, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:20:01"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.src:    {action: change_to, value: "10.0.6.6"}
+        IP.dst:    {action: change_to, value: "10.0.2.2"}
+
+  - name: encap_inner_ttl_preservation
+    visibility: hidden
+    description: |
+      VXLAN is an L2 overlay transport, not an L3 forwarding hop —
+      the inner IPv4 TTL MUST NOT be decremented by the encap
+      action. The output's inner IPv4 TTL field MUST equal the
+      ingress's. Catches implementations that conflate VXLAN encap with
+      IPv4 forwarding.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:10:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 7}
+        - TCP:   {sport: 5002, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[5].IP.ttl:    {action: change_to, value: 7}
+        layers[3].VXLAN.vni: {action: change_to, value: 100}
+
+  - name: encap_outer_src_port_in_dynamic_range
+    visibility: hidden
+    description: |
+      RFC 7348 §5 RECOMMENDED behaviour: the outer UDP source port
+      is derived from a hash of the inner 5-tuple and MUST fall
+      within the dynamic-port range 49152..65535. Asserts on the
+      range; per-flow stickiness is exercised by the pair test
+      that follows.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:10:01"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 11111, dport: 22222, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[2].UDP.sport: {action: change_to_range, min: 49152, max: 65535}
+        layers[3].VXLAN.vni: {action: change_to, value: 100}
+
+  - name: drop_non_ipv4_on_access_port
+    visibility: hidden
+    description: |
+      Non-IPv4 frames on a tenant access port are out of scope and
+      MUST be dropped. Here an ARP request from h1 (no IPv4 layer)
+      MUST be dropped — it is not in the encap path's contract.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff", type: 0x0806}
+        - ARP:   {hwsrc: "08:00:00:00:01:01", psrc: "10.0.1.1", hwdst: "00:00:00:00:00:00", pdst: "10.0.1.254"}
+    expected:
+      behavior: drop

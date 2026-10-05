@@ -1,0 +1,739 @@
+task_name: retransmit_detect_anchor_mut1
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-RetransmitDetect
+pattern_version: '1.0'
+seed:
+  forward_port: 2
+  collector_port: 3
+  detect_marker_field: ipv4_dscp_bit
+  flow_capacity: unbounded
+  eviction: none
+  seq_faithfulness: D8.0_byte_range
+  hash_algo: crc32
+  observable_surface: mark_and_count
+  count_strictness: false
+failure_modes:
+- mark_rewound_by_stale_retransmit
+- retransmit_dropped_instead_of_forwarded
+- payload_len_misderived_reads_ack_as_data
+- no_modulo_2_32_wrap_handling
+- marker_set_on_every_segment_or_never
+- distinct_flows_share_one_mark
+description: |
+  Implement an in-network TCP retransmission / loss detector on a single switch
+  s1. The switch tracks, per TCP flow, the highest data byte it has forwarded so
+  far, and flags any data segment that re-sends bytes it has already forwarded —
+  evidence of upstream loss or a spurious retransmission timeout. Detection is
+  non-destructive: a flagged segment is still delivered. Inspired by LossRadar
+  (Li et al., CoNEXT 2016) and Dapper (Ghasemi et al., SOSR 2017).
+
+  ## Topology
+
+  One switch s1 with two relevant ports:
+    - s1.p1 — the sender side; monitored TCP traffic arrives here.
+    - s1.p2 — the FORWARD port; every forwarded segment leaves here.
+
+  Hosts: h_a (10.0.1.1) on s1.p1 and h_b (10.0.2.2) reachable via s1.p2.
+
+  ## Flow and sequence model
+
+  A flow is identified by the 5-tuple (IPv4 source, IPv4 destination, IP
+  protocol, TCP source port, TCP destination port). For a TCP data segment, the
+  number of data bytes it carries is the IPv4 total length minus the IPv4 header
+  length minus the TCP header length; a segment whose data length is zero is a
+  control segment (SYN / FIN / RST / bare ACK). A data segment occupies the byte
+  range that starts at its TCP sequence number and spans its data-byte count; the
+  far edge of that range is (sequence number + data byte count). Sequence numbers
+  advance over the connection's byte stream and wrap modulo 2^32.
+
+  For each flow the switch maintains the highest forwarded byte index seen so far
+  (the high-water mark): the largest far edge of any data segment forwarded for
+  that flow, modulo 2^32.
+
+  ## Required behaviour (numbered MUST / MUST-NOT)
+
+    1. A frame that is not a TCP-over-IPv4 segment MUST be forwarded unchanged on
+       the forward port (s1.p2). It MUST NOT be dropped and MUST NOT be flagged —
+       this is a transport monitor, not a filter.
+    2. A TCP segment carrying zero data bytes (a control / pure-ACK segment) MUST
+       be forwarded unchanged on the forward port. It MUST NOT alter any flow's
+       high-water mark and MUST NOT be flagged.
+    3. The first data segment of a previously-unseen flow MUST be forwarded
+       unflagged, and the flow's high-water mark MUST be established at that
+       segment's far edge.
+    4. A data segment whose far edge is strictly greater than the flow's current
+       high-water mark is new (in-order or gap-filling) data: it MUST be forwarded
+       unflagged, and the high-water mark MUST be advanced to the segment's far
+       edge.
+    5. A data segment whose far edge is at or below the flow's current high-water
+       mark re-sends already-forwarded bytes — it is a RETRANSMISSION. On a
+       retransmission the switch MUST:
+         a. set a detected-marker bit on the segment (the low bit of the IPv4
+            DSCP field — i.e. the egress packet's IPv4 type-of-service byte
+            becomes 4 where an unflagged segment leaves it 0);
+         b. still forward the segment on the forward port (s1.p2);
+         c. NOT advance the high-water mark.
+       A retransmission produces a SINGLE forwarded copy carrying the
+       detected-marker bit — there is no mirrored / duplicated copy. The IPv4
+       source and destination addresses MUST be left unchanged.
+    6. The high-water mark is non-decreasing per flow: a retransmission MUST NOT
+       lower it, and distinct flows have independent marks.
+
+  ## Comparisons are modulo 2^32
+
+  All sequence comparisons MUST be performed in modulo-2^32 arithmetic so a
+  segment whose far edge wraps past zero is still classified correctly.
+
+  ## Control plane
+
+  The switch maps the sender-side ingress to the forward port. Any control-plane
+  entries your design needs (e.g. an egress-port table) are installed by your own
+  control plane; the test harness provides only the packet stream.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h_a
+    to: s1.p1
+  - from: s1.p2
+    to: h_b
+  - from: s1.p3
+    to: collector
+hosts:
+  h_a:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h_b:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  collector:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+test_cases:
+- name: first_segment_forward_no_flag
+  visibility: public
+  description: The first data segment of a new TCP flow (h_a:5000 → h_b:80, seq=1000, 64 bytes) establishes the per-flow high-water mark and is forwarded out the forward port with the detected-marker bit CLEAR and no mirrored copy. There is no prior byte range it could have re-sent.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: in_order_advance_no_flag
+  visibility: public
+  description: After the first 64-byte segment (seq 1000) the next in-order segment (seq=1064, 64 bytes) advances the flow's high-water mark to 1128 and is forwarded unflagged — its far edge exceeds the stored mark, so it is new data, not a retransmission.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: retransmit_detected_flag_set
+  visibility: public
+  description: Re-sending the first segment (seq=1000, 64 bytes) re-sends bytes already covered by the flow's forwarded byte stream — a retransmission. The switch sets the detected-marker bit on the segment and STILL forwards it on the forward port. There is a SINGLE forwarded copy carrying the marker; no mirrored copy is produced (the mirror-to-collector requirement is not part of this NF — only the marker bit is observed).
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.tos:
+        action: change_to
+        value: 4
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: non_tcp_passthrough_no_flag
+  visibility: public
+  description: 'A non-TCP frame (UDP) is forwarded unchanged on the forward port with the detected-marker bit CLEAR. The NF is transport-assistance, not a filter: it neither drops nor flags non-TCP traffic.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 17
+        tos: 0
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: distinct_flow_independence
+  visibility: hidden
+  description: After flow A (sport 5000) establishes its mark, a different flow B (sport 6000) sending seq=1000 is flow B's FIRST segment (R2), not a retransmission — distinct 5-tuples have independent high-water marks. Forwarded, marker CLEAR, no mirror.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 6000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: retransmit_after_advance_still_detected
+  visibility: hidden
+  description: With the mark advanced to 1128 (segments at 1000 then 1064), re-sending the 1064 segment is fully covered (far edge 1128 == mark) → detected, flagged, forwarded. Confirms the comparison is ≤ the mark, not strictly below it.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.tos:
+        action: change_to
+        value: 4
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: retransmit_does_not_rewind_mark
+  visibility: hidden
+  description: 'After advancing the mark to 1128 (segments 1000 then 1064), re-sending the FIRST segment (seq=1000) is flagged as a retransmission, AND the mark stays at 1128: a later in-order segment at 1128 must still be accepted as new. This test packet is the stale retransmit — it is detected and must not rewind the high-water mark (the classic unconditional-write bug).'
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.tos:
+        action: change_to
+        value: 4
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: advance_after_stale_retransmit_is_new
+  visibility: hidden
+  description: Following the priors of case 7 (mark at 1128) plus a stale retransmit of seq 1000, a fresh in-order segment at seq=1128 advances the mark and is forwarded UNFLAGGED. Proves the stale retransmit did not corrupt the mark (if it had rewound it to 1064, the 1128 segment would still be new here, so the discriminating part is the retransmit detection on the prior).
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1128
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: partial_overlap_advances_byte_range
+  visibility: hidden
+  description: A segment that overlaps covered bytes but whose far edge advances past the mark is NEW under byte-range detection. Mark at 1064 (one 64-byte segment at 1000); send seq=1032, 64 bytes (far edge 1096 > 1064). It overlaps [1032,1064) but advances to 1096, so it is forwarded UNFLAGGED and the mark moves to 1096.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1032
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: pure_ack_not_flagged
+  visibility: hidden
+  description: A bare ACK (zero payload) is forwarded with the marker CLEAR and leaves the high-water mark untouched — a control segment covers no byte range and cannot be a data retransmission.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 2000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: zero_len_interleave_then_retransmit
+  visibility: hidden
+  description: 'Interleaving a pure ACK between data segments must not corrupt the mark: after [seq 1000 data], [pure ACK], re-sending seq=1000 data is still detected as a retransmission and flagged. Probes the payload-length / data-offset derivation (a mis-derived length would read the ACK as data).'
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1500
+        flags: A
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.tos:
+        action: change_to
+        value: 4
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: new_advance_after_retransmit_unflagged
+  visibility: hidden
+  description: After [seq 1000], [seq 1000 retransmit], a genuinely new in-order segment at seq=1064 advances the mark and is forwarded UNFLAGGED — the retransmit did not perturb the data path or the mark.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1000
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.tos:
+        action: change_to
+        value: 0
+- name: arp_passthrough_no_flag
+  visibility: hidden
+  description: An ARP frame (non-IP, non-TCP) is forwarded unchanged on the forward port and never flagged — R0 forwards all non-TCP traffic.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: forward
+    output_port: s1.p2
+- name: fully_covered_smaller_retransmit
+  visibility: hidden
+  description: With the mark at 1128 (two 64-byte segments), a smaller 32-byte segment at seq=1064 (far edge 1096 ≤ 1128) is fully covered → detected, flagged, still forwarded. The mark stays at 1128.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        proto: 6
+        tos: 0
+    - TCP:
+        sport: 5000
+        dport: 80
+        seq: 1064
+        flags: A
+    - Raw:
+        load_hex: abababababababababababababababababababababababababababababababab
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.tos:
+        action: change_to
+        value: 4
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

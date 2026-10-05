@@ -1,0 +1,960 @@
+# P-IPv4Routing — IPv4 Unicast Forwarding (LPM + ECMP)
+#
+# TPL v1.0 task pattern. Tier-1 instances of P-IPv4Routing behaviourally
+# subsume the p4lang/tutorials "basic" IPv4 forwarding exercise. Instances
+# are produced by binding the parameters below.
+
+pattern_id: P-IPv4Routing
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                            # destination-based unicast forwarding
+  prescriptive: [P1:forwarding]                         # match-action + LPM table; multicast group / ECMP composable
+target_capability: redesign                             # programmability redesigns the previously fixed-function L3 forwarder
+summary: >
+  Destination-based IPv4 unicast forwarding: longest-prefix-match FIB lookup,
+  TTL decrement with sentinel-drop, Ethernet rewrite on every hop, and IP
+  header integrity preserved across the forwarder. Tier-1 is single-next-hop
+  static FIB; Tier-2 lifts to ECMP groups with per-flow hash consistency
+  (RFC 2992); Tier-3 adds weighted multipath (WCMP), martian-source
+  filtering, ICMP error origination on TTL exhaustion, and/or scaled FIB
+  with overlapping prefixes.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: contra_nsdi20
+      role: scaling_approach
+      relevance: |
+        Contra (NSDI 2020) compiles performance-aware routing policies to
+        per-switch P4 programs running a custom distance-vector protocol.
+        While Contra targets adaptive routing (a sibling pattern), its
+        construction sits on top of the same destination-based LPM forwarder
+        modelled here, and it documents the realistic FIB scales (10²–10⁴
+        prefixes per switch) that motivate Tier-3 capacity pressure and the
+        ${fib_capacity} parameter. Cited as the engineering ceiling for
+        scaled-FIB Tier-3 instances rather than as a Tier-1 reference.
+
+  rfcs:
+    - id: RFC1812
+      sections: ["4.2.2", "5.2.1", "5.2.2", "5.2.7", "5.3.1", "5.3.4", "5.3.5", "5.3.7"]
+      role: canonical_spec
+      grounds: R2_ttl_exhausted   # also ttl_quantum_one invariant (TTL decrement-by-one)
+      # Verbatim from RFC 1812 §5.3.1 "Time to Live (TTL)" (cached in
+      # grounding/RFC1812.txt). Grounds the TTL-decrement / sentinel-drop
+      # requirement realised by R2 and the ttl_quantum_one invariant.
+      quote: "When a router forwards a packet, it MUST reduce the TTL by at least"
+      relevance: |
+        Requirements for IP Version 4 Routers — the canonical MUST/SHOULD
+        clauses every rule in this pattern realises:
+          - §5.2.2  IP header validation (version=4, IHL≥5, total length
+                    ≥ header, header checksum) — basis for R1.
+          - §5.3.1  TTL processing: "A router MUST decrement the TTL by
+                    one when forwarding a datagram" and "The datagram MUST
+                    be discarded if the TTL becomes zero during processing"
+                    — basis for R2 (TTL-exhausted drop) and the
+                    ttl_quantum_one invariant.
+          - §5.2.2.5 Header checksum: when TTL changes the router MUST
+                    recompute (incrementally allowed) — basis for the
+                    ip_checksum_validity invariant.
+          - §5.2.1  Forwarding algorithm — the canonical step ordering
+                    (validate → forward decision → TTL → checksum → L2
+                    rewrite → transmit) the rules below reflect.
+          - §4.2.2.9 / §5.3.4 Forwarding table semantics: longest-prefix
+                    match, default route, no-route ⇒ drop — basis for R3 /
+                    R4 / lpm_longest_match_correctness.
+          - §5.3.7  Martian filtering: source addresses 127.0.0.0/8,
+                    0.0.0.0/8, 224.0.0.0/4, 255.255.255.255 MUST NOT be
+                    forwarded — basis for R6 (guard-gated).
+          - §5.3.5  Limited-broadcast (255.255.255.255) MUST be discarded;
+                    directed broadcasts SHOULD NOT be forwarded by default
+                    — basis for the dst-broadcast G3 cases.
+          - §5.2.7  ICMP error generation (Time Exceeded / Destination
+                    Unreachable) — gated by ${emit_icmp_errors} at Tier-3.
+
+    - id: RFC2992
+      sections: ["1", "2", "2.2", "3"]
+      role: normative_behaviour
+      relevance: |
+        Analysis of an Equal-Cost-Multi-Path Algorithm. The binding
+        properties this pattern enforces in R4 / flow_consistency:
+          - §1     Hash-threshold ECMP keys a flow on packet header fields
+                   (typically the 5-tuple) and partitions the hash range
+                   across N next-hops — basis for the
+                   `ecmp_hash_5tuple` / `ecmp_hash_3tuple` parameter
+                   options and the per-flow stickiness rule.
+          - §2.2   "As long as the region boundaries remain unchanged the
+                   same next-hop will be chosen for a given flow" — the
+                   verbatim flow-consistency MUST that informs the
+                   ecmp_flow_consistency invariant. The RFC's modulo-N
+                   disruption analysis ((N-1)/N) motivates the
+                   ${ecmp_remap_algo} parameter for Tier-3.
+          - §3     Hash-Threshold vs Modulo-N vs Highest-Random-Weight
+                   (HRW) — the three algorithms the
+                   ${ecmp_remap_algo} parameter enumerates and the
+                   `swap_ecmp_to_hrw` mutation operator targets.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The canonical p4lang/tutorials "basic" exercise — a 3-host,
+        single-switch topology with a single LPM table on hdr.ipv4.dstAddr
+        whose action rewrites the Ethernet src/dst, decrements ipv4.ttl,
+        and forwards to the matched egress port. The Tier-1 instance of
+        P-IPv4Routing reproduces this topology exactly and must subsume the
+        exercise's behaviour.
+
+  # No dedicated knowledge-base entry for routing / forwarding domain
+  # concepts; the grounding block is still non-empty (papers + rfcs +
+  # tutorials).
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. All decisions are derived from
+      hdr.ipv4 fields, std.ingress_port, and the control-plane-installed
+      route / nexthop tables.
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Flow tuple used solely by ECMP / WCMP hashing to pin every packet of
+      one flow onto one next-hop (RFC 2992 §2.2). Not materialised as
+      data-plane state at any tier — the hash is recomputed per-packet,
+      flow membership is implicit.
+
+  route:                                  # plays the TPL `bucket` role: prefix / VRF / tenant / class
+    keyed_by_lpm: hdr.ipv4.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int               # for tie-break diagnostics; the LPM primitive itself selects longest
+    capacity: ${fib_capacity}
+    notes: |
+      A FIB entry. The LPM table is keyed on the destination address;
+      the matched entry yields a nexthop_group_id pointing into
+      `nexthop_group`. First-match semantics is *longest-prefix*, not
+      list-order — rules below express this with `match(... lpm)`.
+
+  nexthop_group:                          # also a `bucket` (class) — a set of one or more next-hops
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops:   "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac:   "list[address]"         # per-egress source MAC for the L2 rewrite
+    notes: |
+      A multipath group. Singletons (|nexthops| == 1, weight == 1) handle
+      non-ECMP routes; |nexthops| > 1 enables ECMP / WCMP picking per
+      ${multipath_mode}.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0, 32],
+      nexthop_group_id:int; LPM relation well-formed (no two entries
+      share both prefix AND prefix_len).
+    notes: |
+      Control-plane-installed FIB. Determines which destinations are
+      reachable and where they go. A `default route` is expressed as
+      prefix 0.0.0.0/0.
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights are positive ints"
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of route entries supported. Realistic single-pipe
+      ASICs sit around 10⁴–10⁵ (Contra NSDI 20 §6). Tier-3
+      `inflate_fib_with_long_prefixes` exercises this axis.
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+    notes: |
+      The largest ECMP/WCMP group size the FIB can host. Drives Tier-2
+      ECMP test scaffolding and the implementation's choice of group-indexing
+      structure.
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_3tuple, ecmp_hash_5tuple, wcmp]
+    default: none
+    notes: |
+      none              → singleton next-hops only (Tier-1; matches the
+                          p4lang/tutorials basic forwarding
+                          exercise).
+      ecmp_hash_3tuple  → hash over (ipv4.src, ipv4.dst, ipv4.proto) only;
+                          robust against L4 spoofing but ignores L4 ports.
+      ecmp_hash_5tuple  → hash over the full 5-tuple; canonical RFC 2992
+                          default for TCP/UDP-rich traffic.
+      wcmp              → weighted ECMP — weights from
+                          `nexthop_group.nexthops[*].weight`; selection
+                          probability proportional to weight.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    notes: |
+      Hash function used by ECMP/WCMP. RFC 2992 §1 cites CRC16 as the
+      example. xor_fold is the cheapest but weakest — used to harden the
+      pattern via `swap_hash_to_xor_fold`.
+
+  ecmp_remap_algo:
+    type: enum
+    values: [modulo_n, hash_threshold, hrw]
+    default: hash_threshold
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Algorithm that maps the hash output to a next-hop index. Determines
+      disruption when the group changes (RFC 2992 §2.2 / §3):
+        modulo_n        → cheapest; (N-1)/N flows remap on group change.
+        hash_threshold  → 1/4–1/2 of flows remap; uniform under equal-size
+                          regions.
+        hrw             → 1/N flows remap; minimal-disruption HRW
+                          ("rendezvous hashing").
+
+  martian_filter_enabled:
+    type: bool
+    default: false
+    notes: |
+      RFC 1812 §5.3.7 source-address filtering. When true, R6 drops
+      packets with source ∈ {127.0.0.0/8, 0.0.0.0/8, 224.0.0.0/4,
+      255.255.255.255}. Lifted at Tier-3.
+
+  emit_icmp_errors:
+    type: bool
+    default: false
+    notes: |
+      RFC 1812 §5.2.7. When true, TTL-exhausted packets (R2) emit an
+      ICMP Time Exceeded back to the source instead of being silently
+      dropped; no-route packets (R4) emit ICMP Destination Unreachable.
+      Adds packet origination (the TPL `emit` primitive) to the implementation.
+
+  default_action:
+    type: enum
+    values: [drop, send_icmp_unreachable]
+    default: drop
+    notes: |
+      Behaviour when the LPM table misses. `drop` is the v1.0 default
+      (matches the basic_ipv4_forwarding twin). `send_icmp_unreachable`
+      is gated by ${emit_icmp_errors} and only realisable at Tier-3.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_static_fib, D5.1_ecmp, D5.2_wcmp_or_scale]
+    default: D5.0_static_fib
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The pattern is IPv4 unicast forwarding only. ARP, IPv6, MPLS,
+      LLDP, and any other non-IPv4 ether-type are not in scope and
+      MUST NOT be forwarded (the `drop_non_ipv4` G3 case).
+
+  - id: R1_invalid_header_drop
+    when: |
+      header_present(ipv4) ∧ (
+        hdr.ipv4.version ≠ 4
+        ∨ hdr.ipv4.ihl < 5
+        ∨ hdr.ipv4.totalLen < (hdr.ipv4.ihl * 4)
+        ∨ ¬checksum_valid(ipv4)
+      )
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.2.2 — IP header validation. Version, IHL, total length,
+      and header checksum MUST all be valid; any failure ⇒ silent
+      discard. At Tier-1 the harness sends only well-formed packets,
+      so this rule is mostly proved by inspection (G2 boundary tests
+      exist for IHL < 5 and total_length too short).
+
+  - id: R2_ttl_exhausted
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl ≤ 1
+    then:
+      - drop
+      - "emit(icmp_time_exceeded(src=local_interface_ip, dst=hdr.ipv4.src)) IF ${emit_icmp_errors}"
+    notes: |
+      RFC 1812 §5.3.1 — "The datagram MUST be discarded if the TTL
+      becomes zero during processing." The standard expression is to
+      drop before decrement when TTL ≤ 1, equivalently to drop after
+      decrement when the post-decrement TTL == 0. Either ordering must
+      yield the same observable behaviour (the test scaffolding pins
+      both: drop_ttl_zero and fwd_ttl_one).
+
+  - id: R3_lpm_hit_forward
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1
+        ∧ exists(route, lpm(hdr.ipv4.dst, ${routes}))
+        ∧ ¬martian_src(hdr.ipv4.src)        IF ${martian_filter_enabled}
+        ∧ ¬is_directed_broadcast(hdr.ipv4.dst)
+        ∧ hdr.ipv4.dst ≠ 255.255.255.255
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      The canonical RFC 1812 §5.2.1 forwarding step. Order matters in
+      the implementation: TTL is decremented BEFORE the IP-header checksum is
+      finalised; the checksum recompute (incremental allowed,
+      RFC 1812 §5.2.2.5) is a *consequence* of the rule firing and is
+      pinned by the `ip_checksum_validity` invariant rather than
+      appearing as an explicit postcondition. When
+      `multipath_mode == none` the nexthop_group is a singleton, the
+      helper `nexthop_index_for(...)` collapses to `i = 0`, and R3 is
+      a single-next-hop forward. The helper expands to:
+        - none              → 0
+        - ecmp_hash_3tuple  → remap(${ecmp_remap_algo},
+                                    hash(${hash_algo},
+                                         hdr.ipv4.src, hdr.ipv4.dst,
+                                         hdr.ipv4.proto),
+                                    |nexthop_group.nexthops|)
+        - ecmp_hash_5tuple  → remap(${ecmp_remap_algo},
+                                    hash(${hash_algo}, flow.key),
+                                    |nexthop_group.nexthops|)
+        - wcmp              → wcmp_pick(hash(${hash_algo}, flow.key),
+                                        nexthop_group.nexthops[*].weight)
+      The Ether-src rewrite uses the EGRESS port's MAC, not the
+      ingress port's — load-bearing source-MAC-rewrite property
+      (RFC 1812 §5.2.1).
+
+  - id: R4_no_route
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    then:
+      - "${default_action}"
+      - "emit(icmp_dest_unreachable(src=local_interface_ip, dst=hdr.ipv4.src, code=0)) IF ${emit_icmp_errors} ∧ ${default_action} == send_icmp_unreachable"
+    notes: |
+      RFC 1812 §4.2.2.9 / §5.3.4 — no matching route ⇒ drop (or send
+      ICMP Destination Unreachable when `default_action == send_icmp_unreachable`).
+      The default route (0.0.0.0/0) if present absorbs all otherwise-unmatched
+      traffic; R4 fires only when no route, including 0.0.0.0/0, applies.
+
+  - id: R5_limited_broadcast_dst
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.dst == 255.255.255.255
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.1 — the limited-broadcast destination MUST be
+      discarded; routers do not forward 255.255.255.255.
+
+  - id: R6_martian_src
+    when: |
+      header_present(ipv4) ∧
+      (  match(hdr.ipv4.src, 127.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 0.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 224.0.0.0/4)
+       ∨ hdr.ipv4.src == 255.255.255.255
+      )
+    enforced_when: "${martian_filter_enabled}"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.7 — source-address filtering. Gated by parameter to
+      keep Tier-1 close to the textbook tutorial (which does not filter).
+
+  - id: R7_directed_broadcast_dst
+    when: |
+      header_present(ipv4) ∧ is_directed_broadcast(hdr.ipv4.dst)
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.2 — directed broadcasts SHOULD NOT be forwarded
+      by default. `is_directed_broadcast(d)` is true when `d` is the
+      all-ones host portion of a network this router is configured for
+      (test-scaffolding determined at instantiation time).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The mechanism is TTL
+      decrement on every forward (R3): finite hop budget enforces
+      finite path. There is no recirculation in this pattern.
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "rule R3 fires"
+    notes: |
+      RFC 1812 §5.3.1 — TTL is decremented by EXACTLY one per forward.
+      A common implementation bug is double-decrement (e.g., applying TTL-- in
+      both MyIngress and MyEgress); the fwd_ttl_one G2 case catches it.
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "exists(route, lpm(hdr.ipv4.dst, ${routes}))"
+    notes: |
+      RFC 1812 §5.2.1 / §5.3.4 — the chosen next-hop belongs to the
+      LONGEST matching prefix. Implementation bug: keying a ternary table on
+      hdr.ipv4.dst without prefix-length priorities (LPM-vs-ternary
+      confusion in BMv2) ⇒ wrong route may be selected when prefixes
+      overlap.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "rule R3 fires"
+    free_under: []
+    notes: |
+      RFC 1812 §5.2.1 — IP source and destination addresses MUST NOT be
+      modified during unicast forwarding. Distinguishes this pattern
+      from NAT and tunnels.
+
+  - id: ip_checksum_validity
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ rule R3 fires"
+    notes: |
+      RFC 1812 §5.2.2.5 — header checksum MUST be valid on egress.
+      Since TTL changed, the implementation MUST recompute the checksum
+      (incrementally allowed). Most-common implementation bug: forgetting the
+      MyComputeChecksum block ⇒ silent forwarding with stale checksum;
+      real peers reject the packet, BMv2 emits it as-is.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ rule R3 fires"
+    notes: |
+      RFC 1812 §5.2.1 — on every forward, the egress Ethernet src MUST
+      be the egress port's own MAC, and the egress Ethernet dst MUST
+      be the next-hop's MAC. Implementation anti-pattern: setting src = old
+      dst from ingress (only correct on point-to-point links) or
+      forgetting the src rewrite entirely.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "rule R3 fires ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1 ∧ nexthop_group membership unchanged"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — "As long as the region boundaries remain
+      unchanged the same next-hop will be chosen for a given flow."
+      Every packet of one flow MUST land on the same i within its
+      group. Implementation bug: hashing on a field that changes between
+      packets of the same flow (e.g., IP identification field) ⇒
+      flow splits across next-hops, breaking TCP ordering.
+
+  - id: ecmp_traffic_distribution
+    clause: fairness
+    target: traffic_per_nexthop_within_group
+    while: "rule R3 fires ∧ ${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    enforced_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    notes: |
+      RFC 2992 §2 — under a uniformly-distributed hash, flows
+      distribute uniformly across the K next-hops of each group.
+      Test floor: per-nexthop share within ±20% of 1/K over 1000
+      random flows (looser than the ECMP-LB ideal because BMv2's
+      hash is not adversarial-resistant).
+
+  - id: wcmp_weighted_distribution
+    clause: fairness
+    target: traffic_per_nexthop_within_group
+    while: "rule R3 fires ∧ ${multipath_mode} == wcmp"
+    enforced_when: "${multipath_mode} == wcmp"
+    notes: |
+      Weighted analogue of `ecmp_traffic_distribution`: each
+      nexthop's share is proportional to its weight / sum(weights),
+      again within ±20% over 1000 random flows.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-goal conventions.
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_lpm_hit_single_prefix
+      generate: |
+        Send an IPv4 packet from an ingress host to a destination
+        covered by exactly one prefix in ${routes}. Assert:
+          - output_port == matched nexthop's egress_port
+          - hdr.ethernet.src changed to matched nexthop's port_mac
+          - hdr.ethernet.dst changed to matched nexthop's next_hop_mac
+          - hdr.ipv4.ttl decremented by 1
+          - hdr.ipv4.src and hdr.ipv4.dst unchanged
+          - hdr.ipv4.hdrChecksum valid on egress
+
+    - id: fwd_lpm_distinct_prefixes
+      generate: |
+        Install ≥ 2 distinct prefixes pointing to different ports.
+        Send packets to representative destinations in each prefix;
+        assert each lands on its prefix's egress_port with the
+        appropriate L2 rewrite. (Tier-1 anchor — mirrors the
+        basic_ipv4_forwarding twin's fwd_h1_to_h2 / fwd_h1_to_h3.)
+
+    - id: fwd_longest_prefix_priority
+      generate: |
+        Install overlapping prefixes (e.g., 10.0.0.0/8 → port A and
+        10.0.2.0/24 → port B). Send packets to 10.0.2.x; assert they
+        forward to port B, not port A. Tests
+        lpm_longest_match_correctness.
+
+    - id: fwd_l4_payload_independence
+      generate: |
+        Send IPv4+TCP and IPv4+UDP packets to a single matching
+        prefix. Assert both forward on the same egress_port (L3
+        forwarding is L4-agnostic when multipath_mode == none).
+
+    - id: fwd_ttl_one_post_decrement_zero
+      generate: |
+        Send a packet with ipv4.ttl == 1 to a matching prefix. Assert
+        the packet is FORWARDED with ipv4.ttl == 0 on egress. (Pairs
+        with G2 drop_ttl_zero — together they pin the exact
+        decrement-then-test ordering required by RFC 1812 §5.3.1.)
+
+    - id: fwd_ecmp_flow_consistency
+      requires: "${multipath_mode} != none"
+      generate: |
+        Install a nexthop group with K ≥ 2 nexthops for one prefix.
+        Send 10 packets of the same 5-tuple to that prefix. Assert
+        all 10 packets exit on the same egress_port. Tests
+        ecmp_flow_consistency (RFC 2992 §2.2).
+
+    - id: fwd_ecmp_traffic_distribution
+      requires: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+      generate: |
+        Install a nexthop group with K = 3 or K = 4 nexthops for one
+        prefix. Send 1000 packets across uniformly-random distinct
+        flow keys. Assert each nexthop receives within 20% of
+        (1/K) of the traffic. Tests ecmp_traffic_distribution.
+
+    - id: fwd_wcmp_weighted_distribution
+      requires: "${multipath_mode} == wcmp"
+      generate: |
+        Install a nexthop group with weights [1, 1, 2] (sum = 4).
+        Send 1000 random-flow packets. Assert per-nexthop traffic
+        shares are within 20% of [0.25, 0.25, 0.50]. Tests
+        wcmp_weighted_distribution.
+
+  G2:
+    - id: drop_ttl_zero
+      generate: |
+        Send a packet with ipv4.ttl == 0 to a destination that would
+        otherwise match. Assert drop. RFC 1812 §5.3.1 boundary.
+
+    - id: drop_no_route
+      generate: |
+        Send a packet to a destination not covered by any prefix in
+        ${routes} (and ${routes} contains no 0.0.0.0/0 default).
+        Assert drop. RFC 1812 §5.3.4.
+
+    - id: fwd_default_route_fallback
+      requires: "0.0.0.0/0 ∈ ${routes}"
+      generate: |
+        Send a packet to an arbitrary destination NOT covered by any
+        specific prefix in ${routes}. Assert it forwards via the
+        nexthop_group bound to 0.0.0.0/0.
+
+    - id: fwd_host_route_32
+      generate: |
+        Install a host route (/32). Send a packet to that exact
+        address; assert forward on its egress_port. Send a packet to
+        an adjacent address NOT in any other prefix; assert drop.
+        Mirrors the twin task's drop_dst_near_miss G3 case.
+
+    - id: drop_invalid_total_length
+      generate: |
+        Send a packet whose ipv4.totalLen is smaller than the IPv4
+        header (e.g., totalLen = 10, IHL = 5 → header alone is 20).
+        Assert drop. RFC 1812 §5.2.2 header-validation boundary.
+
+    - id: fib_capacity_overflow
+      requires: "${fib_capacity} != unbounded"
+      generate: |
+        Install ${fib_capacity} routes successfully. Attempt to install
+        one more. Assert: either the additional install is rejected
+        at the control plane, or it evicts the oldest entry (impl-
+        defined). Then send a packet that would have matched the
+        evicted entry; assert drop. Tier-3 anchor for the
+        ${fib_capacity} axis.
+
+  G3:
+    - id: drop_non_ipv4
+      generate: |
+        Send a non-IPv4 frame (ARP, IPv6, raw Ethernet payload, or a
+        random ether-type) to any port. Assert drop. Mirrors the
+        twin task's drop_non_ipv4 case (R0).
+
+    - id: drop_limited_broadcast_dst
+      generate: |
+        Send an IPv4 packet with dst == 255.255.255.255 (e.g., DHCP
+        DISCOVER). Assert drop. RFC 1812 §5.3.5.1.
+
+    - id: drop_martian_src
+      requires: "${martian_filter_enabled}"
+      generate: |
+        Send IPv4 packets with sources in {127.0.0.1, 0.0.0.42,
+        224.1.2.3, 255.255.255.255}. Assert each is dropped. RFC
+        1812 §5.3.7.
+
+    - id: drop_directed_broadcast
+      generate: |
+        Send an IPv4 packet whose dst is the all-ones host of a
+        directly-attached subnet (e.g., 10.0.2.255 for 10.0.2.0/24).
+        Assert drop. RFC 1812 §5.3.5.2 default behaviour.
+
+    - id: emit_icmp_time_exceeded
+      requires: "${emit_icmp_errors}"
+      generate: |
+        Send a packet with ipv4.ttl == 1 such that R2 fires post-
+        decrement. Assert: (a) the original packet is NOT forwarded;
+        (b) an ICMP Time Exceeded (type 11, code 0) packet is emitted
+        back toward the source, containing the original IP header
+        + ≥ 64 bits of payload (RFC 1812 §5.2.7 / RFC 792).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: enable_ecmp_5tuple
+    axis: feature-breadth
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4) ∧
+      ${faithfulness} ← D5.1_ecmp
+    d_axis_delta: {D5: +1, D3: +1, test_rigor: +1}
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Lift Tier-1 → Tier-2. Activates ecmp_flow_consistency and
+      ecmp_traffic_distribution invariants. Common implementation: a separate
+      ecmp_group table that selects a nexthop index via
+      hash(5-tuple) mod K, then a second table indexing into the
+      per-group nexthop set.
+
+  - id: enable_ecmp_fixed_pair
+    axis: feature-breadth
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← 2 ∧
+      ${faithfulness} ← D5.1_ecmp ∧
+      constrain EVERY multipath nexthop_group to exactly 2 members
+      (fixed power-of-two cardinality). Member selection is therefore a
+      single hash bit over the 5-tuple — there is no runtime-derived
+      group size to divide by.
+    d_axis_delta: {D5: +1, D3: +1, test_rigor: +1}
+    feasibility_postcondition: |
+      ${max_nexthop_group_size} == 2 ∧ every multi-member nexthop_group
+      has exactly 2 members
+    notes: |
+      Gap-filling sibling of enable_ecmp_5tuple, added by extending the
+      mutation-operator library. MOTIVATION: enable_ecmp_5tuple overshoots
+      the moderate-difficulty range straight to the hard end (≈0.125 pass
+      rate under the gemini-3.1-pro-preview one-shot baseline) because its
+      variable-size groups force the implementation into the hash-extern +
+      RUNTIME-modulo idiom `hash(5-tuple) % group_size`, whose `%` over a
+      table-derived size p4c --Werror rejects with "could not evaluate
+      expression". That is a near-binary COMPILE cliff, not an algorithmic
+      one, and every forwarding-only operator (martian, deep-LPM, directed
+      broadcast — see ipv4_routing_mut1) saturates ≈0.97; the moderate-difficulty
+      range sits in the GAP between the two regimes and is unreachable with
+      the rest of the v1.0 operator library under the one-shot protocol.
+
+      Fixing every group to exactly 2 members makes member selection a
+      single-bit choice (constant-modulo `% 2`, bit-mask `& 1`, low-bit of a
+      hand-rolled fold, or a 1-bit hash output) — the runtime-modulo cliff
+      disappears while the ECMP ALGORITHMIC difficulty is preserved:
+      flow-consistent selection (hash only stable 5-tuple fields), an even
+      split across the pair, the two-stage group→member lookup, and the
+      per-member L2 rewrite. The behavioural RFC 2992 invariants
+      (ecmp_flow_consistency, ecmp_traffic_distribution) are unchanged.
+
+      ORACLE: reuses the audited ECMP oracle 98ffd4ff UNCHANGED. That oracle
+      reads the group size from runtime state (`len(group)`, per the
+      parametric-source contract), so binding group cardinality to 2 is a
+      parameter rebinding, NOT a rule-semantics change — no oracle re-audit. The oracle ref resolves to
+      the same 98ffd4ff because rules + invariants + entities are untouched.
+
+  - id: enable_wcmp
+    axis: feature-breadth
+    applicable_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    effect: |
+      ${multipath_mode} ← wcmp ∧ ${faithfulness} ← D5.2_wcmp_or_scale
+    d_axis_delta: {D3: +1, D5: +1, test_rigor: +1}
+    feasibility_postcondition: |
+      every nexthop_group with size > 1 has at least two distinct weights
+    notes: |
+      Lift Tier-2 → Tier-3. Weighted multipath demands the implementation
+      realise a weighted-pick function (typical: replicate each nexthop
+      `weight` times in a virtual array, then ECMP-pick into the
+      expanded array). Adds the wcmp_weighted_distribution invariant.
+
+  - id: shrink_fib_capacity_4x
+    axis: capacity
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${fib_capacity} ≥ 16"
+    notes: |
+      Tighten the FIB-capacity axis. At Contra-realistic 10⁴ → 256
+      the implementation cannot rely on a TCAM-of-everything strategy and
+      must consider compression / aggregation.
+
+  - id: inflate_fib_with_overlapping_prefixes
+    axis: workload
+    applicable_when: |
+      'longest_prefix_priority_stress' ∉ test_scaffolding.G2
+    effect: |
+      Generate ${routes} so that ≥ 30% of installed prefixes overlap
+      (a /16 plus several /24s and /32s within it). Add G2 test
+      `longest_prefix_priority_stress` that sends packets at addresses
+      requiring 3 levels of LPM tie-break.
+    d_axis_delta: {D2: +1, test_rigor: +1}
+    feasibility_postcondition: "${fib_capacity} ≥ 64 ∨ ${fib_capacity} == unbounded"
+    notes: |
+      Pattern-augmenting: enriches the route set to stress
+      lpm_longest_match_correctness. Catches the implementation bug of using
+      a ternary table without explicit prefix-length priorities.
+
+  - id: enable_martian_filter
+    axis: strictness
+    applicable_when: "${martian_filter_enabled} == false"
+    effect: "${martian_filter_enabled} ← true"
+    d_axis_delta: {D7: +1, test_rigor: +1}
+    notes: |
+      Activates R6 and the drop_martian_src G3 case. Realistic
+      datacenter routers all do this; toy implementations omit it.
+      One common bug: gating on hdr.ipv4.dst instead of hdr.ipv4.src.
+
+  - id: enable_icmp_error_emission
+    axis: feature-breadth
+    applicable_when: "${emit_icmp_errors} == false"
+    effect: |
+      ${emit_icmp_errors} ← true ∧ ${default_action} ← send_icmp_unreachable
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "${faithfulness} ≥ D5.1_ecmp"
+    notes: |
+      Lift to Tier-3. Adds packet origination (the TPL `emit` primitive) to
+      the implementation — Time Exceeded on TTL exhaustion, Destination
+      Unreachable on no-route. Realistic implementation: a control-plane
+      digest plus clone+modify; in BMv2, can be approximated with
+      packet cloning to an internal port + header rewrite.
+
+  - id: swap_ecmp_remap_to_hrw
+    axis: hash-family
+    applicable_when: |
+      ${multipath_mode} != none ∧ ${ecmp_remap_algo} ≠ hrw
+    effect: "${ecmp_remap_algo} ← hrw"
+    d_axis_delta: {D3: +1, D5: +1}
+    notes: |
+      Lift the remap algorithm to Highest-Random-Weight (RFC 2992
+      §3). HRW requires per-nexthop hash + arg-max — substantially
+      harder in P4 (no native arg-max over a register array) than
+      hash-threshold or modulo-N. Common implementation: unroll a fixed
+      K-way comparator tree.
+
+  - id: swap_hash_to_xor_fold
+    axis: hash-family
+    applicable_when: |
+      ${multipath_mode} != none ∧ ${hash_algo} ∈ {crc16, crc32}
+    effect: "${hash_algo} ← xor_fold"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "ecmp_traffic_distribution still observable within ±25% over 1000 random flows"
+    notes: |
+      Weaker hash → worse uniformity. Used to harden the panel
+      against implementations that copy the textbook CRC-mod-N pattern
+      blindly without considering hash quality.
+
+  - id: add_pool_change_test
+    axis: hidden-coverage
+    applicable_when: |
+      'ecmp_disruption_on_pool_change' ∉ test_scaffolding.G2
+        ∧ ${multipath_mode} != none
+    effect: |
+      Add G2 test `ecmp_disruption_on_pool_change`: open 100 flows
+      against a K=4 group, record per-flow nexthop assignment. Remove
+      one nexthop, resend all 100 flows. Assert the fraction of flows
+      whose assignment changed matches the RFC 2992 disruption bound
+      for ${ecmp_remap_algo} (modulo_n: ≥ (N-1)/N - 0.1; hash_threshold:
+      ∈ [0.20, 0.55]; hrw: ≤ 1/N + 0.1).
+    d_axis_delta: {test_rigor: +1, D5: +1}
+    notes: |
+      Tests the disruption-on-pool-change property from RFC 2992
+      §2.2. Distinguishes the three ${ecmp_remap_algo} values
+      operationally.
+
+  - id: expand_topology_multi_switch
+    axis: algebra-breadth
+    applicable_when: |
+      'multi_switch' ∉ topology
+    effect: |
+      Expand topology to 2+ switches in a chain (h1 — s1 — s2 — h2).
+      Each switch installs a route toward the other end. Add G1 test
+      `transit_through_two_switches` asserting cumulative TTL
+      decrement is 2 and each hop's L2 rewrite is correct.
+    d_axis_delta: {D1: +1, test_rigor: +1}
+    feasibility_postcondition: "the harness supports multi-switch topologies"
+    notes: |
+      Lifts the spec from single-switch to multi-hop forwarding,
+      exercising hop-by-hop L2 rewrite correctness across multiple
+      forwarders. Catches implementations that bake the source MAC into the
+      compiled program instead of installing it per route.
+
+  - id: inject_workload_skew
+    axis: workload
+    applicable_when: "${multipath_mode} != none"
+    effect: |
+      Replace G1 `fwd_ecmp_traffic_distribution` with skewed: 80% of
+      traffic on 20% of flow keys (Zipfian α = 1.0). Assert per-flow
+      stickiness (ecmp_flow_consistency) still holds AND no single
+      nexthop receives > 70% of the traffic (because some
+      heavy-hitter flows DO end up on the same nexthop, but no
+      pathological concentration).
+    d_axis_delta: {D6: +1, test_rigor: +1}
+    notes: |
+      Realistic-traffic stress. Catches implementations that pass the
+      uniform-random ECMP distribution check but fail under skew
+      because of weak hash quality.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4:
+
+    Tier-1 (multipath_mode: none, fib_capacity: unbounded, no martians,
+            no ICMP emission):
+      - One LPM table on hdr.ipv4.dstAddr with action `ipv4_forward(
+        port, port_mac, next_hop_mac)`.
+      - The action: standard_metadata.egress_spec = port;
+                    hdr.ethernet.srcAddr = port_mac;
+                    hdr.ethernet.dstAddr = next_hop_mac;
+                    hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+      - Pre-LPM gate: if (hdr.ipv4.isValid() && hdr.ipv4.ttl > 0).
+        TTL == 0 (or ≤ 1, depending on convention) drops before LPM.
+      - Default action = drop() — handles R4 / no-route.
+      - MyComputeChecksum: incremental update for the TTL change
+        (P4_16 update_checksum(...)). Forgetting this is the single
+        most common silent bug.
+      - Non-IPv4 frames: parser's transition select(etherType) routes
+        anything ≠ 0x0800 to the `accept` state with `ipv4.isValid()
+        == false`, so the LPM gate naturally drops them. (Matches the
+        p4lang basic forwarding exercise structure exactly.)
+
+    Tier-2 (multipath_mode: ecmp_hash_5tuple, max_nexthop_group_size ≥ 2):
+      - Two tables: ecmp_group on hdr.ipv4.dstAddr (LPM) → action
+        sets meta.ecmp_group_id and meta.ecmp_group_size; then
+        ecmp_nhop_select on (meta.ecmp_group_id, meta.ecmp_hash_index)
+        → action does the L2 rewrite + forward.
+      - meta.ecmp_hash_index = hash(... 5-tuple ...) % group_size.
+        hash() is BMv2's `hash` extern with HashAlgorithm.crc16 or
+        crc32.
+      - For singleton groups (size == 1), ecmp_hash_index is always
+        0 — the same pipeline handles both single-nexthop and ECMP
+        routes uniformly.
+      - The hash input MUST include only fields that are stable
+        within a flow. Including hdr.ipv4.identification or
+        hdr.ipv4.ttl will split flows across nexthops and break
+        ecmp_flow_consistency.
+
+    Tier-3 (multipath_mode: wcmp ∨ icmp errors ∨ scaled FIB):
+      - WCMP: replicate each nexthop weight-many times in the
+        ecmp_nhop_select table; the per-group expanded size is
+        sum(weights). Hash mod expanded_size picks proportionally.
+      - ICMP origination: clone3() the packet to a magic egress
+        port, then in egress rewrite headers as an ICMP Time
+        Exceeded / Destination Unreachable (with the original IP
+        header + 8 bytes of payload). Set ipv4.proto = 1,
+        ipv4.totalLen accordingly, recompute checksums.
+      - Scaled FIB / Contra-realism: when ${fib_capacity} approaches
+        on-chip TCAM limits, the implementation must consider prefix
+        aggregation (route-summarisation), or two-stage LPM (first
+        match a /16-coarse table, then a /32-fine table within the
+        matched region).
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Forgetting MyComputeChecksum — the most common silent bug;
+      BMv2 emits the packet, real Linux peers drop it. The G1
+      checksum-on-egress assertion catches it.
+
+    * Decrementing TTL twice (once in MyIngress, once in MyEgress
+      via an inherited "common header rewrite" block) — the
+      fwd_ttl_one G1 case and ttl_quantum_one invariant catch it.
+
+    * Setting hdr.ethernet.src = hdr.ethernet.dst (the "shift"
+      trick) — only correct on point-to-point links between
+      identical-MAC routers; fails for any topology where ports
+      have distinct MACs. The p4lang basic exercise's
+      `08:00:00:00:01:00` ports use the shift convention, but that's
+      a topology choice, not a generic rule. Tier-2+ instances must
+      install the port_mac per nexthop and rewrite from there.
+
+    * Including hdr.ipv4.identification, hdr.ipv4.ttl, or
+      hdr.ipv4.hdrChecksum in the ECMP hash — these fields change
+      between packets of the same flow, splitting flows across
+      nexthops. ecmp_flow_consistency catches it.
+
+    * Using ternary (or exact) match on hdr.ipv4.dstAddr instead of
+      LPM — wrong prefix may win when prefixes overlap.
+      lpm_longest_match_correctness catches it.
+
+    * Forwarding IPv4 packets whose dst == 255.255.255.255 because
+      the LPM table happens to have a 0.0.0.0/0 entry — RFC 1812
+      §5.3.5.1 says limited-broadcast MUST be discarded
+      unconditionally. R5 fires BEFORE R3.
+
+    * At Tier-3, advancing the implementation to emit ICMP errors but
+      forgetting that the ICMP packet MUST itself be exempt from
+      further ICMP-error generation (RFC 1812 §4.3.2.7) — leads to
+      ICMP loops between two routers.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must
+       all pass.
+
+    2. For anchor instances of P-IPv4Routing (single-next-hop FIB,
+       no ECMP, no martian filter), the resulting task SHOULD be
+       behaviourally equivalent to the canonical p4lang basic_forwarding
+       tutorial reference; running the public test set through the oracle
+       for the seed cross-checks this.

@@ -1,0 +1,806 @@
+task_name: ecmp_selector_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ECMPSelector
+pattern_version: '1.0'
+seed:
+  routes:
+  - dst_prefix: 10.0.2.0/24
+    next_hop_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+  miss_behaviour: drop
+description: |
+  Implement an equal-cost multipath (ECMP) forwarder on a single switch s1, per
+  RFC 2992. For each IPv4 packet, look up its destination address by longest-
+  prefix match to find a GROUP of equal-cost next-hop ports, then choose ONE of
+  those ports for the packet and forward it there. There is no per-flow state.
+
+  ## Routing policy (control-plane installed)
+
+   - Destination in 10.0.2.0/24 → an equal-cost group of next-hop ports
+     {s1.p2, s1.p3, s1.p4}: forward the packet out exactly ONE of these.
+   - Any other destination, and any non-IPv4 frame → drop.
+
+  ## How the next-hop is chosen
+
+  The next-hop for a packet is selected by hashing the packet's flow identity —
+  its 5-tuple (IPv4 source address, IPv4 destination address, IP protocol, L4
+  source port, L4 destination port) — and using the hash to pick one member of
+  the group. The selection MUST satisfy the two RFC 2992 properties:
+
+   1. CONSISTENCY: every packet belonging to the same flow (same 5-tuple) is
+      forwarded out the SAME next-hop port, so a TCP stream is never reordered.
+      The choice must depend ONLY on the 5-tuple — never on a field that varies
+      packet-to-packet within a flow such as the TTL or the IPv4 identification.
+   2. DISTRIBUTION: across many distinct flows, the traffic spreads over the
+      group — the next-hop is genuinely a function of the hash, not a constant.
+
+  The chosen next-hop port MUST always be a member of the matched group.
+
+  ## Required behaviour / invariants
+
+   - A flow's packets all leave on one group member (consistency).
+   - Distinct flows use ≥ 2 of the group's members (distribution).
+   - The egress port is always one of the matched group's members.
+   - A packet whose destination matches no route, and any non-IPv4 frame, is
+     dropped (the switch must declare an explicit miss/default behaviour).
+
+  ## Topology
+
+  One switch s1. Ingress is s1.p1; the equal-cost next-hops are s1.p2, s1.p3,
+  s1.p4. (Port s1.p5 is present but unused at this configuration.)
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+  - from: s1.p5
+    to: h5
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+  h5:
+    ip: 10.0.5.5
+    mac: 08:00:00:00:05:05
+    port: s1.p5
+test_cases:
+- name: ecmp_consistent_udp
+  visibility: public
+  description: A same-flow UDP burst (4 packets, identical 5-tuple) to 10.0.2.0/24 MUST land wholly on one group member {p2,p3,p4}.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id001
+  input:
+    port: s1.p1
+    layers: *id001
+  expected:
+    behavior: ecmp_consistent
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_count: 4
+- name: ecmp_distributes_udp
+  visibility: public
+  description: 8 distinct UDP flows (varying src port) to 10.0.2.0/24 MUST spread across ≥2 of the group members {p2,p3,p4}.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5006
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5007
+        dport: 80
+  expected:
+    behavior: ecmp_distributes
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_distinct_ports: 2
+- name: route_miss_drops
+  visibility: public
+  description: Destination 10.0.9.9 matches no route → drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.9.9
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: ecmp_consistent_tcp
+  visibility: hidden
+  description: A same-flow TCP burst (4 packets) MUST land on one member.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id002
+  input:
+    port: s1.p1
+    layers: *id002
+  expected:
+    behavior: ecmp_consistent
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_count: 4
+- name: ecmp_distributes_tcp
+  visibility: hidden
+  description: 8 distinct TCP flows MUST spread across ≥2 members.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5006
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - TCP:
+        sport: 5007
+        dport: 80
+  expected:
+    behavior: ecmp_distributes
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_distinct_ports: 2
+- name: non_ipv4_arp_drops
+  visibility: hidden
+  description: A non-IPv4 frame (ARP) has no IPv4 destination → drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 10.0.2.50
+        psrc: 10.0.1.1
+  expected:
+    behavior: drop
+- name: icmp_flow_consistent
+  visibility: hidden
+  description: A same-flow ICMP burst (no L4 ports; 4 packets) MUST land wholly on one member — the selector handles a zero-port 5-tuple.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id003
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - ICMP:
+        type: 8
+  - port: s1.p1
+    layers: *id003
+  - port: s1.p1
+    layers: *id003
+  input:
+    port: s1.p1
+    layers: *id003
+  expected:
+    behavior: ecmp_consistent
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_count: 4
+- name: miss_other_prefix_drops
+  visibility: hidden
+  description: Destination 10.0.3.3 (outside 10.0.2.0/24) → drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.3
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: volatile_ttl_no_split
+  visibility: hidden
+  description: A same-flow UDP burst whose packets differ ONLY in TTL (64,32,16,8) MUST still land on one member — the hash must ignore TTL. Catches a program that folds a volatile field into the selector key (flow split).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 32
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 16
+    - UDP:
+        sport: 5000
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 8
+    - UDP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: ecmp_consistent
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_count: 4
+- name: distribution_spread_strict
+  visibility: hidden
+  description: 12 distinct UDP flows MUST spread across ≥2 members — a constant-index selector (no real hash) would use only one.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6006
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6007
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6008
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6009
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6010
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 6011
+        dport: 80
+  expected:
+    behavior: ecmp_distributes
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_distinct_ports: 2
+- name: distinct_dport_same_flow_fields
+  visibility: hidden
+  description: A same 5-tuple burst with identical ports (4 packets) lands on one member — baseline consistency for a fixed flow.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id004
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.50
+        ttl: 64
+    - UDP:
+        sport: 7777
+        dport: 443
+  - port: s1.p1
+    layers: *id004
+  - port: s1.p1
+    layers: *id004
+  input:
+    port: s1.p1
+    layers: *id004
+  expected:
+    behavior: ecmp_consistent
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_count: 4
+- name: distribute_over_dst_in_prefix
+  visibility: hidden
+  description: 8 flows to DIFFERENT destinations within 10.0.2.0/24 (varying dst) spread across ≥2 members — distribution is over the full 5-tuple.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.10
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.11
+        ttl: 64
+    - UDP:
+        sport: 5001
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.12
+        ttl: 64
+    - UDP:
+        sport: 5002
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.13
+        ttl: 64
+    - UDP:
+        sport: 5003
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.14
+        ttl: 64
+    - UDP:
+        sport: 5004
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.15
+        ttl: 64
+    - UDP:
+        sport: 5005
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.16
+        ttl: 64
+    - UDP:
+        sport: 5006
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.17
+        ttl: 64
+    - UDP:
+        sport: 5007
+        dport: 80
+  expected:
+    behavior: ecmp_distributes
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    min_distinct_ports: 2

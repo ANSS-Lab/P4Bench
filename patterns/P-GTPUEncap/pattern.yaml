@@ -1,0 +1,1453 @@
+# P-GTPUEncap — GTP-U user-plane tunnel encap/decap at the UPF / mobile-gateway boundary (3GPP TS 29.281)
+#
+# TPL v1.0 task pattern. Fills the P13 "mobile
+# data-plane functions" prescriptive cell — a publication-record gap in
+# the SIGCOMM/NSDI/CoNEXT 2017–2026 literature survey that nonetheless backs an
+# enormous production audience (every 4G/5G core). A stateless GTP-U
+# tunnel endpoint: on the uplink path (N3, gNB/eNB-facing) it identifies
+# a G-PDU by outer UDP destination port 2152, validates the GTP-U header,
+# looks up the tunnel by TEID, strips the outer IPv4 + UDP + GTP-U stack
+# and forwards the inner T-PDU toward the data network (N6). On the
+# downlink path (N6, data-network-facing) it matches a bare IP packet's
+# destination against the per-UE bearer table, prepends an outer IPv4 +
+# UDP(2152) + GTP-U(egress TEID) stack — optionally with a PDU Session
+# Container extension header carrying the QFI for 5G — and forwards toward
+# the gNB. target_capability = relocate: GTP-U termination is the textbook
+# host/appliance-side UPF user-plane function being relocated DOWN into
+# the switch (P4-UPF / SD-Fabric / Aether), which is the
+# structurally hardest LLM frontier (host-side-algorithm redesign for the
+# match-action substrate).
+#
+# Sibling of P-VXLANTunnel under the same (D5:routing) descriptive cell,
+# but differentiated on three axes: (1) target_capability relocate vs
+# redesign; (2) the GTP-U *outer* stack (UDP/GTP-U with a Length field
+# and a version/PT/message-type discipline) rather than VXLAN; and (3)
+# the inner payload is an IP packet (T-PDU), NOT an inner Ethernet frame
+# — a GTP-U-specific surface that catches implementations copied wholesale from a
+# VXLAN inner-Ethernet parser. Reuses the P-VXLANTunnel outer-header-
+# CONSTRUCTION surface (the common v1model setValid()-without-assignment
+# and checksum-recompute bug magnets) against a second, production-critical
+# encapsulation — the cheapest marginal pattern in the v1.1 extension.
+# Grounded in 3GPP TS 29.281 (canonical/normative) + the ONF Aether and
+# SD-Fabric P4-UPF write-ups. Instances are produced by binding the
+# parameters below.
+
+pattern_id: P-GTPUEncap
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                                  # tunnel forwarding at the UPF boundary; closest surveyed family — the P13 row is itself a publication-record gap with no descriptive counterpart
+  prescriptive: [P13:mobile-data-plane-functions]             # GTP / PFCP, UPF, mobile gateway — the `relocate` row in Table 1
+
+target_capability: relocate                                   # GTP-U user-plane termination is the host/appliance-side UPF function relocated into the switch (P4-UPF / Aether)
+
+summary: >
+  A stateless GTP-U tunnel endpoint (3GPP TS 29.281) for the 4G/5G
+  user plane, terminating at the UPF / mobile-gateway boundary. On the
+  uplink path (a port facing the gNB/eNB, the N3 interface) the switch
+  identifies a G-PDU by outer UDP destination port 2152, validates the
+  GTP-U header (version 1, Protocol Type 1, message type 255 = G-PDU),
+  confirms the outer IPv4 destination is this UPF's N3 address, looks
+  up the tunnel by its 32-bit TEID in the uplink session table, strips
+  the outer IPv4 + UDP + GTP-U stack, rewrites the L2 header toward the
+  data network and forwards the inner T-PDU. On the downlink path (a
+  port facing the data network, the N6 interface) it matches a bare IP
+  packet's destination address against the per-UE bearer table, builds
+  the outer GTP-U + UDP(2152) + IPv4 stack with the bearer's egress
+  TEID — optionally a PDU Session Container extension header carrying
+  the QoS Flow Identifier (QFI) for 5G — resolves the gNB's underlay
+  nexthop for the egress port and outer L2 rewrite, and forwards. State
+  is stateless control-plane-installed table lookup (the PFCP-provisioned
+  PDR/FAR surface), keyed on TEID uplink and UE-IP downlink. The
+  pattern's headline capabilities are *outer-header construction* (every
+  field of the newly-validated outer headers explicitly assigned — the
+  v1model setValid()-without-assignment bug surface this shares with
+  P-VXLANTunnel) and two GTP-U-specific disciplines a generic tunnel
+  implementation gets wrong: the GTP-U Length field MUST count exactly the
+  octets following the first 8 mandatory octets (including any optional
+  / extension-header octets), and the inner payload is an IP T-PDU, not
+  an inner Ethernet frame. Faithfulness anchors at D5.0 (minimal G-PDU
+  encap/decap, single bearer, no extension headers, lax validation) and
+  ladders through D5.1 (5G PDU Session Container + QFI, DSCP copy,
+  strict header validation, per-flow outer source-port hashing), D5.2
+  (End Marker handling, optional sequence-number field, multi-TEID
+  scale) and D5.3 (strict scale under a bounded bearer table at
+  realistic 4G/5G fan-out).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                                  # GTP-U user-plane termination is engineering-mature and absent from the SIGCOMM/NSDI/CoNEXT 2017–2026 survey corpus by construction — "mobile" (P13) is exactly such a publication-record gap (no descriptive counterpart in the survey). The protocol's authoritative source is its 3GPP TS; the P4 design is documented in the ONF Aether / SD-Fabric production write-ups (see posts).
+
+  rfcs:                                                       # 3GPP TS 29.281 is a normative protocol standard (not an IETF RFC); placed in the normative-document slot of the grounding block.
+    - cite: 3gpp_ts_29281
+      title: "3GPP TS 29.281 — General Packet Radio System (GPRS) Tunnelling Protocol User Plane (GTPv1-U)"
+      sections: ["§4.1 transmission order / addressing", "§5 GTP-U header", "§5.1 general format", "§5.2 GTP-U extension headers", "§7 GTP-U messages (G-PDU §7.3.1, End Marker §7.3.4)"]
+      quote: "This field unambiguously identifies a tunnel endpoint in the receiving GTP-U protocol entity."
+      quote_source: "3GPP TS 29.281 §5 GTP-U header / TEID (verbatim; cached at patterns/P-GTPUEncap/grounding/3gpp_ts_29281.txt). Grounds the TEID-keyed session lookup driving uplink decap (R1) and downlink encap (R2)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      role: normative_behaviour
+      relevance: |
+        The protocol's authoritative source. The pattern's rule sequence
+        preserves the SHALL/MUST clauses that bind data-plane behaviour,
+        drawn from §5 (header format) and §7 (messages):
+
+          - §5 mandatory header — the first 8 octets are mandatory:
+            Version (3 bits, "shall be set to decimal 1" for GTPv1-U),
+            Protocol Type flag PT ("shall be set to '1'" to distinguish
+            GTP from GTP'), the E / S / PN optional-field flags, the
+            Message Type (1 octet), the Length (2 octets), and the
+            32-bit TEID. The pattern's R1 uplink-decap `when` clause
+            tests `header_present(gtpu) ∧ gtpu.message_type == 255` and
+            (under strict validation) `gtpu.version == 1 ∧ gtpu.pt == 1`;
+            R2 stamps all of these on the encap path and the
+            `gtpu_header_wellformed_on_tx` invariant pins the transmit
+            MUSTs.
+
+          - §5 Length field — "indicates the length in octets of the
+            payload, i.e. the rest of the packet following the mandatory
+            part of the GTP header (that is the first 8 octets). The
+            Sequence Number, the N-PDU Number or any Extension headers
+            shall be considered to be part of the payload, i.e. included
+            in the length count." This is the GTP-U-specific arithmetic
+            a generic tunnel implementation gets wrong: the
+            `gtpu_length_field_correct` invariant and its G1 test pin
+            that Length excludes the first 8 octets and includes the
+            optional/extension-header octets.
+
+          - §5 TEID — "the Tunnel Endpoint Identifier ... unambiguously
+            identifies a tunnel endpoint in the receiving GTP-U protocol
+            entity. The receiving end side of a GTP tunnel locally
+            assigns the TEID value the transmitting side has to use."
+            The pattern's `ul_session` bucket is keyed on `teid`
+            (R1 lookup) and the `dl_bearer` bucket supplies the egress
+            `teid` the encap path stamps (R2).
+
+          - §5.1 / §5.2 flags + extension headers — when the E (Extension
+            Header) flag is set, the optional 4-octet field (Sequence
+            Number, N-PDU Number, Next Extension Header Type) is present
+            and is followed by extension headers; the 5G PDU Session
+            Container (Next Extension Header Type 0x85) carries the QFI.
+            The pattern's `${gtpu_ext_header_handling}` /
+            `${qfi_policy}` parameters expose this; the `qfi_set_on_tx`
+            invariant pins the QFI value.
+
+          - §7.3.1 G-PDU — message type 255 carries user data (a T-PDU
+            plus GTP-U header). §7.3.4 End Marker — message type 254
+            "indicates the end of the payload stream on a given tunnel.
+            ... a G-PDU that arrives after an End Marker message on this
+            tunnel may be silently discarded." The pattern's R5 handles
+            the End Marker per `${end_marker_handling}` (drop at the
+            anchor — an End Marker is signalling, not user data, and
+            MUST NOT be decapsulated and delivered to the data network).
+
+          - §4.2.1 / IANA — GTP-U uses UDP destination port 2152. The
+            pattern's `${outer_udp_dst_port}` defaults to 2152 and the
+            decap path's R1 matcher tests `udp.dst == ${outer_udp_dst_port}`.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model bridging — `setValid()` on the new outer
+        IPv4 / UDP / GTP-U headers, the explicit per-field assignment
+        that turns an uninitialised-header bug into a compile-clean
+        silent failure, `update_checksum` on the new outer IPv4, the
+        Length-field arithmetic as a header-length expression, and the
+        parser cascade Eth → outer-IPv4 → UDP(2152) → GTP-U → inner-IPv4
+        — is widely-known P4-on-v1model practice rather than TS-cited.
+        These bridging notes are flagged `[common-knowledge baseline]`
+        in `bridging_notes:` rather than re-attributed to the TS.
+
+  posts:
+    - url: "https://opennetworking.org/news-and-events/blog/using-p4-and-programmable-switches-to-implement-a-4g-5g-upf-in-aether/"
+      title: "Using P4 and Programmable Switches to Implement a 4G/5G UPF in Aether (ONF)"
+      role: canonical_implementation
+      relevance: |
+        The production write-up of the relocate target this pattern
+        models: a GTP-U user-plane function implemented in P4 on a
+        programmable switch. Read in Step 3 — establishes that P4-UPF
+        "implements GTP-U tunnel encap/decap including support for 5G
+        extensions such as PDU Session Container carrying QoS Flow
+        Information, with scalability to tens of thousands of uplink and
+        downlink tunnels", that the control plane uses PFCP abstracted
+        through a virtual-UPF model, and that the unprovisioned-downlink
+        case triggers a host-side buffering service (a Downlink Data
+        Notification path the pattern's anchor simplifies to a drop in
+        R6). Grounds the `relocate` capability tag, the PDR/FAR table
+        structure, and the QFI feature ladder.
+    - url: "https://docs.sd-fabric.org/master/advanced/p4-upf.html"
+      title: "P4-based User Plane Function (P4-UPF) — SD-Fabric documentation"
+      role: optimisation
+      relevance: |
+        The SD-Fabric P4-UPF reference. Read in Step 3 (via the page's
+        indexed content) — documents the two directional pipelines this
+        pattern's R1/R2 realise: the uplink pipeline "uses the tunnel
+        end-point identifier (TEID) of GTP-U to look up the session" and
+        the matched rule stores the QFI in packet metadata, while the
+        downlink matches "against UEs' IP addresses". Confirms the
+        TEID-keyed uplink (`ul_session`) vs UE-IP-keyed downlink
+        (`dl_bearer`) split and the PDR (Packet Detection Rule) / FAR
+        (Forwarding Action Rule) / QFI abstraction the parameter surface
+        encodes.
+
+  tutorials:
+    - url: https://github.com/p4lang/tutorials/tree/master/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        The P4 tutorials MyTunnel outer-header-construction forerunner (a
+        three-host single-switch topology with two forwarding paths and
+        an encap/decap parse graph). P-GTPUEncap reuses the topology
+        SHAPE and the access/uplink port partitioning, but replaces the
+        4-byte MyTunnel header with the GTP-U/UDP/outer-IPv4 stack and —
+        critically — drops the inner-Ethernet assumption: GTP-U
+        encapsulates an IP T-PDU, so the inner stack parses straight to
+        IPv4 with no inner Ethernet. The anchor-band instance is
+        behaviourally a GTP-U lift of this tutorial's plain-pass-through
+        cases.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. All forwarding decisions derive from
+      header fields, the ingress port, and control-plane-installed
+      (PFCP-provisioned) mapping tables. The pattern is stateless — no
+      `flow` / `connection` / `session` rows are maintained across
+      packets, which differentiates it from the per-flow state patterns
+      (P-NAT44, P-StatefulLB) and aligns it with its sibling
+      P-VXLANTunnel. ("Session" here is the 3GPP PDU session, modelled
+      as a control-plane table row, not a TPL `session` entity.)
+
+  link:                                                       # port-keyed N3 (gNB-facing) / N6 (data-network-facing) interface role
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      role:  "enum {access_n3, core_n6}"                      # access_n3 ports face the gNB/eNB and carry GTP-U-encapsulated traffic; core_n6 ports face the data network and carry bare inner IP
+    populated_from:
+      n3_rows: ${n3_ports}                                    # one row per gNB-facing port under role=access_n3
+      n6_rows: ${n6_ports}                                    # one row per data-network-facing port under role=core_n6
+    notes: |
+      Maps every ingress port to either the N3 role (gNB-facing,
+      GTP-U-encapsulated traffic, drives the uplink-decap R1) or the
+      N6 role (data-network-facing, bare inner IP, drives the
+      downlink-encap R2). Per-port-role gating is what lets R1 (decap)
+      and R2 (encap) be first-match-disjoint rather than relying on
+      header validity alone — and it pins the relocate twist: a bare IP
+      packet on N6 destined to a UE must be RECOGNISED as needing
+      tunnelling (the host-side-algorithm-redesign challenge behind
+      relocate-frontier failures).
+
+  ul_session:                                                 # TPL `bucket` — TEID → uplink-decap forwarding action (PFCP PDR ∘ FAR)
+    type: bucket
+    keyed_by_tuple: [teid]
+    attrs:
+      n6_egress_port:  port
+      n6_dst_mac:      address                                # next-hop MAC toward the data network
+      n6_src_mac:      address                                # this UPF's N6 port MAC
+    capacity: ${ul_session_capacity}
+    populated_from: ${ul_session_entries}                     # rows the seed installs
+    notes: |
+      The uplink Packet-Detection-Rule ∘ Forwarding-Action-Rule table:
+      a received G-PDU's 32-bit TEID resolves to the decap forwarding
+      action (egress port toward N6 + outer L2 rewrite of the now-
+      exposed inner IP frame). Keyed on `teid` per TS 29.281 §5 (the
+      receiver assigns the TEID the sender must use). At D5.0 the table
+      is a single tunnel; D5.2/D5.3 ladder to multi-TEID scale under a
+      bounded capacity.
+
+  dl_bearer:                                                  # `bucket` — UE IP → downlink-encap bearer (egress TEID, gNB address, QFI)
+    type: bucket
+    keyed_by_tuple: [ue_ip]
+    attrs:
+      egress_teid:  int                                       # the downlink TEID the gNB assigned for this bearer
+      gnb_ip:       address                                   # the gNB's GTP-U endpoint IP (outer destination on encap)
+      qfi:          int                                       # 5G QoS Flow Identifier (0..63); stamped into the PDU Session Container when ${qfi_policy} != none
+    capacity: ${dl_bearer_capacity}
+    populated_from: ${dl_bearer_entries}                      # rows the seed installs
+    notes: |
+      The downlink PDR ∘ FAR table: a bare IP packet's destination
+      address (a UE IP) resolves to the bearer's egress TEID, the gNB
+      tunnel-endpoint IP, and the QFI. Drives R2's encap action. Keyed
+      on `ue_ip` per the SD-Fabric P4-UPF downlink pipeline ("packets
+      match against UEs' IP addresses in the downlink direction").
+
+  n3_nexthop_fib:                                             # `bucket` — gNB IP → underlay nexthop (egress port + outer L2 rewrite)
+    type: bucket
+    keyed_by_tuple: [gnb_ip]
+    attrs:
+      n3_egress_port:  port
+      outer_dst_mac:   address                                # next-underlay-hop MAC toward the gNB
+      outer_src_mac:   address                                # this UPF's N3 port MAC
+    populated_from: ${n3_nexthop_entries}                     # rows the seed installs
+    notes: |
+      Underlay-side resolution toward the gNB. After R2 picks the gNB
+      tunnel-endpoint IP from `dl_bearer`, this table picks the N3
+      egress port and the outer Ethernet rewrite. Singletons at the
+      anchor band; N3 ECMP is out of scope (P-IPv4Routing covers
+      underlay multipathing — P-GTPUEncap composes with it transitively
+      as the P-UPFRouter composite,
+      rather than re-encoding ECMP here).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  n3_ports:
+    type: list[int]
+    constraint: "every entry is a port number in [1, 511] (BMv2 simple_switch range); disjoint from n6_ports."
+    notes: |
+      Ingress ports configured as N3 (gNB-facing). Populate the `link`
+      entity's `role == access_n3` rows. R1 / R3 / R4 / R5 fire only
+      when `ingress(access_n3)` holds.
+
+  n6_ports:
+    type: list[int]
+    constraint: "every entry is a port number in [1, 511]; disjoint from n3_ports."
+    notes: |
+      Ingress ports configured as N6 (data-network-facing). Populate the
+      `link` entity's `role == core_n6` rows. R2 / R6 fire only when
+      `ingress(core_n6)` holds.
+
+  ul_session_entries:
+    type: list[ul_session_entry]
+    constraint: |
+      every entry has teid:int ∈ [0, 4294967295] (32-bit); n6_egress_port:int
+      ∈ n6_ports; n6_dst_mac:address; n6_src_mac:address; teid is unique
+      across the list; |entries| ≤ ${ul_session_capacity} when bounded.
+    notes: |
+      The (teid → decap forwarding action) rows that populate the
+      `ul_session` bucket. Drives R1's lookup `ul_session by_key(gtpu.teid)`.
+      Bound by the seed.
+
+  dl_bearer_entries:
+    type: list[dl_bearer_entry]
+    constraint: |
+      every entry has ue_ip:address; egress_teid:int ∈ [0, 4294967295];
+      gnb_ip:address; qfi:int ∈ [0, 63]; ue_ip is unique across the list;
+      every gnb_ip MUST resolve in n3_nexthop_entries;
+      |entries| ≤ ${dl_bearer_capacity} when bounded.
+    notes: |
+      The (ue_ip → egress_teid, gnb_ip, qfi) rows that populate the
+      `dl_bearer` bucket. Drives R2's lookup `dl_bearer by_key(ipv4.dst)`
+      on the downlink path. Bound by the seed.
+
+  n3_nexthop_entries:
+    type: list[n3_nexthop_entry]
+    constraint: |
+      every entry has gnb_ip:address; n3_egress_port:int ∈ n3_ports;
+      outer_dst_mac:address; outer_src_mac:address; gnb_ip is unique
+      across the list.
+    notes: |
+      Underlay nexthop rows that populate the `n3_nexthop_fib` bucket.
+      Drives R2's `n3_nexthop_fib by_key(dl_bearer.gnb_ip)` lookup and
+      supplies the outer Ethernet rewrite the encap action stamps.
+
+  upf_n3_ip:
+    type: address
+    notes: |
+      The IPv4 address of this UPF's GTP-U endpoint on the N3 interface
+      — the outer source IP on every downlink-encap packet, and the
+      outer destination IP that uplink G-PDUs target. R1's `when` clause
+      tests `outer_ipv4.dst == ${upf_n3_ip}` (only G-PDUs addressed to
+      THIS UPF are decapsulated); R2 stamps it as `outer_ipv4.src`.
+
+  outer_udp_dst_port:
+    type: int
+    range: "[1, 65535]"
+    default: 2152
+    notes: |
+      TS 29.281 / IANA assignment for GTP-U is UDP port 2152. The encap
+      path stamps this as the outer UDP destination port and the decap
+      path's R1 matcher tests `udp.dst == ${outer_udp_dst_port}`.
+      Exposed as a parameter only to keep the surface configurable; the
+      default 2152 is the production value.
+
+  outer_udp_src_port_mode:
+    type: enum
+    values: [fixed, hash_inner_5tuple]
+    default: fixed
+    notes: |
+      Whether the outer UDP source port on the encap path is a fixed
+      value or a hash of the inner T-PDU's 5-tuple. Production GTP-U
+      endpoints frequently hash the inner flow into the outer source
+      port so the N3 underlay's ECMP can spread bearers across paths.
+      `fixed` is the anchor-band simplification; `hash_inner_5tuple`
+      ladders to D5.1 entropy.
+
+  outer_udp_src_port_fixed_value:
+    type: int
+    range: "[1, 65535]"
+    default: 2152
+    enforced_when: "${outer_udp_src_port_mode} == fixed"
+    notes: |
+      The literal UDP source port to stamp when
+      `${outer_udp_src_port_mode} == fixed`. GTP-U commonly reuses 2152
+      on both ends; this is the anchor default.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${outer_udp_src_port_mode} != fixed"
+    notes: |
+      Hash function used to derive the outer UDP source port from the
+      inner T-PDU 5-tuple when `${outer_udp_src_port_mode} ==
+      hash_inner_5tuple`. `xor_fold` is the cheapest but weakest — used
+      to harden the panel via `swap_hash_to_xor_fold` (under adversarial
+      inner flow-tuples its output collapses to a narrow port range and
+      the N3 ECMP cannot spread the bearer).
+
+  outer_udp_checksum_mode:
+    type: enum
+    values: [zero_on_tx, computed_on_tx]
+    default: zero_on_tx
+    notes: |
+      For IPv4-transported GTP-U the outer UDP checksum MAY be
+      transmitted as zero (no checksum). `zero_on_tx` is the anchor-band
+      default; `computed_on_tx` lifts to the harder variant where the
+      implementation MUST compute the UDP checksum across the outer-IP
+      pseudo-header + UDP + GTP-U + inner T-PDU — a multi-layer checksum
+      extern invocation BMv2 supports but LLM-drafted P4 commonly gets
+      wrong (forgetting the pseudo-header or mis-spanning).
+
+  gtpu_ext_header_handling:
+    type: enum
+    values: [none, pdu_session_container, strict_drop_unknown]
+    default: none
+    notes: |
+      How GTP-U extension headers are handled. `none` (anchor) emits no
+      extension header (E flag = 0) on encap and ignores any on decap.
+      `pdu_session_container` adds the 5G PDU Session Container
+      extension header (Next Extension Header Type 0x85) on encap,
+      setting the E flag and the optional 4-octet field, and parses it
+      on decap. `strict_drop_unknown` additionally drops uplink G-PDUs
+      carrying an unrecognised Next-Extension-Header-Type. Moved by the
+      faithfulness ladder (entailed binding); see `tighten_faithfulness`.
+
+  qfi_policy:
+    type: enum
+    values: [none, set_from_bearer]
+    default: none
+    enforced_when: "${gtpu_ext_header_handling} == pdu_session_container"
+    notes: |
+      Whether the encap path stamps the bearer's QFI into the PDU
+      Session Container extension header (`set_from_bearer`) or omits it
+      (`none`). The `qfi_set_on_tx` invariant is enforced only under
+      `set_from_bearer`. Moved by the faithfulness ladder.
+
+  dscp_copy_policy:
+    type: enum
+    values: [none, copy_inner_to_outer]
+    default: none
+    notes: |
+      Whether the encap path copies the inner T-PDU's DSCP into the
+      outer IPv4 DSCP (`copy_inner_to_outer`, the 3GPP TS 23.501
+      transport-level QoS marking practice) or leaves the outer DSCP at
+      0 (`none`, the anchor simplification). Moved by the faithfulness
+      ladder.
+
+  teid_validation_strict:
+    type: bool
+    default: false
+    notes: |
+      Whether the uplink path enforces the GTP-U header MUSTs (version
+      == 1, PT == 1) as a drop condition (`true`) or accepts a G-PDU on
+      TEID lookup alone (`false`). TS 29.281 §5 makes version 1 / PT 1 a
+      transmit MUST; a security-conscious UPF treats a violating header
+      as a malformed-packet drop (R4). `false` is the anchor default.
+
+  end_marker_handling:
+    type: enum
+    values: [drop, forward_to_n6]
+    default: drop
+    notes: |
+      How a GTP-U End Marker (message type 254) on the uplink is
+      handled. An End Marker is tunnel signalling, not user data — TS
+      29.281 §7.3.4 says a G-PDU after an End Marker MAY be silently
+      discarded, and the End Marker itself MUST NOT be delivered to the
+      data network as a T-PDU. `drop` (anchor) discards it;
+      `forward_to_n6` is a deliberately-wrong harder-to-distinguish
+      foil only used to widen the discriminating band — it is NOT
+      spec-conformant and is excluded from anchor/ceiling seeds.
+      Moved by the faithfulness ladder.
+
+  inner_ttl_handling:
+    type: enum
+    values: [preserve, decrement]
+    default: preserve
+    notes: |
+      Whether the inner T-PDU's IPv4 TTL is preserved across the tunnel
+      endpoint (`preserve`, the tunnel-correct behaviour: GTP-U is
+      transport, the inner packet is opaque) or decremented (`decrement`,
+      the L3-router conflation bug). `preserve` is the only
+      spec-conformant value; `decrement` exists solely so the
+      `encap_path_inner_ttl_preservation` G3 test has a named foil. The
+      inner-payload-persistence invariant pins `preserve`.
+
+  mtu_enforcement:
+    type: enum
+    values: [ignore, strict_drop_oversize]
+    default: ignore
+    notes: |
+      Whether the encap path drops a downlink packet whose post-encap
+      size would exceed `${outer_mtu}` (`strict_drop_oversize`) or lets
+      the underlay handle it (`ignore`, the anchor default). 3GPP leaves
+      transport-network fragmentation to IP; this knob exposes the
+      strict-drop variant for the bands that want an explicit boundary
+      check.
+
+  outer_mtu:
+    type: int
+    range: "[576, 9216]"
+    default: 1500
+    enforced_when: "${mtu_enforcement} == strict_drop_oversize"
+    notes: |
+      The outer MTU the encap path checks against under
+      `${mtu_enforcement} == strict_drop_oversize`. 1500 is the
+      anchor-band default; jumbo (9000+) is the realistic transport
+      choice that keeps the ~36–44-byte GTP-U/UDP/IP encap overhead
+      from hitting the MTU ceiling for line-rate inner T-PDUs.
+
+  ul_session_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of TEID entries the uplink session table supports.
+      Production UPFs sit in the 10⁴–10⁶ tunnel range;
+      `shrink_session_capacity_4x` exercises this axis from the anchor
+      band's `unbounded` baseline.
+
+  dl_bearer_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of UE-IP bearer entries the downlink table
+      supports. Mutated jointly with `ul_session_capacity` by the
+      capacity operators so a hardened instance squeezes both
+      directions symmetrically.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of inner flow-tuples / UE addresses used by the G1
+      traffic tests. `uniform` is the anchor default;
+      `raise_workload_skew` ladders through `zipfian` (a few heavy UEs)
+      and `adversarial` (collision-prone tuples that stress
+      `${hash_algo}` quality on the outer-source-port hash).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_gpdu, D5.1_qfi_ext_header, D5.2_endmarker_multi_teid, D5.3_strict_scale]
+    default: D5.0_anchor_gpdu
+    notes: |
+      The faithfulness/feature ladder for this pattern. D5.0 is the
+      minimal G-PDU encap/decap (no extension headers, no QFI, no DSCP
+      copy, lax validation, fixed outer src port, zero UDP checksum,
+      single bearer/TEID, MTU ignore, End Marker drop). D5.1 lifts to
+      the 5G PDU Session Container + QFI, DSCP copy, strict header
+      validation, and per-flow outer-source-port hashing. D5.2 adds
+      End Marker handling, the optional sequence-number field, and
+      multi-TEID scale. D5.3 raises the bearer-table scale under a
+      bounded capacity with strict everything. Note: this is a
+      feature-surface ladder (GTP-U is stateless — there is no
+      exact↔approximate STATE fidelity to vary), so its operators carry
+      `axis: feature-breadth`, not `faithfulness`.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+
+rules:
+
+  - id: R0_non_handled_drop
+    when: |
+      ¬header_present(ethernet)
+      ∨ ¬header_present(ipv4)
+      ∨ ( ingress(access_n3) ∧ ¬header_present(udp) )
+    then:
+      - drop
+    notes: |
+      The UPF handles bare IPv4 on N6 ports (downlink T-PDUs) and
+      GTP-U-over-UDP/IPv4 on N3 ports (uplink G-PDUs). Anything that
+      fails to parse to IPv4 (ARP, IPv6, LLDP) is out of scope; anything
+      on an N3 port that fails to parse the outer UDP is non-GTP-U
+      transit the UPF does not terminate. Drop in both cases.
+
+  - id: R1_uplink_decap
+    when: |
+      ingress(access_n3)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(gtpu)
+        ∧ gtpu.message_type == 255                            # G-PDU (TS 29.281 §7.3.1)
+        ∧ ( ¬${teid_validation_strict}
+            ∨ ( gtpu.version == 1 ∧ gtpu.pt == 1 ) )
+        ∧ match(outer_ipv4.dst, ${upf_n3_ip})
+        ∧ exists(ul_session, gtpu.teid)
+    given:
+      port_role:   by_key(standard_metadata.ingress_port)
+      ul_session:  by_key(gtpu.teid)
+    then:
+      - "set(outer_ipv4.valid, false)"                        # strip outer IPv4
+      - "set(udp.valid, false)"                               # strip outer UDP
+      - "set(gtpu.valid, false)"                              # strip GTP-U (incl. any optional/ext fields)
+      - "set(ethernet.src, ul_session.n6_src_mac)"            # L2 rewrite toward the data network
+      - "set(ethernet.dst, ul_session.n6_dst_mac)"
+      - forward(ul_session.n6_egress_port)
+    notes: |
+      TS 29.281 uplink decap: identify a G-PDU by outer UDP dst port,
+      validate the GTP-U header MUSTs under `${teid_validation_strict}`,
+      confirm the outer IPv4 destination is this UPF's N3 endpoint, look
+      up the tunnel by TEID, strip the outer IPv4 + UDP + GTP-U stack,
+      rewrite the L2 header toward N6 and forward the inner T-PDU. The
+      inner payload is an IP packet — there is NO inner Ethernet to
+      strip (GTP-U §5: the payload of a G-PDU is a T-PDU = an IP
+      packet). Bridge anti-pattern #1: parsing/expecting an inner
+      Ethernet (a VXLAN habit) — `decap_inner_is_ip_not_ethernet`
+      catches it. Bridge anti-pattern #2: a single forward without the
+      three explicit `setInvalid` clauses leaves outer headers in the
+      deparser's emit list — `outer_headers_truly_stripped_on_decap`
+      catches it.
+
+  - id: R2_downlink_encap
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)                               # belt-and-braces: N6 traffic is not already tunnelled
+        ∧ exists(dl_bearer, ipv4.dst)
+        ∧ exists(n3_nexthop_fib, dl_bearer.gnb_ip)
+        ∧ ( ${mtu_enforcement} == ignore
+            ∨ encapsulated_size(packet) ≤ ${outer_mtu} )
+    given:
+      dl_bearer:        by_key(ipv4.dst)
+      n3_nexthop_fib:   by_key(dl_bearer.gnb_ip)
+    then:
+      # The arriving IPv4 packet becomes the inner T-PDU; outer headers are pushed in front of it.
+      # 1. Stamp the new GTP-U header (TS 29.281 §5)
+      - "set(gtpu.valid, true)"
+      - "set(gtpu.version, 1)"                                # §5 MUST: GTPv1-U
+      - "set(gtpu.pt, 1)"                                     # §5 MUST: GTP (not GTP')
+      - "set(gtpu.spare, 0)"
+      - "set(gtpu.e_flag, ext_flag(${gtpu_ext_header_handling}))"   # 1 iff a PDU Session Container is added
+      - "set(gtpu.s_flag, 0)"                                 # no sequence number at D5.0/D5.1
+      - "set(gtpu.pn_flag, 0)"
+      - "set(gtpu.message_type, 255)"                         # G-PDU
+      - "set(gtpu.teid, dl_bearer.egress_teid)"
+      - "set(gtpu.length, gtpu_length(packet, ${gtpu_ext_header_handling}))"   # §5: octets after the first 8 mandatory, incl optional/ext-header octets
+      - "set(pdu_session_container.valid, ${gtpu_ext_header_handling} == pdu_session_container)"
+      - "set(pdu_session_container.qfi, qfi_value(${qfi_policy}, dl_bearer.qfi))"
+      # 2. Stamp the new outer UDP header
+      - "set(udp.valid, true)"
+      - "set(udp.dst, ${outer_udp_dst_port})"                 # 2152
+      - "set(udp.src, outer_udp_src(${outer_udp_src_port_mode}, ${outer_udp_src_port_fixed_value}, ${hash_algo}, inner_ipv4))"
+      - "set(udp.length, gtpu_udp_length(packet))"
+      - "set(udp.checksum, outer_udp_checksum(${outer_udp_checksum_mode}, packet))"
+      # 3. Stamp the new outer IPv4 header
+      - "set(outer_ipv4.valid, true)"
+      - "set(outer_ipv4.version, 4)"
+      - "set(outer_ipv4.ihl, 5)"
+      - "set(outer_ipv4.dscp, outer_dscp(${dscp_copy_policy}, inner_ipv4.dscp))"
+      - "set(outer_ipv4.ecn, 0)"
+      - "set(outer_ipv4.total_length, outer_ipv4_total_length(packet))"
+      - "set(outer_ipv4.identification, 0)"
+      - "set(outer_ipv4.flags, df_bit_only)"                  # set DF — do not fragment the transport packet
+      - "set(outer_ipv4.frag_offset, 0)"
+      - "set(outer_ipv4.ttl, 64)"
+      - "set(outer_ipv4.protocol, 17)"                        # UDP
+      - "set(outer_ipv4.src, ${upf_n3_ip})"
+      - "set(outer_ipv4.dst, dl_bearer.gnb_ip)"
+      - "set(outer_ipv4.header_checksum, outer_ipv4_checksum_recompute())"
+      # 4. Rewrite the outer Ethernet toward the gNB underlay nexthop
+      - "set(ethernet.src, n3_nexthop_fib.outer_src_mac)"
+      - "set(ethernet.dst, n3_nexthop_fib.outer_dst_mac)"
+      - "set(ethernet.ether_type, 0x0800)"                    # IPv4
+      # 5. Forward on the N3 egress port
+      - forward(n3_nexthop_fib.n3_egress_port)
+    notes: |
+      TS 29.281 downlink encap (the SD-Fabric P4-UPF "match on UE IP →
+      encap" pipeline). The arriving IPv4 packet is the inner T-PDU; the
+      action pushes a fresh outer IPv4 + UDP(2152) + GTP-U(egress TEID)
+      stack in front of it and rewrites the outer Ethernet toward the
+      gNB. The dense per-field assignment is the
+      `outer_header_field_completeness` surface — forgetting any one
+      field leaves a garbage value that compiles cleanly. THREE GTP-U-
+      specific traps live here: (a) `gtpu.length` MUST equal the octets
+      AFTER the first 8 mandatory octets (incl. the 4 optional + 4-per
+      PDU-Session-Container octets when present), not the inner total
+      length and not the whole packet — `gtpu_length_field_correct`
+      pins it; (b) `gtpu.version`/`pt`/`message_type` MUSTs —
+      `gtpu_header_wellformed_on_tx`; (c) the inner T-PDU must NOT be
+      TTL-decremented (this is tunnel transport, not L3 forwarding) —
+      `encap_path_inner_ttl_preservation`. Bridge: typical PDR/FAR table
+      layout — port-role, dl_bearer (exact on ipv4.dst), n3_nexthop_fib
+      (exact on gnb_ip), plus the outer-header builder action.
+      Forgetting `update_checksum` over the outer IPv4 is the most
+      common silent failure (`checksum_recompute_on_outer_ipv4`).
+
+  - id: R3_uplink_unknown_teid_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(gtpu)
+        ∧ gtpu.message_type == 255
+        ∧ ¬exists(ul_session, gtpu.teid)
+    then:
+      - drop
+    notes: |
+      A G-PDU whose TEID has no installed session is dropped (TS 29.281:
+      a TEID unambiguously identifies a tunnel endpoint at the receiver;
+      an unknown TEID has no endpoint). In a full UPF this would emit a
+      GTP-U Error Indication; the anchor band drops silently. R3 fires
+      AFTER R1 in declared order: if R1's `when` already accepted (TEID
+      exists and header valid), control never reaches R3.
+
+  - id: R4_uplink_malformed_gtpu_drop
+    when: |
+      ingress(access_n3)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(gtpu)
+        ∧ ${teid_validation_strict}
+        ∧ ( gtpu.version != 1 ∨ gtpu.pt != 1 )
+    then:
+      - drop
+    notes: |
+      TS 29.281 §5 strict-validation path: a GTP-U-looking packet whose
+      Version is not 1 or whose Protocol Type bit is not 1 is malformed
+      under `${teid_validation_strict}` and dropped. The spec makes
+      version 1 / PT 1 a transmit MUST; the security-conscious UPF
+      treats a violation as a malformed-packet signal. R4 is the
+      explicit-drop disjoint partner of R1's `version == 1 ∧ pt == 1`
+      acceptance guard.
+
+  - id: R5_uplink_end_marker
+    when: |
+      ingress(access_n3)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(gtpu)
+        ∧ gtpu.message_type == 254                            # End Marker (TS 29.281 §7.3.4)
+        ∧ ${end_marker_handling} == drop
+    then:
+      - drop
+    notes: |
+      TS 29.281 §7.3.4 End Marker: tunnel signalling indicating the end
+      of the payload stream — NOT user data. Under the conformant
+      `${end_marker_handling} == drop` it is discarded; it MUST NOT be
+      decapsulated and delivered to the data network as though it were a
+      T-PDU. The `gtpu_end_marker_not_forwarded` G2 test pins this.
+
+  - id: R6_downlink_unknown_ue_drop
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)
+        ∧ ¬exists(dl_bearer, ipv4.dst)
+    then:
+      - drop
+    notes: |
+      A downlink packet whose destination is not a provisioned UE bearer
+      is dropped. In a full UPF an unprovisioned downlink triggers a
+      Downlink Data Notification and host-side buffering (the Aether
+      P4-UPF buffering service); the anchor band simplifies this to a
+      drop. R6 is the explicit partner of R2's `exists(dl_bearer, ...)`
+      acceptance guard.
+
+  - id: R7_downlink_oversize_drop
+    when: |
+      ingress(core_n6)
+        ∧ header_present(ipv4)
+        ∧ ¬header_present(gtpu)
+        ∧ exists(dl_bearer, ipv4.dst)
+        ∧ ${mtu_enforcement} == strict_drop_oversize
+        ∧ encapsulated_size(packet) > ${outer_mtu}
+    then:
+      - drop
+    notes: |
+      Under strict MTU enforcement a downlink packet whose post-encap
+      size would exceed `${outer_mtu}` is dropped rather than forwarded
+      oversize. R7 fires only when R2's MTU guard rules the packet out,
+      making it R2's explicit disjoint drop partner. (3GPP's general
+      practice is transport-network IP fragmentation; this strict-drop
+      variant is the band-laddering boundary check, not a protocol MUST.)
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The decap path strips outer
+      headers and forwards on an N6 port; the encap path pushes outer
+      headers and forwards on an N3 port. No recirculation in this
+      pattern.
+
+  - id: teid_decap_routing_correctness
+    clause: persistence
+    target: "(decap_egress_port, gtpu.teid)"
+    while: "rule R1 fires"
+    free_under: []
+    notes: |
+      TS 29.281 §5 TEID semantics: the uplink decap egress decision is
+      determined SOLELY by the received G-PDU's TEID via its
+      `ul_session` binding — two G-PDUs with the same TEID always decap
+      to the same N6 egress action, and the inner header fields do not
+      influence the egress port. Bridge anti-pattern: routing the
+      decapsulated inner packet by inner-destination LPM (conflating the
+      GTP-U endpoint with an IP router) instead of by the TEID's FAR.
+
+  - id: inner_payload_persistence
+    clause: persistence
+    target: "(inner_ipv4, inner_l4_payload)"
+    while: "rule R1 fires ∨ rule R2 fires"
+    free_under: []
+    enforced_when: "${inner_ttl_handling} == preserve"
+    notes: |
+      The inner T-PDU (inner IPv4 header and everything beneath it) is
+      delivered byte-for-byte identical across the tunnel endpoint —
+      stripped out unchanged on decap (R1) and wrapped unchanged on
+      encap (R2). GTP-U is transparent transport; the inner packet is
+      opaque. Bridge anti-pattern: decrementing the inner IPv4 TTL or
+      rewriting inner addresses (an L3-forwarder habit) —
+      `encap_path_inner_ttl_preservation` and
+      `decap_inner_is_ip_not_ethernet` catch the two manifestations.
+
+  - id: outer_header_field_completeness
+    clause: stability
+    target: "(outer_ipv4.*, udp.*, gtpu.*)"
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      Every field of each newly-validated outer header on the encap path
+      is explicitly assigned, not left to the `setValid()` default
+      (which leaves fields uninitialised). The formal pin on the common
+      v1model `setValid()`-without-assignment bug — the
+      `gtpu_encap_all_outer_fields_set` test enumerates every field,
+      including the GTP-U flags byte and Length.
+
+  - id: outer_ipv4_checksum_validity
+    clause: stability
+    target: outer_ipv4.header_checksum
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      The newly-stamped outer IPv4 header MUST carry a valid header
+      checksum, computed from scratch (no prior valid checksum to update
+      incrementally). Implementation anti-pattern: omitting `update_checksum`
+      for the outer IPv4 (the common v1model checksum-miss bug) —
+      BMv2 emits the packet as-is and the receiving gNB / transport
+      router silently drops. `checksum_recompute_on_outer_ipv4` catches
+      it.
+
+  - id: gtpu_length_field_correct
+    clause: stability
+    target: gtpu.length
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      TS 29.281 §5: the GTP-U Length field MUST equal the number of
+      octets following the first 8 mandatory octets — i.e. the inner
+      T-PDU length PLUS any optional 4-octet field (when E/S/PN set)
+      PLUS any extension-header octets (the 4-octet PDU Session
+      Container when present). This GTP-U-specific arithmetic is the
+      pattern's signature discriminating surface: a generic tunnel
+      implementation sets Length to the inner total length, or to the whole
+      outer packet length, or forgets the extension-header octets. The
+      `gtpu_length_field_correct` test pins it across the
+      with/without-extension-header cases.
+
+  - id: gtpu_header_wellformed_on_tx
+    clause: stability
+    target: "(gtpu.version, gtpu.pt, gtpu.message_type, gtpu.e_flag)"
+    while: "rule R2 fires ∧ egress(packet)"
+    notes: |
+      TS 29.281 §5 transmit MUSTs, independent of
+      `${teid_validation_strict}` (which gates the RECEIVE side): every
+      encapped G-PDU MUST carry Version == 1, Protocol Type == 1,
+      Message Type == 255 (G-PDU), and an E flag consistent with whether
+      a PDU Session Container extension header is actually present.
+      Bridge anti-pattern: leaving the flags byte at the `setValid()`
+      default (commonly 0x00 → version 0, PT 0) — accepted by a lax
+      receiver but rejected by any conformant gNB.
+
+  - id: qfi_set_on_tx
+    clause: stability
+    target: pdu_session_container.qfi
+    while: "rule R2 fires ∧ egress(packet)"
+    enforced_when: "${qfi_policy} == set_from_bearer"
+    notes: |
+      Under `${qfi_policy} == set_from_bearer` the PDU Session Container
+      extension header's QFI MUST equal the matched bearer's
+      `dl_bearer.qfi`. Pins the 5G QoS-marking step; the `qfi_set_from_bearer`
+      test catches an implementation that adds the extension header but leaves the
+      QFI uninitialised or hard-codes a constant.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-generation rules and the v1model bug taxonomy for
+# per-entry materialisation.
+
+test_scaffolding:
+
+  G1:
+    - id: gtpu_decap_basic
+      generate: |
+        Send a G-PDU on an N3 port: outer Ether / outer IPv4(dst =
+        ${upf_n3_ip}) / UDP(dst = ${outer_udp_dst_port}) / GTP-U(version
+        = 1, PT = 1, message_type = 255, teid = T) wrapping an inner
+        IPv4+TCP T-PDU. Pre-install teid T → (n6_egress_port,
+        n6_dst_mac, n6_src_mac) in `ul_session`. Assert the egress
+        packet on n6_egress_port equals the inner T-PDU BYTE-FOR-BYTE
+        beneath a rewritten Ethernet (no outer IPv4, no UDP, no GTP-U
+        present) and that the inner IPv4 fields are unmodified. (Anchor
+        — TS 29.281 uplink decap.)
+
+    - id: gtpu_encap_basic
+      generate: |
+        Send a bare inner IPv4+TCP packet on an N6 port whose
+        destination is a provisioned UE IP. Pre-install ue_ip →
+        (egress_teid = T, gnb_ip = G, qfi = Q) in `dl_bearer` and
+        gnb_ip G → (n3_egress_port, outer_src_mac, outer_dst_mac) in
+        `n3_nexthop_fib`. Assert the egress packet on n3_egress_port is
+        the inner packet wrapped in outer Ether(src = outer_src_mac,
+        dst = outer_dst_mac, type = 0x0800) / IPv4(src = ${upf_n3_ip},
+        dst = G, proto = 17) / UDP(dst = ${outer_udp_dst_port}) /
+        GTP-U(version = 1, PT = 1, message_type = 255, teid = T).
+        (Anchor — TS 29.281 downlink encap.)
+
+    - id: gtpu_encap_all_outer_fields_set
+      generate: |
+        Same setup as `gtpu_encap_basic`, but assert each outer field
+        individually in the egress packet rather than only layer
+        presence:
+          outer_ethernet.src, outer_ethernet.dst, outer_ethernet.ether_type,
+          outer_ipv4.version (== 4), outer_ipv4.ihl (== 5), outer_ipv4.ttl,
+          outer_ipv4.protocol (== 17), outer_ipv4.src (== ${upf_n3_ip}),
+          outer_ipv4.dst (== gnb_ip), outer_ipv4.total_length,
+          outer_ipv4.header_checksum (validity), udp.dst
+          (== ${outer_udp_dst_port}), udp.length, gtpu.version (== 1),
+          gtpu.pt (== 1), gtpu.message_type (== 255), gtpu.teid (== T),
+          gtpu.length, gtpu.e_flag (consistent with ext-header presence).
+        (G1-P4-T3 instance — catches the `setValid()`-without-per-field-
+        assignment bug, here including the GTP-U flags byte and Length.)
+
+    - id: gtpu_length_field_correct
+      generate: |
+        Run two encap cases against the same SUT: (a)
+        ${gtpu_ext_header_handling} == none and (b) (when the seed
+        enables it) ${gtpu_ext_header_handling} == pdu_session_container.
+        In each, parse the egress packet's GTP-U Length field and assert
+        it equals the octet count of everything AFTER the first 8
+        mandatory octets — i.e. inner-T-PDU length in case (a), and
+        inner-T-PDU length + 4 (optional field) + 4 (PDU Session
+        Container) in case (b). Catches the implementation that sets Length to
+        the inner total length, the whole outer packet length, or omits
+        the extension-header octets. (TS 29.281 §5 Length clause — the
+        pattern's signature discriminating probe.)
+
+    - id: encap_outer_src_port_varies
+      requires: "${outer_udp_src_port_mode} != fixed"
+      generate: |
+        Send 100 downlink packets across distinct inner 5-tuples to the
+        same UE bearer. Assert every egress outer udp.src is a valid
+        port AND that at least 10 distinct values are observed (the hash
+        actually varies the source port for N3-ECMP entropy). Tests the
+        D5.1 outer-source-port entropy claim.
+
+  G2:
+    - id: decap_unknown_teid_drop
+      generate: |
+        Send a well-formed G-PDU on an N3 port whose teid is NOT present
+        in `ul_session`. Assert drop (TS 29.281 — an unknown TEID has no
+        tunnel endpoint at this receiver). R3.
+
+    - id: encap_unknown_ue_drop
+      generate: |
+        Send a bare downlink IPv4 packet on an N6 port whose destination
+        is NOT a provisioned UE bearer. Assert drop. R6.
+
+    - id: gtpu_end_marker_not_forwarded
+      requires: "${end_marker_handling} == drop"
+      generate: |
+        Send a GTP-U End Marker (message_type = 254, no T-PDU payload)
+        on an N3 port with a teid that IS present in `ul_session`. Assert
+        the End Marker is dropped and NOT decapsulated/forwarded to the
+        N6 port as user data. (TS 29.281 §7.3.4 — an End Marker is
+        signalling, not a T-PDU.) Catches the implementation that decaps any
+        GTP-U message regardless of message_type.
+
+    - id: malformed_gtpu_version_drop_under_strict
+      requires: "${teid_validation_strict}"
+      generate: |
+        Send a GTP-U packet on an N3 port with gtpu.version != 1 (or
+        gtpu.pt != 1), otherwise well-formed with a known teid. Assert
+        drop under `${teid_validation_strict}`. (TS 29.281 §5 version/PT
+        MUST.) R4.
+
+    - id: encap_mtu_overflow_drop
+      requires: "${mtu_enforcement} == strict_drop_oversize"
+      generate: |
+        Send a downlink inner packet whose post-encap size would exceed
+        `${outer_mtu}` (inner size ≈ outer_mtu − 36, leaving no room for
+        the GTP-U/UDP/outer-IP overhead). Assert the encap path drops it.
+        R7.
+
+  G3:
+    - id: outer_headers_truly_stripped_on_decap
+      generate: |
+        Send a G-PDU on N3 as in `gtpu_decap_basic`, but assert the
+        egress packet on the N6 port has NO outer IPv4, NO UDP, and NO
+        GTP-U layers — verified by parsing the egress bytes top-to-bottom
+        and confirming the first IPv4 header IS the inner T-PDU (matching
+        the inner source/destination addresses). (G3-P4 information-
+        leakage probe — leaked outer headers expose the operator's
+        transport topology and TEIDs to the data network.)
+
+    - id: decap_inner_is_ip_not_ethernet
+      generate: |
+        Send a G-PDU on N3 whose inner T-PDU is an IPv4 packet directly
+        after the GTP-U header (NO inner Ethernet — this is the GTP-U
+        wire format). Assert the decapsulated egress packet's bytes
+        immediately after the (rewritten) outer Ethernet are the inner
+        IPv4 header, with inner addresses intact. Catches the implementation
+        that copies a VXLAN-style inner-Ethernet parser and either
+        mis-parses the inner IP as an Ethernet frame or emits a spurious
+        inner Ethernet on egress. (GTP-U-specific structural probe.)
+
+    - id: checksum_recompute_on_outer_ipv4
+      generate: |
+        Same setup as `gtpu_encap_basic`. Recompute the outer IPv4
+        header checksum from the egress packet bytes (Σ over the 20-byte
+        outer header) and assert it matches outer_ipv4.header_checksum.
+        Catches the common v1model bug where the SUT setValid()s the outer IPv4 and
+        assigns every field BUT forgets to wire `update_checksum` — BMv2
+        emits a stale/arbitrary checksum and downstream routers drop.
+
+    - id: conditional_deparser_emit_order
+      generate: |
+        Run both paths against the same SUT in one run: one downlink
+        bare-IP packet (encap) followed by one uplink G-PDU (decap).
+        Assert the encap egress layer order is
+        Ether/IPv4/UDP/GTP-U/inner-IPv4/... and the decap egress layer
+        order is Ether/inner-IPv4/... only. Catches the v1model
+        conditional-deparser bug where the SUT emits the outer stack on
+        the wrong path because the deparser's `emit(hdr.X)` calls are not
+        guarded by `hdr.X.isValid()`.
+
+    - id: encap_path_inner_ttl_preservation
+      requires: "${inner_ttl_handling} == preserve"
+      generate: |
+        Send a downlink inner IPv4 packet with inner_ipv4.ttl = 64.
+        Assert that after encap on the N3 side the inner_ipv4.ttl is
+        still 64 (the tunnel endpoint MUST NOT decrement the inner TTL —
+        GTP-U is transport, not L3 forwarding; the fresh OUTER IPv4 ttl
+        is independent and set to 64). Catches the implementation that reuses a
+        common "ttl--" action across the tunnel path.
+
+    - id: qfi_set_from_bearer
+      requires: "${qfi_policy} == set_from_bearer"
+      generate: |
+        Send a downlink packet to a UE bearer with qfi = Q. Assert the
+        egress G-PDU carries a PDU Session Container extension header
+        (E flag = 1, Next Extension Header Type = 0x85) whose QFI field
+        == Q, AND that gtpu.length correctly includes the extra
+        extension-header octets (cross-links with `gtpu_length_field_correct`).
+        Catches the implementation that adds the extension header but leaves the
+        QFI uninitialised or hard-codes it.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Harden operators paired with ease counterparts; every operator declares
+# `direction` so difficulty recalibration by parameter rebinding can pick from the
+# matching pool depending on whether r > r* + δ (harden) or r < r* − δ (ease).
+
+mutation_operators:
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_gpdu,
+                          D5.1_qfi_ext_header,
+                          D5.2_endmarker_multi_teid}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_qfi_ext_header then
+          ${gtpu_ext_header_handling} ← pdu_session_container ∧
+          ${qfi_policy} ← set_from_bearer ∧
+          ${dscp_copy_policy} ← copy_inner_to_outer ∧
+          ${teid_validation_strict} ← true ∧
+          ${outer_udp_src_port_mode} ← hash_inner_5tuple ) ∧
+      ( if ${faithfulness}_post == D5.2_endmarker_multi_teid then
+          ${gtpu_ext_header_handling} ← strict_drop_unknown ∧
+          ${mtu_enforcement} ← strict_drop_oversize ) ∧
+      ( if ${faithfulness}_post == D5.3_strict_scale then
+          ${ul_session_capacity} ← bounded(${ul_session_entries}) ∧
+          ${dl_bearer_capacity} ← bounded(${dl_bearer_entries}) )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_gpdu ∧
+      ( ${faithfulness} ≠ D5.1_qfi_ext_header
+        ∨ ${gtpu_ext_header_handling} == pdu_session_container ) ∧
+      ( ${qfi_policy} == none ∨ ${gtpu_ext_header_handling} == pdu_session_container )
+    kind: parameter
+    notes: |
+      Lift the feature ladder by one band. D5.0 → D5.1 turns on the 5G
+      PDU Session Container + QFI, DSCP copy, strict header validation
+      and per-flow outer-source-port hashing (the big jump — adds the
+      extension header, which forces the Length-field arithmetic to
+      account for the extra octets). D5.1 → D5.2 adds strict
+      unknown-extension drop and the MTU boundary. D5.2 → D5.3 binds the
+      session/bearer table capacities to their installed entry counts
+      for the strict-scale band. Every step widens the protocol/feature
+      surface the SUT must implement — `feature-breadth`, not
+      `faithfulness` (GTP-U is stateless; there is no exact↔approximate
+      state fidelity to vary).
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_qfi_ext_header,
+                          D5.2_endmarker_multi_teid,
+                          D5.3_strict_scale}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_gpdu then
+          ${gtpu_ext_header_handling} ← none ∧
+          ${qfi_policy} ← none ∧
+          ${dscp_copy_policy} ← none ∧
+          ${teid_validation_strict} ← false ∧
+          ${outer_udp_src_port_mode} ← fixed ∧
+          ${mtu_enforcement} ← ignore ) ∧
+      ( if ${faithfulness}_post == D5.1_qfi_ext_header then
+          ${gtpu_ext_header_handling} ← pdu_session_container ∧
+          ${mtu_enforcement} ← ignore ) ∧
+      ( if ${faithfulness}_post == D5.2_endmarker_multi_teid then
+          ${ul_session_capacity} ← unbounded ∧
+          ${dl_bearer_capacity} ← unbounded )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_strict_scale
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the
+      ladder back one band and reverts the entailed parameter bindings,
+      giving difficulty recalibration a path back to the target difficulty
+      after an over-harden.
+
+  - id: enable_strict_teid_validation
+    applicable_when: "${teid_validation_strict} == false"
+    effect: "${teid_validation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${teid_validation_strict} == true"
+    kind: parameter
+    notes: |
+      Activates R4 and the `malformed_gtpu_version_drop_under_strict`
+      G2 case. Catches implementations that decapsulate on TEID lookup alone
+      without validating the GTP-U version/PT MUSTs (TS 29.281 §5).
+
+  - id: disable_strict_teid_validation
+    applicable_when: "${teid_validation_strict} == true"
+    effect: "${teid_validation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${teid_validation_strict} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_strict_teid_validation`. R4 is
+      gated off; the strict-mode malformed-header G2 test's `requires:`
+      guard goes false and the test is skipped.
+
+  - id: enable_outer_udp_checksum_compute
+    applicable_when: "${outer_udp_checksum_mode} == zero_on_tx"
+    effect: "${outer_udp_checksum_mode} ← computed_on_tx"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_udp_checksum_mode} == computed_on_tx"
+    kind: parameter
+    notes: |
+      Lift from the MAY-be-zero default to the harder MUST-correctly-cover
+      variant. The implementation MUST compute the UDP checksum across (outer-IP
+      pseudo-header + UDP + GTP-U + inner T-PDU) — a multi-layer checksum
+      extern invocation BMv2 supports but most LLM-drafted P4 gets wrong
+      on the first attempt.
+
+  - id: revert_outer_udp_checksum_to_zero
+    applicable_when: "${outer_udp_checksum_mode} == computed_on_tx"
+    effect: "${outer_udp_checksum_mode} ← zero_on_tx"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${outer_udp_checksum_mode} == zero_on_tx"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_outer_udp_checksum_compute`.
+      Returns to the zero-on-tx variant; the harder checksum span is
+      gated off.
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: |
+      ${outer_udp_src_port_mode} != fixed ∧
+      ${hash_algo} ∈ {crc16, crc32}
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    kind: parameter
+    notes: |
+      Weaker hash on the outer-source-port computation. Hardens the
+      panel against implementations that copy a textbook CRC pattern blindly;
+      under adversarial inner flow-tuples xor_fold collapses to a narrow
+      port range and N3 ECMP cannot spread the bearer
+      (`encap_outer_src_port_varies` then fails the distinct-value
+      count).
+
+  - id: swap_hash_to_crc32
+    applicable_when: |
+      ${outer_udp_src_port_mode} != fixed ∧
+      ${hash_algo} ∈ {xor_fold, crc16}
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `swap_hash_to_xor_fold`. CRC32 gives
+      the strongest entropy of the three options and maximises the
+      `encap_outer_src_port_varies` distinct-value count.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the inner flow-tuple / UE-address distribution skew by one
+      step (uniform → zipfian → adversarial). Combined with a weak
+      `${hash_algo}` this drives the `encap_outer_src_port_varies`
+      distinct-value count toward 1.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: shrink_session_capacity_4x
+    applicable_when: |
+      ${dl_bearer_capacity} ≠ unbounded ∧ ${dl_bearer_capacity} > 64
+    effect: |
+      ${dl_bearer_capacity} ← ${dl_bearer_capacity} / 4 ∧
+      ${ul_session_capacity} ← ${ul_session_capacity} / 4
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: |
+      ${dl_bearer_capacity} ≥ 16 ∧ ${ul_session_capacity} ≥ 16
+    kind: parameter
+    notes: |
+      Tighten both the uplink-session and downlink-bearer table
+      capacities by 4×. The implementation cannot rely on a TCAM-of-everything
+      strategy and must consider aggregation; pairs with the
+      realistic-fan-out regime at D5.3.
+
+  - id: enlarge_session_capacity_2x
+    applicable_when: |
+      ${dl_bearer_capacity} ≠ unbounded ∧ ${dl_bearer_capacity} < 1048576
+    effect: |
+      ${dl_bearer_capacity} ← ${dl_bearer_capacity} * 2 ∧
+      ${ul_session_capacity} ← ${ul_session_capacity} * 2
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: |
+      ${dl_bearer_capacity} ≤ 1048576 ∧ ${ul_session_capacity} ≤ 1048576
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_session_capacity_4x`. Doubles
+      (not quadruples) so the harden/ease asymmetry gives the
+      difficulty recalibration a slow climb back after an over-harden.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source to task.description so the SUT
+      sees a host-side reference implementation in addition to the
+      behavioural spec — the heaviest hammer among the difficulty
+      axes, and especially load-bearing for a `relocate` pattern where
+      the baseline cannot redesign the host-side algorithm
+      from a behavioural spec alone.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      From the starter operator library — laddering the input form
+      from behavioural-spec to host-side-reference EASES the SUT's job.
+      Pairs with `revert_input_form_to_behavioural`.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`.
+      Restores the behavioural-only spec — the SUT must design the
+      encap/decap from TS 29.281 alone. The default state for a
+      relocate-frontier ceiling instance.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4 (every entry below is
+  `[common-knowledge baseline]` rather than TS-cited):
+
+    Anchor band (D5.0_anchor_gpdu; gtpu_ext_header_handling = none,
+                 qfi_policy = none, dscp_copy_policy = none,
+                 teid_validation_strict = false, outer_udp_src_port_mode
+                 = fixed, outer_udp_checksum_mode = zero_on_tx,
+                 mtu_enforcement = ignore, end_marker_handling = drop):
+      - Parser: state_start → parse_ethernet → (etherType == 0x0800 ?
+        parse_ipv4 : accept). On N3 ingress the parsed ipv4 is the
+        OUTER; continue (ipv4.protocol == 17 ? parse_udp : accept) →
+        (udp.dst == 2152 ? parse_gtpu : accept) → parse_inner_ipv4 →
+        accept. On N6 ingress the parsed ipv4 is the INNER T-PDU; no
+        further tunnel parsing. The typical implementation declares
+        `header ipv4_t outer_ipv4; header ipv4_t inner_ipv4;` and a
+        `header gtpu_t { bit<3> version; bit<1> pt; bit<1> spare;
+        bit<1> e; bit<1> s; bit<1> pn; bit<8> message_type;
+        bit<16> length; bit<32> teid; }` (8 mandatory octets), keying
+        the parse graph by ingress port role and `isValid()`.
+      - GTP-U-specific gotcha #1 (THE signature bug): the inner payload
+        of a G-PDU is an IP packet, NOT an Ethernet frame. An implementation that
+        copies a VXLAN inner-Ethernet parser mis-parses the inner IPv4.
+        `decap_inner_is_ip_not_ethernet` catches it.
+      - GTP-U-specific gotcha #2: gtpu.length = octets AFTER the first 8
+        mandatory octets. At D5.0 (no optional/ext fields) that is the
+        inner T-PDU length: `gtpu.length = standard_metadata.packet_length
+        - (14 outer-eth + 20 outer-ip + 8 udp + 8 gtpu)`; with a PDU
+        Session Container it is inner-len + 4 (optional field) + 4
+        (container). `gtpu_length_field_correct` catches a Length set to
+        the inner total length, the whole packet, or omitting the
+        ext-header octets.
+      - Three control-plane tables (the PFCP PDR/FAR surface):
+        port_role_table (exact on ingress_port), ul_session_table (exact
+        on gtpu.teid → decap FAR), dl_bearer_table (exact on ipv4.dst →
+        egress_teid/gnb_ip/qfi), n3_nexthop_table (exact on gnb_ip →
+        port + outer MACs).
+      - Encap action (R2): setValid() the three outer headers
+        (outer_ipv4, udp, gtpu), then assign EVERY field explicitly
+        (the `outer_header_field_completeness` invariant). The GTP-U
+        flags byte is the easiest to leave at the setValid() default
+        0x00 → version 0, PT 0; `gtpu_header_wellformed_on_tx` and
+        `gtpu_encap_all_outer_fields_set` catch it.
+      - Decap action (R1): setInvalid() on outer_ipv4, udp, gtpu in that
+        order; rewrite the (retained) ethernet MACs toward N6; the
+        deparser then emits ethernet, skips the invalid outer headers,
+        and emits the inner_ipv4. `outer_headers_truly_stripped_on_decap`
+        catches a missed setInvalid.
+      - MyComputeChecksum: update_checksum(outer_ipv4.isValid(),
+        {outer_ipv4.* fields}, outer_ipv4.header_checksum,
+        HashAlgorithm.csum16) on the encap path. Outer UDP checksum left
+        at 0 at the anchor (allowed for IPv4-transported GTP-U).
+
+    D5.1 (QFI + PDU Session Container): add the
+    `header pdu_session_ext_t { bit<8> ext_len; bit<8> pdu_type;
+    bit<6> qfi; ... bit<8> next_ext_header_type; }` after the GTP-U
+    optional 4-octet field; set gtpu.e_flag = 1 and the
+    next-extension-header-type 0x85; recompute gtpu.length to include
+    the +8 octets; copy inner_ipv4.dscp → outer_ipv4.dscp; add the
+    strict version/PT receive check; add the outer-source-port hash
+    extern (hash(udp.src, HashAlgorithm.crc16, 0, {inner_ipv4.src,
+    inner_ipv4.dst, inner_l4.src, inner_l4.dst, inner_ipv4.protocol},
+    16384)).
+
+    D5.2 (End Marker + multi-TEID + seq number): add the R5 End Marker
+    drop on message_type == 254; handle the optional sequence-number
+    field (S flag); scale ul_session/dl_bearer to many entries.
+
+    D5.3 (strict scale): bind the table capacities to the installed
+    entry counts; the implementation must size tables tightly.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Expecting/emitting an inner Ethernet on the GTP-U inner payload —
+      GTP-U carries an IP T-PDU, not an Ethernet frame. The #1 GTP-U-
+      specific bug; `decap_inner_is_ip_not_ethernet` catches it.
+
+    * Setting gtpu.length to the inner total length, the whole outer
+      packet length, or forgetting the extension-header octets — the
+      TS 29.281 §5 Length clause is GTP-U-specific arithmetic.
+      `gtpu_length_field_correct` catches it.
+
+    * Calling setValid() on the outer headers WITHOUT individually
+      assigning every field (especially the GTP-U flags byte → version
+      0 / PT 0) — the deparser emits garbage. `gtpu_encap_all_outer_
+      fields_set` and `gtpu_header_wellformed_on_tx` catch it.
+
+    * Forgetting `update_checksum` for outer_ipv4 — BMv2 emits a stale
+      checksum; real receivers drop. `checksum_recompute_on_outer_ipv4`
+      catches it.
+
+    * Emitting outer headers unconditionally in the deparser regardless
+      of `hdr.outer_*.isValid()` — leaks outer headers to N6 on decap.
+      The v1model conditional-deparser bug; `conditional_deparser_emit_order`
+      catches it.
+
+    * Decrementing the inner T-PDU's TTL on encap or decap — GTP-U is
+      transport, not L3 forwarding. `encap_path_inner_ttl_preservation`
+      catches it.
+
+    * Routing the decapsulated inner packet by inner-destination LPM
+      instead of by the TEID's FAR — conflates the GTP-U endpoint with
+      an IP router. The `teid_decap_routing_correctness` invariant pins
+      it (full inner-IP routing is P-IPv4Routing's job; the composition
+      is the P-UPFRouter composite, not this pattern).
+
+    * Decapsulating an End Marker (message_type 254) and delivering it
+      to N6 as user data — it is tunnel signalling.
+      `gtpu_end_marker_not_forwarded` catches it.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must
+       all pass.
+
+    2. For D5.0 instances (single bearer/TEID, fixed outer
+       src port, zero UDP checksum, no extension headers), the resulting
+       task SHOULD be behaviourally a GTP-U lift of the p4lang basic_tunnel
+       tutorial's plain encap/decap — cross-check the public test
+       set against the oracle for the seed.
+
+    3. As a `relocate`-frontier pattern, expect the baseline to fail the
+       behavioural-spec form predictably: the ceiling instance is
+       the behavioural-only D5.1+ seed; the `ladder_input_form_to_python_ref`
+       operator (host-side reference in the prompt) is the documented
+       lever that recovers it toward the discriminating band.
+
+    4. The pattern composes upstream of P-IPv4Routing on both the N3
+       underlay (encap egress) and the N6 inner routing (decap egress):
+       a P-GTPUEncap instance whose egress packets are then forwarded by
+       a P-IPv4Routing instance is the P-UPFRouter composite
+       (P1 ∪ P13). Within the v1 corpus
+       the composition is implicit (the nexthop tables encode static
+       forwarding directly); the composite layer chains a real
+       multi-pattern pipeline.

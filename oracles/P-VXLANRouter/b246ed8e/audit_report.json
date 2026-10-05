@@ -1,0 +1,237 @@
+{
+  "oracle_hash": "bd27db8f5380841057a2aed125f13fa8776bcc79b01c3295ccf30d69821ca4a4",
+  "instance": "vxlan_router_anchor-default",
+  "ran_at": "2026-05-30T11:51:46.866513Z",
+  "canonical_examples": {
+    "passed": 21,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_unbound_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_encap_and_underlay_route_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r8_encap_origination_ttl_rebound",
+        "status": "pass"
+      },
+      {
+        "example_id": "r9a_encap_bum_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r10_known_remote_no_underlay_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r11_encap_oversize_drop_mtu_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_decap_local_vtep_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_decap_strict_flag_malformed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_decap_unknown_vni_dmac_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_decap_vni_isolation_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_transit_plain_ipv4_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_transit_vxlan_for_other_vtep_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_transit_ttl_exhausted_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r7_transit_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r6_transit_martian_src_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "access_port_bindings_rebound_vni_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "routes_empty_transit_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_src_port_hash_crc16_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_src_port_hash_crc32_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "encap_bum_flood_mode_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "outer_inner_header_disjointness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "vtep_transit_dichotomy": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "origination_vs_transit_ttl": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "underlay_route_for_every_remote_vtep": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "vni_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_header_field_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "vxlan_i_flag_set_on_tx": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_vtep_fragmentation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "outer_ipv4_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_quantum_one_transit": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_flow_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "outer_inner_header_disjointness",
+      "vtep_transit_dichotomy",
+      "origination_vs_transit_ttl",
+      "underlay_route_for_every_remote_vtep",
+      "vni_isolation",
+      "outer_header_field_completeness",
+      "inner_payload_persistence",
+      "vxlan_i_flag_set_on_tx",
+      "no_vtep_fragmentation",
+      "lpm_longest_match_correctness",
+      "outer_ipv4_checksum_validity",
+      "ttl_quantum_one_transit",
+      "ether_rewrite_correctness",
+      "ecmp_flow_consistency",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "contra_nsdi20",
+      "RFC7348",
+      "RFC1812",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

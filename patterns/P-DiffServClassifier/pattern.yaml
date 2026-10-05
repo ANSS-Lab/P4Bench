@@ -1,0 +1,190 @@
+# P-DiffServClassifier — DiffServ edge multi-field classifier + DSCP remark
+#
+# TPL v1.0 task pattern. A DiffServ boundary node: classify
+# IPv4 packets by a multi-field (MF) match into a behaviour aggregate, remark
+# the DSCP codepoint (preserving the ECN bits), and forward to the class-bound
+# port. Distinct from P-ECNMarker (which marks ECN from queue depth); this is
+# header-field classification → DSCP rewrite. RFC 2474 (DS field), RFC 2597
+# (AF PHB), RFC 3246 (EF PHB).
+
+pattern_id: P-DiffServClassifier
+version: "1.0"
+nf_categories:
+  descriptive:  [D6:qos]
+  prescriptive: [P6:marking]
+target_capability: scale_up
+summary: >
+  DiffServ edge multi-field classifier and marker: match IPv4 packets on a
+  multi-field key (dst, protocol, L4 port), map to a class, REWRITE the 6-bit
+  DSCP in the IPv4 DS field to the class codepoint while PRESERVING the 2 ECN
+  bits, rewrite Ethernet, and forward to the class-bound port. Unmatched
+  packets fall to the Best-Effort (DSCP 0) default class. Mutation lifts to
+  per-class drop-precedence (AF11/12/13), a wider classifier, and DSCP-to-port
+  (PHB) scheduling.
+
+grounding:
+  rfcs:
+    - id: RFC2474
+      sections: ["3", "4.1"]
+      role: canonical_spec
+      quote: >-
+        Implementors should note that the DSCP field is six bits wide.  DS-
+        compliant nodes MUST select PHBs by matching against the entire 6-bit
+        DSCP field, e.g., by treating the value of the field as a table index
+        which is used to select a particular packet handling mechanism which
+        has been implemented in that device.  The value of the CU field MUST
+        be ignored by PHB selection.
+      quote_source: patterns/P-DiffServClassifier/grounding/RFC2474.txt
+      relevance: |
+        Definition of the Differentiated Services Field (DS Field) in IPv4 —
+        the DS field is the former IPv4 TOS octet; its top 6 bits are the DSCP
+        and the low 2 bits are ECN (RFC 3168). A boundary node classifies and
+        sets the DSCP; it MUST NOT alter the ECN bits when remarking — basis
+        for R2 (remark) and the ecn_preserved invariant.
+    - id: RFC2597
+      sections: ["2", "6"]
+      role: normative_behaviour
+      relevance: |
+        Assured Forwarding PHB Group — the AFxy codepoints (AF31 = 26, etc.)
+        and three drop-precedence levels. Basis for the AF class codepoints
+        and the drop-precedence mutation.
+    - id: RFC3246
+      sections: ["1", "3"]
+      role: normative_behaviour
+      relevance: "Expedited Forwarding PHB — DSCP 46 (EF) for low-latency aggregates."
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "Atomic. The class is a pure function of the multi-field key + classifier table."
+  class_rule:                               # the TPL `bucket` role
+    keyed_by_tuple: [dst, protocol, l4_port]
+    attrs:
+      dscp: int                             # 0..63 codepoint
+      egress_port: port
+      next_hop_mac: address
+      port_mac: address
+    capacity: ${classifier_capacity}
+    notes: "One MF classifier entry → behaviour aggregate (DSCP) + forwarding."
+
+parameters:
+  class_rules:
+    type: list[class_rule]
+    constraint: "each has a multi-field key, dscp ∈ [0,63], egress_port, MACs"
+  classifier_capacity:
+    type: int | unbounded
+    default: unbounded
+  default_dscp:
+    type: int
+    default: 0
+    notes: "Best-Effort codepoint for unmatched packets (RFC 2474 default PHB)."
+  preserve_ecn:
+    type: bool
+    default: true
+    notes: "When true, remark only the top 6 DSCP bits; keep the low 2 ECN bits."
+  faithfulness:
+    type: enum
+    values: [D6.0_be_ef_af, D6.1_drop_precedence, D6.2_full_phb]
+    default: D6.0_be_ef_af
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then: [drop]
+    notes: "Only IPv4 is classified; other ether-types are dropped."
+  - id: R2_classify_remark_forward
+    when: "header_present(ipv4) ∧ exists(class_rule, mf_match(packet, ${class_rules}))"
+    given:
+      rule: by_mf_match(packet, ${class_rules})
+    then:
+      - "set(hdr.ipv4.dscp, rule.dscp)"
+      - "preserve(hdr.ipv4.ecn) IF ${preserve_ecn}"
+      - set(hdr.ethernet.src, rule.port_mac)
+      - set(hdr.ethernet.dst, rule.next_hop_mac)
+      - forward(rule.egress_port)
+    notes: |
+      Multi-field match → remark DSCP (top 6 bits of the DS field) to the
+      class codepoint, preserve ECN, rewrite L2, forward. The IPv4 addresses
+      and TTL are NOT modified (this is a classify+mark+forward edge node, not
+      a routing TTL-decrementing hop).
+  - id: R3_default_be
+    when: "header_present(ipv4) ∧ ¬exists(class_rule, mf_match(packet, ${class_rules}))"
+    then:
+      - "set(hdr.ipv4.dscp, ${default_dscp})"
+      - "preserve(hdr.ipv4.ecn) IF ${preserve_ecn}"
+      - forward(default_egress)
+    notes: |
+      Unmatched → Best-Effort default class: DSCP set to ${default_dscp}
+      (0 by default, i.e. left at BE) and forwarded to the default port.
+
+invariants:
+  - id: ecn_preserved
+    clause: persistence
+    target: hdr.ipv4.ecn
+    while: "rule R2 fires ∧ ${preserve_ecn}"
+    enforced_when: "${preserve_ecn}"
+    notes: "RFC 2474/3168 — remarking the DSCP MUST NOT change the 2 ECN bits."
+  - id: dscp_set_correctness
+    clause: stability
+    target: hdr.ipv4.dscp
+    while: "rule R2 fires"
+    notes: "The egress DSCP equals the matched class codepoint."
+  - id: addr_ttl_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.ttl)"
+    while: "rule R2 fires"
+    notes: "Classify+mark does not modify the IPv4 addresses or TTL."
+
+test_scaffolding:
+  G1:
+    - id: classify_ef
+      generate: "MF match for an EF flow → DSCP 46, class port, L2 rewrite, ECN preserved."
+    - id: classify_af
+      generate: "MF match for an AF flow → AF codepoint (e.g. 26), distinct port."
+    - id: classify_default_be
+      generate: "Unmatched flow → BE (DSCP unchanged at 0), default port."
+    - id: preserve_ecn_bits
+      generate: "Input with ECN=01 on a classified flow → DSCP remarked, ECN bits intact."
+  G2:
+    - id: mf_specificity
+      generate: "Same dst as an EF rule but a non-matching L4 port → falls to BE, NOT EF."
+  G3:
+    - id: drop_non_ipv4
+      generate: "ARP / non-IPv4 frame → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_drop_precedence
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} == D6.0_be_ef_af"
+    effect: "${faithfulness} ← D6.1_drop_precedence ∧ add AF11/12/13 multi-precedence classes"
+    d_axis_delta: {D6: +1, test_rigor: +1}
+    notes: "Add the three AF drop precedences keyed on an additional field."
+  - id: widen_classifier
+    axis: workload
+    direction: harden
+    applicable_when: "true"
+    effect: "Grow ${class_rules} with overlapping MF keys requiring priority ordering."
+    d_axis_delta: {D2: +1, test_rigor: +1}
+  - id: disable_ecn_preservation
+    axis: strictness
+    direction: ease
+    applicable_when: "${preserve_ecn}"
+    effect: "${preserve_ecn} ← false (remark the whole DS byte)"
+    d_axis_delta: {D6: -1}
+    notes: "Ease: drop the ECN-preservation requirement; the SUT may write the full TOS byte."
+
+bridging_notes: |
+  Canonical implementation:
+    - A multi-field classifier table (ternary/exact on dst, protocol, L4 port)
+      → action set_class(dscp, port, port_mac, next_hop_mac): write the top 6
+      bits of hdr.ipv4.diffserv (DS field), preserve the low 2 ECN bits, L2
+      rewrite, egress. default_action = best-effort (dscp 0, default port).
+    - DSCP occupies bits [7:2] of the IPv4 DS/TOS byte; ECN is bits [1:0].
+      `hdr.ipv4.diffserv[7:2] = dscp` (or a dscp:6 + ecn:2 sub-field split).
+  Anti-patterns to reject:
+    * Overwriting the whole DS byte (clobbering ECN) when preserve_ecn.
+    * Decrementing TTL (this is a marker, not a routing hop).
+    * Matching on dst alone when the rule also keys on L4 port (over-broad).

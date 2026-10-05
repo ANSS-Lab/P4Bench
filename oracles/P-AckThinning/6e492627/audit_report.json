@@ -1,0 +1,99 @@
+{
+  "oracle_hash": "52974b94d9069e177d4d93640f3063183b50f204f668314faedebf179a732f9a",
+  "instance": "ack_thinning_anchor-default",
+  "ran_at": "2026-05-30T00:57:41.998104Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_tcp_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "control_fin_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "first_ack_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "advancing_ack_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "redundant_dup_ack_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "stale_below_watermark_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "ack_flag_clear_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "dup_budget_one_forwards_first_dup",
+        "status": "pass"
+      },
+      {
+        "example_id": "dup_budget_one_thins_second_dup",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_false_thinning": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ack_watermark_monotone": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "non_ack_pass_through": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "flow_state_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "no_false_thinning",
+      "ack_watermark_monotone",
+      "non_ack_pass_through",
+      "flow_state_no_orphan"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "balakrishnan_snoop_mobicom1995",
+      "RFC3135"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

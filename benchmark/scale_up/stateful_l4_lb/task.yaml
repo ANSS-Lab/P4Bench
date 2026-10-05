@@ -1,0 +1,1132 @@
+task_name: stateful_l4_lb
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-StatefulLB
+pattern_version: '1.0'
+seed:
+  vip: 10.0.100.1
+  backends:
+  - 10.0.2.10
+  - 10.0.2.20
+  - 10.0.2.30
+  assign: round_robin
+  flow_table_capacity: unbounded
+  eviction_policy: none
+  faithfulness: D5.0_exact
+  persistence_strict: false
+failure_modes:
+- round_robin_counter_advances_on_existing_flow
+- round_robin_counter_advances_on_ineligible_packet
+- flow_table_aliasing_overwrites_prior_binding
+- five_tuple_keyed_on_subset_only
+- modn_via_bitmask_with_non_power_of_two
+- sentinel_collision_with_backend_zero
+description: "A switch s1 fronts a single virtual service address with three real\nback-end servers and must distribute incoming TCP connections across\nthem while preserving the connection-to-server binding\
+  \ for the life of\neach connection.\n\n## Topology and roles\n\n  - s1.p1 \u2014 connection point facing clients.\n  - s1.p2 \u2014 connection point facing back-end server B0\n            (address 10.0.2.10,\
+  \ hardware address 08:00:00:00:02:01).\n  - s1.p3 \u2014 connection point facing back-end server B1\n            (address 10.0.2.20, hardware address 08:00:00:00:02:02).\n  - s1.p4 \u2014 connection point\
+  \ facing back-end server B2\n            (address 10.0.2.30, hardware address 08:00:00:00:02:03).\n  - The advertised service address (the VIP) is 10.0.100.1; no host owns\n    this address directly \u2014\
+  \ the switch terminates and re-targets traffic\n    addressed to it.\n\n## Eligibility\n\nA packet is eligible for admission only when ALL of the following hold;\nthe checks short-circuit in the order\
+  \ listed, and a packet that fails an\nearlier check is never inspected against later checks and never affects\nany internal state the switch keeps:\n\n  1. The packet is an IPv4 datagram.\n  2. The packet's\
+  \ IPv4 destination address equals the VIP.\n  3. The IPv4 payload is TCP.\n\nA frame that is not IPv4 (e.g. an ARP frame), an IPv4 packet whose\ndestination is anything other than the VIP, and an IPv4\
+  \ packet to the VIP\nthat is not TCP must each be discarded.\n\n## Connection identity\n\nTwo TCP packets are considered to belong to the SAME connection if and\nonly if they agree on the 5-tuple\n(IPv4\
+  \ source, IPv4 destination, TCP source port, TCP destination port,\nIPv4 protocol). Any difference in any of these five components produces\na different connection.\n\n## Backend assignment\n\nThe switch\
+  \ keeps an internal record of which back-end each connection has\nbeen bound to. The first time a packet of a given connection is admitted,\nthe switch chooses a back-end as follows:\n\n  - The switch\
+  \ maintains a single integer \"selector\" that is initialised\n    to zero on power-on and that advances by exactly one immediately\n    after each first-of-a-connection admission. Selector advances ONLY\n\
+  \    on first-of-a-connection admissions; it MUST NOT advance on\n    subsequent packets of an existing connection, and MUST NOT advance\n    on ineligible packets that were discarded.\n  - A first-of-a-connection\
+  \ packet is bound to back-end (selector value\n    AT THE TIME OF THIS ADMISSION, taken modulo three). Concretely:\n    the very first new connection admitted on a fresh switch goes to\n    B0; the second\
+  \ distinct new connection goes to B1; the third to B2;\n    the fourth wraps and goes to B0; and so on.\n\nThe binding (which back-end a connection has been assigned to) MUST be\nremembered. Every subsequent\
+  \ packet of an already-admitted connection\nMUST be forwarded to the same back-end as that connection's first packet,\nregardless of how many other connections have been admitted between the\ntwo packets.\n\
+  \n## On admission\n\nWhen a packet is admitted, the packet observed at the bound back-end's\nconnection point must satisfy ALL of:\n\n  - Its IPv4 destination address has been replaced by the bound\n\
+  \    back-end's address (one of 10.0.2.10 / 10.0.2.20 / 10.0.2.30).\n  - Its Ethernet destination address has been replaced by the bound\n    back-end's hardware address (one of the three listed above).\n\
+  \  - Its IPv4 hop count is exactly one less than on ingress, and the\n    datagram remains a well-formed IPv4 packet that an unmodified\n    downstream receiver would accept.\n  - All other fields of\
+  \ the packet are byte-identical to the received\n    packet (in particular, the IPv4 source address, the TCP source and\n    destination ports, the TCP sequence numbers, and any payload).\n\nDiscarded\
+  \ packets produce NO output and MUST NOT alter any of the\nswitch's internal state (neither the per-connection bindings nor the\nselector).\n\n## Control plane\n\nNo control-plane configuration is supplied\
+  \ \u2014 the entire VIP / back-end\nrelationship and the round-robin policy are determined by the switch's\ninternal state and the constants given above.\n"
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: b0
+  - from: s1.p3
+    to: b1
+  - from: s1.p4
+    to: b2
+hosts:
+  client:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  b0:
+    ip: 10.0.2.10/24
+    mac: 08:00:00:00:02:01
+    port: s1.p2
+  b1:
+    ip: 10.0.2.20/24
+    mac: 08:00:00:00:02:02
+    port: s1.p3
+  b2:
+    ip: 10.0.2.30/24
+    mac: 08:00:00:00:02:03
+    port: s1.p4
+test_cases:
+- name: first_new_flow_lands_on_backend_zero
+  visibility: public
+  description: Fresh switch, no prior traffic. The first TCP packet to the VIP is a new flow; the round-robin counter starts at 0 so the flow is bound to backend B0 (10.0.2.10) and forwarded with full DNAT.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: second_distinct_flow_lands_on_backend_one
+  visibility: public
+  description: After one warm-up flow has been admitted (counter advanced to 1), a packet from a different 5-tuple is a NEW flow and is bound to backend B1 (10.0.2.20).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: third_distinct_flow_lands_on_backend_two
+  visibility: public
+  description: Two distinct warm-up flows have been admitted (counter advanced twice). A third new flow is bound to backend B2 (10.0.2.30).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+- name: existing_flow_sticky_to_original_backend
+  visibility: public
+  description: "After flow A has been admitted (and bound to B0), a second packet with the same 5-tuple is matched as an existing flow and is forwarded to the same backend B0 \u2014 even though several\
+    \ other new flows have advanced the round-robin counter in between."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: non_vip_destination_dropped
+  visibility: public
+  description: A TCP/IPv4 packet whose destination IP is NOT the VIP must be dropped. No backend rewrite, no forwarding.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.99.99
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: fourth_new_flow_wraps_to_backend_zero
+  visibility: hidden
+  description: After three distinct flows have been admitted (counter at 3), the fourth distinct new flow wraps the round-robin selector and is bound to backend B0. A modulo-by-N off-by-one or an unsigned
+    overflow bug fails this test.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.4
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4003
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: second_flow_replay_remains_on_backend_one
+  visibility: hidden
+  description: "Flow B was admitted as the second new flow (B1) before flow C advanced the counter. Replaying flow B's 5-tuple must still hit the existing-flow path and forward to B1 \u2014 NOT re-assign\
+    \ via the current counter value."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.4
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4003
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: counter_does_not_advance_on_existing_flow_replay
+  visibility: hidden
+  description: Flow A is admitted, then re-sent four more times. Since each replay is an existing flow (R2), the round-robin counter MUST NOT advance. When a different new flow then arrives it is the SECOND
+    distinct flow and is bound to backend B1 (NOT B2 or B0).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: icmp_to_vip_dropped
+  visibility: hidden
+  description: "An ICMP echo request to the VIP must be dropped. The LB only services TCP \u2014 non-TCP IPv4 packets to the VIP fail R1's TCP precondition and fall through to drop."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: udp_to_vip_dropped
+  visibility: hidden
+  description: A UDP packet to the VIP must be dropped (non-TCP, no admission).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 53
+  expected:
+    behavior: drop
+- name: arp_frame_dropped
+  visibility: hidden
+  description: An ARP frame on the client port (non-IPv4) must be dropped. The LB does not respond to ARP for the VIP at the data-plane level.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.100.1
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+- name: ineligible_priors_do_not_advance_counter
+  visibility: hidden
+  description: A long sequence of ineligible packets (ICMP to VIP, UDP to VIP, TCP to a non-VIP, ARP) MUST NOT consume the round-robin counter or install any flow-table entries. The first eligible TCP/VIP
+    flow that follows is therefore the FIRST distinct flow and must be bound to backend B0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.99.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.4
+        pdst: 10.0.100.1
+        hwsrc: 08:00:00:00:01:01
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.6
+        dst: 10.0.99.99
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: long_sequence_existing_flow_remains_pinned
+  visibility: hidden
+  description: After seven distinct new flows have been admitted, the FIFTH flow (originally bound to B1, since counter=4 at its arrival; 4 mod 3 = 1) is replayed. It must still forward to B1, regardless
+    of how far the round-robin counter has advanced since.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.4
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4003
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4004
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.6
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4005
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4006
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4004
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: different_sport_is_a_distinct_flow
+  visibility: hidden
+  description: Two packets with identical src/dst IPs and same dport but DIFFERENT TCP source ports must be treated as DIFFERENT flows. The second sport gets a fresh counter advance and is bound to B1.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4099
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: admit_full_dnat_and_ttl_decrement
+  visibility: hidden
+  description: "On admission, the packet's IPv4 destination must be rewritten to the bound backend's IP, the Ethernet destination to the bound backend's MAC, the egress port set to the bound backend's port,\
+    \ and the IPv4 TTL decremented by exactly one. A fresh switch admits this single packet to backend B0; observe TTL=10 \u2192 TTL=9 on egress."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.100.1
+        ttl: 10
+        proto: 6
+    - TCP:
+        sport: 4321
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: malformed_zero_sport_admitted_deterministically
+  visibility: hidden
+  description: A TCP packet to the VIP with TCP source port 0 (RFC-invalid but syntactically a well-formed header) must produce a deterministic, well-defined response. On a fresh switch this is the first
+    new flow and is bound to B0. Implementations that silently corrupt the flow-key on sport=0 (e.g. compute the hash differently, or drop without consuming the counter) fail this test.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 0
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: malformed_zero_sport_replay_consistent
+  visibility: hidden
+  description: "A TCP packet to the VIP with sport=0 is admitted as a new flow (B0) and a second packet with the same 5-tuple replays to the same backend \u2014 confirming the flow-key derivation is total\
+    \ and the reference's choice is consistent across replays."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 0
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 0
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: two_existing_flows_each_pinned_to_own_backend
+  visibility: hidden
+  description: "Two distinct flows A and B were admitted and bound to B0 and B1 respectively. After several other flows have been processed, a replay of flow B must still go to B1 \u2014 proving each flow's\
+    \ backend binding is held independently (not just the most-recent flow's)."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

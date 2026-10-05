@@ -1,0 +1,616 @@
+task_name: int_metadata_threshold_report
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-INTMetadata
+pattern_version: '1.0'
+seed:
+  role: source_and_sink
+  faithfulness: D5.1_int_mx
+  metadata_fields:
+  - switch_id
+  - ingress_ts
+  - egress_ts
+  - hop_latency
+  - queue_depth
+  max_hop_count: 8
+  sample_rate: 1
+  bit_width_timestamp: 48
+  conditional_emit_predicate: hop_latency_exceeds_threshold
+  report_threshold: 1000000
+  report_port: 9
+  switch_id: 42
+  source_port_set:
+  - 1
+description: |
+  A switch s1 stands at the edge of a small network. For traffic
+  entering on one designated ingress (port 1), s1 acts as a
+  telemetry "source" — it observes a small set of per-packet
+  measurements about itself (its own identity, the time the packet
+  was seen on ingress, the time it left on egress, the elapsed
+  time inside the switch, the depth of the egress queue at that
+  moment) and packages those measurements into a small "telemetry
+  record" that travels along with the packet. For traffic entering
+  on the other host-facing ingresses (ports 2, 3, 4), s1 acts as a
+  telemetry "sink": it expects each packet to already carry a
+  telemetry record from an upstream source, decides whether the
+  record is worth reporting (based on a threshold over the elapsed-
+  time field), emits a separate report packet to a collector on
+  port 9 when it is, and in all cases removes the telemetry record
+  from the original packet before forwarding the original onward
+  toward its destination.
+
+  Inspired by the In-band Network Telemetry framework (p4.org
+  INT 2.1 dataplane specification) with the conditional-emit
+  extension surveyed in Sonata (SIGCOMM 2018).
+
+  ## Topology and roles
+
+    - s1.p1 — host h1 (10.0.1.1). Traffic from h1 enters as
+              plain IPv4+TCP, with no telemetry record attached.
+              s1 plays the SOURCE role for this traffic.
+    - s1.p2 — host h2 (10.0.2.2). Inbound traffic on this port
+              already carries a telemetry record. s1 plays the
+              SINK role.
+    - s1.p3 — host h3 (10.0.3.3). Sink role for inbound traffic.
+    - s1.p4 — host h4 (10.0.4.4). Sink role for inbound traffic.
+    - s1.p9 — telemetry collector (10.0.9.9). NO inbound traffic
+              from this port is expected; it is the egress for
+              report packets the sink emits.
+
+  ## Telemetry-record content
+
+  Each per-hop record consists of five fields, in this order:
+
+    1. The hop's switch identifier — a 32-bit integer the control
+       plane assigns to each switch (for s1, this is `42`).
+    2. Ingress timestamp — the time the packet was observed at the
+       hop's ingress port, in nanoseconds.
+    3. Egress timestamp — the time the packet left the hop's
+       egress port, in nanoseconds.
+    4. Hop latency — the elapsed time the packet spent inside
+       the hop, in nanoseconds (egress_timestamp minus
+       ingress_timestamp).
+    5. Egress queue depth — the number of packets queued at the
+       egress port at the moment the packet left.
+
+  Times MUST be encoded with the full 48-bit precision the data
+  plane natively provides; truncation to a narrower width loses
+  the upper bits and causes wraparound on a real timescale.
+
+  ## Source path (ingress on port 1)
+
+  For an IPv4 datagram entering on port 1 that does NOT yet
+  carry a telemetry record:
+
+    R1. Construct a one-hop record with s1's values for the five
+        fields above. The "ingress timestamp" is the time the
+        packet was seen on port 1; the "egress timestamp" is the
+        time at which the packet leaves its outbound port.
+
+    R2. Attach the record (and a small header indicating that the
+        record is present and how many hop entries it contains)
+        to the packet in such a way that a downstream device
+        playing the sink role can detect, parse, and remove it.
+
+    R3. Forward the resulting packet to the destination implied
+        by its IPv4 destination address (see "Per-packet output"
+        below). The packet's L2/L3/L4 headers MUST otherwise be
+        unchanged, except where forwarding requires them
+        (Ethernet rewrite, TTL decrement, IPv4 totalLen reflecting
+        the new payload size, IPv4 header checksum recomputed).
+
+  ## Sink path (ingress on ports 2, 3, 4)
+
+  For an IPv4 datagram entering on port 2, 3, or 4 that DOES
+  carry a telemetry record:
+
+    R4. Parse the telemetry header and the stack of per-hop
+        records.
+
+    R5. Compute the maximum hop-latency value across all
+        per-hop records in the stack. Call this `max_latency`.
+
+    R6. IF `max_latency` is greater than 1 000 000 (one
+        million, expressed in the same nanosecond unit as the
+        records themselves), the switch MUST emit ONE
+        additional packet on port 9 containing the harvested
+        telemetry record stack. The original packet still
+        progresses (see R7).
+
+    R7. Regardless of whether the predicate in R5 fired, the
+        switch MUST remove the telemetry header and stack
+        from the packet, leaving it in the same shape as
+        before any source had added them. Then forward the
+        stripped packet to the destination implied by its
+        IPv4 destination address.
+
+  ## Sink path (no record present)
+
+  An IPv4 datagram entering on port 2/3/4 that does NOT carry
+  a telemetry record (e.g., a packet from an upstream device
+  that wasn't an INT source) is forwarded UNCHANGED: no new
+  record is added (this switch is the sink, not a source for
+  this port), no record is stripped, and no report is emitted.
+
+  ## Other traffic
+
+    R8. Non-IPv4 frames (ARP, IPv6, raw L2): dropped. This
+        switch's forwarding table is IPv4-only — there is no
+        L2 path for a non-IPv4 frame — so the frame is
+        discarded, with no telemetry inspection or modification.
+
+    R9. IPv4 traffic that is NOT TCP: forwarded normally; the
+        telemetry layer in this task is only carried over TCP.
+
+  ## Per-packet output (admitted IPv4+TCP packets)
+
+  For every admitted packet, the observed egress packet MUST:
+
+    - Exit on the port the destination address resolves to via
+      the control-plane-installed prefix → port mapping.
+    - Have hdr.ethernet.dst set to the destination host's MAC.
+    - Have hdr.ethernet.src set to the egress port's own MAC
+      (each port has its own MAC, supplied by the harness).
+    - Have hdr.ipv4.ttl decremented by exactly one.
+    - Have hdr.ipv4.totalLen reflecting the new payload size:
+      larger by the telemetry record size on the source path
+      (R2 added it), smaller on the sink path (R7 removed it),
+      unchanged otherwise.
+    - Have hdr.ipv4.hdrChecksum valid on egress.
+    - Carry the original transport payload bytes unchanged
+      (except for the telemetry record prefix added in R2 or
+      removed in R7).
+
+  Telemetry-report packets emitted on port 9 by R6 carry the
+  harvested telemetry record stack in their payload. The report's
+  IPv4 source/destination, Ethernet src/dst, and other outer
+  headers are configured by the harness via the control plane.
+
+  ## Control plane
+
+  The control plane installs:
+    - The destination-prefix → (egress port, host MAC) mapping.
+    - The switch's own identifier (42 for s1) and per-port role
+      classification (port 1 → source, ports 2/3/4 → sink, port
+      9 → reserved collector-side).
+
+  The exact contents of both are part of the test fixture and
+  are supplied to the data plane by the harness.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p9: 9
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+  - from: s1.p9
+    to: collector
+hosts:
+  h1:
+    ip: 10.0.1.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+  collector:
+    ip: 10.0.9.9
+    mac: 08:00:00:00:09:09
+    port: s1.p9
+test_cases:
+- name: g1_source_push_anchor
+  visibility: public
+  description: Unstamped TCP packet on p1 → source path adds INT shim + 1 metadata slot, forwards to dst.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 48454c4c4f
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_source_push_to_h3
+  visibility: hidden
+  description: Unstamped TCP packet on p1 destined h3 → INT shim added, forwards to p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 574f524c44
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_source_push_to_h4
+  visibility: hidden
+  description: Unstamped TCP packet on p1 destined h4 → INT shim added, forwards to p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: '41414141'
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:04
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_sink_below_threshold_strip_only
+  visibility: public
+  description: Pre-stamped TCP (hop_latency=500000 < 1000000) on p2 → strip, NO report, forwards.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e80007a120000000005041594c4f4144
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g1_sink_above_threshold_emit_report
+  visibility: public
+  description: Pre-stamped TCP (hop_latency=2000000 > 1000000) on p3 → report on p9.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 08:00:00:00:00:03
+    - IP:
+        src: 10.0.3.3
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e8001e84800000000044415441
+  expected:
+    behavior: forward
+    output_port: s1.p9
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:09:09
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:09
+- name: g2_sink_at_threshold_no_report
+  visibility: hidden
+  description: Pre-stamped TCP with hop_latency exactly == 1000000 (not >); strip only.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e8000f42400000000041545f5448524553484f4c44
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g2_sink_no_shim_passthrough
+  visibility: hidden
+  description: Plain TCP packet (no INT shim) entering on sink port p2 → forward unchanged, no shim added.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 504c41494e5f5443505f4e4f5f494e54
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_no_int_leak_on_passthrough
+  visibility: hidden
+  description: 'Plain TCP on p2 (sink-with-no-shim): output payload MUST be byte-identical to input.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 4e4f5f494e545f42595445535f4c45414b
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_report_emit_exactly_one
+  visibility: hidden
+  description: Pre-stamped TCP above-threshold on p4 → exactly one report on p9 (not zero, not two).
+  input:
+    port: s1.p4
+    layers:
+    - Ether:
+        src: 08:00:00:00:04:04
+        dst: 08:00:00:00:00:04
+    - IP:
+        src: 10.0.4.4
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e8004c4b400000000a5245504f52545f4d45
+  expected:
+    behavior: forward
+    output_port: s1.p9
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:09:09
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:09
+- name: g3_source_ts_48bit_preservation
+  visibility: hidden
+  description: Source path with ingress_ts=0x1_0000_0001 (>32-bit value); output INT slot must carry full 48-bit value.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 484947485f5453
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_sink_strip_preserves_payload
+  visibility: hidden
+  description: 'Pre-stamped TCP below-threshold: stripped payload MUST equal the inner payload bytes verbatim.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e8000186a000000000494e4e45525f50524553455256455f4d45
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_sink_above_threshold_strip_and_forward
+  visibility: hidden
+  description: 'Above-threshold sink (hop_latency>1000000): the original is stripped and forwarded on its routed egress (R7) in addition to the p9 report.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 33000
+        dport: 80
+    - Raw:
+        load_hex: 0101071f0000002a0000000005f5e1000000000005f5e4e8002dc6c000000000454d49545f504154485f465744
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: g3_non_ipv4_dropped
+  visibility: hidden
+  description: ARP frame on any port → drop, no INT inspection, no shim added.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP: {}
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

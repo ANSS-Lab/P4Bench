@@ -1,0 +1,243 @@
+# P-OverlayGateway — VXLAN L3 gateway: stateless ACL ∘ VXLAN tunnel ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass VTEP / VXLAN L3 gateway data plane: a stateless
+# ternary ACL (P-ACL, P4), a VXLAN tunnel endpoint that encaps inner tenant
+# frames onto the underlay and decaps underlay VXLAN frames back to the tenant
+# (P-VXLANTunnel, derived from P1 encapsulation primitives), and an LPM
+# unicast forwarder (P-IPv4Routing, P1). The value of the *chained* pattern
+# over instantiating the three apart is the cross-stage ORDERING and the data
+# dependence between stages — invisible when each half is tested alone:
+#   (a) ACL-ON-INNER — the ACL verdict keys on the INNER 5-tuple in BOTH
+#       directions. On the encap side the inner tuple is the received frame;
+#       on the decap side it is the tuple carried *inside* the VXLAN payload,
+#       only visible after the outer headers are parsed. Neither half binds
+#       this: standalone P-ACL has no tunnel to peer with; standalone
+#       P-VXLANTunnel has no policy gate.
+#   (b) DECAP-BEFORE-ROUTE — the decap-direction LPM lookup runs on the INNER
+#       destination, which is only exposed after the outer Ether/IP/UDP/VXLAN
+#       headers are stripped. The forwarding decision is data-dependent on the
+#       decap stage having run first.
+#   (c) VNI GATE — a decap-direction packet whose VXLAN VNI does not equal the
+#       configured tenant VNI is dropped; tenant isolation is enforced at the
+#       tunnel boundary, before classification or routing of the inner frame.
+
+pattern_id: P-OverlayGateway
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D6:tunnel-encapsulation"
+    - "D8:overlay-virtualization"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P4:stateless-classification"
+    - "P13:header-encapsulation"
+
+target_capability: composition   # chains a redesign (P-ACL/P-IPv4Routing) and an encapsulation (P-VXLANTunnel) primitive; failure modes are cross-cutting
+
+summary: >
+  Single-pass VXLAN L3 gateway (VTEP). Every frame is (1) classified by a
+  stateless ternary ACL on its INNER 5-tuple — a deny drops it before any
+  tunnel or routing work; (2) VXLAN-encapsulated if it arrives on the tenant
+  side (wrap the inner Ethernet frame in Ether/IP(local VTEP -> remote VTEP)/
+  UDP(4789)/VXLAN(tenant VNI)) or VXLAN-decapsulated if it arrives on the
+  underlay side with the configured VNI (strip the outer headers; a wrong VNI
+  drops); (3) forwarded by LPM — on the OUTER dst (remote VTEP) for the encap
+  direction, on the restored INNER dst for the decap direction, with a single
+  TTL decrement on the routed inner header. The pipeline order
+  ACL -> encap/decap -> route, the inner-tuple ACL in both directions, the
+  decap-before-route inner-destination dependence, and the VNI gate are the
+  load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC7348
+      quote: "VXLAN Segment ID/VXLAN Network Identifier (VNI): this is a 24-bit value used to designate the individual VXLAN overlay network on which the communicating VMs are situated."
+      title: "Virtual eXtensible Local Area Network (VXLAN)"
+      sections: ["4", "5", "6"]
+      role: VXLAN encap/decap header layout, VNI semantics, UDP dst port 4789
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: ACL classification vocabulary (permit/deny)
+  papers:
+    - cite: "Mahalingam et al., VXLAN: A Framework for Overlaying Virtualized L2 Networks over L3 Networks, 2014"
+      role: VTEP gateway encap/decap data-plane rationale
+
+entities:
+  acl_table:
+    type: bucket
+    key: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {action: "permit|deny", priority: int}
+    capacity: ${rule_count_capacity}
+    eviction: none
+    notes: stateless ternary first-match-by-priority; evaluated on the INNER 5-tuple in both directions.
+  vtep_peer:
+    type: bucket
+    key: [tenant_vni]
+    attrs: {local_vtep_ip: ipv4, remote_vtep_ip: ipv4, udp_dport: int}
+    capacity: 1
+    eviction: none
+    notes: the tunnel-endpoint binding consulted on the encap path (outer-header source/dest) and the VNI gate on decap.
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast table; consulted on the OUTER dst (encap) or the INNER dst (decap).
+
+parameters:
+  tenant_subnet:        {type: cidr,   default: "192.168.1.0/24"}
+  tenant_vni:           {type: int,    default: 100, constraint: "1 <= tenant_vni <= 16777215"}
+  local_vtep_ip:        {type: ipv4,   default: "10.0.2.1"}
+  remote_vtep_ip:       {type: ipv4,   default: "10.0.2.9"}
+  vxlan_udp_port:       {type: int,    default: 4789, constraint: "1 <= vxlan_udp_port <= 65535"}
+  acl_rules:            {type: list,   default: []}
+  rule_count_capacity:  {type: int,    default: 256}
+  match_field_breadth:  {type: enum,   values: [dst_only, tuple3, tuple5], default: tuple5}
+  priority_depth:       {type: int,    default: 16}
+  default_acl_action:   {type: enum,   values: [permit, deny], default: permit}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [acl_tunnel_route], default: acl_tunnel_route}
+  tenant_port:          {type: int,    default: 1}
+  underlay_port:        {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4 (or no VXLAN/UDP on the underlay side)"}
+    then: ["drop(pkt)"]
+    notes: a tenant frame with no inner IPv4, or an underlay frame that is not a VXLAN packet on the configured UDP port, is unroutable.
+
+  - id: R1_acl_classify
+    when: "header_present(inner IPv4)"
+    given: {match: "acl_table on the INNER 5-tuple by descending priority"}
+    then: ["drop(pkt) if matched action == deny or (miss and default_acl_action == deny)"]
+    notes: stateless classification on the INNER tuple in both directions; the deny path short-circuits before tunnel/route (acl_on_inner).
+
+  - id: R2_vni_gate
+    when: "ingress on underlay_port and header_present(VXLAN)"
+    given: {check: "VXLAN.vni == tenant_vni"}
+    then: ["drop(pkt) if VXLAN.vni != tenant_vni"]
+    notes: tenant-isolation gate at the tunnel boundary; a wrong VNI drops before the inner frame is classified or routed.
+
+  - id: R3_encap
+    when: "ingress on tenant_port and not denied"
+    then:
+      - "wrap(inner Ether/IP/... in Ether/IP(src=local_vtep_ip, dst=remote_vtep_ip)/UDP(dport=vxlan_udp_port)/VXLAN(vni=tenant_vni))"
+    notes: VXLAN encapsulation toward the configured tunnel peer; the inner header is carried verbatim (no inner TTL change).
+
+  - id: R4_decap
+    when: "ingress on underlay_port and not denied and VXLAN.vni == tenant_vni"
+    then:
+      - "strip(outer Ether/IP/UDP/VXLAN) leaving the inner Ether/IP/..."
+    notes: VXLAN decapsulation; exposes the inner destination consumed by R5 (decap_before_route).
+
+  - id: R5_route_forward
+    when: "not dropped by R0-R4"
+    given: {match: "fib LPM on the OUTER dst (encap) or the INNER dst (decap)"}
+    then:
+      - "drop(pkt) if no LPM match or (decap and inner IP.ttl == 0)"
+      - "dec(inner IP.ttl, 1) on the decap direction"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: encap routes on the outer remote-VTEP dst out the underlay_port; decap routes on the restored inner dst out the tenant_port with one TTL decrement.
+
+invariants:
+  - id: acl_on_inner
+    clause: stability
+    target: "the ACL verdict keys on the inner 5-tuple in BOTH directions"
+    notes: the deny path short-circuits before encap/decap and routing.
+  - id: decap_before_route
+    clause: stability
+    target: "the decap-direction LPM lookup keys on IP.dst AFTER the outer/VXLAN headers are stripped"
+  - id: vni_isolation
+    clause: stability
+    target: "a decap-direction packet is forwarded iff its VXLAN VNI equals tenant_vni"
+    notes: a wrong VNI drops at the tunnel boundary.
+  - id: outer_header_completeness
+    clause: stability
+    target: "the encap output carries Ether/IP(local->remote VTEP)/UDP(4789)/VXLAN(tenant_vni)/inner"
+  - id: no_loop
+    clause: no_loop
+    target: "the routed inner header's TTL strictly decreases on decap; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: encap_forward
+      generate: "tenant inner frame is VXLAN-encapped and routed out the underlay port toward the remote VTEP"
+    - id: decap_forward
+      generate: "underlay VXLAN frame with the correct VNI is decapped and the inner dst routed to the tenant port, TTL-1"
+    - id: acl_deny_drop
+      generate: "an inner flow matching an ACL deny rule is dropped before tunnel/route in either direction"
+  G2:
+    - id: wrong_vni_drop
+      generate: "an underlay VXLAN frame whose VNI != tenant_vni is dropped"
+    - id: decap_inner_route_miss
+      generate: "a decapped frame whose inner dst has no FIB route is dropped (post-decap routing)"
+    - id: ttl_one_forwards_zero
+      generate: "a decap frame whose inner ttl==1 forwards with egress inner ttl==0; ttl==0 drops"
+  G3:
+    - id: acl_on_inner_decap
+      generate: "a denied inner src carried inside a valid-VNI VXLAN frame is dropped — the ACL sees the inner tuple after decap"
+    - id: encap_route_keys_outer
+      generate: "an inner dst outside the local FIB still encaps and forwards — the encap route keys on the outer remote VTEP, not the inner dst"
+    - id: non_ipv4_drop
+      generate: "a non-IPv4 frame is dropped before classification on both ports"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: flip_default_to_deny
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "${default_acl_action}: permit -> deny (unlisted inner flows dropped; only explicit permits pass)"
+    feasibility_postcondition: "at least one explicit permit rule exists"
+  - id: expand_match_field_breadth
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "match_field_breadth: dst_only -> tuple5 (full inner 5-tuple ACL matching)"
+  - id: add_second_vni
+    direction: harden
+    kind: parameter
+    axis: tunnel_multiplexing
+    effect: "introduce a second tenant_vni + vtep_peer binding so encap/decap demux per VNI (multi-tenant isolation)"
+    feasibility_postcondition: "each VNI has a distinct vtep_peer and FIB scope"
+  - id: enforce_outer_mtu
+    direction: harden
+    kind: rule
+    axis: tunnel_mtu
+    effect: "drop encap-direction frames whose post-encap size exceeds outer_mtu (no VTEP fragmentation); oracle regenerated"
+  - id: disable_acl
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "acl_rules: [] and default_acl_action: permit (tunnel+route only; the ACL stage is a pass-through)"
+  - id: encap_only
+    direction: ease
+    kind: rule
+    axis: pipeline_breadth
+    effect: "drop the decap path: the gateway only encaps tenant frames (one-directional VTEP); oracle regenerated"
+    feasibility_postcondition: "no underlay-ingress test cases"
+
+bridging_notes: |
+  - The ACL is stateless first-match by descending priority on the INNER
+    5-tuple. A miss falls through to default_acl_action.
+  - Direction is decided by ingress port: tenant_port frames are encapped,
+    underlay_port frames are decapped. Encap stamps the outer header
+    Ether/IP(local_vtep_ip -> remote_vtep_ip)/UDP(dport=vxlan_udp_port)/
+    VXLAN(vni=tenant_vni) around the verbatim inner Ethernet frame.
+  - The VNI gate is checked on decap before the inner frame is classified or
+    routed: VXLAN.vni must equal tenant_vni or the packet drops.
+  - LPM keys on the OUTER dst (remote VTEP) for the encap direction — the
+    inner dst is opaque payload and is not routed at this gateway — and on the
+    restored INNER dst for the decap direction (decap_before_route).
+  - TTL convention: the encap direction carries the inner TTL verbatim; the
+    decap direction decrements the restored inner TTL exactly once; inner
+    ttl==0 on decap drops.

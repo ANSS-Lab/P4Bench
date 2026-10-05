@@ -1,0 +1,619 @@
+# P-RetransmitDetect — In-Network TCP Retransmission / Loss Detection
+#
+# TPL v1.0 task pattern. A `scale_up` transport-assistance NF:
+# track, per TCP flow and at line rate, the highest sequence-number byte
+# forwarded so far in a per-flow register; for each data segment compare the
+# segment's covered byte range against that high-water mark. A segment that
+# advances the mark is in-order/new and is forwarded; a segment whose bytes were
+# already covered is a RETRANSMISSION (evidence of upstream loss / spurious RTO)
+# — it is flagged (a detected-marker header bit), counted in a per-flow
+# retransmit bucket, and MIRRORED to a telemetry collector, while still being
+# forwarded so the data path is unperturbed. This is purely sequence-comparison
+# driven by received packets: there is NO RTO timer and NO time_tick — detection
+# happens the instant a covered segment arrives. Closes the corpus's
+# transport-assistance retransmit/loss-detection gap (only dedup / overlay /
+# state-serving D8 tags existed). Grounded in LossRadar (CoNEXT '16) and Dapper
+# (SOSR '17).
+
+pattern_id:        P-RetransmitDetect
+version:           "1.0"
+nf_categories:                          # NF-category tags (ID:name pairs)
+  descriptive:  [D8:transport-assistance]   # retransmit / loss detection on the data-plane path
+  prescriptive: [P9:telemetry]              # per-flow seq tracking + mirror-to-collector (scale_up row)
+target_capability: scale_up             # per-flow seq high-water tracking at line rate is a scaling trick (Dapper)
+
+summary: >
+  Per-flow TCP retransmission / loss detection. The switch holds, per 5-tuple
+  flow, the highest TCP sequence number forwarded so far (a per-flow register
+  high-water mark). For each TCP data segment it compares the segment's covered
+  byte range (seq … seq+len) against the stored mark: a segment that advances
+  the mark is in-order/new — it updates the mark and is forwarded unchanged; a
+  segment whose bytes were already covered (seq ≤ stored mark) is a
+  RETRANSMISSION — the switch sets a detected-marker bit in a header field,
+  increments a per-flow retransmit counter, and mirrors a copy to a telemetry
+  collector, while still forwarding the data segment. Detection is purely
+  sequence-comparison driven by arriving packets (no RTO timer, no time_tick).
+  The canonical instance is an exact per-flow seq map; mutation shrinks it to a
+  fixed-cell hashed register (introducing collision-induced misclassification),
+  raises faithfulness from byte-range to bare-seq comparison, and ladders the
+  observable surface (mark-only → mark + counter + mirror).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+
+    - cite: lossradar_conext16
+      role: canonical_implementation
+      relevance: |
+        LossRadar (Li et al., "LossRadar: Fast Detection of Lost Packets in
+        Data Center Networks", CoNEXT 2016) frames loss detection as a
+        data-plane responsibility: switches maintain compact per-flow digests
+        of forwarded packets so that a loss (and, dually, a retransmission of
+        already-forwarded bytes) is identified directly in the data plane
+        rather than inferred end-to-end. This is the source of the pattern's
+        core "compare an arriving segment against per-flow forwarded state and
+        flag the anomaly in-line" shape (R3/R4), the detected-marker bit as the
+        in-band loss/retransmit signal, and the mirror-to-collector readout —
+        and of the exact→hashed-register faithfulness ladder, since LossRadar's
+        own filters are compact approximate digests rather than exact maps.
+
+    - cite: dapper_sosr17
+      role: scaling_approach
+      relevance: |
+        Dapper (Ghasemi et al., "Dapper: Data Plane Performance Diagnosis of
+        TCP", SOSR 2017) tracks TCP connection state — including the highest
+        sequence number seen and retransmission events — entirely in the switch
+        data plane to diagnose performance at line rate, the defining scale_up
+        trick this pattern instantiates (per-flow seq high-water tracking in a
+        register, no host involvement). Dapper also supplies the domain
+        concepts the rules and invariants encode: a segment is a retransmission
+        when its sequence range has already been covered by the connection's
+        forwarded byte stream, and the retransmit count is a per-flow accumulator.
+        Motivates the ${flow_capacity} register-cell axis, the per-flow
+        retransmit bucket, and the seq-wrap / SACK-hole edge cases the test
+        scaffolding probes.
+
+  rfcs:
+    - id: RFC9293
+      sections: ["3.1", "3.4"]
+      role: normative_behaviour
+      quote: >-
+        A fundamental notion in the design is that every octet of data sent over
+        a TCP connection has a sequence number. Since every octet is sequenced,
+        each of them can be acknowledged. This mechanism allows for
+        straightforward duplicate detection in the presence of retransmission.
+      quote_source: patterns/P-RetransmitDetect/grounding/RFC9293.txt
+      relevance: |
+        Transmission Control Protocol — the sequence-number semantics the seq
+        comparison relies on:
+          - §3.1  the segment header carries a 32-bit Sequence Number; a data
+                  segment occupies the byte range [seq, seq + payload_len);
+                  this is the range the high-water comparison uses.
+          - §3.4  sequence numbers advance monotonically over a connection's
+                  byte stream and wrap modulo 2^32; reused here as the basis
+                  for the modulo-2^32 comparison and the seq_wraparound G2
+                  edge case. A segment whose covered range lies at or below the
+                  stored high-water mark re-sends already-acknowledged bytes —
+                  i.e. a retransmission.
+
+  tutorials: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; decisions derive from hdr.tcp fields (seq, flags, data offset),
+      hdr.ipv4 fields (total length, IHL, src/dst/proto), and the per-flow
+      register read. The TCP payload length is computed as
+      ipv4.totalLen − ipv4.ihl*4 − tcp.dataOffset*4.
+
+  flow:                                   # the TPL `flow` entity (5-tuple-keyed)
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - hdr.tcp.srcPort
+      - hdr.tcp.dstPort
+    attrs:
+      seq_highwater:  int                 # highest forwarded byte index seen so far (seq+len), mod 2^32
+      retransmit_cnt: int                 # per-flow retransmit bucket (the TPL `inc` target)
+    capacity: ${flow_capacity}
+    eviction: ${eviction}
+    notes: |
+      Per-flow forwarded-byte high-water mark plus a retransmit counter. Exact
+      map at the canonical binding; a fixed-cell hashed register of
+      ${flow_capacity} cells under capacity pressure (collisions then alias
+      distinct flows, the LossRadar approximate regime). seq_highwater is
+      initialised on the first data segment of a flow.
+
+  collector:                              # the TPL `link`/side-target role for mirror()
+    keyed_by_tuple: [collector_port]
+    notes: |
+      Telemetry sink. A detected retransmission is mirror()'d to
+      ${collector_port} as an out-of-band copy; the original data segment is
+      still forwarded on its normal egress.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  forward_port:
+    type: port
+    default: 2
+    notes: "Egress port for forwarded TCP data segments (canonical single-next-hop datapath)."
+
+  collector_port:
+    type: port
+    default: 3
+    notes: "Egress port the mirrored retransmit copy is sent to (telemetry collector)."
+
+  detect_marker_field:
+    type: enum
+    values: [ipv4_dscp_bit, tcp_reserved_bit]
+    default: ipv4_dscp_bit
+    notes: |
+      Which 1-bit header field the detected-marker is written into. Both are
+      observable on the egress packet in BMv2 --use-files. ipv4_dscp_bit uses a
+      low DSCP bit; tcp_reserved_bit uses a TCP reserved/flag bit.
+
+  flow_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+    notes: |
+      Number of distinct flows the per-flow register holds. unbounded = exact
+      per-flow map. A finite value forces a fixed-cell hashed register where
+      collisions alias flows (shrink_flow_capacity_4x / shrink_to_hashed_register).
+
+  eviction:
+    type: enum
+    values: [none, lru]
+    default: none
+    notes: "Eviction policy on the per-flow table once ${flow_capacity} is finite."
+
+  seq_faithfulness:
+    type: enum
+    values: [D8.0_byte_range, D8.1_bare_seq]
+    default: D8.0_byte_range
+    notes: |
+      D8.0_byte_range → compare seq+payload_len against the high-water mark
+                        (exact: counts a strictly-advancing segment as new even
+                        when seq < mark but seq+len > mark — a partial
+                        retransmit overlapping new bytes is treated as new).
+      D8.1_bare_seq   → compare seq alone against the mark (approximate: a
+                        partially-overlapping segment is misclassified). The
+                        faithfulness ladder.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32]
+    default: crc32
+    enforced_when: "${flow_capacity} != unbounded"
+    notes: "Hash family indexing the fixed-cell register; only meaningful when capacity is finite."
+
+  observable_surface:
+    type: enum
+    values: [mark_only, mark_and_count, mark_count_mirror]
+    default: mark_count_mirror
+    notes: |
+      How much of the detection effect is observable / required:
+        mark_only         → only the detected-marker bit is set on a retransmit.
+        mark_and_count    → marker bit + per-flow retransmit counter inc.
+        mark_count_mirror → marker bit + counter inc + mirror to collector
+                            (the full canonical NF).
+
+  count_strictness:
+    type: bool
+    default: false
+    enforced_when: "${observable_surface} != mark_only"
+    notes: |
+      When true, the per-flow retransmit_cnt must equal EXACTLY the number of
+      retransmissions detected for that flow (enforced counter invariant);
+      when false the counter is advisory (monotone non-decreasing only).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_non_tcp_forward
+    when: "¬(header_present(ipv4) ∧ header_present(tcp))"
+    then:
+      - forward(${forward_port})
+    notes: |
+      The NF only inspects TCP/IPv4. Non-TCP traffic is forwarded unchanged on
+      the normal datapath (the NF is transport-assistance, not a filter) — it
+      is not dropped and not flagged.
+
+  - id: R1_non_data_segment_forward
+    when: |
+      header_present(ipv4) ∧ header_present(tcp)
+        ∧ value(packet.tcp_payload_len, ==, 0)
+    then:
+      - forward(${forward_port})
+    notes: |
+      Pure-ACK / control segments (SYN, FIN, RST, bare ACK) carry no data bytes
+      (payload_len == 0), so they advance no byte range and cannot be a data
+      retransmission. Forwarded unchanged; the high-water mark is untouched.
+
+  - id: R2_first_segment_init
+    when: |
+      header_present(ipv4) ∧ header_present(tcp)
+        ∧ value(packet.tcp_payload_len, >, 0)
+        ∧ ¬exists(flow, key(packet))
+    given:
+      flow: deduce_from_packet
+    then:
+      - "bind(flow, key(packet), {seq_highwater: (hdr.tcp.seq + packet.tcp_payload_len) mod 2^32, retransmit_cnt: 0})"
+      - forward(${forward_port})
+    notes: |
+      First data segment of a previously-unseen flow → establish the per-flow
+      high-water mark at seq+len and forward. Never flagged (no prior bytes to
+      have covered). retransmit_cnt starts at 0.
+
+  - id: R3_retransmission_detected
+    when: |
+      header_present(ipv4) ∧ header_present(tcp)
+        ∧ value(packet.tcp_payload_len, >, 0)
+        ∧ exists(flow, key(packet))
+        ∧ ( (${seq_faithfulness} == D8.0_byte_range
+               ∧ value(packet.seq_plus_len_mod32, ≤, flow.seq_highwater))
+            ∨ (${seq_faithfulness} == D8.1_bare_seq
+               ∧ value(hdr.tcp.seq, <, flow.seq_highwater)) )
+    given:
+      flow: by_key(key(packet))
+    then:
+      - "set(detected_marker, 1)                    # ${detect_marker_field}, 1 bit"
+      - "inc(flow.retransmit_cnt)                    IF ${observable_surface} != mark_only"
+      - "mirror(${collector_port})                   IF ${observable_surface} == mark_count_mirror"
+      - forward(${forward_port})
+    notes: |
+      The arriving data segment re-sends bytes already covered by the flow's
+      forwarded byte stream (seq range at or below the high-water mark) → it is
+      a retransmission / evidence of upstream loss. Set the detected-marker bit,
+      increment the per-flow retransmit bucket, mirror a copy to the collector,
+      and STILL forward the data segment (the data path is not perturbed). The
+      high-water mark is NOT advanced (a retransmit cannot lower it; under
+      D8.0 a covered segment also cannot raise it).
+
+  - id: R4_in_order_advance
+    when: |
+      header_present(ipv4) ∧ header_present(tcp)
+        ∧ value(packet.tcp_payload_len, >, 0)
+        ∧ exists(flow, key(packet))
+        ∧ ( (${seq_faithfulness} == D8.0_byte_range
+               ∧ value(packet.seq_plus_len_mod32, >, flow.seq_highwater))
+            ∨ (${seq_faithfulness} == D8.1_bare_seq
+               ∧ value(hdr.tcp.seq, ≥, flow.seq_highwater)) )
+    given:
+      flow: by_key(key(packet))
+    then:
+      - "bind(flow, key(packet), {seq_highwater: (hdr.tcp.seq + packet.tcp_payload_len) mod 2^32})"
+      - forward(${forward_port})
+    notes: |
+      The segment advances the flow's high-water mark (new in-order or
+      gap-filling data whose far edge exceeds the mark) → update the mark to
+      seq+len and forward unflagged. retransmit_cnt is untouched.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: highwater_monotone
+    clause: persistence
+    target: flow.seq_highwater
+    while: "exists(flow, key(packet))"
+    free_under: ["rule R4 fires", "rule R2 fires"]
+    notes: |
+      The per-flow high-water mark is non-decreasing (mod 2^32): it changes
+      ONLY when R4 advances it (or R2 initialises it). A retransmission (R3)
+      MUST NOT lower or alter it — the classic implementation bug is writing seq+len
+      back unconditionally and letting a stale retransmit rewind the mark.
+
+  - id: retransmit_flag_correctness
+    clause: stability
+    target: detected_marker
+    while: "rule R3 fires"
+    notes: |
+      The detected-marker bit is set on EXACTLY the segments R3 classifies as
+      retransmissions, and is left clear on R0/R1/R2/R4 segments. A forwarder
+      that never sets it (no read-before-write) detects nothing; one that sets
+      it on every segment over-reports.
+
+  - id: data_path_preserved
+    clause: stability
+    target: forward_decision
+    while: "always"
+    notes: |
+      Every admitted TCP segment — retransmission or not — is FORWARDED; the NF
+      never drops a data segment. Detection is non-destructive (flag + mirror),
+      so a retransmit still reaches its destination.
+
+  - id: retransmit_count_exact
+    clause: stability
+    target: flow.retransmit_cnt
+    while: "rule R3 fires ∧ ${observable_surface} != mark_only"
+    enforced_when: "${count_strictness}"
+    notes: |
+      RFC/Dapper accumulator semantics — when enforced, the per-flow counter
+      equals exactly the number of R3 detections for that flow. Advisory
+      (monotone non-decreasing) when ${count_strictness} is false.
+
+  - id: mirror_no_orphan
+    clause: no_orphan
+    target: collector
+    enforced_when: "${observable_surface} == mark_count_mirror"
+    notes: |
+      Every R3 detection emits exactly one mirrored copy to ${collector_port};
+      no detection is silently dropped from the telemetry stream, and no mirror
+      is emitted without a detection.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: first_segment_forward_no_flag
+      generate: |
+        Send the first data segment of a new flow (seq=S, len=L>0). Assert:
+        FORWARDED on forward_port; detected-marker bit CLEAR; no mirror copy on
+        collector_port. (R2 establishes the high-water mark at S+L.)
+    - id: in_order_advance_no_flag
+      generate: |
+        prior=[seq=S len=L]; send the next in-order segment (seq=S+L, len=M).
+        Assert FORWARDED, marker CLEAR, no mirror, and the mark advances to
+        S+L+M (R4). A subsequent retransmit test confirms the new mark.
+    - id: retransmit_detected_flag_set
+      generate: |
+        prior=[seq=S len=L]; resend the SAME segment (seq=S, len=L) — its range
+        is fully covered. Assert: detected-marker bit SET; segment STILL
+        FORWARDED on forward_port; under mark_count_mirror a mirrored copy
+        appears on collector_port; retransmit_cnt incremented to 1 (R3).
+    - id: retransmit_mirror_to_collector
+      requires: "${observable_surface} == mark_count_mirror"
+      generate: |
+        Trigger one retransmission as above. Assert EXACTLY one mirrored copy of
+        the segment is delivered to collector_port in addition to the normal
+        forwarded copy on forward_port (mirror_no_orphan).
+    - id: distinct_flow_independence
+      generate: |
+        prior=[flow A: seq=S len=L]; send flow B (different 5-tuple) with seq=S,
+        len=L. Assert flow B's first segment is treated as new (R2), NOT a
+        retransmission — distinct flows have independent high-water marks.
+
+  G2:
+    - id: partial_overlap_retransmit
+      generate: |
+        prior=[seq=S len=L]; send seq=S, len=2L (overlaps covered bytes but its
+        far edge S+2L exceeds the mark S+L). Under D8.0_byte_range assert
+        FORWARDED unflagged and mark advances to S+2L (far edge advances);
+        under D8.1_bare_seq assert it is misclassified as a retransmit (seq<mark).
+        Pins the seq_faithfulness ladder.
+    - id: seq_wraparound
+      generate: |
+        Drive the high-water mark near 2^32 (seq just below wrap), then send a
+        segment whose seq+len wraps past 0. Assert the modulo-2^32 comparison
+        classifies it as in-order advance, not a retransmit. RFC 9293 §3.4.
+    - id: capacity_collision_alias
+      requires: "${flow_capacity} != unbounded"
+      generate: |
+        Install enough distinct flows to exceed ${flow_capacity} so two flows
+        hash to one cell; send a new segment of the colliding flow and assert
+        the documented collision behaviour (false retransmit detection or
+        eviction per ${eviction}).
+    - id: pure_ack_not_flagged
+      generate: |
+        prior=[seq=S len=L]; send a bare ACK (payload_len==0, ack covering S+L).
+        Assert FORWARDED, marker CLEAR, mark UNCHANGED (R1 — control segments
+        carry no data range).
+
+  G3:
+    - id: non_tcp_passthrough
+      generate: |
+        Send a UDP / ARP / non-TCP frame; assert FORWARDED unchanged on
+        forward_port with marker CLEAR (R0 — NF is transport-assistance, not a
+        filter; it MUST NOT drop or flag non-TCP).
+    - id: retransmit_does_not_rewind_mark
+      generate: |
+        prior=[seq=S len=L], then [seq=S+L len=M] (mark = S+L+M). Resend the
+        FIRST segment (seq=S len=L). Assert it is flagged AND the mark stays at
+        S+L+M (a stale retransmit MUST NOT rewind seq_highwater —
+        highwater_monotone). Probes the unconditional-write implementation bug.
+    - id: zero_len_no_state_corruption
+      generate: |
+        Interleave bare ACKs (payload_len==0) between data segments; assert the
+        ACKs never alter the high-water mark and never set the marker, so a
+        following genuine retransmit is still detected correctly. Probes the
+        v1model payload-length / data-offset computation bug (mis-derived
+        payload_len reads control segments as data).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: shrink_flow_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${flow_capacity} != unbounded ∧ ${flow_capacity} > 256"
+    effect: "${flow_capacity} ← ${flow_capacity} / 4"
+    feasibility_postcondition: "${flow_capacity} ≥ 64"
+    notes: |
+      Tighten the per-flow register so more flows collide into one cell,
+      stressing the hashed-register approximate regime (LossRadar digests).
+
+  - id: enlarge_flow_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${flow_capacity} != unbounded ∧ ${flow_capacity} < 1048576"
+    effect: "${flow_capacity} ← min(${flow_capacity} * 2, 1048576)"
+    feasibility_postcondition: "${flow_capacity} ≤ 1048576"
+    notes: "Paired ease for shrink_flow_capacity_4x — gives the loop a path back up the capacity axis."
+
+  - id: shrink_to_hashed_register
+    axis: capacity
+    direction: harden
+    applicable_when: "${flow_capacity} == unbounded"
+    effect: "${flow_capacity} ← 4096 ∧ ${eviction} ← none"
+    feasibility_postcondition: "${flow_capacity} ≥ 64"
+    notes: |
+      Replace the exact per-flow map with a fixed-cell hashed register —
+      collisions now alias distinct flows, so a new segment of one flow can be
+      mis-flagged against another's mark. Same capacity axis as the shrink.
+
+  - id: restore_exact_map
+    axis: capacity
+    direction: ease
+    applicable_when: "${flow_capacity} != unbounded"
+    effect: "${flow_capacity} ← unbounded ∧ ${eviction} ← none"
+    feasibility_postcondition: "${flow_capacity} == unbounded"
+    notes: "Paired ease for shrink_to_hashed_register — back to the exact, collision-free map."
+
+  - id: tighten_seq_to_bare
+    axis: faithfulness
+    direction: harden
+    applicable_when: "${seq_faithfulness} == D8.0_byte_range"
+    effect: "${seq_faithfulness} ← D8.1_bare_seq"
+    feasibility_postcondition: "${seq_faithfulness} == D8.1_bare_seq"
+    notes: |
+      Drop from byte-range comparison (seq+len vs mark) to bare-seq comparison
+      (seq vs mark). Partial-overlap segments are now misclassified — the SUT
+      must reproduce the approximate semantics exactly. Moves the faithfulness
+      ladder.
+
+  - id: relax_seq_to_byte_range
+    axis: faithfulness
+    direction: ease
+    applicable_when: "${seq_faithfulness} == D8.1_bare_seq"
+    effect: "${seq_faithfulness} ← D8.0_byte_range"
+    feasibility_postcondition: "${seq_faithfulness} == D8.0_byte_range"
+    notes: "Paired ease for tighten_seq_to_bare — back to exact byte-range detection."
+
+  - id: enable_count_strictness
+    axis: strictness
+    direction: harden
+    applicable_when: "¬${count_strictness} ∧ ${observable_surface} != mark_only"
+    effect: "${count_strictness} ← true"
+    feasibility_postcondition: "${count_strictness} == true"
+    notes: |
+      Promote retransmit_count_exact from advisory to enforced: the per-flow
+      counter must equal exactly the detection count, not merely be monotone.
+
+  - id: disable_count_strictness
+    axis: strictness
+    direction: ease
+    applicable_when: "${count_strictness}"
+    effect: "${count_strictness} ← false"
+    feasibility_postcondition: "¬${count_strictness}"
+    notes: "Paired ease for enable_count_strictness — counter reverts to advisory."
+
+  - id: ladder_observable_surface_up
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${observable_surface} != mark_count_mirror"
+    effect: |
+      ${observable_surface} ← (mark_only → mark_and_count; mark_and_count → mark_count_mirror)
+    feasibility_postcondition: "${observable_surface} ∈ {mark_and_count, mark_count_mirror}"
+    notes: |
+      Widen the required detection effect one rung — add the per-flow counter,
+      then the mirror-to-collector. Activates retransmit_count_exact (when
+      strict) and mirror_no_orphan. feature-breadth difficulty axis (how
+      much of the NF's observable surface the SUT must implement), distinct
+      from faithfulness (state/computation fidelity).
+
+  - id: ladder_observable_surface_down
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${observable_surface} != mark_only"
+    effect: |
+      ${observable_surface} ← (mark_count_mirror → mark_and_count; mark_and_count → mark_only)
+    feasibility_postcondition: "${observable_surface} ∈ {mark_only, mark_and_count}"
+    notes: "Paired ease for ladder_observable_surface_up — narrows the required surface back down."
+
+  - id: switch_to_crc32
+    axis: hash-family
+    direction: harden
+    applicable_when: "${flow_capacity} != unbounded ∧ ${hash_algo} == crc16"
+    effect: "${hash_algo} ← crc32"
+    feasibility_postcondition: "${hash_algo} == crc32"
+    notes: |
+      Switch the per-flow register index hash from crc16 to the wider crc32,
+      changing the collision pattern the SUT must reproduce in the hashed-register
+      regime. Only meaningful when ${flow_capacity} is finite.
+
+  - id: switch_to_crc16
+    axis: hash-family
+    direction: ease
+    applicable_when: "${flow_capacity} != unbounded ∧ ${hash_algo} == crc32"
+    effect: "${hash_algo} ← crc16"
+    feasibility_postcondition: "${hash_algo} == crc16"
+    notes: "Paired ease for switch_to_crc32 — reverts the register index hash family."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations to v1model P4:
+
+    Canonical (flow_capacity: unbounded, seq_faithfulness: D8.0_byte_range,
+    observable_surface: mark_count_mirror):
+      - Parser: ethernet → ipv4 (proto==6) → tcp. Compute the TCP payload
+        length as ipv4.totalLen - (ipv4.ihl<<2) - (tcp.dataOffset<<2); a
+        zero result is a control segment (R0/R1 forward path).
+      - One register array `seq_highwater[flow]` and one `retransmit_cnt[flow]`,
+        each indexed by hash(5-tuple). At unbounded capacity model the index as
+        a wide hash; the finite-capacity (collision) regime is the mutation.
+      - On a data segment: read seq_highwater[idx]; compute far = (tcp.seq +
+        payload_len) & 0xFFFFFFFF. If the cell is uninitialised → init to `far`,
+        forward (R2). Else compare: far > stored (mod 2^32 via signed-diff or a
+        wrap-tolerant compare) → in-order, write `far` back, forward (R4);
+        far ≤ stored → retransmit, set marker bit, retransmit_cnt[idx] += 1,
+        clone/mirror to collector_port, forward WITHOUT writing the mark (R3).
+      - Marker: set a low DSCP bit (hdr.ipv4.diffserv) or a TCP reserved bit;
+        recompute the IPv4 checksum if the IPv4 field is used.
+      - Mirror: clone_preserving_field_list / clone3 to a session bound to
+        collector_port, OR resubmit/recirculate — the cloned copy carries the
+        marker so the collector sees the flagged segment.
+
+  Gradability in BMv2 --use-files (HARD CONSTRAINT):
+    - Detection is observable four ways, all readable from the egress pcaps:
+      (a) the detected-marker header bit on the forwarded segment,
+      (b) the mirrored copy appearing on collector_port (a second output pkt),
+      (c) the drop/forward decision (here always forward — a dropped data
+          segment is a defect, see data_path_preserved),
+      (d) the per-flow retransmit counter's EFFECT — exposed behaviourally by
+          having the marker / mirror fire on exactly the detected segments
+          (the counter value itself is internal register state; tests assert
+          its effect via the per-segment marker/mirror, and count_strictness
+          enforces the cumulative count through that observable channel).
+    - NO time_tick / NO RTO timer: detection is purely seq-comparison driven by
+      RECEIVED packets. A segment is a retransmit the instant its covered range
+      is ≤ the stored high-water mark — there is no timeout, no periodic event,
+      and the harness injects no time. This is the design choice that keeps the
+      NF gradable under the v1.0 packet-only harness.
+
+  Anti-pattern implementations to reject:
+    * Writing seq+len back to the mark UNCONDITIONALLY (lets a stale retransmit
+      rewind the high-water mark — violates highwater_monotone; G3
+      retransmit_does_not_rewind_mark pins it).
+    * DROPPING the retransmission instead of forwarding it (this is loss
+      DETECTION, not dedup — the data path must be preserved).
+    * Mis-deriving payload_len (forgetting IHL or data-offset word scaling) so
+      control segments read as data and get flagged (G3 zero_len case).
+    * Naive `seq < mark` integer compare with no modulo-2^32 wrap handling
+      (G2 seq_wraparound).
+    * Reading standard_metadata.drop or a conditional deparser around the
+      mirror (the corpus's two top compile-gate bugs).
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance and
+  hand-run the public tests through the oracle for the seed. Confirm the
+  mirrored-copy egress is on a port DISTINCT from forward_port so the verifier
+  can attribute the two output packets (collector_port != forward_port).

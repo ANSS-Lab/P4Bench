@@ -1,0 +1,95 @@
+{
+  "oracle_hash": "fdb95fd73006151be99b1f3520fa0def6c0474755972fdcb60c4a41117722a18",
+  "instance": "gre_key_tunnel_anchor-default",
+  "ran_at": "2026-06-14T00:12:52.063344Z",
+  "canonical_examples": {
+    "passed": 10,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "not_gre_proto_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "wrong_vtep_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "keyless_require_key_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "keyless_require_key_off_still_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "unknown_key_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_key_1001_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "decap_distinct_key_1002_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "injected_tunnel_table_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "rebound_vtep_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "outer_stripped": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inner_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      }
+    },
+    "uncovered": [
+      "outer_stripped",
+      "inner_preserved"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2784",
+      "RFC2890"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

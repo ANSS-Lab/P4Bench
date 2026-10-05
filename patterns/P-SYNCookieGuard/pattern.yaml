@@ -1,0 +1,1108 @@
+# P-SYNCookieGuard — Stateless SYN-cookie SYN-flood guard
+#
+# TPL v1.0 task pattern. Fills the previously empty
+# P8:security row of the NF design-space map. The defining property is *no per-flow state
+# is allocated until a returning ACK is cryptographically validated*: on an
+# inbound SYN to a protected server with no established connection, the switch
+# ORIGINATES a SYN-ACK whose initial sequence number encodes a keyed cookie
+# over the connection 4-tuple + a coarse time epoch, and drops the SYN without
+# touching the connection table. A returning ACK is admitted only if its
+# acknowledgement number decodes to a cookie the switch would have minted for
+# that 4-tuple within the validity window. The pattern therefore straddles two
+# mechanism surfaces in one NF: per-flow connection state under capacity
+# pressure (the P3 surface it shares with P-StatefulFW) AND switch-originated
+# traffic (the P16 surface it shares with P-BFDLiveness — the emitted SYN-ACK
+# is constructed fresh in metadata, so the conditional-deparser / checksum-on-
+# emit failure class applies). target_capability = scale_up: the SYN-cookie
+# challenge is the canonical data-structure trick that lets the switch absorb a
+# volumetric SYN flood the server's connection backlog cannot. Post-validation
+# semantics are the FLOW-ADMIT model (validated flows are pinned + L3-forwarded;
+# no sequence-number splicing) — the full SYN-proxy seq-rewrite variant is a
+# deferred D5.x rung (see bridging_notes).
+
+pattern_id: P-SYNCookieGuard
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D7:security, D1:stateful-flow-tracking]      # DDoS mitigation (D7) that also keeps per-connection state (D1) — straddles two leaves, like P-StatefulFW
+  prescriptive: [P8:security]                                 # mechanism is the scaled SYN-flood challenge; the switch-origination surface it exercises is a *mechanism* (P16), not a second prescriptive cell — see summary
+
+target_capability: scale_up                                   # P8 → scale_up. The cookie challenge is the data-structure trick that scales the switch past the server's backlog wall under flood
+
+summary: >
+  Stateless SYN-cookie guard that protects a set of servers from TCP
+  SYN-flood resource exhaustion. Inbound SYNs to a protected server with
+  no established connection trigger a switch-originated SYN-ACK whose
+  sequence number encodes a keyed cookie over the 4-tuple and a coarse
+  time epoch; the SYN is dropped and NO connection state is allocated.
+  A returning ACK is admitted (and its flow pinned to the established
+  table) only if its acknowledgement number validates against a cookie
+  the switch would have minted for that 4-tuple inside the validity
+  window. Whitelisted sources bypass the challenge; under the optional
+  activation-threshold mode the challenge engages only once the inbound
+  SYN rate to a server exceeds a backlog threshold. Faithfulness ladders
+  from a truncated keyed hash (D5.0) to the RFC 4987 §3.6 timestamp +
+  MSS-encoding cookie (D5.1).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - cite: rfc4987
+      id: RFC4987
+      title: "TCP SYN Flooding Attacks and Common Mitigations"
+      sections: ["§1 the attack", "§3.1 filtering", "§3.6 SYN cookies", "§4 analysis"]
+      role: normative_behaviour
+      quote: >-
+        SYN cookies go a step further and allocate no state at all for
+        connections in SYN-RECEIVED. Instead, they encode most of the state
+        (and all of the strictly required) state that they would normally keep
+        into the sequence number transmitted on the SYN-ACK. If the SYN was not
+        spoofed, then the acknowledgement number (along with several other
+        fields) in the ACK that completes the handshake can be used to
+        reconstruct the state to be put into the TCB.
+      quote_source: patterns/P-SYNCookieGuard/grounding/RFC4987.txt
+      relevance: |
+        The canonical reference for the NF. RFC 4987 is Informational —
+        it "does not define any standards", so the pattern's rules
+        realise its *described mechanism* rather than MUST-clauses:
+          - §3.6 SYN cookies — the exact cookie construction the D5.1
+            faithfulness rung reproduces: "the top five bits come from
+            a 32-bit counter value modulo 32, where the counter
+            increases every 64 seconds", "the next 3 bits encode a
+            usable MSS near to the one in the SYN", and "the bottom 24
+            bits are a server-selected secret function of [the] pair of
+            IP addresses, [the] pair of port numbers" plus the counter.
+            This is the source for the `cookie_faithfulness`,
+            `cookie_validity_epochs`, `epoch_period_s`, and
+            `cookie_secret` parameters and for R7's cookie mint / R8's
+            cookie validation.
+          - §3.6 validation — "If an ACK comes back, the difference
+            between the acknowledged sequence number and the sequence
+            number of the ACK segment can be checked against recent
+            values of the counter and the secret function's output".
+            R8's `cookie_valid(...)` predicate is exactly this recompute-
+            and-compare against the in-window epoch counters.
+          - §3.6 the headline property — "allocate no state at all for
+            connections in SYN-RECEIVED". This is the
+            `no_state_on_unvalidated_syn` invariant, the master security
+            property of the pattern and the reason a SYN flood cannot
+            exhaust the connection table.
+          - §3.6 limitations the pattern inherits — SYN cookies "are
+            incompatible with some TCP options" and "do not handle
+            application data piggybacked on the SYN segment"; the
+            flow-admit model accepts these limitations (no option
+            replay, no SYN-payload carry), documented in bridging_notes.
+          - §3.6 / §3.1 activation — "[SYN cookies] are only enabled
+            either under high-stress conditions indicative of an attack,
+            or via administrative action", and §3.1 filtering by source
+            address (BCP 38 / RFCs 2827, 3704). These ground the
+            `syn_rate_activation` / `syn_rate_threshold` parameters
+            (engage the challenge only above a backlog threshold) and
+            the `whitelist` source-bypass parameter.
+
+  papers:
+    - cite: poseidon_ndss20
+      venue: "NDSS 2020 (security venue — secondary to the SIGCOMM/NSDI/CoNEXT corpus)"
+      role: canonical_implementation
+      relevance: |
+        Poseidon ("Mitigating Volumetric DDoS Attacks with Programmable
+        Switches", Zhang et al., NDSS '20) is the programmable-switch
+        realisation the pattern is modelled on: it ships switch-native
+        defence primitives for TCP-based DDoS, "includes defenses with
+        primitives for SYN flood attacks", and shows the challenge can
+        be expressed on a reconfigurable switch data plane at line rate
+        without a hardware upgrade. It is the evidence that the cookie
+        challenge belongs in the `scale_up` frontier (switch absorbs
+        the flood the host backlog cannot) and informs the
+        `syn_rate_activation` framing — the defence is a primitive
+        activated under attack rather than always-on. Cited as a
+        secondary (out-of-corpus, NDSS) source: the canonical *grounding*
+        is RFC 4987; Poseidon supplies the switch-data-plane realisation
+        and threat model.
+
+  tutorials: []                                               # the p4lang/tutorials firewall exercise is not vendored in this repo (checked); topology is the standard 2-zone / N-server shape described in bridging_notes
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic. Traffic that is not TCP-to-a-protected-server traverses
+      the pattern as a pass-through (R2/R3 forward it to the downstream
+      pipeline); the guard neither challenges nor tracks it.
+
+  connection:                                                 # per-connection TCP state — only ever bound from a VALIDATED ACK (R8), never from a bare SYN
+    name: established_conn
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.tcp.sport
+      - hdr.tcp.dport
+    attrs:
+      established:  bool                                       # true once the cookie ACK validated
+      last_seen:    timestamp
+      decoded_mss:  int                                        # MSS recovered from the cookie at D5.1 (RFC 4987 §3.6 3-bit MSS encoding); unused at D5.0
+    capacity: ${state_capacity}
+    eviction: ${eviction_policy}
+    decay:    ${idle_timeout_s}
+    notes: |
+      The established-connection table. The load-bearing security
+      property is that a `bind(connection, ...)` happens ONLY in R8,
+      after `cookie_valid` succeeds — never in R7 (the SYN path). This
+      is what makes the table immune to SYN-flood exhaustion: an
+      unanswered cookie challenge leaves no footprint.
+
+  bucket:                                                     # per-server inbound-SYN-rate accumulator — only active under syn_rate_activation
+    name: syn_rate
+    keyed_by: hdr.ipv4.dst                                    # one accumulator per protected server
+    attrs:
+      count: int
+    enforced_when: "${syn_rate_activation} == true"
+    notes: |
+      A windowed inbound-SYN counter per protected server. When
+      ${syn_rate_activation} is on, the cookie challenge (R7) engages
+      only once `rate_exceeds(syn_rate, ${syn_rate_threshold})` — below
+      the threshold the server's own backlog handles SYNs (R6 forwards
+      them). Realises RFC 4987's "enabled only under high-stress
+      conditions indicative of an attack" guidance.
+
+  halfopen:                                                   # optional bounded half-open accounting table — only active under track_halfopen
+    name: halfopen_conn
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.tcp.sport
+      - hdr.tcp.dport
+    attrs:
+      challenged_at: timestamp
+    capacity: ${halfopen_capacity}
+    eviction: FIFO
+    enforced_when: "${track_halfopen} == true"
+    notes: |
+      A bounded, FIFO-evicted record of outstanding challenges. This is
+      a DELIBERATELY non-default, harder variant: the pure stateless
+      cookie keeps no half-open state at all (the secure design), but
+      `track_halfopen` adds a bounded accounting table so the harden
+      axis can introduce half-open eviction pressure WITHOUT ever
+      letting it touch the established table. Overflow here MUST NOT
+      evict established connections and MUST NOT cause a SYN to allocate
+      established state.
+
+  time_tick:                                                  # advances the coarse cookie epoch counter and drives idle-timeout eviction
+    period: ${epoch_period_s}
+    notes: |
+      A periodic event the harness injects every ${epoch_period_s}
+      seconds (RFC 4987 §3.6 uses 64 s). Each tick advances the global
+      epoch counter the cookie's high bits encode; a cookie minted in
+      epoch E validates only while the current epoch is within
+      [E, E + ${cookie_validity_epochs}). Ticks also drive the
+      `timeout` eviction policy on the established table.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  protected_servers:
+    type: list[address]
+    constraint: "every entry is an ipv4 address or ipv4_cidr the guard sits in front of"
+    notes: |
+      The destination addresses whose TCP connections are challenged.
+      Traffic to any other destination is forwarded untouched (R2).
+
+  whitelist:
+    type: list[address]
+    constraint: "every entry is an ipv4 address or ipv4_cidr; sources here bypass the challenge"
+    default: []
+    notes: |
+      Trusted source prefixes that skip the cookie challenge entirely
+      (RFC 4987 §3.1 source-based filtering, inverted to an allow-list).
+      Narrowing this set (`narrow_whitelist`) forces more traffic
+      through the challenge and is a harden axis.
+
+  cookie_faithfulness:
+    type: enum
+    values:
+      - D5.0_truncated_hash        # anchor — cookie is a truncated keyed hash over the 4-tuple + epoch; no MSS encoding
+      - D5.1_rfc4987_mss           # RFC 4987 §3.6 — 5-bit epoch-counter-mod-32 + 3-bit MSS encoding + 24-bit keyed hash
+    default: D5.0_truncated_hash
+    notes: |
+      Faithfulness ladder. D5.0 is the anchor: the
+      cookie is `truncate(hash(4tuple, epoch, secret))` placed in the
+      SYN-ACK seq; validation recomputes and compares. D5.1 lifts to the
+      full RFC 4987 §3.6 layout — the top 5 bits carry the epoch counter
+      mod 32, the next 3 bits encode the client's MSS bucket, and the
+      bottom 24 bits are the keyed hash; R8 additionally decodes the MSS
+      from the validated cookie into `connection.decoded_mss`.
+      Seed-only parameter; not an nf_categories design-space tag.
+
+  faithfulness:                                               # conventional alias for cookie_faithfulness; seeds may use either key
+    type: enum
+    values: [D5.0_truncated_hash, D5.1_rfc4987_mss]
+    default: D5.0_truncated_hash
+    notes: |
+      Convenience alias for ${cookie_faithfulness} so seeds can use the
+      conventional `faithfulness` key. Bound identically;
+      mutations that move one move the other.
+
+  cookie_hash_algo:
+    type: function
+    values: [crc32, csum16, keyed_crc16, custom_keyed]
+    default: crc32
+    notes: |
+      The hash family used to derive the keyed cookie. `swap_cookie_
+      hash_family` walks this axis; a weaker family (csum16) makes
+      collisions / forgeries more reachable and stresses whether the
+      implementation actually keys the hash on all 4-tuple fields + secret.
+
+  cookie_secret:
+    type: int
+    range: "[1, 4294967295]"
+    notes: |
+      The server-selected secret folded into the cookie hash (RFC 4987
+      §3.6). Constant for the lifetime of the secret epoch; the
+      `secret_persistence` invariant forbids regenerating it per packet.
+
+  state_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of ESTABLISHED connections the data-plane table
+      holds. Only validated flows occupy it; SYN floods never do.
+      `shrink_state_capacity_4x` walks it down to expose the eviction
+      policy under realistic validated-flow counts.
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO, LRU, timeout]
+    default: none
+    notes: |
+      Eviction policy on the established-connection table when
+      ${state_capacity} is bounded.
+
+  idle_timeout_s:
+    type: int
+    range: "[30, 7440]"
+    default: 300
+    notes: |
+      Idle timeout for the `timeout` eviction policy; an established
+      connection with no traffic for this long is evicted on a tick.
+
+  cookie_validity_epochs:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: |
+      How many epochs a minted cookie stays valid (RFC 4987 §3.6 checks
+      the ACK "against recent values of the counter"). A cookie minted
+      in epoch E validates while the current epoch ∈ [E, E + this).
+      Tightening to 1 (`tighten_cookie_validity_window`) means a slow
+      client whose ACK arrives one epoch late is rejected — catches
+      implementations that compare only the current epoch.
+
+  epoch_period_s:
+    type: int
+    range: "[8, 64]"
+    default: 64
+    notes: |
+      Coarse timestamp granularity for the cookie epoch counter (RFC
+      4987 §3.6 uses 64 s). The harness fires a time_tick every
+      ${epoch_period_s} seconds to advance the counter.
+
+  track_halfopen:
+    type: bool
+    default: false
+    notes: |
+      When true, the switch additionally records each outstanding
+      challenge in the bounded FIFO `halfopen` table (a hybrid
+      accounting variant). Adds half-open eviction pressure as a harden
+      axis WITHOUT weakening the no-state-on-SYN property for the
+      established table.
+
+  halfopen_capacity:
+    type: int
+    range: "[16, 65536]"
+    default: 1024
+    enforced_when: "${track_halfopen} == true"
+    notes: |
+      Capacity of the bounded half-open accounting table; only meaningful
+      when ${track_halfopen} is true.
+
+  syn_rate_activation:
+    type: bool
+    default: false
+    notes: |
+      When true, the cookie challenge (R7) engages only once the inbound
+      SYN rate to a protected server exceeds ${syn_rate_threshold};
+      below threshold, SYNs are forwarded to the server (R6). Realises
+      RFC 4987's activation-threshold guidance. Harder than always-on
+      because it adds a `rate_exceeds` precondition and a per-server
+      windowed counter.
+
+  syn_rate_threshold:
+    type: int
+    range: "[8, 1048576]"
+    default: 128
+    enforced_when: "${syn_rate_activation} == true"
+    notes: |
+      Inbound SYNs-per-window to a protected server above which the
+      cookie challenge engages. Only meaningful when
+      ${syn_rate_activation} is true.
+
+  reference_impl_shown:
+    type: bool
+    default: false
+    notes: |
+      Input-form axis (starter-library difficulty axis). When
+      true, the SUT-facing description is accompanied by a host-side
+      Python reference implementation of the cookie mint / validate
+      logic (the heaviest ease). `provide_host_reference_impl` /
+      `strip_to_behavioural_spec` walk this axis.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. R0–R9 fire on packet ingress; the
+# epoch counter and idle-timeout eviction advance on time_tick ingress (no
+# packet-producing rule fires on a tick — ticks only mutate counters/evict).
+
+rules:
+
+  - id: R1_non_ipv4_drop
+    when: |
+      ¬header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Non-IPv4 (ARP / IPv6 / LLDP) is dropped unconditionally. G3 parser-
+      edge anchor; keeps the first-match cascade from reading garbage.
+
+  - id: R2_unprotected_forward
+    when: |
+      header_present(ipv4) ∧ ¬match(hdr.ipv4.dst, ${protected_servers})
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      Traffic not destined to a protected server is forwarded normally.
+      The guard is transparent outside the protected set.
+
+  - id: R3_non_tcp_to_protected_forward
+    when: |
+      header_present(ipv4) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧ ¬header_present(tcp)
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      SYN cookies are TCP-only (RFC 4987). UDP / ICMP to a protected
+      server is forwarded untouched; the challenge never applies.
+
+  - id: R4_whitelist_bypass_forward
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧
+      match(hdr.ipv4.src, ${whitelist})
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      Whitelisted sources skip the challenge entirely (RFC 4987 §3.1
+      source filtering as an allow-list). Fires before the established /
+      challenge rules so a trusted client never sees a cookie.
+
+  - id: R5_established_forward
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧
+      exists(connection, deduce_from_packet.key) ∧
+      value(connection[deduce_from_packet.key].established, ==, true)
+    given:
+      connection: by_key(deduce_from_packet)
+    then:
+      - "bind(connection, deduce_from_packet.key, {last_seen: now()})"
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      Data / handshake-completion packets of an already-validated flow
+      are forwarded (flow-admit model: pinned + L3-forwarded, no
+      sequence rewrite). Refreshes last_seen for the idle-timeout policy.
+
+  - id: R6_syn_below_threshold_forward
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧
+      match(hdr.tcp.flag_syn, 1) ∧ ¬match(hdr.tcp.flag_ack, 1) ∧
+      ¬exists(connection, deduce_from_packet.key) ∧
+      ${syn_rate_activation} == true ∧
+      ¬rate_exceeds(syn_rate, ${syn_rate_threshold})
+    given:
+      bucket: by_key(hdr.ipv4.dst)
+    then:
+      - "inc(syn_rate[hdr.ipv4.dst])"
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    enforced_when: "${syn_rate_activation} == true"
+    notes: |
+      Activation-threshold mode, below threshold: the server's own
+      backlog handles the SYN, so it is forwarded (and counts toward the
+      per-server rate). Only present when ${syn_rate_activation} is true;
+      otherwise this rule is dormant and a SYN falls straight to R7.
+
+  - id: R7_syn_cookie_challenge
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧
+      match(hdr.tcp.flag_syn, 1) ∧ ¬match(hdr.tcp.flag_ack, 1) ∧
+      ¬exists(connection, deduce_from_packet.key) ∧
+      (${syn_rate_activation} == false ∨ rate_exceeds(syn_rate, ${syn_rate_threshold}))
+    given:
+      bucket: by_key(hdr.ipv4.dst)
+    then:
+      - "inc(syn_rate[hdr.ipv4.dst]) IF ${syn_rate_activation} == true"
+      - "emit(syn_ack_packet with
+              flag_syn=1, flag_ack=1,
+              seq = cookie(mint: 4tuple=deduce_from_packet.key,
+                                  epoch=current_epoch,
+                                  mss=encode_mss(hdr.tcp.mss) IF ${cookie_faithfulness}==D5.1_rfc4987_mss,
+                                  secret=${cookie_secret},
+                                  algo=${cookie_hash_algo}),
+              ack = hdr.tcp.seq + 1,
+              encapsulated_in: ipv4_udp_swap(src=hdr.ipv4.dst, dst=hdr.ipv4.src,
+                                             tcp_sport=hdr.tcp.dport, tcp_dport=hdr.tcp.sport,
+                                             egress=std.ingress_port))"
+      - "bind(halfopen, deduce_from_packet.key, {challenged_at: now()}) IF ${track_halfopen} == true"
+      - drop                                                  # the inbound SYN is consumed; NO established state is allocated (RFC 4987 §3.6)
+    notes: |
+      The headline rule. On an unestablished SYN to a protected server
+      (and, under activation mode, only once the SYN rate is over
+      threshold), the switch ORIGINATES a SYN-ACK whose seq encodes the
+      keyed cookie over the 4-tuple + current epoch (+ MSS at D5.1),
+      with ack = client_seq + 1 and the IP/TCP src/dst swapped so the
+      reply retraces the link. The inbound SYN is then dropped and the
+      established table is untouched — only the optional bounded
+      half-open accounting table is written. This is the P16 origination
+      surface; the emitted packet is built fresh in metadata, so the
+      conditional-deparser / checksum-on-emit failure class applies
+      (see G3 `regression_conditional_deparser_on_synack`).
+
+  - id: R8_ack_validate_and_admit
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers}) ∧
+      match(hdr.tcp.flag_ack, 1) ∧ ¬match(hdr.tcp.flag_syn, 1) ∧
+      ¬exists(connection, deduce_from_packet.key) ∧
+      cookie_valid(value=hdr.tcp.ack - 1,
+                   4tuple=deduce_from_packet.key,
+                   epoch_window=[current_epoch - ${cookie_validity_epochs} + 1, current_epoch],
+                   secret=${cookie_secret},
+                   algo=${cookie_hash_algo})
+    given:
+      connection: by_key(deduce_from_packet)
+    then:
+      - "bind(connection, deduce_from_packet.key,
+              {established: true, last_seen: now(),
+               decoded_mss: decode_mss(hdr.tcp.ack - 1) IF ${cookie_faithfulness}==D5.1_rfc4987_mss})"
+      - "evict(halfopen, deduce_from_packet.key) IF ${track_halfopen} == true"
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      A returning ACK with no established connection is admitted iff its
+      acknowledgement number minus one decodes to a cookie the switch
+      would have minted for this 4-tuple within the validity window (RFC
+      4987 §3.6 "checked against recent values of the counter and the
+      secret function's output"). On success the flow is pinned to the
+      established table (flow-admit) and forwarded; at D5.1 the MSS is
+      recovered from the cookie. An ACK that fails validation falls
+      through to R9 (drop) — no state, no admission.
+
+  - id: R9_default_deny
+    when: |
+      header_present(tcp) ∧ match(hdr.ipv4.dst, ${protected_servers})
+    then:
+      - drop
+    notes: |
+      Default-deny for any TCP to a protected server that did not match
+      R4 (whitelist), R5 (established), R6 (sub-threshold SYN), R7 (SYN
+      challenge), or R8 (validated ACK). Covers invalid-cookie ACKs,
+      stray segments, RSTs with no state, and crafted flag combinations.
+      Anchors the `cookie_validation_determinism` invariant.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_state_on_unvalidated_syn
+    clause: stability
+    target: established_conn_population
+    while: "an inbound SYN matches R7 (challenge) and no validating ACK follows"
+    free_under: ["bind(halfopen, _, _)"]
+    notes: |
+      The master security property (RFC 4987 §3.6 "allocate no state at
+      all for connections in SYN-RECEIVED"). A SYN that triggers a cookie
+      challenge MUST NOT add an entry to the established `connection`
+      table; only R8 (validated ACK) may. Free only under the optional
+      bounded half-open accounting bind. This is what makes a SYN flood
+      unable to exhaust the connection table — the G2
+      `syn_flood_no_state_exhaustion` test anchors on it.
+
+  - id: cookie_validation_determinism
+    clause: stability
+    target: admit_decision
+    while: "an inbound ACK has no established connection"
+    free_under: []
+    notes: |
+      An ACK is admitted (R8) iff `ack - 1` recomputes to a cookie the
+      switch would mint for its 4-tuple within the validity window —
+      stable across connection-table contents and independent of any
+      half-open record. An implementation that admits on a partial-key or
+      constant cookie, or that compares only the current epoch (ignoring
+      ${cookie_validity_epochs}), violates this.
+
+  - id: emit_synack_structure_completeness
+    clause: stability
+    target: emitted_synack_layers
+    while: "rule R7 fires"
+    notes: |
+      Every SYN-ACK R7 emits MUST be a full Eth + IPv4 + TCP stack with
+      flag_syn=1, flag_ack=1, every IPv4/TCP field explicitly assigned,
+      and freshly recomputed IPv4 + TCP checksums. The implementation
+      anti-pattern is a conditional `packet.emit(hdr.tcp)` in the
+      deparser, or copying a checksum from the parsed-in SYN rather than
+      recomputing on the emit-time bytes — both silently corrupt the
+      originated packet. Probed by `regression_conditional_deparser_on_synack`.
+
+  - id: secret_persistence
+    clause: persistence
+    target: cookie_secret
+    while: "within one secret epoch"
+    free_under: []
+    notes: |
+      ${cookie_secret} is fixed for its lifetime; the switch MUST NOT
+      regenerate it per packet. An implementation that re-randomises the secret
+      on each mint produces cookies no returning ACK can ever validate —
+      every legitimate client is rejected and the session never opens.
+
+  - id: no_orphan_connection
+    clause: no_orphan
+    target: established_conn
+    enforced_when: "${state_capacity} != unbounded"
+    notes: |
+      Every `bind(connection, ...)` (R8) is eventually followed by an
+      `evict(...)` — via capacity pressure under ${eviction_policy} or
+      via `decay: ${idle_timeout_s}`. Otherwise the validated-flow table
+      fills and new admissions are blackholed.
+
+  - id: halfopen_no_orphan
+    clause: no_orphan
+    target: halfopen_conn
+    enforced_when: "${track_halfopen} == true"
+    notes: |
+      Every half-open record (R7) is eventually removed — by FIFO
+      capacity pressure or by the validating ACK's evict (R8). The
+      half-open table never grows unbounded and never spills into the
+      established table.
+
+  - id: bounded_latency
+    clause: bounded_latency
+    target: packet
+    while: "header_present(ipv4)"
+    enforced_when: "true"
+    notes: |
+      Per-packet latency (parse → match-action → deparse, plus the
+      single originated SYN-ACK on R7) is bounded by the pipeline depth.
+      The cookie challenge MUST be answered in-pipeline, not deferred to
+      a control-plane round trip.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. R7 emits exactly one fresh
+      SYN-ACK per challenged SYN and drops the SYN; the emitted packet is
+      not a recirculated copy.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Every entry maps
+# to a G{1,2,3}-P{n}-T{m} rule from the goal framework.
+
+test_scaffolding:
+
+  G1:                                                         # functional correctness
+    - id: syn_triggers_cookie_synack
+      rule_ref: G1-P1-T3                                      # one test per table action — origination is its own action
+      generate: |
+        Send a TCP SYN (flags="S", TTL=64) from an untrusted source to a
+        ${protected_servers} address with no prior state. Assert: the
+        switch emits exactly one packet back toward the source with
+        flags="SA", tcp.ack == incoming tcp.seq + 1, IP/TCP src/dst
+        swapped, egress == ingress port; the inbound SYN is consumed
+        (not forwarded to the server); AND no established connection was
+        created (a follow-up data packet on the same 4-tuple, sent
+        WITHOUT a validating ACK, is dropped by R9).
+
+    - id: valid_ack_admits_flow
+      rule_ref: G1-P2-T5                                      # bidirectional consistency — warm-up then validate
+      generate: |
+        Warm-up: send a SYN to ${protected_servers}[0]; capture the
+        emitted SYN-ACK's seq (the cookie). Test packet: send a TCP ACK
+        (flags="A", TTL=64) on the same 4-tuple with tcp.ack == cookie+1.
+        Assert: behavior=forward toward the server, TTL decremented, MAC
+        rewritten, and the connection is now established (a subsequent
+        data packet on the 4-tuple also forwards via R5).
+
+    - id: established_data_forward
+      rule_ref: G1-P1-T1                                      # one test per forwarding path
+      depends_on: valid_ack_admits_flow
+      generate: |
+        After `valid_ack_admits_flow` has admitted the flow, send a TCP
+        data segment (flags="A", TTL=1) on the same 4-tuple. Assert
+        behavior=forward, TTL decremented by 1, output toward the server.
+
+    - id: whitelist_bypass_forward
+      rule_ref: G1-P1-T1
+      requires: "len(${whitelist}) > 0"
+      generate: |
+        Send a TCP SYN from a source inside ${whitelist} to
+        ${protected_servers}[0]. Assert behavior=forward toward the
+        server (no SYN-ACK emitted, no challenge) — R4 fires before R7.
+
+    - id: non_protected_passthrough
+      rule_ref: G1-P1-T1
+      generate: |
+        Send a TCP SYN to a destination NOT in ${protected_servers}.
+        Assert behavior=forward, TTL decremented — the guard is
+        transparent outside the protected set (R2). No SYN-ACK emitted.
+
+    - id: mss_decoded_on_valid_ack
+      rule_ref: G1-P1-T5                                      # explicit transformation assertion
+      requires: "${cookie_faithfulness} == D5.1_rfc4987_mss"
+      generate: |
+        Warm-up SYN carrying a specific MSS option (e.g., 1460); capture
+        the cookie. Send the validating ACK. Assert the admitted
+        connection's decoded_mss equals the RFC 4987 §3.6 MSS bucket the
+        cookie encoded for 1460 (not 0, not garbage) — verifies the
+        3-bit MSS encode/decode round-trip.
+
+  G2:                                                         # resource robustness / boundary
+    - id: syn_flood_no_state_exhaustion
+      rule_ref: G2-P2-T3                                      # state exhaustion
+      requires: "${state_capacity} != unbounded"
+      generate: |
+        Concurrently: (a) complete one legitimate flow (SYN → capture
+        cookie → validating ACK) so it is established; (b) send
+        2 * ${state_capacity} distinct-4-tuple SYNs to
+        ${protected_servers}[0] with NO validating ACKs. Assert: every
+        adversarial SYN gets a cookie SYN-ACK; ZERO established entries
+        were created by the flood; AND the legitimate flow's subsequent
+        data packet still forwards (the flood neither filled nor evicted
+        the established table). Anchors `no_state_on_unvalidated_syn`.
+
+    - id: established_capacity_eviction
+      rule_ref: G2-P2-T3
+      requires: "${state_capacity} != unbounded ∧ ${eviction_policy} != none"
+      generate: |
+        Establish exactly ${state_capacity} flows (each via SYN +
+        validating ACK). Establish one more (overflow). Send a data
+        packet on the OLDEST established flow. Under FIFO/LRU the oldest
+        was evicted, so the data packet has no established entry and is
+        dropped by R9; under timeout it survives if within
+        ${idle_timeout_s}.
+
+    - id: cookie_epoch_expiry_drop
+      rule_ref: G2-P1-T1                                      # exact threshold boundary
+      generate: |
+        Warm-up SYN; capture the cookie. Feed time_tick events to advance
+        the epoch by exactly ${cookie_validity_epochs} (one past the
+        window). Send the ACK carrying the now-stale cookie. Assert
+        behavior=drop (R8's epoch-window check fails). Boundary twin:
+        the same ACK delivered ${cookie_validity_epochs}-1 epochs late
+        still validates and forwards.
+
+    - id: halfopen_table_overflow_isolated
+      rule_ref: G2-P2-T3
+      requires: "${track_halfopen} == true"
+      generate: |
+        Send ${halfopen_capacity} + 1 distinct-4-tuple SYNs (no ACKs).
+        Assert FIFO eviction of the half-open table, AND that no
+        established entry was created and no established entry evicted —
+        the half-open overflow is isolated from the established table.
+
+  G3:                                                         # security / bypass / regression for v1model bug patterns
+    - id: invalid_cookie_ack_drop
+      rule_ref: G3-P2-T4                                      # default-open audit
+      generate: |
+        Send a TCP ACK to ${protected_servers}[0] with no prior SYN and
+        an arbitrary tcp.ack value (not a valid cookie), no established
+        state. Assert behavior=drop (R9). The only path to admission is a
+        cryptographically valid cookie — verifies no default-open admit.
+
+    - id: spoofed_ack_flood_no_poison
+      rule_ref: G3-P3-T1                                      # external state manipulation
+      generate: |
+        Send a burst of distinct-4-tuple ACKs with random ack values (a
+        cookie-guessing / state-poisoning flood). Assert: zero of them
+        create established state; then complete one legitimate
+        SYN→cookie→ACK exchange and assert it still admits. The flood
+        must not poison or fill the established table.
+
+    - id: crafted_flags_no_bypass
+      rule_ref: G3-P2-T1                                      # policy evasion via unusual flags
+      generate: |
+        To ${protected_servers}[0] with no state, send each of: a SYN+ACK
+        (flags="SA"), an XMAS segment (all flags), and a NULL segment (no
+        flags). Assert each is dropped — only a pure SYN gets a challenge
+        (R7) and only a pure ACK with a valid cookie is admitted (R8); a
+        crafted SYN-ACK MUST NOT be mistaken for a validated ACK.
+
+    - id: regression_conditional_deparser_on_synack
+      rule_ref: G3-P2-T2                                      # bug-driven: conditional deparser + checksum on emit
+      generate: |
+        Force a cookie challenge (SYN to a protected server). Capture the
+        emitted SYN-ACK. Assert the OUTPUT structure is exactly
+        Eth + IPv4 + TCP with every IPv4 field present (version=4, ihl=5,
+        totalLen, identification, flags, fragOffset, ttl, proto=6,
+        srcAddr, dstAddr), tcp flags="SA", and BOTH a valid recomputed
+        IPv4 checksum and a valid recomputed TCP checksum. Catches
+        implementations that conditionally emit hdr.tcp in the deparser or copy a
+        checksum from the parsed-in SYN. First-corpus probe of the
+        conditional-deparser bug on a switch-originated TCP packet
+        (v1model bug taxonomy "Language Semantic Pitfalls",
+        cross-cut with the checksum-recompute pattern).
+
+    - id: regression_cookie_hash_binds_all_fields
+      rule_ref: G1-P2-T8                                      # bug-driven: hash extern keys on all fields
+      generate: |
+        Send two SYNs differing ONLY in tcp.sport to
+        ${protected_servers}[0]; capture both cookies. Assert the two
+        cookies differ (the hash binds sport). Then replay flow-A's
+        cookie inside an ACK on flow-B's 4-tuple. Assert behavior=drop —
+        a cookie minted for one 4-tuple MUST NOT validate another.
+        Catches a partial-key or constant cookie (the dominant
+        correctness failure and the security hole; a hash-extern
+        misuse bug).
+
+    - id: regression_std_metadata_drop_smoke
+      rule_ref: G3-P2-T2                                      # bug-driven: std_metadata.drop misread
+      generate: |
+        Send a sequence on one ingress port: (a) an invalid-cookie ACK
+        that R9 drops; (b) a data packet of an already-established flow.
+        Assert (b) is forwarded normally — the prior drop did NOT
+        contaminate the implementation's per-packet decision via a misread of
+        `standard_metadata.drop` (v1model bug taxonomy "Backend
+        resource mapping error").
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pair every harden with an ease on the same axis. Eighteen operators across
+# nine paired axes (faithfulness, state-capacity, hash-family, cookie-validity
+# window, half-open tracking, whitelist breadth, syn-rate activation, eviction
+# policy, input form).
+
+mutation_operators:
+
+  - id: tighten_cookie_faithfulness
+    applicable_when: "${cookie_faithfulness} == D5.0_truncated_hash"
+    effect: |
+      ${cookie_faithfulness} ← D5.1_rfc4987_mss ∧
+      ${faithfulness} ← D5.1_rfc4987_mss
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "the cookie now carries the RFC 4987 §3.6 5+3+24-bit layout and R8 decodes MSS"
+    notes: |
+      Lift D5.0 → D5.1. Demands the implementation implement the full RFC 4987
+      §3.6 cookie (epoch-counter-mod-32 high bits, 3-bit MSS bucket,
+      24-bit keyed hash) and decode the MSS on validation — substantially
+      harder bit-packing than a flat truncated hash.
+
+  - id: relax_cookie_faithfulness
+    applicable_when: "${cookie_faithfulness} == D5.1_rfc4987_mss"
+    effect: |
+      ${cookie_faithfulness} ← D5.0_truncated_hash ∧
+      ${faithfulness} ← D5.0_truncated_hash
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "no seed feature requires MSS decoding (the mss_decoded_on_valid_ack test turns off)"
+    notes: |
+      Drop D5.1 → D5.0. Pairs with tighten_cookie_faithfulness; eases a
+      too-hard instance whose only failures are MSS bit-packing.
+
+  - id: shrink_state_capacity_4x
+    applicable_when: "${state_capacity} != unbounded ∧ ${state_capacity} > 256"
+    effect: "${state_capacity} ← ${state_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${state_capacity} >= 64"
+    notes: |
+      Tighten the established-table capacity axis. Forces the eviction
+      policy to engage under realistic validated-flow counts. Pairs with
+      enlarge_state_capacity_2x.
+
+  - id: enlarge_state_capacity_2x
+    applicable_when: "${state_capacity} != unbounded"
+    effect: "${state_capacity} ← ${state_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${state_capacity} <= 1048576"
+    notes: |
+      Loosen the capacity axis. Pairs with shrink_state_capacity_4x so
+      the loop can recover from over-tightening.
+
+  - id: swap_cookie_hash_family
+    applicable_when: "${cookie_hash_algo} != csum16"
+    effect: "${cookie_hash_algo} ← csum16"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "csum16 is a valid v1model hash algorithm and keys on all 4-tuple fields + secret"
+    notes: |
+      Switch to a weaker hash family. A 16-bit checksum-style hash makes
+      forgery / collision more reachable and stresses whether the implementation
+      keys on all 4-tuple fields + secret rather than a subset. Mirrors
+      the hash-family axis on P-StatefulLB / P-StatefulFW.
+
+  - id: revert_cookie_hash_family
+    applicable_when: "${cookie_hash_algo} == csum16"
+    effect: "${cookie_hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "crc32 is a valid v1model hash algorithm"
+    notes: |
+      Restore the stronger crc32 cookie hash. Pairs with
+      swap_cookie_hash_family.
+
+  - id: tighten_cookie_validity_window
+    applicable_when: "${cookie_validity_epochs} > 1"
+    effect: "${cookie_validity_epochs} ← ${cookie_validity_epochs} - 1"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${cookie_validity_epochs} >= 1"
+    notes: |
+      Narrow the cookie's valid-epoch window. At 1, a returning ACK that
+      arrives one epoch late is rejected — catches implementations that compare
+      only the current epoch counter instead of the
+      [current - validity + 1, current] window. Pairs with
+      widen_cookie_validity_window.
+
+  - id: widen_cookie_validity_window
+    applicable_when: "${cookie_validity_epochs} < 8"
+    effect: "${cookie_validity_epochs} ← ${cookie_validity_epochs} + 1"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${cookie_validity_epochs} <= 8"
+    notes: |
+      Widen the valid-epoch window. Pairs with
+      tighten_cookie_validity_window.
+
+  - id: enable_halfopen_tracking
+    applicable_when: "${track_halfopen} == false"
+    effect: |
+      ${track_halfopen} ← true ∧
+      add invariant halfopen_no_orphan to enforced set
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${halfopen_capacity} >= 16"
+    notes: |
+      Add the bounded FIFO half-open accounting table. Introduces
+      half-open eviction pressure (the G2 halfopen_table_overflow_isolated
+      test) WITHOUT weakening no_state_on_unvalidated_syn — the implementation
+      must keep the half-open table strictly isolated from the
+      established table. Pairs with disable_halfopen_tracking.
+
+  - id: disable_halfopen_tracking
+    applicable_when: "${track_halfopen} == true"
+    effect: |
+      ${track_halfopen} ← false ∧
+      remove invariant halfopen_no_orphan from enforced set
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "no seed feature requires the half-open table"
+    notes: |
+      Return to the pure stateless-cookie design (no half-open state).
+      Pairs with enable_halfopen_tracking.
+
+  - id: narrow_whitelist
+    applicable_when: "len(${whitelist}) > 0"
+    effect: "remove the broadest prefix from ${whitelist}"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "len(${whitelist}) >= 0"
+    notes: |
+      Shrink the bypass allow-list so more traffic is forced through the
+      challenge. Pairs with widen_whitelist.
+
+  - id: widen_whitelist
+    applicable_when: "true"
+    effect: "add one trusted source prefix to ${whitelist}"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "every ${whitelist} entry is a valid ipv4 address or cidr"
+    notes: |
+      Grow the bypass allow-list so more traffic skips the challenge.
+      Pairs with narrow_whitelist.
+
+  - id: enable_syn_rate_activation
+    applicable_when: "${syn_rate_activation} == false"
+    effect: |
+      ${syn_rate_activation} ← true ∧
+      activate rule R6_syn_below_threshold_forward and the syn_rate bucket
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${syn_rate_threshold} >= 8"
+    notes: |
+      Engage the challenge only above a per-server SYN-rate backlog
+      threshold (RFC 4987 activation guidance). Adds a rate_exceeds
+      precondition and a windowed per-server counter — harder than
+      always-on because the implementation must track and threshold the rate.
+      Pairs with disable_syn_rate_activation.
+
+  - id: disable_syn_rate_activation
+    applicable_when: "${syn_rate_activation} == true"
+    effect: |
+      ${syn_rate_activation} ← false ∧
+      deactivate rule R6_syn_below_threshold_forward and the syn_rate bucket
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "R7 fires on every unestablished SYN (always-on challenge)"
+    notes: |
+      Return to the always-on challenge (no rate threshold). Pairs with
+      enable_syn_rate_activation.
+
+  - id: swap_eviction_to_LRU
+    applicable_when: "${eviction_policy} != LRU ∧ ${state_capacity} != unbounded"
+    effect: "${eviction_policy} ← LRU"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${state_capacity} != unbounded"
+    notes: |
+      LRU on the established table needs per-flow recency tracking —
+      harder than FIFO in P4 (no native register timestamp arithmetic;
+      common implementation is approximate aging counters). Pairs with
+      revert_eviction_to_FIFO.
+
+  - id: revert_eviction_to_FIFO
+    applicable_when: "${eviction_policy} == LRU"
+    effect: "${eviction_policy} ← FIFO"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${state_capacity} != unbounded"
+    notes: |
+      Drop back to FIFO eviction (implicit via hash-collision replace).
+      Pairs with swap_eviction_to_LRU.
+
+  - id: strip_to_behavioural_spec
+    applicable_when: "${reference_impl_shown} == true"
+    effect: "${reference_impl_shown} ← false"
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "the SUT-facing description carries no host-side reference implementation"
+    notes: |
+      Input-form ladder (starter-library operator). Remove the
+      host-side Python reference of the cookie mint/validate logic,
+      leaving only the behavioural spec — the heaviest harden on the
+      input-form axis. Pairs with provide_host_reference_impl.
+
+  - id: provide_host_reference_impl
+    applicable_when: "${reference_impl_shown} == false"
+    effect: "${reference_impl_shown} ← true"
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "the reference implementation matches the audited oracle's cookie semantics"
+    notes: |
+      Attach a host-side Python reference implementation of the cookie
+      mint/validate logic to the SUT-facing description (the heaviest
+      ease). Pairs with strip_to_behavioural_spec.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4. Items marked
+  [common-knowledge baseline] are synthesised from internalised P4 /
+  networking knowledge rather than retrieved from a cited source; the
+  cookie construction itself is RFC 4987 §3.6.
+
+    D5.0 anchor (cookie_faithfulness: D5.0_truncated_hash,
+                 syn_rate_activation: false, track_halfopen: false,
+                 eviction_policy: none, state_capacity: unbounded):
+      - Two tables: `protected` (exact/LPM on hdr.ipv4.dst → "is this a
+        guarded server?") and the L3 next-hop table for forwarding.
+      - One register: `established<bit<W>>(${state_capacity})` keyed on
+        hash(4-tuple); a set bit (+ a stored tag to disambiguate hash
+        collisions) marks an admitted flow. [common-knowledge baseline.]
+      - Cookie mint (R7): cookie = hash(${cookie_hash_algo},
+        {ipv4.src, ipv4.dst, tcp.sport, tcp.dport, epoch, ${cookie_secret}});
+        epoch = std.ingress_global_timestamp >> log2(${epoch_period_s}·1e6).
+        The originated SYN-ACK is the cleanest as a clone3()/resubmit of a
+        metadata-built header, or by swapping src/dst in place + setting
+        tcp.flags=SA, tcp.seq=cookie, tcp.ack=orig_seq+1 and
+        egress_spec=ingress_port, then recomputing both checksums via
+        update_checksum. [common-knowledge baseline — RFC 4987 §3.6 fixes
+        the cookie *content*; the v1model emit mechanism is convention.]
+      - Cookie validate (R8): recompute the cookie for each epoch in
+        [current-${cookie_validity_epochs}+1, current] and compare to
+        tcp.ack-1; on a match set the established bit and forward.
+
+    D5.1 (cookie_faithfulness: D5.1_rfc4987_mss):
+      - Pack the cookie as RFC 4987 §3.6: bits[31:27] = epoch mod 32,
+        bits[26:24] = MSS bucket (index into an 8-entry MSS table near
+        the SYN's advertised MSS), bits[23:0] = keyed hash. R8 decodes
+        bits[26:24] back to an MSS and stores it in the established entry.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Allocating established state on the SYN (binding `connection` in
+      R7 instead of R8) — collapses the whole defence; a SYN flood
+      exhausts the table exactly as it would on an unprotected host.
+      The `no_state_on_unvalidated_syn` invariant and the G2
+      `syn_flood_no_state_exhaustion` test bind this directly.
+    * A constant or partial-key cookie (e.g., hashing only on srcAddr,
+      or returning a fixed seq) — every ACK validates, so an attacker
+      skips the challenge by sending SYN then ACK with any ack value.
+      `regression_cookie_hash_binds_all_fields` catches this.
+    * Comparing only the current epoch on validate (ignoring
+      ${cookie_validity_epochs}) — legitimate clients whose ACK crosses
+      an epoch boundary are rejected. `cookie_epoch_expiry_drop`'s
+      boundary twin catches this.
+    * Conditional `packet.emit(hdr.tcp)` in the deparser, or copying the
+      parsed-in SYN's checksum onto the SYN-ACK — corrupts the
+      originated packet. `regression_conditional_deparser_on_synack`.
+    * Reading `standard_metadata.drop` to decide "was the last packet
+      dropped?" — reserved-field misread; cross-contaminates subsequent
+      decisions. `regression_std_metadata_drop_smoke`.
+    * Re-randomising ${cookie_secret} per packet — no returning ACK ever
+      validates. `secret_persistence` binds this.
+
+  Deferred (post-v1) faithfulness rung — full SYN-proxy splice:
+    A real SYN-cookie firewall completes its own handshake with the
+    client, then opens a SECOND handshake to the server and splices the
+    two by translating sequence numbers (a NAT44-style seq delta) on
+    every subsequent segment. This pattern uses the simpler FLOW-ADMIT
+    model (validated flows are pinned and L3-forwarded, no seq rewrite)
+    per the authoring decision; the splice variant is a future D5.2 rung
+    that composes this pattern's cookie surface with P-NAT44's
+    sequence-rewrite surface and carries a heavier oracle. Flagged for a
+    v1.1 composite.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and (once the oracle
+       exists) the oracle audit must all pass validation.
+
+    2. The oracle MUST treat time_tick events distinctly from packet
+       events: `step(packet=None, ingress_port=-1, state)` advances the
+       epoch counter and runs idle-timeout eviction; `step(packet=Scapy,
+       ...)` runs R1–R9. The oracle audit's canonical examples MUST
+       include (a) a SYN→cookie sequence asserting NO established state,
+       (b) a SYN→cookie→validating-ACK sequence asserting admission, and
+       (c) a SYN→cookie→tick-past-window→stale-ACK sequence asserting
+       drop, so a constant-baked oracle that hardcodes the epoch window
+       or the secret diverges on at least one example.
+
+    3. Anchor instances (D5.0_truncated_hash, unbounded capacity,
+       always-on challenge, no half-open, empty whitelist) reduce to a
+       compact rule subset (R1, R2, R7 mint, R8 validate, R9 deny) that
+       should compile and pass smoke testing in a ~200-line P4 program.
+       The headline difficulty is the originate-and-recompute pair, not
+       the table count.

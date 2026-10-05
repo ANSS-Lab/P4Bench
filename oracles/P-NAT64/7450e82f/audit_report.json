@@ -1,0 +1,167 @@
+{
+  "oracle_hash": "787936e4ced9c15c60ebbb64068542a7406c626b3a512f141a8cf95e727ebc43",
+  "instance": "nat64_anchor_mut2-dynamic_shrunk_pool",
+  "ran_at": "2026-06-17T14:20:14.533751Z",
+  "canonical_examples": {
+    "passed": 18,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "mode_static_miss_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "mode_dynamic_alloc_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "pool_range_low_base",
+        "status": "pass"
+      },
+      {
+        "example_id": "pool_range_high_base",
+        "status": "pass"
+      },
+      {
+        "example_id": "capacity_full_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "capacity_unbounded_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "eviction_teardown_then_return_miss",
+        "status": "pass"
+      },
+      {
+        "example_id": "eviction_none_then_return_hit",
+        "status": "pass"
+      },
+      {
+        "example_id": "l4_classes_full_udp_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "l4_classes_tcp_only_udp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "checksum_strict_true_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "checksum_strict_false_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "wkp_match_translates",
+        "status": "pass"
+      },
+      {
+        "example_id": "wkp_mismatch_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "v4_to_v6_return_hits_default_binding",
+        "status": "pass"
+      },
+      {
+        "example_id": "v4_inbound_unbound_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "v4_wrong_dst_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ip_frame_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "version_swap_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ipv4_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "address_embedding_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "pair_symmetry": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "binding_reversibility": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "v4_port_uniqueness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_binding": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "version_swap_consistency",
+      "address_embedding_correctness",
+      "pair_symmetry",
+      "binding_reversibility",
+      "v4_port_uniqueness",
+      "no_orphan_binding",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC6146",
+      "RFC6052"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

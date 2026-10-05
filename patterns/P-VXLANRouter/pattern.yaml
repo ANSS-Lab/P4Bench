@@ -1,0 +1,1538 @@
+# P-VXLANRouter — VXLAN VTEP ∘ IPv4 underlay router (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-VXLANTunnel
+# (RFC 7348 L3-VTEP encap/decap) with P-IPv4Routing (RFC 1812 LPM
+# unicast forwarding) into a single overlay/underlay edge NF — the
+# "overlay encap then underlay forward" composition.
+#
+# P-VXLANTunnel's own post-instantiation hooks already flag this exact
+# chain: "a P-VXLANTunnel instance whose encap-path egress packets are
+# then forwarded by a P-IPv4Routing instance is a natural multi-pattern
+# composition. Within the v1 corpus the composition is implicit (the
+# underlay_fib parameter encodes the static nexthop directly); future
+# work may chain a real multi-pattern pipeline." P-VXLANRouter IS that
+# future work: it DISSOLVES P-VXLANTunnel's static `underlay_fib`
+# singleton lookup into P-IPv4Routing's real LPM FIB (`route` +
+# `nexthop_group`), and adds the genuinely new composite behaviour the
+# two patterns cannot exhibit in isolation — the switch is
+# SIMULTANEOUSLY a VTEP (it decapsulates VXLAN destined to its own
+# ${local_vtep_ip}) AND a transit underlay router (it RFC-1812-forwards
+# VXLAN destined to any OTHER VTEP, treating the inner frame as opaque).
+#
+# The value of this *chained* pattern (versus instantiating
+# P-VXLANTunnel and P-IPv4Routing independently) is three interactions
+# invisible when the components are tested apart:
+#   (a) outer-vs-inner header discipline — after encap there are TWO
+#       IPv4 headers; the underlay forward MUST key on the OUTER dst and
+#       MUST NOT touch the inner TTL / addrs (a naive implementation runs the L3
+#       forwarder over `hdr.ipv4` and decrements the inner TTL);
+#   (b) origination-vs-transit TTL semantics — the encap-originate path
+#       stamps the outer TTL at its initial value and does NOT decrement
+#       (RFC 1812 only decrements *forwarded* datagrams), while the
+#       transit path DOES decrement the outer TTL by exactly one;
+#   (c) the VTEP/transit dichotomy — a single uplink packet is decapped
+#       iff outer.dst == ${local_vtep_ip}, else transit-forwarded; a
+#       implementation that decaps every VXLAN-looking packet breaks transit,
+#       and one that transit-forwards everything never decaps.
+# See `bridging_notes:` for the v1model failure modes this exposes.
+#
+# Reuses the two audited halves' oracles under the content-addressed oracle
+# convention
+# (recorded at instantiation as the composed oracle's provenance), the
+# same convention the shipped composite P-StatefulFW-NAT44 follows.
+# target_capability = composition because the chain's
+# failure modes are cross-cutting and neither pure-redesign (the two
+# constituents are both redesign) nor reducible to either half.
+
+pattern_id: P-VXLANRouter
+version: "1.0"
+
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                         # both halves are destination-based forwarding (overlay delivery ∪ underlay LPM)
+  prescriptive: [P1:forwarding]                      # P1 over the overlay ∪ underlay union
+
+target_capability: composition                          # chained composition; the overlay∘underlay failure modes are cross-cutting
+
+summary: >
+  Overlay/underlay edge composition of a VXLAN L3-VTEP (RFC 7348) with
+  an IPv4 unicast underlay router (RFC 1812). On the access→uplink path
+  the switch resolves the access port's VNI, looks up the inner
+  destination MAC in the per-VNI MAC→remote-VTEP table, builds the
+  outer Ethernet+IPv4+UDP+VXLAN stack (outer dst = the remote VTEP IP,
+  outer src = ${local_vtep_ip}, outer TTL stamped at its origination
+  value and NOT decremented), then hands the freshly-encapsulated
+  packet to the underlay FIB — a real LPM lookup on the outer
+  destination that picks the egress port and the outer Ethernet
+  rewrite (replacing P-VXLANTunnel's static underlay_fib singleton).
+  On the uplink→access path the switch is dual-role: a VXLAN packet
+  whose outer destination equals ${local_vtep_ip} is validated,
+  decapsulated, and the inner frame delivered to the VNI's access port
+  (with strict cross-VNI isolation); any other packet on the uplink —
+  VXLAN for a different VTEP, or plain underlay IPv4 — is transit
+  RFC-1812-forwarded on its OUTER header (LPM, decrement-by-one,
+  Ethernet rewrite, checksum recompute) with the inner payload treated
+  as opaque transport. The chain's load-bearing invariants are
+  outer/inner header disjointness, the VTEP/transit dichotomy, and the
+  origination-vs-transit TTL distinction. Faithfulness anchors at D5.0
+  (single VNI, fixed outer src port, zero UDP checksum, lax flags,
+  BUM = drop, singleton underlay next-hops) and ladders through D5.1
+  (real LPM with overlapping prefixes + the transit-forward path with
+  outer-TTL decrement and checksum recompute), D5.2 (full RFC 7348 §5
+  validation cascade + strict VNI isolation + ECMP underlay + martian
+  filtering), and D5.3 (multi-tenant scale: many VNIs, scaled FIB,
+  weighted-multipath underlay).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+# The composite inherits its normative grounding from the two audited
+# halves; the RFC clauses below are reused verbatim from the constituent
+# patterns (P-VXLANTunnel for RFC 7348, P-IPv4Routing for RFC 1812 /
+# RFC 2992) rather than re-derived. The constituents are cited as
+# domain-concepts entries — the same convention P-StatefulFW-NAT44
+# uses for P-StatefulFW + P-NAT44.
+
+grounding:
+
+  papers:
+    - cite: contra_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-IPv4Routing: documents the realistic underlay
+        FIB scales (10²–10⁴ prefixes per switch) that motivate the
+        composite's `fib_capacity` axis and the D5.3 scaled-underlay
+        rung. Cited as the engineering ceiling for the underlay half's
+        scaled-FIB instances, not as an anchor reference.
+
+  rfcs:
+    - id: RFC7348
+      sections: ["§4.1 unicast over VXLAN", "§4.2 broadcast/multicast over VXLAN", "§4.3 fragmentation and MTU", "§5 frame format"]
+      role: normative_behaviour
+      relevance: |
+        The overlay half. Reused verbatim from P-VXLANTunnel: §5 frame
+        format (I-flag MUST be 1 on a valid VNI; the 7-bit / 24-bit /
+        8-bit reserved blocks MUST be zero on transmission and ignored
+        on receipt — strict mode turns ignore-on-receipt into
+        drop-on-receipt at R3); §5 outer UDP (IANA dst port 4789,
+        RECOMMENDED dynamic-range source port computed from a hash of
+        the inner headers for underlay-ECMP entropy); §5 UDP checksum
+        (SHOULD be transmitted zero; a received zero MUST be accepted);
+        §4.1 unicast decap (verify the VNI and the inner-dst-MAC, then
+        strip and deliver) and the VNI-scope MUST that anchors the
+        `vni_isolation` invariant; §4.2 BUM (drop / head-end
+        replication / multicast group); §4.3 "VTEPs MUST NOT fragment
+        VXLAN packets." In the composite, §4.1's "deliver to the VM"
+        decap is gated by the additional `outer.dst == ${local_vtep_ip}`
+        VTEP-ownership test that distinguishes decap from transit.
+
+    - id: RFC1812
+      sections: ["5.2.1", "5.2.2", "5.2.2.5", "5.3.1", "5.3.4", "5.3.7", "5.2.7"]
+      role: canonical_spec
+      relevance: |
+        The underlay half. Reused verbatim from P-IPv4Routing, but in
+        the composite the RFC-1812 forwarding algorithm runs over the
+        OUTER IPv4 header on two distinct paths: §5.2.1 forwarding
+        (validate → forward decision → TTL → checksum → L2 rewrite)
+        drives both the encap-originate underlay forward (R8, no
+        decrement — the switch is the source) and the transit forward
+        (R6, decrement-by-one — the switch is forwarding a received
+        datagram); §5.3.1 TTL ("MUST decrement by one when forwarding";
+        "MUST be discarded if the TTL becomes zero") binds R5/R6 on the
+        transit path and the `origination_vs_transit_ttl` invariant;
+        §5.2.2.5 checksum recompute binds `outer_ipv4_checksum_validity`
+        on both underlay paths; §5.3.4 longest-prefix-match / no-route
+        ⇒ drop binds R6/R7/R10 and `lpm_longest_match_correctness`;
+        §5.3.7 martian source filtering is the underlay-side
+        `martian_filter_enabled` axis; §5.2.7 ICMP error origination is
+        the Tier-3 `emit_transit_icmp_errors` axis.
+
+    - id: RFC2992
+      sections: ["1", "2.2", "3"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-IPv4Routing: governs the underlay ECMP path
+        the composite lifts to at D5.2. §2.2 flow-consistency ("as long
+        as the region boundaries remain unchanged the same next-hop
+        will be chosen for a given flow") binds `ecmp_flow_consistency`
+        on the underlay group selection; the RECOMMENDED RFC 7348 §5
+        inner-header outer-source-port hash and the underlay 5-tuple
+        ECMP hash are the two entropy surfaces the composite's
+        `hash_algo` / `multipath_mode` axes exercise jointly.
+
+  tutorials:
+    - url: https://github.com/p4lang/tutorials/tree/master/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        Inherited from P-VXLANTunnel: the access/uplink port
+        partitioning and the inner-in-outer parse-graph shape the
+        composite's anchor topology reuses. The composite differs
+        by adding a real LPM underlay table between the encap action and
+        egress, plus the transit-forward path on uplink for outer
+        destinations that are not this VTEP.
+
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        Inherited from P-IPv4Routing: the canonical single-LPM-table
+        forwarding topology. In the composite this table is the
+        underlay FIB keyed on the OUTER IPv4 destination — the same LPM
+        + L2-rewrite + TTL/checksum action, but applied to the outer
+        header of an encapsulated or transit packet rather than to a
+        bare IPv4 datagram.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The pattern is stateless — every
+      decision is derived from header fields (outer and inner), the
+      ingress port role, and the control-plane-installed mapping +
+      FIB tables. Inherited unchanged from both halves (P-VXLANTunnel
+      and P-IPv4Routing are both stateless under `redesign`).
+
+  link:                                                       # `link` — port-keyed access/uplink role and access-VNI binding (from P-VXLANTunnel)
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      role:        "enum {access, uplink}"                    # access ports carry inner-only frames; uplink ports carry VXLAN + plain underlay IPv4
+      access_vni:  "int | none"                               # set iff role == access
+    populated_from:
+      access_rows: ${access_port_bindings}
+      uplink_rows: ${uplink_ports}
+    notes: |
+      Reused from P-VXLANTunnel. Access ports face tenant VMs (raw inner
+      Ethernet); uplink ports face the underlay fabric and carry BOTH
+      VXLAN-encapped overlay traffic (to decap or transit) AND plain
+      underlay IPv4 (to transit). The per-port role gates which rules
+      can fire: encap on access (R8/R9/R10/R11), decap-or-transit on
+      uplink (R1–R7).
+
+  vni_mac_remote_fib:                                         # `bucket` — (VNI, inner_dmac) → remote VTEP IP (encap path; from P-VXLANTunnel)
+    type: bucket
+    keyed_by_tuple: [vni, inner_dmac]
+    attrs:
+      remote_vtep_ip: address
+    capacity: ${vni_mac_remote_fib_capacity}
+    populated_from: ${vni_mac_remote_fib_entries}
+    notes: |
+      Reused from P-VXLANTunnel. Drives R8's encap-path lookup. The
+      key change in the composite: `remote_vtep_ip` is no longer
+      resolved by a paired static `underlay_fib` singleton — it becomes
+      the OUTER destination address that the underlay `route` LPM table
+      then forwards. Every `remote_vtep_ip` MUST resolve in `route`
+      (the composite's `underlay_route_for_every_remote_vtep` integrity
+      constraint; a known remote VTEP with no underlay route drops at
+      R10).
+
+  vni_mac_local_fib:                                          # `bucket` — (VNI, inner_dmac) → local access port (decap path; from P-VXLANTunnel)
+    type: bucket
+    keyed_by_tuple: [vni, inner_dmac]
+    attrs:
+      access_egress_port: port
+    populated_from: ${vni_mac_local_fib_entries}
+    notes: |
+      Reused from P-VXLANTunnel. Drives R2's decap-path local delivery,
+      reached only after the `outer.dst == ${local_vtep_ip}` ownership
+      test confirms this switch is the terminating VTEP. The
+      `vni_isolation` invariant is defined against it.
+
+  route:                                                      # `bucket` — LPM FIB on the OUTER IPv4 dst (underlay; from P-IPv4Routing)
+    keyed_by_lpm: outer_ipv4.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int                                   # tie-break diagnostics; the LPM primitive selects longest
+    capacity: ${fib_capacity}
+    populated_from: ${routes}
+    notes: |
+      Reused from P-IPv4Routing, REPLACING P-VXLANTunnel's static
+      `underlay_fib`. Keyed on the OUTER IPv4 destination (longest-prefix
+      match, not list order). Resolves both the encap-originate forward
+      (R8: LPM on the just-stamped outer.dst = remote_vtep_ip) and the
+      transit forward (R6: LPM on the received outer.dst). A default
+      route (0.0.0.0/0) absorbs otherwise-unmatched underlay traffic.
+
+  nexthop_group:                                              # `bucket` — underlay multipath group (from P-IPv4Routing)
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops: "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac: "list[address]"                               # per-egress source MAC for the outer L2 rewrite
+    capacity: ${max_nexthop_group_size}
+    notes: |
+      Reused from P-IPv4Routing. Singletons (|nexthops| == 1) at the
+      anchor realise non-ECMP underlay routes; |nexthops| > 1
+      enables ECMP/WCMP underlay multipath per `${multipath_mode}`.
+      The chosen nexthop supplies the OUTER Ethernet rewrite
+      (outer_ethernet.src = port_mac[i], outer_ethernet.dst =
+      nexthops[i].next_hop_mac) on both underlay paths.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  # ── Structural seed bindings (no difficulty operator; populate entities) ──
+
+  access_port_bindings:
+    type: list[access_port_binding_entry]
+    constraint: |
+      every entry has port:int ∈ [1, 511]; access_vni:int ∈
+      [1, 16777215] (RFC 7348 §5 VNI range); ports unique; no port is
+      both access and uplink.
+    notes: |
+      (ingress_port → access_vni) bindings populating the `link` entity
+      under role == access. Structural; bound by the seed.
+
+  uplink_ports:
+    type: list[int]
+    constraint: "every entry ∈ [1, 511]; disjoint from access_port_bindings ports."
+    notes: |
+      Ports configured as uplinks (underlay-facing). Populate the `link`
+      entity's role == uplink rows. Structural; bound by the seed.
+
+  local_vtep_ip:
+    type: address
+    constraint: ipv4
+    notes: |
+      This VTEP's underlay IP — the outer SOURCE IP on every
+      encap-originated packet, AND the outer-destination ownership test
+      that distinguishes decap (outer.dst == ${local_vtep_ip}) from
+      transit (outer.dst ≠ ${local_vtep_ip}) on the uplink path. The
+      single load-bearing parameter of the composition. Structural.
+
+  vni_mac_remote_fib_entries:
+    type: list[vni_mac_remote_entry]
+    constraint: |
+      every entry has vni:int ∈ [1, 16777215]; inner_dmac:address;
+      remote_vtep_ip:address; (vni, inner_dmac) unique; every
+      remote_vtep_ip MUST resolve in ${routes} (underlay reachability).
+    notes: "Rows populating `vni_mac_remote_fib`. Structural; bound by the seed."
+
+  vni_mac_local_fib_entries:
+    type: list[vni_mac_local_entry]
+    constraint: |
+      every entry has vni:int ∈ [1, 16777215]; inner_dmac:address;
+      access_egress_port:int ∈ [1, 511]; (vni, inner_dmac) unique;
+      every access_egress_port appears in access_port_bindings; when
+      vni_isolation_strict, that port's access_vni equals the entry's vni.
+    notes: "Rows populating `vni_mac_local_fib`. Structural; bound by the seed."
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0, 32],
+      nexthop_group_id:int; LPM relation well-formed (no two entries
+      share both prefix AND prefix_len); ${local_vtep_ip} need NOT be in
+      ${routes} (locally-terminated, not forwarded).
+    notes: |
+      The underlay FIB populating `route`, keyed on the OUTER dst.
+      Structural; bound by the seed. Difficulty on this surface is moved
+      by `shrink_fib_capacity_4x` / `inflate_underlay_overlapping_prefixes`.
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights positive ints."
+    notes: "Underlay nexthop groups populating `nexthop_group`. Structural."
+
+  # ── Overlay difficulty knobs (paired operators below) ──
+
+  outer_udp_dst_port:
+    type: int
+    range: "[1, 65535]"
+    default: 4789
+    notes: "RFC 7348 §5 IANA assignment 4789; the decap path's R2 matcher tests outer udp.dst == this. Structural-with-default."
+
+  outer_udp_src_port_mode:
+    type: enum
+    values: [fixed, hash_inner_3tuple, hash_inner_5tuple]
+    default: fixed
+    notes: "RFC 7348 §5 RECOMMENDED inner-header hash for underlay ECMP entropy. `fixed` is the anchor; hash modes ladder difficulty (paired with hash_algo)."
+
+  outer_udp_src_port_fixed_value:
+    type: int
+    range: "[49152, 65535]"
+    default: 49152
+    enforced_when: "${outer_udp_src_port_mode} == fixed"
+
+  outer_udp_checksum_mode:
+    type: enum
+    values: [zero_on_tx, computed_on_tx]
+    default: zero_on_tx
+    notes: "RFC 7348 §5 SHOULD-be-zero (anchor) vs MUST-correctly-cover-multilayer (harder). Moved by enable_outer_udp_checksum_compute."
+
+  verify_outer_udp_checksum_on_rx:
+    type: bool
+    default: false
+    notes: "RFC 7348 §5 MAY-verify-and-MUST-drop-on-mismatch on decap. Structural; the zero-MUST-accept clause holds regardless."
+
+  flag_strictness:
+    type: enum
+    values: [strict, lax]
+    default: lax
+    notes: "Decap-side I-flag/reserved validation. `lax` at the anchor; `strict` (activates R3) hardens via tighten_flag_validation."
+
+  vni_isolation_strict:
+    type: bool
+    default: false
+    notes: "Egress-side VNI recheck on decap (R2). `false` at anchor; `true` activates the vni_isolation invariant + cross-wire G3 test via enable_strict_vni_isolation."
+
+  bum_handling:
+    type: enum
+    values: [drop, head_end_replication, ingress_multicast_group]
+    default: drop
+    notes: "Encap-path unknown-(VNI,dmac) handling (RFC 7348 §4.2). `drop` at anchor; head_end_replication via enable_bum_replication."
+
+  bum_replication_targets:
+    type: list[address]
+    constraint: "every entry resolves in ${routes}; non-empty when ${bum_handling} == head_end_replication."
+    default: []
+    enforced_when: "${bum_handling} == head_end_replication"
+
+  mtu_enforcement:
+    type: enum
+    values: [ignore, strict_drop_oversize]
+    default: ignore
+    notes: "RFC 7348 §4.3 VTEPs-MUST-NOT-fragment. `ignore` at anchor; strict via enable_mtu_enforcement."
+
+  outer_mtu:
+    type: int
+    range: "[576, 9216]"
+    default: 1500
+    enforced_when: "${mtu_enforcement} == strict_drop_oversize"
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none"
+    notes: "Hash for the outer-source-port computation AND the underlay ECMP selection. Weakened by swap_hash_to_xor_fold."
+
+  vni_mac_remote_fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Encap-side MAC-FIB capacity. Tightened by shrink_vni_mac_capacity_4x."
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: "Inner/underlay flow-tuple distribution for the entropy tests. Raised by raise_workload_skew."
+
+  # ── Underlay difficulty knobs (paired operators below) ──
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Underlay FIB capacity (Contra-realistic 10⁴–10⁵). Tightened by shrink_fib_capacity_4x."
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+    notes: "Largest underlay ECMP/WCMP group. 1 at anchor (singleton next-hops); raised by enable_ecmp_underlay."
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_3tuple, ecmp_hash_5tuple, wcmp]
+    default: none
+    notes: "Underlay multipath over the OUTER 5-tuple. `none` at anchor; lifted by enable_ecmp_underlay / enable_wcmp_underlay."
+
+  ecmp_remap_algo:
+    type: enum
+    values: [modulo_n, hash_threshold, hrw]
+    default: hash_threshold
+    enforced_when: "${multipath_mode} != none"
+    notes: "Hash→index map for the underlay group (RFC 2992 §3). Hardened to HRW via swap_underlay_remap_to_hrw."
+
+  martian_filter_enabled:
+    type: bool
+    default: false
+    notes: "RFC 1812 §5.3.7 source filtering on the OUTER src of transit packets. `false` at anchor; enabled by enable_martian_filter."
+
+  emit_transit_icmp_errors:
+    type: bool
+    default: false
+    notes: "RFC 1812 §5.2.7 ICMP Time-Exceeded / Dest-Unreachable origination on the transit path. Adds `emit`; enabled by enable_transit_icmp_errors."
+
+  default_action:
+    type: enum
+    values: [drop, send_icmp_unreachable]
+    default: drop
+    notes: "Underlay no-route behaviour (R7). `drop` at anchor; send_icmp_unreachable gated by ${emit_transit_icmp_errors}."
+
+  origination_ttl:
+    type: int
+    range: "[2, 255]"
+    default: 64
+    notes: |
+      The outer IPv4 TTL the encap-originate path (R8) stamps. NOT
+      decremented on origination (RFC 1812 decrements only forwarded
+      datagrams) — the `origination_vs_transit_ttl` invariant. Structural-with-default.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_static_encap_route          # anchor — single VNI, lax flags, fixed src port, zero udp csum, BUM=drop, singleton underlay
+      - D5.1_underlay_lpm_transit        # real LPM overlapping prefixes + the transit-forward path (outer TTL decrement + csum)
+      - D5.2_full_validation_ecmp        # strict flags + strict VNI isolation + ECMP underlay + martian filter + MTU enforcement
+      - D5.3_multitenant_scale           # many VNIs + scaled FIB + weighted-multipath underlay
+    default: D5.0_static_encap_route
+    notes: |
+      The composite faithfulness ladder. D5.0 is the minimal happy-path
+      encap-and-route + decap. D5.1 introduces the genuinely-composite
+      transit path with full RFC 1812 forwarding on the outer header.
+      D5.2 lifts the full overlay validation cascade and the underlay
+      ECMP/martian surfaces. D5.3 raises multi-tenant + scaled-underlay
+      data-centre fan-out.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true fires;
+# subsequent rules are not evaluated for that packet. Uplink rules (R1–R7)
+# precede access rules (R8–R11); within uplink, decap (R2–R4) precedes
+# transit (R5–R7) under the outer.dst-ownership gate.
+
+rules:
+
+  - id: R0_non_routable_drop
+    when: |
+      ¬header_present(ethernet)
+      ∨ ¬header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Non-IPv4 (ARP, IPv6, LLDP, …) is out of scope on both port roles.
+      Reused from P-VXLANTunnel R0 / P-IPv4Routing R0 (merged). `ipv4`
+      here is the OUTER IPv4 on uplink and the only IPv4 on access.
+
+  - id: R1_outer_header_invalid_drop
+    when: |
+      ingress(uplink) ∧ header_present(ipv4) ∧ (
+        ipv4.version ≠ 4
+        ∨ ipv4.ihl < 5
+        ∨ value(ipv4.totalLen, <, ipv4.ihl * 4)
+        ∨ ¬checksum_valid(ipv4)
+      )
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.2.2 — outer IPv4 header validation on every uplink
+      packet, before decap or transit. Reused from P-IPv4Routing R1,
+      applied to the OUTER header.
+
+  - id: R2_decap_path
+    when: |
+      ingress(uplink)
+        ∧ header_present(udp)
+        ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(vxlan)
+        ∧ value(ipv4.dst, ==, ${local_vtep_ip})
+        ∧ ( ${flag_strictness} == lax
+            ∨ ( vxlan.i_flag == 1 ∧ vxlan.reserved == 0 ) )
+        ∧ ( ¬${verify_outer_udp_checksum_on_rx}
+            ∨ udp.checksum == 0
+            ∨ udp.checksum_valid )
+        ∧ exists(vni_mac_local_fib, (vxlan.vni, inner_ethernet.dst))
+        ∧ ( ¬${vni_isolation_strict}
+            ∨ port_role(vni_mac_local_fib.access_egress_port).access_vni == vxlan.vni )
+    given:
+      port_role:         by_key(standard_metadata.ingress_port)
+      vni_mac_local_fib: by_key(vxlan.vni, inner_ethernet.dst)
+    then:
+      - "set(outer_ethernet.valid, false)"
+      - "set(ipv4.valid, false)"                              # strip the OUTER ipv4
+      - "set(udp.valid, false)"
+      - "set(vxlan.valid, false)"
+      - forward(vni_mac_local_fib.access_egress_port)
+    notes: |
+      RFC 7348 §4.1 decap — but reached only when the OUTER destination
+      is THIS VTEP (`ipv4.dst == ${local_vtep_ip}`). This ownership gate
+      is the composite's load-bearing addition over P-VXLANTunnel R1: it
+      lets the same switch decap its own traffic and transit everyone
+      else's. Strip the four outer layers, deliver the inner frame to
+      the VNI's access port. The inner Ethernet/IPv4 are NOT modified
+      (`inner_payload_persistence`).
+
+  - id: R3_decap_malformed_drop
+    when: |
+      ingress(uplink)
+        ∧ header_present(udp) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ header_present(vxlan)
+        ∧ value(ipv4.dst, ==, ${local_vtep_ip})
+        ∧ ${flag_strictness} == strict
+        ∧ ( vxlan.i_flag ≠ 1 ∨ vxlan.reserved ≠ 0 )
+    then:
+      - drop
+    notes: |
+      RFC 7348 §5 strict validation — a VXLAN packet FOR THIS VTEP whose
+      I-flag ≠ 1 or reserved bits ≠ 0 is malformed and dropped under
+      strict mode. Reused from P-VXLANTunnel R3, gated by the same
+      outer.dst ownership test as R2 (a malformed VXLAN for another VTEP
+      is not our problem to validate — it would transit via R6, where
+      it fails to parse a clean inner and is forwarded opaquely).
+
+  - id: R4_decap_unknown_vni_drop
+    when: |
+      ingress(uplink)
+        ∧ header_present(vxlan) ∧ match(udp.dst, ${outer_udp_dst_port})
+        ∧ value(ipv4.dst, ==, ${local_vtep_ip})
+        ∧ ¬exists(vni_mac_local_fib, (vxlan.vni, inner_ethernet.dst))
+    then:
+      - drop
+    notes: |
+      RFC 7348 §4.1 — VXLAN for this VTEP with an unknown (VNI,
+      inner_dmac) is dropped (no local VM matches). Reused from
+      P-VXLANTunnel R4 under the ownership gate.
+
+  - id: R5_transit_ttl_exhausted_drop
+    when: |
+      ingress(uplink) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${local_vtep_ip})
+        ∧ value(ipv4.ttl, ≤, 1)
+    then:
+      - drop
+      - "emit(icmp_time_exceeded(src=${local_vtep_ip}, dst=ipv4.src)) IF ${emit_transit_icmp_errors}"
+    notes: |
+      RFC 1812 §5.3.1 — a transit packet (outer.dst ≠ this VTEP) with
+      TTL ≤ 1 is discarded (the post-decrement TTL would be 0). Reused
+      from P-IPv4Routing R2, applied to the OUTER header on the transit
+      path only. Optionally originates ICMP Time-Exceeded at Tier-3.
+
+  - id: R6_transit_underlay_forward
+    when: |
+      ingress(uplink) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${local_vtep_ip})
+        ∧ value(ipv4.ttl, >, 1)
+        ∧ ( ¬${martian_filter_enabled} ∨ ¬martian_src(ipv4.src) )
+        ∧ exists(route, lpm(ipv4.dst, ${routes}))
+    given:
+      route:         by_lpm(ipv4.dst, ${routes})
+      nexthop_group: by_key(route.nexthop_group_id)
+      flow:          deduce_from_outer_packet                 IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo})"
+      - dec(ipv4.ttl, 1)                                      # OUTER ttl, decrement-by-one (this IS a forwarded datagram)
+      - set(outer_ethernet.src, nexthop_group.port_mac[i])
+      - set(outer_ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      RFC 1812 §5.2.1 transit forwarding on the OUTER IPv4 header — the
+      genuinely-composite path. The packet (VXLAN-for-another-VTEP, or
+      plain underlay IPv4) is forwarded by LPM on outer.dst; the OUTER
+      TTL is decremented by exactly one, the OUTER Ethernet is rewritten
+      from the chosen nexthop, and the outer IPv4 checksum is recomputed
+      (`outer_ipv4_checksum_validity`). The inner frame (if VXLAN) is
+      OPAQUE TRANSPORT — inner TTL/addrs MUST NOT be touched
+      (`outer_inner_header_disjointness`). Reused from P-IPv4Routing R3
+      lifted onto the outer header.
+
+  - id: R7_transit_no_route_drop
+    when: |
+      ingress(uplink) ∧ header_present(ipv4)
+        ∧ value(ipv4.dst, ≠, ${local_vtep_ip})
+        ∧ ¬exists(route, lpm(ipv4.dst, ${routes}))
+    then:
+      - "${default_action}"
+      - "emit(icmp_dest_unreachable(src=${local_vtep_ip}, dst=ipv4.src, code=0)) IF ${emit_transit_icmp_errors} ∧ ${default_action} == send_icmp_unreachable"
+    notes: |
+      RFC 1812 §5.3.4 — transit packet with no underlay route ⇒ drop
+      (or ICMP Destination Unreachable at Tier-3). Reused from
+      P-IPv4Routing R4 on the outer header.
+
+  - id: R8_encap_and_underlay_route
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ¬header_present(vxlan)                              # access ports never receive VXLAN
+        ∧ exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ exists(route, lpm(vni_mac_remote_fib.remote_vtep_ip, ${routes}))
+        ∧ ( ${mtu_enforcement} == ignore
+            ∨ encapsulated_size(packet) ≤ ${outer_mtu} )
+    given:
+      port_role:          by_key(standard_metadata.ingress_port)
+      vni_mac_remote_fib: by_key(port_role.access_vni, ethernet.dst)
+      route:              by_lpm(vni_mac_remote_fib.remote_vtep_ip, ${routes})
+      nexthop_group:      by_key(route.nexthop_group_id)
+      flow:               deduce_from_outer_packet            IF ${multipath_mode} != none
+    then:
+      # 1. Build the VXLAN header (RFC 7348 §5, 8 bytes)
+      - "set(vxlan.valid, true)"
+      - "set(vxlan.i_flag, 1)"
+      - "set(vxlan.reserved_flags, 0)"
+      - "set(vxlan.reserved_24bit, 0)"
+      - "set(vxlan.reserved_8bit, 0)"
+      - "set(vxlan.vni, port_role.access_vni)"
+      # 2. Build the outer UDP header
+      - "set(udp.valid, true)"
+      - "set(udp.dst, ${outer_udp_dst_port})"
+      - "set(udp.src, outer_udp_src(${outer_udp_src_port_mode}, ${outer_udp_src_port_fixed_value}, ${hash_algo}, inner_packet))"
+      - "set(udp.length, vxlan_payload_length(packet))"
+      - "set(udp.checksum, outer_udp_checksum(${outer_udp_checksum_mode}, packet))"
+      # 3. Build the outer IPv4 header — outer.dst = remote VTEP, ttl = origination value (NOT decremented)
+      - "set(outer_ipv4.valid, true)"
+      - "set(outer_ipv4.version, 4)"
+      - "set(outer_ipv4.ihl, 5)"
+      - "set(outer_ipv4.dscp, 0)"
+      - "set(outer_ipv4.ecn, 0)"
+      - "set(outer_ipv4.total_length, outer_ipv4_total_length(packet))"
+      - "set(outer_ipv4.identification, 0)"
+      - "set(outer_ipv4.flags, df_bit_only)"                  # §4.3 DF (VTEP MUST NOT fragment)
+      - "set(outer_ipv4.frag_offset, 0)"
+      - "set(outer_ipv4.ttl, ${origination_ttl})"             # origination: stamp, do NOT decrement
+      - "set(outer_ipv4.protocol, 17)"                        # UDP
+      - "set(outer_ipv4.src, ${local_vtep_ip})"
+      - "set(outer_ipv4.dst, vni_mac_remote_fib.remote_vtep_ip)"
+      - "set(outer_ipv4.header_checksum, outer_ipv4_checksum_recompute())"
+      # 4. Underlay forward: LPM picked `route`/`nexthop_group` above → OUTER L2 rewrite + egress
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo}, ${ecmp_remap_algo})"
+      - set(outer_ethernet.valid, true)
+      - set(outer_ethernet.src, nexthop_group.port_mac[i])
+      - set(outer_ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - "set(outer_ethernet.ether_type, 0x0800)"
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      THE load-bearing chain rule — RFC 7348 §5 encap FUSED with
+      RFC 1812 §5.2.1 underlay forwarding. Builds the full outer stack
+      (every field explicitly assigned — `outer_header_field_completeness`),
+      then resolves the egress port and outer Ethernet rewrite via the
+      underlay LPM FIB on outer.dst (NOT a static singleton). The outer
+      TTL is stamped at `${origination_ttl}` and NOT decremented (the
+      switch ORIGINATES this datagram — `origination_vs_transit_ttl`).
+      The inner frame's TTL/addrs are untouched. Subsumes
+      P-VXLANTunnel R2 + the underlay-resolution half of P-IPv4Routing R3.
+
+  - id: R9a_encap_bum_drop
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ¬exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ${bum_handling} == drop
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+    then:
+      - drop
+    notes: "RFC 7348 §4.2 BUM under drop mode (anchor). Reused from P-VXLANTunnel R5a."
+
+  - id: R9b_encap_bum_replicate
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ¬exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ${bum_handling} == head_end_replication
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+    then:
+      - "emit(outer_encap_and_route_template(packet, port_role.access_vni, t)) for t in ${bum_replication_targets}"
+    notes: |
+      RFC 7348 §4.2 head-end replication — one encapsulated-and-routed
+      copy per target, each underlay-LPM-forwarded by the same R8 logic
+      parameterised by the replica's remote_vtep_ip. Reused from
+      P-VXLANTunnel R5b, extended so each replica is also underlay-routed.
+
+  - id: R10_encap_no_underlay_route_drop
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ exists(vni_mac_remote_fib, (port_role.access_vni, ethernet.dst))
+        ∧ ¬exists(route, lpm(vni_mac_remote_fib.remote_vtep_ip, ${routes}))
+    given:
+      port_role:          by_key(standard_metadata.ingress_port)
+      vni_mac_remote_fib: by_key(port_role.access_vni, ethernet.dst)
+    then:
+      - drop
+    notes: |
+      Composite-SPECIFIC rule with no standalone analogue: the remote
+      VTEP is known in the overlay FIB but the UNDERLAY has no route to
+      it (a misconfiguration the chain can detect that neither half
+      alone can). The packet cannot be delivered — drop. This is the
+      failure mode that P-VXLANTunnel's static `underlay_fib` made
+      impossible to express (its singleton always resolved by
+      construction); the real LPM FIB can miss.
+
+  - id: R11_encap_oversize_drop
+    when: |
+      ingress(access)
+        ∧ header_present(ethernet) ∧ header_present(ipv4)
+        ∧ ${mtu_enforcement} == strict_drop_oversize
+        ∧ value(encapsulated_size(packet), >, ${outer_mtu})
+    then:
+      - drop
+    notes: |
+      RFC 7348 §4.3 — "VTEPs MUST NOT fragment VXLAN packets." A frame
+      whose post-encap size would exceed ${outer_mtu} drops at the VTEP.
+      Reused from P-VXLANTunnel R6. Fires only when R8's MTU guard
+      excludes the packet.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  # ── Composite-specific (the chain's load-bearing properties) ──
+
+  - id: outer_inner_header_disjointness
+    clause: persistence
+    target: "(inner_ethernet.*, inner_ipv4.*)"
+    while: "rule R6 fires ∨ rule R8 fires"
+    free_under: []
+    notes: |
+      The composite's #1 invariant. On BOTH underlay paths (transit R6,
+      encap-originate R8) the forwarder operates on the OUTER IPv4
+      header ONLY; the inner Ethernet/IPv4 (TTL, src, dst, checksum)
+      MUST be byte-for-byte preserved. Implementation anti-pattern: running the
+      L3 forwarder over `hdr.ipv4` (which, on a VXLAN packet, is the
+      outer on uplink but would be the *inner* if the SUT mis-parses)
+      or reusing a single "ttl--" action that hits the inner header.
+      The single most likely failure when chaining a VXLAN VTEP with an
+      IPv4 forwarder.
+
+  - id: vtep_transit_dichotomy
+    clause: stability
+    target: forward_decision
+    while: "ingress(uplink) ∧ header_present(vxlan) ∧ match(udp.dst, ${outer_udp_dst_port})"
+    free_under: []
+    notes: |
+      A VXLAN packet on the uplink is DECAPPED iff its outer destination
+      is this VTEP (`ipv4.dst == ${local_vtep_ip}`) and TRANSIT-FORWARDED
+      otherwise. Exactly one of the two paths fires; never both, never
+      neither (modulo the malformed/unknown drops). Implementation anti-patterns:
+      decapping every VXLAN-looking packet (breaks transit of overlay
+      traffic for other VTEPs) or transit-forwarding everything (the
+      switch never delivers to its own VMs). Pinned by the
+      `decap_only_for_local_vtep` / `transit_preserves_vxlan` G1 tests.
+
+  - id: origination_vs_transit_ttl
+    clause: stability
+    target: outer_ipv4.ttl
+    while: "egress(packet) ∧ (rule R6 fires ∨ rule R8 fires)"
+    notes: |
+      RFC 1812 §5.3.1: a router decrements TTL when FORWARDING a received
+      datagram, not when ORIGINATING one. So the encap path (R8, the
+      switch is the source) stamps `outer_ipv4.ttl = ${origination_ttl}`
+      with NO decrement, while the transit path (R6, the switch forwards
+      a received datagram) decrements the outer TTL by exactly one.
+      Implementation anti-pattern: a shared encap+forward action that decrements
+      on the origination path (outer egresses with TTL = origination-1)
+      or a transit path that forgets to decrement.
+
+  - id: underlay_route_for_every_remote_vtep
+    clause: no_orphan
+    target: "(vni_mac_remote_fib.remote_vtep_ip)"
+    while: "true"
+    notes: |
+      Every `remote_vtep_ip` reachable through the overlay FIB MUST have
+      a matching underlay `route` (else R10 drops the encapsulated frame
+      — a delivered overlay packet would otherwise be a dangling encap).
+      The integrity tie between the two halves' tables.
+
+  # ── Overlay-half invariants (reused from P-VXLANTunnel) ──
+
+  - id: vni_isolation
+    clause: persistence
+    target: "(decap_egress_port, vxlan.vni)"
+    while: "rule R2 fires"
+    free_under: []
+    enforced_when: "${vni_isolation_strict}"
+    notes: |
+      RFC 7348 §4.1 VNI scope — a frame decapped with VNI = V is
+      delivered only to an access port whose access_vni == V. Reused
+      from P-VXLANTunnel; the `vni_crosswire_attempt_blocked` G3 test
+      anchors it.
+
+  - id: outer_header_field_completeness
+    clause: stability
+    target: "(outer_ethernet.*, outer_ipv4.*, udp.*, vxlan.*)"
+    while: "rule R8 fires ∧ egress(packet)"
+    notes: |
+      Every field of each newly-validated outer header on the encap path
+      is explicitly assigned (the common v1model cross-cutting setValid()-without-
+      assignment bug). Reused from P-VXLANTunnel. NOTE: in the composite
+      `outer_ethernet.src/dst` are assigned from the UNDERLAY nexthop
+      (R8 step 4), not from a static underlay_fib — the completeness
+      check now spans the chained L2 rewrite.
+
+  - id: inner_payload_persistence
+    clause: persistence
+    target: "(inner_ethernet, inner_ipv4_payload)"
+    while: "rule R2 fires"
+    free_under: []
+    notes: |
+      RFC 7348 — decap delivers the inner frame to the access port
+      byte-for-byte identical to what was inside the received outer
+      frame. Reused from P-VXLANTunnel. Complemented on the underlay
+      side by `outer_inner_header_disjointness`.
+
+  - id: vxlan_i_flag_set_on_tx
+    clause: stability
+    target: vxlan.i_flag
+    while: "rule R8 fires ∧ egress(packet)"
+    notes: "RFC 7348 §5 transmit-side MUST. Reused from P-VXLANTunnel."
+
+  - id: no_vtep_fragmentation
+    clause: stability
+    target: forward_decision
+    while: "rule R8 fires ∧ encapsulated_size(packet) > ${outer_mtu}"
+    enforced_when: "${mtu_enforcement} == strict_drop_oversize"
+    notes: "RFC 7348 §4.3 VTEPs-MUST-NOT-fragment. Reused from P-VXLANTunnel."
+
+  # ── Underlay-half invariants (reused from P-IPv4Routing, on the OUTER header) ──
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "exists(route, lpm(outer_ipv4.dst, ${routes}))"
+    notes: |
+      RFC 1812 §5.3.4 — the chosen underlay next-hop belongs to the
+      LONGEST matching prefix of the OUTER destination. Reused from
+      P-IPv4Routing; implementation bug is ternary-instead-of-LPM on outer.dst.
+
+  - id: outer_ipv4_checksum_validity
+    clause: stability
+    target: outer_ipv4.header_checksum
+    while: "egress(packet) ∧ (rule R6 fires ∨ rule R8 fires)"
+    notes: |
+      The outer IPv4 header MUST carry a valid checksum on egress —
+      computed from scratch on encap (R8, no prior valid value) and
+      recomputed after the TTL decrement on transit (R6, RFC 1812
+      §5.2.2.5). Fuses P-VXLANTunnel's `outer_ipv4_checksum_validity`
+      (encap) with P-IPv4Routing's `ip_checksum_validity` (forward).
+      Forgetting `update_checksum` is the #1 silent failure on both.
+
+  - id: ttl_quantum_one_transit
+    clause: stability
+    target: outer_ipv4.ttl_decrement
+    while: "rule R6 fires"
+    notes: |
+      RFC 1812 §5.3.1 — the OUTER TTL is decremented by EXACTLY one on
+      the transit path. Reused from P-IPv4Routing `ttl_quantum_one`;
+      double-decrement (ingress + egress) is the classic bug. NB: does
+      NOT apply to R8 (origination) — see `origination_vs_transit_ttl`.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(outer_ethernet.src, outer_ethernet.dst)"
+    while: "egress(packet) ∧ (rule R6 fires ∨ rule R8 fires)"
+    notes: |
+      RFC 1812 §5.2.1 — on every underlay forward the OUTER Ethernet src
+      MUST be the egress port's own MAC and the dst MUST be the chosen
+      nexthop's MAC. Reused from P-IPv4Routing, applied to the outer
+      Ethernet.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "(rule R6 fires ∨ rule R8 fires) ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — every packet of one underlay flow lands on the same
+      next-hop index. Reused from P-IPv4Routing. The hash MUST key on
+      stable OUTER fields (and, for encap, the RFC 7348 outer-source-port
+      that itself derives from stable inner fields) — never on a
+      per-packet-varying field.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Every packet egresses on a definite port or is dropped; the TTL
+      decrement on the transit path bounds underlay hop count, and the
+      encap/decap paths are one-shot. Head-end replication (R9b) is
+      bounded by |${bum_replication_targets}|.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Entries marked [composite] probe the chain interactions.
+
+test_scaffolding:
+
+  G1:
+    - id: encap_then_underlay_lpm_route
+      generate: |
+        [composite] Send an inner Ethernet+IPv4+TCP frame on an access
+        port bound to VNI V. Pre-install (V, inner_dmac) → remote_vtep_ip
+        in vni_mac_remote_fib, and an underlay route covering
+        remote_vtep_ip → nexthop_group(egress_port P, src_mac, dst_mac).
+        Assert the egress packet on P is the inner frame wrapped in
+        outer Ether(src=src_mac, dst=dst_mac, type=0x0800) /
+        IPv4(src=${local_vtep_ip}, dst=remote_vtep_ip, ttl=${origination_ttl},
+        proto=17, valid checksum) / UDP(dst=${outer_udp_dst_port}) /
+        VXLAN(I=1, vni=V), AND that the egress port P came from the LPM
+        FIB (not a hard-coded uplink). The load-bearing chain assertion
+        (R8). Anchors `outer_header_field_completeness` +
+        `lpm_longest_match_correctness` jointly.
+
+    - id: decap_only_for_local_vtep
+      generate: |
+        [composite] Send a well-formed VXLAN frame on an uplink port with
+        outer IPv4 dst == ${local_vtep_ip}, VNI V, inner_dmac M present
+        in vni_mac_local_fib → access_port_X. Assert the egress on
+        access_port_X equals the inner frame byte-for-byte (all outer
+        layers stripped). Anchors the decap arm of `vtep_transit_dichotomy`.
+
+    - id: transit_preserves_vxlan_and_decrements_outer_ttl
+      generate: |
+        [composite] Send a well-formed VXLAN frame on an uplink port with
+        outer IPv4 dst == a REMOTE VTEP (≠ ${local_vtep_ip}), outer
+        ttl=64, and an underlay route covering that remote dst. Assert:
+        (a) the egress packet STILL carries the full outer VXLAN stack
+        (NOT decapped); (b) outer ipv4.ttl == 63 (decremented by one);
+        (c) outer ipv4 checksum recomputed; (d) outer Ethernet rewritten
+        from the nexthop; (e) the INNER ipv4.ttl and inner addrs are
+        UNCHANGED. Anchors the transit arm of `vtep_transit_dichotomy`,
+        `outer_inner_header_disjointness`, and `ttl_quantum_one_transit`.
+
+    - id: origination_outer_ttl_not_decremented
+      generate: |
+        [composite] As `encap_then_underlay_lpm_route`, but assert the
+        egress outer ipv4.ttl == ${origination_ttl} EXACTLY (not
+        origination-1). Pairs with `transit_..._decrements_outer_ttl` to
+        pin `origination_vs_transit_ttl` — the two together distinguish
+        an origination path from a transit path.
+
+    - id: plain_underlay_ipv4_transit
+      generate: |
+        Send a plain (non-VXLAN) IPv4 packet on an uplink port whose dst
+        ≠ ${local_vtep_ip}, with an underlay route. Assert it forwards
+        like a normal IPv4 router hop (LPM, ttl-1, L2 rewrite, checksum).
+        Confirms the underlay half works standalone (R6 with no inner).
+
+    - id: underlay_ecmp_flow_consistency
+      requires: "${multipath_mode} != none"
+      generate: |
+        Install an underlay nexthop group with K ≥ 2 for one remote-VTEP
+        prefix. Send 10 packets of the same outer 5-tuple (e.g., 10
+        encap packets for the same inner flow → same outer src port).
+        Assert all 10 exit on the same egress port. Tests
+        `ecmp_flow_consistency` on the outer header (RFC 2992 §2.2).
+
+  G2:
+    - id: encap_unknown_underlay_route_drop
+      generate: |
+        [composite] Pre-install (V, inner_dmac) → remote_vtep_ip in
+        vni_mac_remote_fib, but install NO underlay route covering
+        remote_vtep_ip (and no default route). Send the inner frame.
+        Assert drop (R10) — the composite-specific "known overlay,
+        unreachable underlay" failure no single half can express.
+        Anchors `underlay_route_for_every_remote_vtep`.
+
+    - id: transit_ttl_one_drop
+      generate: |
+        [composite] Send a VXLAN frame on uplink with outer dst == a
+        remote VTEP and outer ttl == 1. Assert drop (R5; post-decrement
+        TTL would be 0). Distinguishes the transit path from decap
+        (where outer TTL is irrelevant because the packet terminates).
+
+    - id: encap_mtu_overflow_drop
+      requires: "${mtu_enforcement} == strict_drop_oversize"
+      generate: |
+        Send an inner frame whose post-encap size exceeds ${outer_mtu}
+        (inner ≈ outer_mtu - 49). Assert drop (R11). RFC 7348 §4.3.
+
+    - id: underlay_longest_prefix_priority
+      generate: |
+        Install overlapping underlay prefixes (e.g., 10.0.0.0/8 → port A
+        and 10.0.2.0/24 → port B). Send a transit (or encap) packet whose
+        outer dst is 10.0.2.x; assert it forwards via port B. Tests
+        `lpm_longest_match_correctness` on the outer header.
+
+  G3:
+    - id: vni_crosswire_attempt_blocked
+      requires: "${vni_isolation_strict}"
+      generate: |
+        Maliciously install a (VNI=A, inner_dmac=M) → access_port_for_VNI_B
+        cross-VNI entry in vni_mac_local_fib. Send a VXLAN frame for this
+        VTEP with vni=A, inner_dmac=M. Assert drop (the egress-side VNI
+        recheck catches the mismatch). RFC 7348 §4.1 under strict
+        isolation. Reused from P-VXLANTunnel.
+
+    - id: inner_ttl_untouched_on_transit
+      generate: |
+        [composite] Send a VXLAN frame on uplink to transit (outer dst ==
+        remote VTEP) with inner ipv4.ttl = 5 and outer ipv4.ttl = 64.
+        Assert the egress inner ipv4.ttl is STILL 5 (only the outer was
+        decremented). Catches the implementation that conflates the two IPv4
+        headers and runs ttl-- on the inner. Anchors
+        `outer_inner_header_disjointness` — the canonical composite bug.
+
+    - id: outer_ipv4_checksum_recompute_on_both_paths
+      generate: |
+        [composite] Run one encap packet (R8) and one transit packet (R6)
+        through the same SUT. Recompute the outer IPv4 header checksum
+        from the egress bytes for each and assert it matches the
+        emitted value. Catches the common v1model cross-cutting bug where the SUT
+        builds/forwards the outer header but forgets `update_checksum` —
+        especially likely in the chain because the checksum must be wired
+        for BOTH the freshly-built encap outer AND the TTL-mutated
+        transit outer. Anchors `outer_ipv4_checksum_validity`.
+
+    - id: conditional_deparser_emit_order_chain
+      generate: |
+        [composite] In one run, exercise encap (inner-on-access), decap
+        (VXLAN-for-us-on-uplink), and transit (VXLAN-for-other-on-uplink).
+        Assert the egress layer order is: encap → outer-Eth/IPv4/UDP/
+        VXLAN/inner…; decap → inner-Eth/IPv4… only; transit → outer-Eth/
+        IPv4/UDP/VXLAN/inner… (outer headers intact). Catches the common v1model
+        conditional-deparser bug where `emit(hdr.X)` is not guarded on
+        `hdr.X.isValid()`, leaking or stripping the wrong stack per path.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Every harden is paired with an ease on the same axis so parameter
+# rebinding can move difficulty in either direction. Operators are inherited from
+# the two halves (overlay: flag/VNI/BUM/MTU/csum/hash/capacity; underlay:
+# ECMP/WCMP/martian/ICMP/FIB-capacity) plus the composite faithfulness ladder.
+
+mutation_operators:
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_static_encap_route,
+                         D5.1_underlay_lpm_transit,
+                         D5.2_full_validation_ecmp}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if post == D5.1_underlay_lpm_transit then
+          ${routes} ← add_overlapping_prefixes(${routes}) ) ∧
+      ( if post == D5.2_full_validation_ecmp then
+          ${flag_strictness} ← strict ∧ ${vni_isolation_strict} ← true ∧
+          ${multipath_mode} ← ecmp_hash_5tuple ∧
+          ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4) ∧
+          ${martian_filter_enabled} ← true ∧
+          ${outer_udp_src_port_mode} ← hash_inner_5tuple ∧
+          ${mtu_enforcement} ← strict_drop_oversize ) ∧
+      ( if post == D5.3_multitenant_scale then
+          ${multipath_mode} ← wcmp ∧
+          ${access_port_bindings} ← multi_vni_expansion(${access_port_bindings}) )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_static_encap_route ∧
+      ( ${faithfulness} ≠ D5.3_multitenant_scale
+        ∨ distinct_vni_count(${access_port_bindings}) ≥ 2 )
+    notes: |
+      Lift the composite ladder one rung. D5.0→D5.1 turns on the genuine
+      transit path with overlapping-prefix underlay LPM; D5.1→D5.2 the
+      full overlay validation cascade + underlay ECMP/martian; D5.2→D5.3
+      multi-tenant + weighted underlay.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_underlay_lpm_transit,
+                         D5.2_full_validation_ecmp,
+                         D5.3_multitenant_scale}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if post == D5.0_static_encap_route then
+          ${flag_strictness} ← lax ∧ ${vni_isolation_strict} ← false ∧
+          ${multipath_mode} ← none ∧ ${martian_filter_enabled} ← false ∧
+          ${outer_udp_src_port_mode} ← fixed ∧ ${mtu_enforcement} ← ignore )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${faithfulness} ≠ D5.3_multitenant_scale"
+    notes: "Paired ease counterpart of tighten_faithfulness; steps the ladder back and reverts entailed bindings."
+
+  - id: enable_ecmp_underlay
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Lift the underlay from singleton next-hops to ECMP over the OUTER
+      5-tuple. Activates `ecmp_flow_consistency`. Reused from
+      P-IPv4Routing `enable_ecmp_5tuple`, applied to the chained outer.
+
+  - id: disable_ecmp_underlay
+    applicable_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    effect: "${multipath_mode} ← none ∧ ${max_nexthop_group_size} ← 1"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${multipath_mode} == none"
+    notes: "Paired ease counterpart of enable_ecmp_underlay."
+
+  - id: enable_wcmp_underlay
+    applicable_when: "${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    effect: "${multipath_mode} ← wcmp"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every nexthop_group with size > 1 has ≥ 2 distinct weights"
+    notes: "Lift underlay ECMP → weighted multipath (weighted-pick over the expanded array). Reused from P-IPv4Routing enable_wcmp."
+
+  - id: disable_wcmp_underlay
+    applicable_when: "${multipath_mode} == wcmp"
+    effect: "${multipath_mode} ← ecmp_hash_5tuple"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${multipath_mode} == ecmp_hash_5tuple"
+    notes: "Paired ease counterpart of enable_wcmp_underlay."
+
+  - id: tighten_flag_validation
+    applicable_when: "${flag_strictness} == lax"
+    effect: "${flag_strictness} ← strict"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${flag_strictness} == strict"
+    notes: "Activates R3 + the strict-flag G2/G3 cases. Reused from P-VXLANTunnel."
+
+  - id: relax_flag_validation
+    applicable_when: "${flag_strictness} == strict"
+    effect: "${flag_strictness} ← lax"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${flag_strictness} == lax"
+    notes: "Paired ease counterpart of tighten_flag_validation."
+
+  - id: enable_strict_vni_isolation
+    applicable_when: "${vni_isolation_strict} == false"
+    effect: "${vni_isolation_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${vni_isolation_strict} == true"
+    notes: "Activates `vni_isolation` + the `vni_crosswire_attempt_blocked` G3 test. Reused from P-VXLANTunnel."
+
+  - id: disable_strict_vni_isolation
+    applicable_when: "${vni_isolation_strict} == true"
+    effect: "${vni_isolation_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${vni_isolation_strict} == false"
+    notes: "Paired ease counterpart of enable_strict_vni_isolation."
+
+  - id: enable_martian_filter
+    applicable_when: "${martian_filter_enabled} == false"
+    effect: "${martian_filter_enabled} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${martian_filter_enabled} == true"
+    notes: |
+      RFC 1812 §5.3.7 source filtering on the OUTER src of transit
+      packets (R6 guard). Reused from P-IPv4Routing; common bug is
+      gating on dst instead of src.
+
+  - id: disable_martian_filter
+    applicable_when: "${martian_filter_enabled} == true"
+    effect: "${martian_filter_enabled} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${martian_filter_enabled} == false"
+    notes: "Paired ease counterpart of enable_martian_filter."
+
+  - id: enable_mtu_enforcement
+    applicable_when: "${mtu_enforcement} == ignore"
+    effect: "${mtu_enforcement} ← strict_drop_oversize"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_mtu} ≥ 576"
+    notes: "RFC 7348 §4.3 — activates R11 + the encap_mtu_overflow_drop G2 case. Reused from P-VXLANTunnel."
+
+  - id: disable_mtu_enforcement
+    applicable_when: "${mtu_enforcement} == strict_drop_oversize"
+    effect: "${mtu_enforcement} ← ignore"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${mtu_enforcement} == ignore"
+    notes: "Paired ease counterpart of enable_mtu_enforcement."
+
+  - id: enable_outer_udp_checksum_compute
+    applicable_when: "${outer_udp_checksum_mode} == zero_on_tx"
+    effect: "${outer_udp_checksum_mode} ← computed_on_tx"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${outer_udp_checksum_mode} == computed_on_tx"
+    notes: "Lift from §5 SHOULD-be-zero to the multi-layer MUST-cover checksum. Reused from P-VXLANTunnel."
+
+  - id: revert_outer_udp_checksum_to_zero
+    applicable_when: "${outer_udp_checksum_mode} == computed_on_tx"
+    effect: "${outer_udp_checksum_mode} ← zero_on_tx"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${outer_udp_checksum_mode} == zero_on_tx"
+    notes: "Paired ease counterpart of enable_outer_udp_checksum_compute."
+
+  - id: enable_bum_replication
+    applicable_when: "${bum_handling} == drop"
+    effect: "${bum_handling} ← head_end_replication"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "|${bum_replication_targets}| ≥ 1"
+    notes: "Activate R9b head-end replication (each replica encapped AND underlay-routed). Reused from P-VXLANTunnel, extended for the chain."
+
+  - id: disable_bum_replication
+    applicable_when: "${bum_handling} == head_end_replication"
+    effect: "${bum_handling} ← drop"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${bum_handling} == drop"
+    notes: "Paired ease counterpart of enable_bum_replication."
+
+  - id: enable_transit_icmp_errors
+    applicable_when: "${emit_transit_icmp_errors} == false"
+    effect: "${emit_transit_icmp_errors} ← true ∧ ${default_action} ← send_icmp_unreachable"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${faithfulness} ≥ D5.1_underlay_lpm_transit"
+    notes: |
+      RFC 1812 §5.2.7 — origination of ICMP Time-Exceeded (R5) /
+      Destination-Unreachable (R7) on the transit path. Adds the `emit`
+      postcondition. Reused from P-IPv4Routing enable_icmp_error_emission.
+
+  - id: disable_transit_icmp_errors
+    applicable_when: "${emit_transit_icmp_errors} == true"
+    effect: "${emit_transit_icmp_errors} ← false ∧ ${default_action} ← drop"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${emit_transit_icmp_errors} == false"
+    notes: "Paired ease counterpart of enable_transit_icmp_errors."
+
+  - id: swap_underlay_remap_to_hrw
+    applicable_when: "${multipath_mode} != none ∧ ${ecmp_remap_algo} ≠ hrw"
+    effect: "${ecmp_remap_algo} ← hrw"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${ecmp_remap_algo} == hrw"
+    notes: "Lift the underlay remap to Highest-Random-Weight (RFC 2992 §3) — arg-max over nexthops is hard in P4. Reused from P-IPv4Routing."
+
+  - id: swap_underlay_remap_to_hash_threshold
+    applicable_when: "${multipath_mode} != none ∧ ${ecmp_remap_algo} ∈ {hrw, modulo_n}"
+    effect: "${ecmp_remap_algo} ← hash_threshold"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${ecmp_remap_algo} == hash_threshold"
+    notes: "Paired ease counterpart of swap_underlay_remap_to_hrw."
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: |
+      (${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none) ∧
+      ${hash_algo} ∈ {crc16, crc32}
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    notes: "Weaker hash on both the outer-source-port and underlay ECMP selection. Reused from both halves."
+
+  - id: swap_hash_to_crc32
+    applicable_when: |
+      (${outer_udp_src_port_mode} != fixed ∨ ${multipath_mode} != none) ∧
+      ${hash_algo} ∈ {xor_fold, crc16}
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    notes: "Paired ease counterpart of swap_hash_to_xor_fold."
+
+  - id: shrink_fib_capacity_4x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 16"
+    notes: "Tighten the underlay FIB capacity (Contra-realistic). Reused from P-IPv4Routing."
+
+  - id: enlarge_fib_capacity_2x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} < 524288"
+    effect: "${fib_capacity} ← ${fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${fib_capacity} ≤ 1048576"
+    notes: "Paired ease counterpart of shrink_fib_capacity_4x (doubles, for a slow climb back after an over-shrink)."
+
+  - id: shrink_vni_mac_capacity_4x
+    applicable_when: "${vni_mac_remote_fib_capacity} ≠ unbounded ∧ ${vni_mac_remote_fib_capacity} > 64"
+    effect: "${vni_mac_remote_fib_capacity} ← ${vni_mac_remote_fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${vni_mac_remote_fib_capacity} ≥ 16"
+    notes: "Tighten the encap-side MAC-FIB capacity. Reused from P-VXLANTunnel."
+
+  - id: enlarge_vni_mac_capacity_2x
+    applicable_when: "${vni_mac_remote_fib_capacity} ≠ unbounded ∧ ${vni_mac_remote_fib_capacity} < 1048576"
+    effect: "${vni_mac_remote_fib_capacity} ← ${vni_mac_remote_fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${vni_mac_remote_fib_capacity} ≤ 1048576"
+    notes: "Paired ease counterpart of shrink_vni_mac_capacity_4x."
+
+  - id: inflate_underlay_overlapping_prefixes
+    applicable_when: "'underlay_longest_prefix_stress' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${routes} so that ≥ 30% of prefixes overlap (a /16 plus
+      several /24s and /32s within it). Add G2 test
+      `underlay_longest_prefix_stress` exercising 3-level LPM tie-break
+      on the OUTER dst.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 64 ∨ ${fib_capacity} == unbounded"
+    notes: "Pattern-augmenting: stresses `lpm_longest_match_correctness` on the outer header. Reused from P-IPv4Routing."
+
+  - id: flatten_underlay_prefixes
+    applicable_when: "'underlay_longest_prefix_stress' ∈ test_scaffolding.G2"
+    effect: "Revert ${routes} to non-overlapping prefixes; remove the underlay_longest_prefix_stress G2 test."
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Paired ease counterpart of inflate_underlay_overlapping_prefixes."
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    notes: "Raise inner/underlay flow-tuple skew (uniform → zipfian → adversarial) to stress hash quality. Reused from both halves."
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    notes: "Paired ease counterpart of raise_workload_skew."
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: "Append the composed Python oracle source to task.description (heaviest ease lever)."
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    notes: "Starter-library operator — gives the SUT a host-side reference to transliterate. Reused from P-VXLANTunnel."
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    notes: "Paired harden counterpart of ladder_input_form_to_python_ref."
+
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the shared noisify_spec_low protocol: 1 true-but-irrelevant deployment
+      distractor + 1 named-artefact "plays no role" disclaimer. Rule
+      truth-values, oracle output, and test corpus stay byte-identical;
+      append to provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Inherited noise protocol shared with the constituent patterns."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: "Revert the most recent noisify_spec_* operator (most-recent first); restore clean description; clear the provenance entries."
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Paired ease counterpart of the noisify_spec_* operators."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4 (every entry
+  is [common-knowledge baseline] unless RFC-cited via a constituent):
+
+    Header layout: declare BOTH an outer and an inner stack —
+      `header ethernet_t outer_ethernet; header ipv4_t outer_ipv4;
+       header udp_t udp; header vxlan_t vxlan;
+       header ethernet_t inner_ethernet; header ipv4_t inner_ipv4;`
+    On uplink the parser fills outer_* (+ vxlan/inner_* iff udp.dst ==
+    4789); on access it fills inner_* and the encap action setValid()s
+    the outer_*. Keying the L3 forwarder on the WRONG ipv4 (inner vs
+    outer) is the canonical composite bug.
+
+    Anchor (D5.0_static_encap_route): single VNI, lax flags, fixed
+    outer src port, zero UDP checksum, BUM = drop, MTU ignore, underlay
+    multipath = none (singleton nexthop groups). Tables:
+      - port_role (exact on ingress_port → role, access_vni)
+      - vni_mac_remote_fib (exact on (vni, inner_ethernet.dst) → remote_vtep_ip)
+      - vni_mac_local_fib (exact on (vni, inner_ethernet.dst) → access_port)
+      - underlay_route (LPM on OUTER ipv4.dst → nexthop_group_id)
+      - nexthop group table (→ egress_port, port_mac, next_hop_mac)
+    Pipeline: if uplink ∧ vxlan ∧ outer.dst==local → decap; elif uplink
+    ∧ outer.dst≠local → transit (LPM outer, ttl--, csum, L2 rewrite);
+    elif access → encap (build outer, then LPM outer, NO ttl--).
+    MyComputeChecksum: update_checksum on outer_ipv4 for BOTH the encap
+    (fresh) and transit (ttl-mutated) paths — guarded on
+    outer_ipv4.isValid().
+
+    D5.1 (underlay LPM + transit): overlapping underlay prefixes; the
+    transit path becomes load-bearing. Implementation MUST split origination
+    (R8, no decrement) from transit (R6, decrement) — typically two
+    distinct actions, not one shared "forward" action.
+
+    D5.2 (full validation + ECMP underlay): strict flag cascade on
+    decap; strict VNI egress recheck (second-table apply); underlay ECMP
+    via hash(outer 5-tuple) % group_size; martian filter on outer src;
+    MTU drop. The outer-source-port hash (RFC 7348 §5) and the underlay
+    ECMP hash are SEPARATE hash computations.
+
+    D5.3 (multi-tenant scale): many VNIs (vni_mac_*_fib grows); scaled
+    underlay FIB (prefix aggregation); WCMP (weight-replicated nexthop
+    array).
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Running the L3 forwarder over the INNER ipv4 (decrementing inner
+      TTL / keying LPM on inner dst) instead of the outer — breaks
+      `outer_inner_header_disjointness`. The #1 composite bug; the
+      `inner_ttl_untouched_on_transit` G3 case catches it.
+    * Decapping every VXLAN-looking packet regardless of outer.dst —
+      breaks transit of overlay traffic destined to OTHER VTEPs.
+      Or transit-forwarding everything (never decapping its own).
+      `vtep_transit_dichotomy` / the `decap_only_for_local_vtep` +
+      `transit_preserves_vxlan` G1 pair catch both.
+    * Decrementing the outer TTL on the ENCAP-originate path (R8) —
+      a router does not decrement when originating. Or forgetting to
+      decrement on transit (R6). `origination_vs_transit_ttl` +
+      `origination_outer_ttl_not_decremented` catch both.
+    * Forgetting `update_checksum` for the outer IPv4 on EITHER path —
+      especially easy because there are two outer-IPv4-mutating paths
+      (build vs ttl-decrement). `outer_ipv4_checksum_recompute_on_both_paths`.
+    * Calling setValid() on the outer headers without assigning every
+      field (encap). Reused from P-VXLANTunnel.
+    * Keying vni_mac_local_fib on inner_dmac alone (forgetting the VNI
+      component) — breaches VNI isolation. Reused from P-VXLANTunnel.
+    * Treating a known-overlay / unreachable-underlay packet as
+      forwardable (skipping R10) — emits a dangling encap toward a
+      remote VTEP with no underlay route. `encap_unknown_underlay_route_drop`.
+    * Reading `standard_metadata.drop` after `mark_to_drop()` — v1model
+      conditional-deparser bug; behaviour is unspecified after
+      `mark_to_drop()`.
+
+  Oracle reuse: the composed oracle is assembled by
+  chaining the two halves' audited oracles — P-VXLANTunnel's encap/decap
+  step feeding P-IPv4Routing's LPM-forward step over the outer header,
+  with the VTEP/transit dichotomy and origination/transit TTL handled in
+  the composition glue. Recorded at instantiation as the composed
+  oracle's content-addressed provenance (the same convention
+  P-StatefulFW-NAT44 follows for P-StatefulFW + P-NAT44).
+
+  v2 deferrals (out of scope for this v1.0 pattern):
+    * Inner-frame learning (data-plane MAC learning to populate
+      vni_mac_remote_fib) — control-plane-installed here.
+    * Multi-public-VTEP-IP (a switch terminating several local_vtep_ips).
+    * Cross-switch underlay ECMP with consistent overlay hashing.
+    * Inner IPv4 fragmentation / reassembly across the tunnel.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and the composed-oracle
+       audit must all pass validation.
+
+    2. The composed oracle MUST reuse the audited P-VXLANTunnel and
+       P-IPv4Routing oracles (content-addressed oracle reuse) rather
+       than synthesise fresh ground truth — verify the provenance
+       records both parent oracle hashes.
+
+    3. Anchor instances (D5.0, single VNI, singleton underlay)
+       SHOULD behaviourally subsume BOTH a P-VXLANTunnel anchor (on the
+       encap/decap cases) AND a P-IPv4Routing anchor (on the
+       plain-underlay-transit cases). Cross-check the public test set
+       against each parent oracle for the shared cases.

@@ -1,0 +1,811 @@
+task_name: nat44_tpl
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-NAT44
+pattern_version: '1.0'
+seed:
+  public_ip: 203.0.113.10
+  internal_subnet: 192.168.1.0/24
+  mode: static
+  mapping_capacity: unbounded
+  eviction_policy: none
+  port_pool_range:
+  - 10000
+  - 65535
+  faithfulness: D5.0_static
+  persistence_strict: false
+failure_modes:
+- outbound_miss_silently_admitted
+- inbound_to_non_public_ip_admitted
+- snat_keyed_on_destination
+- icmp_admitted_on_either_side
+- ttl_decrement_skipped_on_translate
+- snat_dnat_pair_asymmetric
+- data_plane_allocates_external_port_at_tier_1
+- checksum_not_recomputed_after_rewrite
+description: |
+  A switch s1 sits between a private network and the public internet and
+  must translate the addresses and transport-layer ports of traffic
+  crossing it so that an internal host appears to the outside world as a
+  single public address.
+
+  ## Topology and roles
+
+    - s1.internal — connection point facing the private side. The single
+      internal host h1 lives in 192.168.1.0/24 (the host used in tests
+      holds 192.168.1.5, hardware address 00:00:00:00:01:05).
+    - s1.external — connection point facing the public side. A single
+      external peer h2 holds 8.8.8.8 with hardware address
+      00:00:00:00:08:08.
+    - The public address advertised on the external side is 203.0.113.10;
+      no host owns this address directly — the switch terminates and
+      re-targets traffic addressed to it.
+
+  ## Eligibility
+
+  A packet is eligible for processing only when ALL of the following hold;
+  the checks short-circuit in the order listed, and a packet that fails an
+  earlier check is silently discarded and MUST NOT alter any internal
+  state the switch keeps:
+
+    1. The packet is an IPv4 datagram.
+    2. The IPv4 payload is either TCP or UDP. (No other transport
+       protocol is in scope — ICMP and the rest are discarded.)
+
+  ## Translation policy
+
+  The switch holds a static, externally-supplied table of bidirectional
+  bindings. Each binding pairs a private-side identity with a public-side
+  identity:
+
+      private side : (internal IPv4 address, transport-layer port,
+                       transport-layer protocol)
+      public  side : (the public address 203.0.113.10, an external
+                       transport-layer port, the same transport-layer
+                       protocol)
+
+  Both directions of each binding are installed before any traffic
+  arrives — the switch itself never invents a new external port for an
+  unseen flow.
+
+  The complete set of bindings the switch must serve is fixed and given
+  below. Each row is installed in both directions before any traffic
+  arrives; no other binding exists, and any flow not listed here is
+  treated as unmapped (see the discard rules below):
+
+      private side                         public side
+      (internal IPv4, port, protocol)      (203.0.113.10, ext. port, protocol)
+      ─────────────────────────────────    ────────────────────────────────────
+      (192.168.1.5, 5000, UDP)        ↔    (203.0.113.10, 14000, UDP)
+      (192.168.1.5, 6000, TCP)        ↔    (203.0.113.10, 15000, TCP)
+      (192.168.1.5, 7000, UDP)        ↔    (203.0.113.10, 16000, UDP)
+      (192.168.1.5, 5000, TCP)        ↔    (203.0.113.10, 14000, TCP)
+
+  These external ports are assigned values, not computed from the
+  internal port by any formula — install exactly the four rows above.
+
+  ## Outbound side (packets received on s1.internal)
+
+  When a packet arrives on s1.internal, the switch looks the triple
+  (IPv4 source, transport-layer source port, transport-layer protocol) up
+  in the private side of the binding table.
+
+    - If a matching binding exists, the packet observed at s1.external
+      must satisfy ALL of:
+        * Its IPv4 source address has been replaced by 203.0.113.10.
+        * Its transport-layer source port (TCP source port if the packet
+          is TCP, UDP source port if it is UDP) has been replaced by the
+          binding's external transport-layer port.
+        * Its Ethernet destination address has been replaced by the
+          external peer's hardware address (00:00:00:00:08:08).
+        * Its IPv4 hop count is exactly one less than on ingress, and the
+          datagram remains a well-formed IPv4 packet that an unmodified
+          downstream receiver would accept.
+        * All other fields (the IPv4 destination, the transport-layer
+          destination port, sequence numbers, payload) are byte-identical
+          to the received packet.
+      The packet is forwarded out s1.external.
+
+    - If no matching binding exists, the packet is discarded.
+
+  ## Inbound side (packets received on s1.external)
+
+  When a packet arrives on s1.external, the switch first checks that the
+  IPv4 destination address equals 203.0.113.10; if it does not, the
+  packet is discarded. Otherwise, the switch looks the triple
+  (IPv4 destination, transport-layer destination port, transport-layer
+  protocol) up in the public side of the binding table.
+
+    - If a matching binding exists, the packet observed at s1.internal
+      must satisfy ALL of:
+        * Its IPv4 destination address has been replaced by the binding's
+          internal IPv4 address.
+        * Its transport-layer destination port has been replaced by the
+          binding's internal transport-layer port.
+        * Its Ethernet destination address has been replaced by the
+          internal host's hardware address (00:00:00:00:01:05).
+        * Its IPv4 hop count is exactly one less than on ingress, and the
+          datagram remains a well-formed IPv4 packet.
+        * All other fields are byte-identical to the received packet.
+      The packet is forwarded out s1.internal.
+
+    - If no matching binding exists, the packet is discarded.
+
+  ## On discard
+
+  A discarded packet produces NO output on any port and MUST NOT alter
+  the switch's internal state in any way (in particular, no binding is
+  installed, removed, or modified by a packet that fails any of the
+  checks above).
+
+  ## Endpoint independence
+
+  The mapping from a private-side identity to its external port depends
+  ONLY on the private-side identity itself — not on the destination
+  address and not on the destination port. Two packets sharing the same
+  private-side identity but bound for different destinations MUST be
+  translated to the same external port.
+
+  ## Control plane
+
+  The bindings are fixed and supplied externally; the switch does not
+  allocate, evict, or otherwise create new bindings on its own.
+topology:
+  switches:
+  - name: s1
+    ports:
+      internal: 1
+      external: 2
+  links:
+  - from: h1
+    to: s1.internal
+  - from: s1.external
+    to: h2
+hosts:
+  h1:
+    ip: 192.168.1.5/24
+    mac: 00:00:00:00:01:05
+    port: s1.internal
+  h2:
+    ip: 8.8.8.8/24
+    mac: 00:00:00:00:08:08
+    port: s1.external
+test_cases:
+- name: outbound_udp_snat_hit
+  visibility: public
+  description: 'An outbound UDP packet from h1 (192.168.1.5:5000) to 8.8.8.8:53 is SNAT-translated: IP.src is rewritten to the public IP 203.0.113.10, UDP.sport is rewritten to the installed external port 14000, IP.ttl is decremented by 1, the Ethernet destination is rewritten to the external peer MAC, and the packet is forwarded out the external port.'
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 14000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: outbound_tcp_snat_hit
+  visibility: public
+  description: 'An outbound TCP packet from h1 (192.168.1.5:6000) to 8.8.8.8:80 is SNAT-translated using a distinct (sport, ext_port) mapping: IP.src ← 203.0.113.10, TCP.sport ← 15000, IP.ttl decremented by 1, Ether.dst ← external peer MAC. Confirms the translation path is L4-agnostic across TCP and UDP.'
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: change_to
+        value: 15000
+      TCP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_udp_dnat_return
+  visibility: public
+  description: 'An inbound UDP packet from 8.8.8.8:53 to 203.0.113.10:14000 is DNAT-translated back to the original internal flow: IP.dst ← 192.168.1.5, UDP.dport ← 5000, IP.ttl decremented by 1, Ether.dst ← internal host MAC. The inbound DNAT entry is the symmetric pair of the outbound SNAT entry exercised in `outbound_udp_snat_hit`.'
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 192.168.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: inbound_tcp_dnat_return
+  visibility: public
+  description: 'An inbound TCP packet from 8.8.8.8:80 to 203.0.113.10:15000 is DNAT-translated: IP.dst ← 192.168.1.5, TCP.dport ← 6000, IP.ttl decremented by 1, Ether.dst ← internal host MAC.'
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 15000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 192.168.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 6000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: inbound_unmapped_drop
+  visibility: public
+  description: An inbound UDP packet to 203.0.113.10:19999 has no matching DNAT entry installed and MUST be dropped (default-deny on the external side).
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 19999
+  expected:
+    behavior: drop
+- name: outbound_unmapped_drop
+  visibility: hidden
+  description: An outbound UDP packet from 192.168.1.5:9999 has no installed SNAT mapping (Tier-1 is static; the data plane MUST NOT allocate a new external port). The packet MUST be dropped.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 9999
+        dport: 53
+  expected:
+    behavior: drop
+- name: icmp_dropped
+  visibility: hidden
+  description: An ICMP echo from the internal host is dropped — NAPT only operates on TCP and UDP per RFC 3022 §4.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_wrong_dst_dropped
+  visibility: hidden
+  description: An inbound UDP packet whose IP.dst is something other than the public IP (here 192.168.1.5 directly) MUST be dropped — confirms the public-IP gate on the inbound DNAT path.
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 192.168.1.5
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 80
+        dport: 5000
+  expected:
+    behavior: drop
+- name: outbound_from_foreign_subnet_dropped
+  visibility: hidden
+  description: An outbound UDP packet whose IP.src is OUTSIDE the configured internal subnet (192.168.1.0/24) — here 10.0.0.7 — MUST NOT be translated, even if it arrives on the internal port. Tier-1 NAT drops on a missing SNAT binding regardless of source.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.0.7
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: outbound_replay_same_external_port
+  visibility: hidden
+  description: After the canonical outbound UDP flow has been admitted once, a second packet with the same (src, sport, proto) MUST be SNAT-translated to the SAME external port (14000). Static mappings are deterministic and stable; the sport must not migrate to a different ext_port across packets of the same flow.
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 14000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: outbound_tcp_inbound_pair_symmetry
+  visibility: hidden
+  description: 'After the canonical outbound TCP flow (h1:6000 → 8.8.8.8:80) has been admitted, the symmetric inbound return packet (8.8.8.8:80 → 203.0.113.10:15000) MUST be DNAT-translated back to (192.168.1.5, 6000). Confirms the pair_symmetry invariant: every outbound binding has a matching inbound binding.'
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 15000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 192.168.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 6000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: second_outbound_flow_distinct_mapping
+  visibility: hidden
+  description: A second outbound UDP flow from h1 with a DIFFERENT internal sport (7000) is SNAT-translated to ext_port 16000 (its own installed mapping), not to the 14000 used by the sport=5000 flow. Confirms distinct internal flows do not collide on the external side.
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 7000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 16000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_tcp_wrong_external_port_dropped
+  visibility: hidden
+  description: An inbound TCP packet to the public IP on a port that has no DNAT entry installed (here TCP dport=22000) MUST be dropped, confirming default-deny on unsolicited inbound TCP.
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 22
+        dport: 22000
+        flags: SA
+  expected:
+    behavior: drop
+- name: inbound_icmp_dropped
+  visibility: hidden
+  description: An ICMP packet arriving on the external port MUST be dropped — NAPT does not service ICMP regardless of direction.
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: ineligible_priors_do_not_perturb_mappings
+  visibility: hidden
+  description: A long sequence of ineligible packets (ICMP from internal, outbound from a foreign subnet, inbound to the wrong dst, inbound to an unmapped port) MUST NOT alter any installed static mapping. The canonical outbound UDP flow that follows still SNAT-translates 192.168.1.5:5000 → 203.0.113.10:14000.
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.0.7
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  - port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 192.168.1.5
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 80
+        dport: 5000
+  - port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 19999
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 14000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: outbound_ttl_decrement_non_edge
+  visibility: hidden
+  description: An outbound UDP packet with TTL=10 is translated AND has its TTL decremented to 9 — confirming the TTL decrement is unconditional on the admit path (not gated on TTL==1 or any specific value).
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 8.8.8.8
+        ttl: 10
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 14000
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: outbound_tcp_source_port_rewritten
+  visibility: hidden
+  description: An outbound TCP flow (192.168.1.5:6000 → 93.184.216.34:443, TTL 50) is SNAT-translated. Asserts the L4 SOURCE port is rewritten to the mapped external port 15000 — a program that rewrites IP.src but forgets the TCP source-port rewrite is caught here (the public suite only asserts this on the UDP side).
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 192.168.1.5
+        dst: 93.184.216.34
+        ttl: 50
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: change_to
+        value: 15000
+      TCP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_udp_dest_port_rewritten
+  visibility: hidden
+  description: An inbound UDP packet (9.9.9.9:1234 → 203.0.113.10:14000, TTL 50) is DNAT-translated back to the internal host. Asserts the L4 DESTINATION port is rewritten to the mapped internal port 5000 — a program that rewrites IP.dst but forgets the UDP destination-port rewrite is caught here (the public suite only asserts this on the TCP side).
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 9.9.9.9
+        dst: 203.0.113.10
+        ttl: 50
+        proto: 17
+    - UDP:
+        sport: 1234
+        dport: 14000
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 192.168.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

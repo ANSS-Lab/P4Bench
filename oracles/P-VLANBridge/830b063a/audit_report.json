@@ -1,0 +1,96 @@
+{
+  "oracle_hash": "6c6ec7d055b2dbb2cdeb70db7bac614fc24985388d66ca05db91afd68d9e1769",
+  "instance": "vlan_bridge_anchor-default",
+  "ran_at": "2026-05-30T02:19:39.870053Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "R0_access_tagged_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "R0b_trunk_untagged_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "R2_vlan_not_allowed_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "R3_access_to_trunk_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "R3_trunk_to_access_pop",
+        "status": "pass"
+      },
+      {
+        "example_id": "R3_trunk_to_trunk_keep_tag",
+        "status": "pass"
+      },
+      {
+        "example_id": "R4_unknown_unicast_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "R4_unknown_unicast_flood",
+        "status": "pass"
+      },
+      {
+        "example_id": "vlan_isolation_cross_vlan_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "vlan_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "tag_push_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "tag_pop_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "mac_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      }
+    },
+    "uncovered": [
+      "vlan_isolation",
+      "tag_push_correctness",
+      "tag_pop_correctness"
+    ]
+  },
+  "grounding": {
+    "sources": [],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

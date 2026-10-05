@@ -1,0 +1,115 @@
+{
+  "oracle_hash": "69c205c5425c2962f6e5f61749a38b3f800bc7d1e90d9adab9a91285e5cdda1c",
+  "instance": "in_network_sequencer_anchor-default",
+  "ran_at": "2026-06-17T04:03:39.017941Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "malformed_no_seq_header_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "stamp_first_packet_cold_start",
+        "status": "pass"
+      },
+      {
+        "example_id": "stamp_monotone_train_trailing",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_sequenced_forward_untouched",
+        "status": "pass"
+      },
+      {
+        "example_id": "off_class_does_not_burn_counter",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_sequenced_drop_strict",
+        "status": "pass"
+      },
+      {
+        "example_id": "session_reset_multicasts",
+        "status": "pass"
+      },
+      {
+        "example_id": "session_reset_disabled_treated_non_sequenced",
+        "status": "pass"
+      },
+      {
+        "example_id": "multi_group_independent_counters",
+        "status": "pass"
+      },
+      {
+        "example_id": "stamp_session_off_reset_not_fired_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "seq_width_bits_narrow_still_stamps",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "seq_monotonicity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_persistence_off_class": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "per_group_isolation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "session_stamp_stability": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "seq_monotonicity",
+      "counter_persistence_off_class",
+      "per_group_isolation",
+      "session_stamp_stability",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "nopaxos_osdi16",
+      "eris_sosp17"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

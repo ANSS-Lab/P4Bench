@@ -1,0 +1,256 @@
+# P-LoadBalancedFW — North-south service LB behind a connection-tracking firewall
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass north-south service path a datacentre edge runs: a
+# stateful connection-tracking firewall (P-StatefulFW, P3), a stateful service
+# load balancer that pins each admitted flow to a backend (P-StatefulLB, P3),
+# and an LPM unicast forwarder (P-IPv4Routing, P1). The value of the *chained*
+# pattern over instantiating the three apart is the cross-stage ORDERING and the
+# state dependence between stages — invisible when each half is tested alone:
+#   (a) ADMIT-BEFORE-PIN — the firewall verdict is computed first; only a
+#       firewall-ADMITTED connection ever reaches the LB and gets a backend
+#       binding. A non-SYN packet with no live conntrack entry is dropped BEFORE
+#       the LB allocates a pin (no orphan LB state). Neither half binds this:
+#       standalone P-StatefulFW has no LB to gate; standalone P-StatefulLB has
+#       no admission policy.
+#   (b) STICKY LB (persistence) — the same client flow always maps to the SAME
+#       backend across all of its packets; the backend is chosen once (hash of
+#       the 5-tuple) and PINNED in a per-flow table, then reused. The forwarding
+#       decision is data-dependent on the pin installed by the first packet.
+#   (c) REVERSE PATH — backend→client return traffic is un-rewritten (the
+#       packet's source backend IP is restored to the service VIP) ONLY for a
+#       tracked connection; a reply with no matching conntrack entry drops. The
+#       inbound success path exists only because the matching forward packet
+#       installed the conntrack + pin first.
+#   (d) STATEFUL FORWARD DEPENDENCE — the firewall's whitelist rule: a non-SYN
+#       packet that opens no connection and matches no live entry is dropped,
+#       so the LB never sees an un-admitted flow.
+
+pattern_id: P-LoadBalancedFW
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D5:address-rewriting"
+    - "D7:connection-state"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P3:stateful-flow-affinity"
+
+target_capability: composition   # chains a redesign (P-IPv4Routing) and two scale_up/stateful (P-StatefulFW/P-StatefulLB) primitives; failure modes are cross-cutting
+
+summary: >
+  Single-pass north-south service path behind a datacentre edge. Every IPv4
+  packet is (1) screened by a stateful connection-tracking firewall keyed on
+  the 5-tuple — a new TCP SYN from the client side opens a connection; a packet
+  with no live connection that does not open one is dropped (whitelist / no
+  orphan); (2) if it is a new client flow to the service VIP, hashed to a
+  backend from the pool and PINNED in a per-flow table (the same flow always
+  maps to the same backend), with the destination rewritten to that backend; an
+  established flow reuses its pinned backend; a backend reply is reverse-mapped
+  (source restored to the VIP) for a tracked connection only; (3) forwarded by
+  LPM with TTL decrement and next-hop MAC rewrite. The pipeline order
+  firewall -> LB -> route and the admit-before-pin / sticky / reverse-path
+  state dependences are the load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC5382
+      quote: "A NAT session is an association between a TCP session as seen in the internal realm and a TCP session as seen in the external realm, by virtue of NAT translation."
+      title: "NAT Behavioral Requirements for TCP"
+      sections: ["4.1", "5"]
+      role: connection-tracking lifecycle (SYN opens, established reuse, reverse direction)
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: firewall admission vocabulary (admit/deny)
+  papers:
+    - cite: "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer, NSDI 2016"
+      role: per-flow backend affinity (consistent pin) for a service VIP
+    - cite: "Miao et al., SilkRoad: Making Stateful Layer-4 Load Balancing Fast and Cheap Using Switching ASICs, SIGCOMM 2017"
+      role: in-switch connection-affinity table; pin-once-reuse semantics
+
+entities:
+  conntrack:
+    type: connection
+    keyed_by_tuple: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {state: "new|established", pinned_backend: ipv4}
+    capacity: ${conntrack_capacity}
+    eviction: ${conntrack_eviction}
+    notes: per-5-tuple connection state; a new TCP SYN from the client side opens it; the reverse direction is matched by the swapped tuple.
+  backend_pool:
+    type: bucket
+    key: [backend_index]
+    attrs: {backend_ip: ipv4, next_hop_mac: mac}
+    capacity: ${backend_pool_size}
+    eviction: none
+    notes: the ordered service backend pool; the per-flow pin selects backend_pool[ hash5tuple % backend_pool_size ].
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table, consulted on the post-LB destination.
+
+parameters:
+  client_subnet:        {type: cidr,   default: "10.0.1.0/24"}
+  backend_subnet:       {type: cidr,   default: "10.0.2.0/24"}
+  service_vip:          {type: ipv4,   default: "10.0.9.9"}
+  backend_pool:         {type: list,   default: ["10.0.2.11", "10.0.2.12", "10.0.2.13"]}
+  backend_pool_size:    {type: int,    default: 3,    constraint: "backend_pool_size >= 1"}
+  conntrack_capacity:   {type: int,    default: 256,  constraint: "conntrack_capacity >= 1"}
+  conntrack_eviction:   {type: enum,   values: [none, LRU, FIFO], default: none}
+  syn_opens_only:       {type: bool,   default: true}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [fw_lb_route], default: fw_lb_route}
+  client_port:          {type: int,    default: 1}
+  backend_port:         {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no trackable/routable header.
+
+  - id: R1_firewall_conntrack
+    when: "header_present(IPv4)"
+    given: {match: "conntrack by 5-tuple (forward) or swapped 5-tuple (reverse)"}
+    then:
+      - "open(conntrack, 5-tuple, state=new) if (ingress on client_port and TCP SYN and syn_opens_only)"
+      - "admit if a live forward/reverse conntrack entry matches"
+      - "drop(pkt) if no live entry and the packet does not open one (no-orphan whitelist)"
+    notes: stateful screening; a new client TCP SYN opens a connection, an established packet is admitted by its entry, an un-tracked non-opening packet is dropped BEFORE the LB.
+
+  - id: R2_lb_pin_forward
+    when: "ingress on client_port and admitted and dst == service_vip"
+    given: {match: "conntrack pinned_backend for this 5-tuple"}
+    then:
+      - "pin(conntrack[5-tuple].pinned_backend = backend_pool[ stable_hash(5-tuple) % backend_pool_size ]) if absent"
+      - "rewrite(IP.dst -> pinned_backend)"
+    notes: load balance; choose the backend ONCE by a deterministic stable hash of the 5-tuple and PIN it, reuse the pin for every later packet of the flow (sticky persistence).
+
+  - id: R3_lb_reverse
+    when: "ingress on backend_port and admitted"
+    given: {match: "reverse conntrack entry by the swapped 5-tuple (backend->client)"}
+    then:
+      - "rewrite(IP.src -> service_vip) if a tracked connection matches"
+      - "drop(pkt) if no matching tracked connection (untracked return)"
+    notes: reverse path; a backend reply is un-rewritten (src restored to VIP) only for a connection the client opened; the success path depends on the matching forward flow.
+
+  - id: R4_route_forward
+    when: "not dropped by R0-R3"
+    given: {match: "fib LPM on the post-LB IP.dst"}
+    then:
+      - "drop(pkt) if no LPM match or IP.ttl == 0"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: LPM forward on the rewritten destination; one checksum recompute covers the LB rewrite and the TTL decrement.
+
+invariants:
+  - id: admit_precedes_pin
+    clause: stability
+    target: "a connection that is not firewall-admitted installs no LB pin"
+    notes: the firewall verdict is computed first and a drop short-circuits before R2/R3 (no orphan LB state).
+  - id: sticky_backend
+    clause: persistence
+    target: "every packet of a flow maps to the same pinned backend"
+    free_under: [conntrack_eviction]
+    notes: the backend is chosen once by a deterministic hash and reused for the life of the connection.
+  - id: reverse_path_consistency
+    clause: persistence
+    target: "a backend reply is reverse-mapped (src -> VIP) iff a matching tracked connection is live"
+    notes: untracked return traffic is dropped.
+  - id: no_orphan
+    clause: no_orphan
+    target: "a packet with no live connection that does not open one is dropped"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "IPv4 (and L4) checksums are valid over the combined LB-rewrite + TTL-decrement"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: new_flow_pinned_forward
+      generate: "new client TCP SYN to the VIP: admitted, hashed+pinned to a backend, IP.dst rewritten, routed out backend_port, TTL-1"
+    - id: established_flow_reuse
+      generate: "second packet of the established flow reuses the SAME pinned backend and routes out backend_port"
+    - id: backend_return_forward
+      generate: "backend->client reply for a tracked connection: IP.src restored to the VIP, routed to client_port, TTL-1"
+  G2:
+    - id: nonsyn_no_conntrack_drop
+      generate: "a non-SYN client packet with no live connection is dropped (whitelist / no-orphan)"
+    - id: untracked_return_drop
+      generate: "a backend->client packet with no matching tracked connection is dropped"
+    - id: ttl_one_forwards_zero
+      generate: "ttl==1 packet forwards with egress ttl==0; ttl==0 drops"
+  G3:
+    - id: sticky_across_packets
+      generate: "two packets of the same flow pin to the same backend even though the hash is recomputed per packet"
+    - id: distinct_flows_distinct_pins
+      generate: "two distinct client flows pin (possibly) different backends by their 5-tuple hash; each is sticky"
+    - id: non_ipv4_drop
+      generate: "ARP frame dropped before firewall classification"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: shrink_conntrack_capacity_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "${conntrack_capacity} /= 4 and conntrack_eviction: none -> LRU (connection pressure + eviction; an evicted flow re-pins)"
+  - id: enable_conntrack_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "conntrack_eviction: none -> LRU (a re-arriving evicted flow is re-tracked and may re-pin to a new backend)"
+  - id: grow_backend_pool
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "backend_pool_size 3 -> larger pool (wider hash distribution; more distinct pins to demultiplex)"
+  - id: require_syn_strict
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "syn_opens_only stays true and the default for non-opening packets is hard drop (strict whitelist)"
+    feasibility_postcondition: "the client side only ever opens connections via TCP SYN"
+  - id: disable_firewall
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "syn_opens_only: false and admit all (the firewall stage is a pass-through; LB+route only)"
+  - id: static_pin_only
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "replace per-flow hash pinning with control-plane static client->backend bindings (no per-flow allocation); oracle regenerated"
+    feasibility_postcondition: "every client flow has a pre-installed backend binding"
+
+bridging_notes: |
+  - The firewall is stateful connection tracking keyed on the 5-tuple. A new
+    TCP SYN ingressing the client side opens a connection (state=new); any
+    later packet matching a live forward or reverse entry is admitted; a packet
+    with no live entry that does not itself open one is dropped (no-orphan
+    whitelist). The reverse direction is matched by the swapped 5-tuple.
+  - Backend selection is deterministic for grading: pinned_backend =
+    backend_pool[ stable_hash(5-tuple) % backend_pool_size ], where
+    stable_hash is the sum of the 5-tuple integers (src/dst as 32-bit ints,
+    proto, l4_src, l4_dst). The backend is chosen ONCE (on the connection's
+    first packet) and PINNED in the conntrack entry, then reused — this makes
+    the chosen backend observable and unit-testable, and guarantees stickiness.
+  - The LB rewrites IP.dst -> pinned_backend on the client->VIP forward path,
+    and IP.src -> service_vip on the backend->client reverse path (so the
+    client always sees the VIP, never the backend).
+  - LPM forwards on the post-LB IP.dst. TTL is decremented exactly once;
+    ttl==0 drops. One checksum recompute covers IP.dst/src and TTL.
+  - The reverse path is the cross-stage contract: a backend reply is
+    reverse-mapped and routed to the client port ONLY if the matching client
+    flow opened the connection first; otherwise it is dropped as untracked.

@@ -1,0 +1,95 @@
+{
+  "oracle_hash": "f673a92e4978647664bf34dde1bc619db056b2c25731a23ab38f05149d66fc0d",
+  "instance": "ecmp_selector_anchor-default",
+  "ran_at": "2026-06-17T14:22:45.834836Z",
+  "canonical_examples": {
+    "passed": 6,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "flowA_selects_member",
+        "status": "pass"
+      },
+      {
+        "example_id": "flowB_selects_different_member",
+        "status": "pass"
+      },
+      {
+        "example_id": "route_miss_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "route_miss_forward_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "remapped_members_follow_config",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_arp_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "ecmp_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "member_in_group": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ecmp_distribution": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "measured",
+        "grade": "partial",
+        "detail": "64 flows max_dev=0.44 {3: 25, 4: 27, 2: 12}"
+      },
+      "default_action_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "ecmp_consistency",
+      "member_in_group",
+      "default_action_correctness",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2992",
+      "RFC2992"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

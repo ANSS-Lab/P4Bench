@@ -1,0 +1,244 @@
+# P-SecureRouter — Edge security router: stateless ACL ∘ stateful NAT44 ∘ LPM forward
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass edge-router data plane every CPE / branch gateway
+# runs: a stateless ternary ACL (P-ACL, P4), a stateful per-flow source-NAT
+# with reverse de-NAT (P-NAT44, P2), and an LPM unicast forwarder
+# (P-IPv4Routing, P1). The value of the *chained* pattern over instantiating
+# the three apart is the cross-stage ORDERING and the data dependence between
+# stages — invisible when each half is tested alone:
+#   (a) ACL-BEFORE-NAT — the ACL verdict keys on the ORIGINAL (pre-NAT)
+#       5-tuple, so a denied inside host is dropped BEFORE NAT allocates a
+#       mapping (a deny must not leave a stale flow-table entry). Neither
+#       half binds this: standalone P-ACL has no NAT to precede; standalone
+#       P-NAT44 has no policy gate.
+#   (b) NAT-BEFORE-ROUTE — the LPM lookup runs on the POST-NAT destination.
+#       Outbound (inside→outside) routes on the unchanged dst; inbound
+#       (outside→inside) can only be routed AFTER reverse de-NAT restores the
+#       private dst, so the forwarding decision is data-dependent on the NAT
+#       table populated by the matching outbound flow.
+#   (c) COMPOUND CHECKSUM — one pass rewrites the IP src/dst + L4 port (NAT)
+#       AND decrements TTL (route): a single IPv4 (and L4) checksum recompute
+#       must cover all mutations. The common v1model multi-rewrite-one-checksum trap
+#       promoted across stages.
+#   (d) STATEFUL REVERSE DEPENDENCE — an unsolicited inbound packet with no
+#       established mapping is dropped; the inbound success path exists only
+#       because a prior outbound packet installed the reverse entry.
+
+pattern_id: P-SecureRouter
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D5:address-rewriting"
+    - "D7:connection-state"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P2:stateful-address-translation"
+    - "P4:stateless-classification"
+
+target_capability: composition   # chains a redesign (P-ACL/P-IPv4Routing) and a scale_up (P-NAT44) primitive; failure modes are cross-cutting
+
+summary: >
+  Single-pass edge security router. Every IPv4 packet is (1) classified by a
+  stateless ternary ACL on its original 5-tuple — a deny drops it before any
+  state is touched; (2) source-NATed if it is an inside→outside flow (rewrite
+  src IP/port to the public pool, install a reverse mapping) or reverse
+  de-NATed if it is an outside→inside flow with an established mapping (else
+  dropped as unsolicited); (3) forwarded by LPM on the post-NAT destination
+  with TTL decrement and next-hop MAC rewrite. The pipeline order
+  ACL → NAT → route and the outbound→inbound state dependence are the
+  load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC3022
+      quote: "Basic Network Address Translation or Basic NAT is a method by which IP addresses are mapped from one group to another, transparent to end users."
+      title: "Traditional IP Network Address Translator (Traditional NAT)"
+      sections: ["2.1", "3", "4"]
+      role: NAT44 binding + reverse-mapping semantics
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: ACL classification vocabulary (permit/deny)
+  papers:
+    - cite: "Jeyakumar et al., Millions of Little Minions (NAT/ACL pipelining), SIGCOMM 2014"
+      role: ordering rationale for classify→translate→forward in a single pass
+
+entities:
+  acl_table:
+    type: bucket
+    key: [ipv4_src, ipv4_dst, proto, l4_src, l4_dst]
+    attrs: {action: "permit|deny", priority: int}
+    capacity: ${rule_count_capacity}
+    eviction: none
+    notes: stateless ternary first-match-by-priority; evaluated on the pre-NAT tuple.
+  nat_table:
+    type: flow
+    keyed_by_tuple: [ipv4_src, l4_src, proto]
+    attrs: {pool_ip: ipv4, pool_port: int, orig_ip: ipv4, orig_port: int}
+    capacity: ${nat_capacity}
+    eviction: ${nat_eviction}
+    notes: per-flow source-NAT bindings; the reverse direction is keyed by (pool_ip, pool_port, proto).
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {egress_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast forwarding table, consulted on the post-NAT destination.
+
+parameters:
+  inside_subnet:        {type: cidr,   default: "10.0.1.0/24"}
+  nat_pool_ip:          {type: ipv4,   default: "203.0.113.1"}
+  nat_pool_port_base:   {type: int,    default: 20000, constraint: "1024 <= nat_pool_port_base <= 60000"}
+  nat_capacity:         {type: int,    default: 256,  constraint: "nat_capacity >= 1"}
+  nat_eviction:         {type: enum,   values: [none, LRU, FIFO], default: none}
+  acl_rules:            {type: list,   default: []}
+  rule_count_capacity:  {type: int,    default: 256}
+  match_field_breadth:  {type: enum,   values: [dst_only, tuple3, tuple5], default: tuple5}
+  priority_depth:       {type: int,    default: 16}
+  default_acl_action:   {type: enum,   values: [permit, deny], default: permit}
+  fib_capacity:         {type: int,    default: 1024}
+  pipeline_order:       {type: enum,   values: [acl_nat_route], default: acl_nat_route}
+  inside_port:          {type: int,    default: 1}
+  outside_port:         {type: int,    default: 2}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable/translatable header.
+
+  - id: R1_acl_classify
+    when: "header_present(IPv4)"
+    given: {match: "acl_table on original 5-tuple by descending priority"}
+    then: ["drop(pkt) if matched action == deny or (miss and default_acl_action == deny)"]
+    notes: stateless classification on the PRE-NAT tuple; the deny path leaves NAT state untouched (ACL-before-NAT).
+
+  - id: R2_nat_outbound
+    when: "ingress on inside_port and not denied"
+    given: {match: "nat_table by (src,l4_src,proto)"}
+    then:
+      - "bind(nat_table, (src,l4_src,proto) -> (nat_pool_ip, allocated_port)) if absent"
+      - "rewrite(IP.src -> nat_pool_ip)"
+      - "rewrite(L4.src -> allocated_port)"
+    notes: source-NAT; allocate a pool port on first packet, reuse the binding thereafter; install the reverse mapping.
+
+  - id: R3_nat_inbound
+    when: "ingress on outside_port and not denied"
+    given: {match: "reverse nat_table by (dst==nat_pool_ip, l4_dst, proto)"}
+    then:
+      - "rewrite(IP.dst -> orig_ip) if reverse mapping exists"
+      - "rewrite(L4.dst -> orig_port) if reverse mapping exists"
+      - "drop(pkt) if no reverse mapping (unsolicited inbound)"
+    notes: reverse de-NAT; the success path depends on a prior outbound flow having installed the mapping.
+
+  - id: R4_route_forward
+    when: "not dropped by R0-R3"
+    given: {match: "fib LPM on the post-NAT IP.dst"}
+    then:
+      - "drop(pkt) if no LPM match or IP.ttl == 0"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, egress_port)"
+    notes: LPM forward on the translated destination; one checksum recompute covers the NAT rewrites and the TTL decrement.
+
+invariants:
+  - id: acl_precedes_nat
+    clause: stability
+    target: "a denied flow installs no nat_table binding"
+    notes: the ACL verdict is computed on the pre-NAT tuple and a deny short-circuits before R2/R3.
+  - id: reverse_mapping_consistency
+    clause: persistence
+    target: "an inbound packet is de-NATed iff a matching outbound binding is live"
+    free_under: [nat_eviction]
+    notes: unsolicited inbound (no mapping) is dropped.
+  - id: post_nat_routing
+    clause: stability
+    target: "the LPM lookup keys on IP.dst AFTER reverse de-NAT"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "IPv4 and L4 checksums are valid over the combined NAT-rewrite + TTL-decrement"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: outbound_nat_forward
+      generate: "inside->outside permitted flow: src/port rewritten to pool, routed out outside_port, TTL-1"
+    - id: inbound_denat_forward
+      generate: "outside->inside reply for an established flow: dst/port restored, routed to inside_port"
+    - id: acl_deny_drop
+      generate: "a flow matching an ACL deny rule is dropped before NAT"
+  G2:
+    - id: unsolicited_inbound_drop
+      generate: "outside->inside packet with NO established mapping is dropped"
+    - id: nat_binding_reuse
+      generate: "second outbound packet of the same flow reuses the same pool port (no new binding)"
+    - id: ttl_one_forwards_zero
+      generate: "ttl==1 packet forwards with egress ttl==0; ttl==0 drops"
+  G3:
+    - id: deny_leaves_no_state
+      generate: "a denied outbound flow, then its inbound reply -> the reply is dropped (no mapping was installed)"
+    - id: checksum_after_compound_rewrite
+      generate: "outbound NAT+route packet has valid IPv4/L4 checksum over both mutations"
+    - id: non_ipv4_drop
+      generate: "ARP frame dropped before classification"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: flip_default_to_deny
+    direction: harden
+    kind: parameter
+    axis: policy_strictness
+    effect: "${default_acl_action}: permit -> deny (unlisted flows dropped; only explicit permits pass)"
+    feasibility_postcondition: "at least one explicit permit rule exists"
+  - id: shrink_nat_capacity_4x
+    direction: harden
+    kind: parameter
+    axis: state_capacity
+    effect: "nat_capacity /= 4 and nat_eviction: none -> LRU (binding pressure + eviction)"
+  - id: expand_match_field_breadth
+    direction: harden
+    kind: parameter
+    axis: classification_breadth
+    effect: "match_field_breadth: dst_only -> tuple5 (full 5-tuple ACL matching)"
+  - id: enable_nat_eviction
+    direction: harden
+    kind: parameter
+    axis: state_eviction
+    effect: "nat_eviction: none -> LRU (a re-arriving evicted flow is re-bound to a new port)"
+  - id: disable_acl
+    direction: ease
+    kind: parameter
+    axis: policy_strictness
+    effect: "acl_rules: [] and default_acl_action: permit (NAT+route only; the ACL stage is a pass-through)"
+  - id: static_nat_only
+    direction: ease
+    kind: rule
+    axis: state_dynamics
+    effect: "replace dynamic allocation with control-plane static 1:1 bindings (no per-flow allocation); oracle regenerated"
+    feasibility_postcondition: "every inside host has a pre-installed binding"
+
+bridging_notes: |
+  - The ACL is stateless first-match by descending priority on the PRE-NAT
+    5-tuple. A miss falls through to default_acl_action.
+  - NAT direction is decided by ingress port: inside_port packets are
+    source-NATed, outside_port packets are reverse de-NATed. The forward
+    binding key is (orig_src_ip, orig_l4_src, proto); the reverse key is
+    (nat_pool_ip, allocated_port, proto).
+  - Port allocation is deterministic for grading: allocated_port =
+    nat_pool_port_base + (number of live bindings) at install time. Reuse
+    returns the existing binding's port. This makes the pool-port observable
+    and unit-testable.
+  - LPM forwards on the post-NAT IP.dst. TTL is decremented exactly once;
+    ttl==0 drops. One checksum recompute covers IP src/dst, L4 port, and TTL.
+  - The reverse path is the cross-stage contract: an inbound packet is
+    de-NATed and routed to inside_port ONLY if the matching outbound flow
+    installed a binding first; otherwise it is dropped as unsolicited.

@@ -1,0 +1,167 @@
+{
+  "oracle_hash": "b1501362c20d855e266af2a13d8fdd618c7eafd0b07cab322779d37770436bbe",
+  "instance": "ptp_tc_disc_mut2-default",
+  "ran_at": "2026-06-17T04:21:20.182046Z",
+  "canonical_examples": {
+    "passed": 20,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ptp_known_dst_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ptp_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "general_announce_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "general_delay_resp_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_sync_onestep_correct",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_sync_only_delayreq_not_corrected",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_all_event_delayreq_corrected",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_full64_scaled_arithmetic_path",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_domain_filtered_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_domain_active_corrected",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_twostep_sync_store",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_twostep_followup_apply",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_orphan_followup_unmodified",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_capacity_overflow_orphans_followup",
+        "status": "pass"
+      },
+      {
+        "example_id": "flag_dispatched_clear_corrected_in_transit",
+        "status": "pass"
+      },
+      {
+        "example_id": "flag_dispatched_set_store_then_apply",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_eth88f7_transport_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_p2p_link_delay_folded_in",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_p2p_link_delay_unmatched_residence_only",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "correction_is_accumulated": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "residence_correction_equals_measured": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "general_and_non_ptp_unmodified": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_orphan_correlation_entries": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "correction_applied_exactly_once_across_exchange": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stored_correction_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "correction_is_accumulated",
+      "residence_correction_equals_measured",
+      "general_and_non_ptp_unmodified",
+      "no_orphan_correlation_entries",
+      "correction_applied_exactly_once_across_exchange",
+      "stored_correction_persistence",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "dptp_sosr19",
+      "rfc8173"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

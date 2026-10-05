@@ -1,0 +1,559 @@
+task_name: dhcp_relay_anchor
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-DHCPRelay
+pattern_version: '1.0'
+seed:
+  access_port: 1
+  server_facing_port: 2
+  hops_limit: 16
+  multi_server: false
+  option82_insert: false
+  faithfulness: D5.0_single_server
+  default_action: drop
+  relay_interfaces:
+  - ingress_port: 1
+    giaddr_ip: 10.0.1.1
+    client_subnet: 10.0.1.0/24
+    client_mac: 08:00:00:00:01:0c
+  server_targets:
+  - giaddr_ip: 10.0.1.1
+    server_ip: 192.168.100.10
+    server_mac: 08:00:00:00:02:0a
+    server_port: 2
+    relay_src_ip: 192.168.100.1
+    relay_mac: 08:00:00:00:02:01
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: server
+  - from: unconfigured
+    to: s1.p3
+hosts:
+  client:
+    note: DHCP clients in 10.0.1.0/24; relay access interface 10.0.1.1; ingress on s1.p1
+  server:
+    note: DHCP server 192.168.100.10; relay server-side address 192.168.100.1; on s1.p2
+  unconfigured:
+    note: an access port with no relay-interface configuration; on s1.p3
+description: |-
+  Implement a DHCP relay agent for BMv2 (v1model). The switch sits between a
+  client access network and a single DHCP server, and relays bootstrap messages
+  between them in both directions.
+
+  Topology: port 1 is the client-facing access link (clients live in 10.0.1.0/24);
+  port 2 faces the DHCP server at 192.168.100.10. On the access subnet the relay
+  is reached at 10.0.1.1; toward the server it sources traffic from 192.168.100.1.
+
+  DHCP is carried over UDP between the bootstrap ports (67 and 68). Each bootstrap
+  message begins with a fixed-format header whose relevant fields are: a message
+  direction code (a client-to-server request vs a server-to-client reply), a relay
+  hop count, and a "gateway" address field that identifies the relay interface a
+  request entered through. A frame that is not a well-formed bootstrap message
+  carried this way is outside the relay's scope and must be dropped, leaving no
+  trace.
+
+  Required behaviour, per message:
+
+  - Direction. A request must arrive from the client side and a reply from the
+    server side. A request seen coming from the server side, or a reply seen
+    coming from the client side, is in the wrong direction and is dropped.
+
+  - Loop protection. A request that has already been relayed too many times must
+    not be relayed again. The relay enforces a maximum hop count of 16: a request
+    that arrives having already reached that many hops is dropped, before the relay
+    would add its own hop.
+
+  - Relaying a request toward the server. A request that arrives on the access
+    link is relayed to the DHCP server. The relay records which interface the
+    request entered through in the gateway address field — but only if that field
+    is still empty; a gateway address already filled in by an earlier relay must be
+    left exactly as it is. The relay then accounts for its own hop by advancing the
+    hop count by one, redirects the message to the server (the message leaves
+    toward the server with its destination addressing rewritten for the server and
+    its source addressing rewritten as coming from the relay), and sends it out the
+    server-facing port. A request on an access link the relay is not configured to
+    serve cannot be relayed and is dropped.
+
+  - Relaying a reply toward the client. A reply arriving from the server carries
+    the gateway address the relay stamped on the corresponding request. The relay
+    uses that gateway address to decide which client-facing interface the reply
+    belongs to, redirects the reply back toward that client network (rewriting the
+    destination addressing toward the client and the source addressing as coming
+    from the relay), and sends it out the matching access port. The hop count is
+    left untouched on the reply direction. A reply whose gateway address is empty,
+    or names no interface the relay serves, is dropped.
+
+  The relay is a STATELESS function: every decision follows only from the current
+  message's own fields (its direction, hop count, and gateway address), the port it
+  arrived on, and the fixed relay configuration. It keeps no lease, binding, or
+  per-transaction state — address assignment and lease lifetime are the server's
+  responsibility, not the relay's. The relay rewrites the message in flight and
+  changes where it egresses; it does not invent new messages. Both the P4 program
+  and its table entries are yours to author.
+test_cases:
+- name: request_giaddr_stamp_forward
+  visibility: public
+  goal_class: G1
+  description: 'A client bootstrap request arriving on the access link with an empty gateway-address field is relayed to the DHCP server: the relay stamps its access-interface address into the gateway field, advances the hop count by one, and redirects the message toward the server (destination addressing rewritten for the server, source addressing rewritten as coming from the relay), out the server-facing port.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 0
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 192.168.100.10
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.1.1
+      DHCP.hops:
+        action: incremented_by
+        delta: 1
+- name: reply_relay_to_client
+  visibility: public
+  goal_class: G1
+  description: 'A server reply arriving from the server side, carrying the gateway address the relay stamped on the request, is relayed back toward the client: the destination addressing is rewritten toward the client network (the gateway address), the source addressing as coming from the relay, and the message egresses the matching access port. The hop count is left untouched.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:20
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 192.168.100.10
+        dst: 192.168.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 67
+        dport: 68
+    - DHCP:
+        op: 2
+        hops: 1
+        xid: 2882338817
+        giaddr: 10.0.1.1
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.1.1
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:0c
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.1.1
+      DHCP.hops:
+        action: unchanged
+- name: request_preserve_nonzero_giaddr
+  visibility: public
+  goal_class: G1
+  description: A client request that already carries a non-empty gateway address (stamped by an upstream relay) is still relayed to the server, but the existing gateway address is preserved exactly — the relay does not overwrite it — while the hop count is still advanced by one.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 2
+        xid: 2882338817
+        giaddr: 10.0.9.9
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 192.168.100.10
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.9.9
+      DHCP.hops:
+        action: incremented_by
+        delta: 1
+- name: reply_relay_to_client_hidden
+  visibility: hidden
+  goal_class: G1
+  description: A server reply carrying the stamped gateway address is relayed back toward the client out the matching access port (not the server-facing port); the gateway address and hop count are left untouched.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:20
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 192.168.100.10
+        dst: 192.168.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 67
+        dport: 68
+    - DHCP:
+        op: 2
+        hops: 1
+        xid: 2882338819
+        giaddr: 10.0.1.1
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.1.1
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:0c
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.1.1
+      DHCP.hops:
+        action: unchanged
+- name: request_hops_at_limit_drop
+  visibility: hidden
+  goal_class: G2
+  description: A client request whose hop count has already reached the relay's maximum (16) is dropped — it cannot be relayed one more hop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 16
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: drop
+- name: request_hops_one_below_limit_forward
+  visibility: hidden
+  goal_class: G2
+  description: A client request whose hop count is exactly one below the maximum is still relayed, leaving with a hop count equal to the maximum (advanced by exactly one).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 15
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 192.168.100.10
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.1.1
+      DHCP.hops:
+        action: incremented_by
+        delta: 1
+- name: request_hops_exactly_one
+  visibility: hidden
+  goal_class: G2
+  description: A client request that arrives with a hop count of zero leaves with a hop count of one — advanced by exactly one, not two and not zero.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.60
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 0
+        xid: 2882338818
+        giaddr: 0.0.0.0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 192.168.100.10
+      IP.src:
+        action: change_to
+        value: 192.168.100.1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:0a
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:01
+      DHCP.giaddr:
+        action: change_to
+        value: 10.0.1.1
+      DHCP.hops:
+        action: incremented_by
+        delta: 1
+- name: request_unconfigured_access_port_drop
+  visibility: hidden
+  goal_class: G2
+  description: A client request arriving on an access port the relay has no configuration for cannot be stamped with a gateway address and is dropped.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.70
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 0
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: drop
+- name: reply_zero_giaddr_drop
+  visibility: hidden
+  goal_class: G2
+  description: A server reply whose gateway address is empty gives the relay no way to pick the client interface and is dropped.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:20
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 192.168.100.10
+        dst: 192.168.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 67
+        dport: 68
+    - DHCP:
+        op: 2
+        hops: 1
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: drop
+- name: reply_unknown_giaddr_drop
+  visibility: hidden
+  goal_class: G2
+  description: A server reply whose gateway address names no interface the relay serves is dropped.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:20
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 192.168.100.10
+        dst: 192.168.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 67
+        dport: 68
+    - DHCP:
+        op: 2
+        hops: 1
+        xid: 2882338817
+        giaddr: 172.16.0.1
+  expected:
+    behavior: drop
+- name: request_on_server_port_drop
+  visibility: hidden
+  goal_class: G3
+  description: A bootstrap request seen arriving from the server side is in the wrong direction (the relay only forwards requests received from clients) and is dropped.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 68
+        dport: 67
+    - DHCP:
+        op: 1
+        hops: 0
+        xid: 2882338817
+        giaddr: 0.0.0.0
+  expected:
+    behavior: drop
+- name: reply_on_access_port_drop
+  visibility: hidden
+  goal_class: G3
+  description: A bootstrap reply seen arriving from the client side is in the wrong direction (the relay only returns replies received from the server) and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:20
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 192.168.100.10
+        dst: 192.168.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 67
+        dport: 68
+    - DHCP:
+        op: 2
+        hops: 1
+        xid: 2882338817
+        giaddr: 10.0.1.1
+  expected:
+    behavior: drop
+- name: non_dhcp_udp_drop
+  visibility: hidden
+  goal_class: G3
+  description: A UDP frame that is not a bootstrap message (a different application port) is outside the relay's scope and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.51
+        dst: 192.168.100.10
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40000
+        dport: 53
+  expected:
+    behavior: drop
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) on the access link is outside the relay's scope and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.52
+        pdst: 10.0.1.1
+  expected:
+    behavior: drop

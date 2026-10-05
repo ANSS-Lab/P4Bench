@@ -1,0 +1,240 @@
+# P-TelemetryFRR — Telemetry-stamping router with fast reroute:
+#   INTMetadata ∘ IPv4Routing ∘ PURRFastReroute  (P9 ∪ P1 ∪ P7)
+#
+# TPL v1.0 task pattern composing THREE audited basic
+# NFs into the single-pass telemetry router that a transit node in an INT-
+# instrumented fabric runs: a per-next-hop liveness-driven fast-reroute demux
+# (PURR-style FRR, P7), an LPM unicast forwarder (P-IPv4Routing, P1), and an
+# in-band telemetry stamper (INT, P9) that records the ACTUAL egress chosen.
+# The value of the *chained* pattern over instantiating the three apart is the
+# cross-stage ORDERING and the data dependence between stages — invisible when
+# each half is tested alone:
+#   (a) STAMP-REFLECTS-REROUTE — the telemetry value records the egress port the
+#       FRR demux actually selected, NOT the primary nexthop the FIB names. When
+#       the primary is down the packet egresses the backup AND the stamp carries
+#       the backup port. Neither half binds this: standalone INT has no reroute
+#       to observe; standalone FRR has no telemetry field to keep consistent.
+#   (b) LIVENESS-DRIVEN DEMUX — one and the same destination egresses the primary
+#       port or the backup port purely as a function of a per-nexthop liveness
+#       bit; the FIB LPM lookup is the same in both cases. The liveness bit is
+#       maintenance-plane state (set by a prior maintenance packet), so the
+#       forwarding decision is data-dependent on state a previous packet wrote.
+#   (c) ONE CHECKSUM OVER STAMP+TTL — a single pass writes the telemetry field
+#       (IP.id) AND decrements TTL: one IPv4 checksum recompute must cover both
+#       mutations (the common v1model multi-rewrite-one-checksum trap, promoted to a
+#       cross-stage form).
+
+pattern_id: P-TelemetryFRR
+version: "1.0"
+
+nf_categories:
+  descriptive:
+    - "D2:in-band-telemetry"
+    - "D9:failure-resilience"
+  prescriptive:
+    - "P1:longest-prefix-forwarding"
+    - "P7:liveness-driven-fast-reroute"
+    - "P9:telemetry-stamping"
+
+target_capability: composition   # chains a redesign (P-IPv4Routing/INT) and a relocate (FRR liveness) primitive; failure modes are cross-cutting
+
+summary: >
+  Single-pass telemetry router with fast reroute. Every IPv4 packet is
+  (1) LPM-forwarded to a primary next hop; (2) demuxed by a per-next-hop
+  liveness bit — if the primary is up it egresses the primary port, if the
+  primary is down it fast-reroutes to a pre-installed backup port; (3) stamped
+  with in-band telemetry recording the ACTUAL egress port chosen, then
+  forwarded with TTL decrement. A maintenance packet (a control/keepalive frame
+  addressed to a next hop) updates that next hop's liveness register and is
+  consumed. The pipeline order route/FRR-demux → stamp → forward and the
+  stamp-reflects-reroute dependence are the load-bearing composite contracts.
+
+grounding:
+  rfcs:
+    - id: RFC1812
+      title: "Requirements for IP Version 4 Routers"
+      sections: ["5.3.1", "5.2.1", "4.2.2.9"]
+      role: LPM forwarding + TTL decrement + checksum recompute
+      quote: "When a router forwards a packet, it MUST reduce the TTL by at least one."
+    - id: RFC3198
+      title: "Terminology for Policy-Based Management"
+      role: maintenance/keepalive classification vocabulary
+  papers:
+    - cite: "Chiesa et al., PURR: a Primitive for Reconfigurable Fast Reroute, CoNEXT 2019"
+      role: liveness-driven fast-reroute demux semantics (skip a down next hop to a backup)
+    - cite: "In-band Network Telemetry (INT) Dataplane Specification v2.1, P4.org Applications WG"
+      role: switch stamps the actual forwarding decision into a telemetry field
+
+entities:
+  fib:
+    type: bucket
+    key: [ipv4_dst_lpm]
+    attrs: {primary_port: int, backup_port: int, next_hop_mac: mac}
+    capacity: ${fib_capacity}
+    eviction: none
+    notes: LPM unicast table; each route names a primary egress and a pre-installed backup egress for FRR.
+  liveness:
+    type: bucket
+    key: [next_hop_id]
+    attrs: {state: "up|down"}
+    capacity: ${liveness_capacity}
+    eviction: none
+    notes: per-next-hop liveness register; written by a maintenance packet, read by the FRR demux. Default state up.
+  telemetry:
+    type: window
+    key: [packet]
+    attrs: {switch_id: int, egress_port: int}
+    capacity: ${telemetry_field_width}
+    eviction: none
+    notes: in-band telemetry accumulator; the actual egress port chosen is stamped into the observable telemetry field.
+
+parameters:
+  primary_port:            {type: int,  default: 2}
+  backup_port:             {type: int,  default: 3}
+  ingress_port:            {type: int,  default: 1}
+  switch_id:               {type: int,  default: 1, constraint: "0 <= switch_id <= 255"}
+  telemetry_field_width:   {type: int,  default: 16, constraint: "telemetry_field_width == 16"}
+  maintenance_proto:       {type: int,  default: 253, constraint: "0 <= maintenance_proto <= 255"}
+  fib_capacity:            {type: int,  default: 1024}
+  liveness_capacity:       {type: int,  default: 256}
+  primary_initial_state:   {type: enum, values: [up, down], default: up}
+  reroute_policy:          {type: enum, values: [backup_on_down, drop_on_down], default: backup_on_down}
+  pipeline_order:          {type: enum, values: [demux_stamp_forward], default: demux_stamp_forward}
+
+rules:
+  - id: R0_non_ipv4_drop
+    when: "ingress(pkt)"
+    given: {header_present: "not IPv4"}
+    then: ["drop(pkt)"]
+    notes: non-IPv4 frames carry no routable header to stamp or reroute.
+
+  - id: R1_maintenance_liveness_update
+    when: "header_present(IPv4) and IP.proto == maintenance_proto"
+    given: {match: "liveness by next_hop_id of IP.dst"}
+    then:
+      - "set(liveness[next_hop_of(IP.dst)] = down) on a maintenance/down marker"
+      - "consume(pkt)"
+    notes: a maintenance packet addressed to a next hop toggles that next hop's liveness and is consumed (not forwarded).
+
+  - id: R2_route_lookup
+    when: "header_present(IPv4) and IP.proto != maintenance_proto"
+    given: {match: "fib LPM on IP.dst"}
+    then: ["drop(pkt) if no LPM match or IP.ttl == 0"]
+    notes: the LPM lookup names the PRIMARY egress and the pre-installed backup egress; no route / ttl==0 drops.
+
+  - id: R3_frr_demux
+    when: "matched a route in R2"
+    given: {match: "liveness of the primary next hop"}
+    then:
+      - "egress = primary_port if liveness[primary] == up"
+      - "egress = backup_port if liveness[primary] == down and reroute_policy == backup_on_down"
+      - "drop(pkt) if liveness[primary] == down and reroute_policy == drop_on_down"
+    notes: liveness-driven demux; the SAME destination egresses primary or backup purely by the liveness bit.
+
+  - id: R4_int_stamp_forward
+    when: "an egress was chosen in R3"
+    given: {actual_egress: "the port R3 selected"}
+    then:
+      - "stamp(telemetry_field <- actual_egress)"
+      - "dec(IP.ttl, 1)"
+      - "rewrite(Ether.dst -> next_hop_mac)"
+      - "forward(pkt, actual_egress)"
+    notes: the telemetry value records the ACTUAL egress (stamp-reflects-reroute); one checksum recompute covers the stamp + TTL decrement.
+
+invariants:
+  - id: stamp_reflects_reroute
+    clause: stability
+    target: "the stamped telemetry value equals the actual egress port, including when FRR diverts to the backup"
+    notes: when the primary is down the egress AND the stamp are the backup port, never the primary.
+  - id: liveness_driven_demux
+    clause: persistence
+    target: "the egress port for a fixed destination is determined solely by the primary's liveness bit"
+    free_under: [primary_initial_state]
+    notes: a maintenance packet that marks the primary down flips the same route from primary to backup egress.
+  - id: stamp_after_demux
+    clause: stability
+    target: "the telemetry stamp is written AFTER the FRR demux selects the egress"
+  - id: compound_checksum_validity
+    clause: stability
+    target: "the IPv4 checksum is valid over the combined telemetry-stamp + TTL-decrement"
+  - id: no_loop
+    clause: no_loop
+    target: "TTL strictly decreases; ttl==0 drops"
+
+test_scaffolding:
+  G1:
+    - id: forward_primary_stamped
+      generate: "live primary: packet egresses primary_port, telemetry field stamped with primary_port, TTL-1"
+    - id: forward_backup_stamped
+      generate: "after a maintenance packet marks the primary down: same dst egresses backup_port, telemetry stamped with backup_port"
+    - id: liveness_update_consumed
+      generate: "a maintenance packet to a next hop is consumed (not forwarded) and toggles liveness"
+  G2:
+    - id: no_lpm_drop
+      generate: "a dst with no FIB route is dropped"
+    - id: ttl_one_forwards_zero
+      generate: "ttl==1 forwards with egress ttl==0; ttl==0 drops"
+    - id: liveness_isolated_per_nexthop
+      generate: "marking one next hop down does not reroute a different route whose primary is still up"
+  G3:
+    - id: stamp_matches_backup_not_primary
+      generate: "a rerouted packet's telemetry stamp is the backup port, NOT the primary the FIB names (cross-stage)"
+    - id: checksum_after_stamp_and_ttl
+      generate: "a forwarded packet has a valid IPv4 checksum over both the stamp and the TTL decrement"
+    - id: non_ipv4_drop
+      generate: "an ARP frame dropped before routing"
+  coverage_floor: {G1: 3, G2: 3, G3: 3}
+
+mutation_operators:
+  - id: flip_reroute_to_drop
+    direction: harden
+    kind: parameter
+    axis: resilience_policy
+    effect: "${reroute_policy}: backup_on_down -> drop_on_down (a down primary drops instead of rerouting; the SUT must still stamp/forward the up case)"
+    feasibility_postcondition: "${reroute_policy} in [backup_on_down, drop_on_down]"
+  - id: start_primary_down
+    direction: harden
+    kind: parameter
+    axis: liveness_default
+    effect: "${primary_initial_state}: up -> down (default reroute path; the up case must be reached via a maintenance packet that restores it)"
+    feasibility_postcondition: "${primary_initial_state} in [up, down]; a maintenance packet can set liveness up"
+  - id: rebind_maintenance_proto
+    direction: harden
+    kind: parameter
+    axis: maintenance_classification
+    effect: "${maintenance_proto}: 253 -> any 0..255 (which IP.proto is the in-band liveness-down marker; data on the old proto is now forwarded)"
+    feasibility_postcondition: "0 <= ${maintenance_proto} <= 255"
+  - id: widen_telemetry_stack
+    direction: harden
+    kind: rule
+    axis: telemetry_breadth
+    effect: "stamp both switch_id and egress (multi-field INT), not the egress alone; oracle regenerated"
+  - id: disable_frr
+    direction: ease
+    kind: parameter
+    axis: resilience_policy
+    effect: "${reroute_policy} fixed to forward-primary-always (FRR demux is a pass-through; route+stamp only)"
+  - id: static_liveness_only
+    direction: ease
+    kind: rule
+    axis: liveness_dynamics
+    effect: "replace maintenance-packet liveness updates with control-plane static liveness (no in-band toggle); oracle regenerated"
+    feasibility_postcondition: "every next hop has a pre-installed liveness state"
+
+bridging_notes: |
+  - The FIB is LPM on IP.dst; each route names a PRIMARY egress port and a
+    pre-installed BACKUP egress port plus a next-hop MAC.
+  - Liveness is a per-next-hop register defaulting to up. A maintenance packet
+    is an IPv4 packet whose proto == maintenance_proto (253) addressed to a next
+    hop; it sets that next hop's liveness to down and is CONSUMED (not
+    forwarded). It is the in-band way to drive the down state for grading.
+  - FRR demux reads the primary next hop's liveness: up -> egress primary_port;
+    down -> egress backup_port (backup_on_down) or drop (drop_on_down).
+  - The telemetry stamp writes the ACTUAL chosen egress port into the 16-bit
+    telemetry field (IP.id, observable and unit-testable) AFTER the demux. The
+    stamp therefore equals backup_port on a rerouted packet — never the primary.
+  - TTL is decremented exactly once; ttl==0 drops. One IPv4 checksum recompute
+    covers the IP.id stamp AND the TTL decrement.
+  - The cross-stage contract is stamp-reflects-reroute: a packet diverted to the
+    backup carries the backup port in its telemetry field, proving the stamp ran
+    after — and observed — the FRR decision.

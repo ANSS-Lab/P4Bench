@@ -1,0 +1,164 @@
+# P-GREKeyTunnel — GRE (keyed) tunnel decapsulation endpoint
+#
+# TPL v1.0 task pattern. A GRE tunnel endpoint: classify
+# IP-protocol-47 packets addressed to the local tunnel IP, match the GRE Key to
+# a configured tunnel, STRIP the outer IPv4 + GRE headers, and forward the
+# exposed inner IPv4 packet. Distinct from the UDP-based VXLAN/GTP-U tunnels
+# already in the corpus (GRE is an IP-protocol tunnel, no UDP, RFC 2784/2890).
+
+pattern_id: P-GREKeyTunnel
+version: "1.0"
+nf_categories:
+  descriptive:  [D2:tunnel]
+  prescriptive: [P13:encap-decap]
+target_capability: relocate
+summary: >
+  GRE tunnel decapsulation endpoint. Packets arriving as IPv4 (protocol 47,
+  GRE) addressed to the local tunnel endpoint, whose GRE Key matches a
+  configured tunnel, are decapsulated: the outer IPv4 header and the GRE header
+  are removed and the inner IPv4 packet is forwarded out the tunnel's egress
+  port with an Ethernet rewrite. Packets to the wrong endpoint, with an unknown
+  Key, or that are not GRE are dropped. Mutation adds the encap direction,
+  sequence-number checking, and inner-TTL propagation.
+
+grounding:
+  rfcs:
+    - id: RFC2784
+      sections: ["2.1", "2.3"]
+      role: canonical_spec
+      relevance: |
+        Generic Routing Encapsulation — the GRE header (C/Reserved0/Version,
+        Protocol Type) rides directly over IPv4 as protocol 47. The Protocol
+        Type field gives the inner payload ether-type (0x0800 for IPv4). Basis
+        for the parse + decap (R2) and the deliver-inner behaviour.
+    - id: RFC2890
+      sections: ["2.1", "2.2"]
+      role: normative_behaviour
+      quote: "The Key field is intended to be used for identifying an individual traffic flow within a tunnel."
+      quote_source: "RFC 2890 §2.1 Key Field (verbatim; cached at patterns/P-GREKeyTunnel/grounding/rfc2890.txt). Grounds keying the tunnel table on the GRE Key (R2 decap-forward) and dropping unkeyed/unknown-key packets (R1)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        Key and Sequence Number Extensions to GRE — the K bit signals a 32-bit
+        Key that identifies an individual traffic flow / tunnel. Basis for
+        keying the tunnel table on the GRE Key (R2) and dropping unkeyed or
+        unknown-key packets.
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "Outer IPv4(proto 47) + GRE(key) + inner IPv4. Decap delivers the inner."
+  tunnel:                                   # the TPL `bucket` role
+    keyed_by_tuple: [gre_key]
+    attrs: {egress_port: port, next_hop_mac: address, port_mac: address}
+    notes: "A configured GRE tunnel, keyed on the 32-bit GRE Key."
+
+parameters:
+  local_vtep_ip:
+    type: ipv4
+    default: "10.200.0.1"
+    notes: "The tunnel endpoint's own IP; only packets addressed here are decapsulated."
+  tunnels:
+    type: list[tunnel_entry]
+    constraint: "each has gre_key, egress_port, MACs"
+  require_key:
+    type: bool
+    default: true
+    notes: "When true, a GRE packet without the Key bit is dropped (RFC 2890)."
+  faithfulness:
+    type: enum
+    values: [D13.0_decap_only, D13.1_encap_decap, D13.2_seq_checked]
+    default: D13.0_decap_only
+
+rules:
+  - id: R0_not_gre_to_vtep_drop
+    when: "¬(header_present(ipv4) ∧ hdr.ipv4.proto == 47 ∧ hdr.ipv4.dst == ${local_vtep_ip})"
+    then: [drop]
+    notes: "Only IPv4/GRE packets addressed to the local endpoint are processed."
+  - id: R1_unkeyed_or_unknown_key_drop
+    when: "is_gre_to_vtep ∧ (¬gre.key_present ∨ ¬exists(tunnel, by_key(gre.key)))"
+    then: [drop]
+    notes: "Drop GRE packets with no Key (when require_key) or an unconfigured Key."
+  - id: R2_decap_forward
+    when: "is_gre_to_vtep ∧ exists(tunnel, by_key(gre.key))"
+    given:
+      tunnel: by_key(gre.key, ${tunnels})
+    then:
+      - "set(hdr.ipv4.valid, false)"
+      - "set(hdr.gre.valid, false)"
+      - set(hdr.ethernet.src, tunnel.port_mac)
+      - set(hdr.ethernet.dst, tunnel.next_hop_mac)
+      - "forward(tunnel.egress_port)"
+    notes: |
+      Decapsulate: invalidate the outer IPv4 and GRE headers so the deparser
+      does not re-emit them (`set(hdr.ipv4.valid, false)` /
+      `set(hdr.gre.valid, false)` — the TPL `set`-the-validity-flag idiom for
+      header removal), exposing the inner IPv4 packet, then forward it out the
+      tunnel's egress port with the L2 rewrite. The INNER packet (its addresses
+      and TTL) is delivered unchanged — this is a decap-and-deliver endpoint,
+      not a routing hop.
+
+invariants:
+  - id: outer_stripped
+    clause: stability
+    target: delivered_packet
+    while: "rule R2 fires"
+    notes: "The delivered packet is the inner IPv4 packet (outer IPv4+GRE removed)."
+  - id: inner_preserved
+    clause: persistence
+    target: "(inner.ipv4.src, inner.ipv4.dst, inner.ipv4.ttl)"
+    while: "rule R2 fires"
+    notes: "Decap does not modify the inner IPv4 addresses or TTL."
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ rule R2 fires"
+    notes: "Egress Ether.src ← egress port MAC; Ether.dst ← next-hop MAC."
+
+test_scaffolding:
+  G1:
+    - id: decap_basic
+      generate: "IP(proto47,dst=VTEP)/GRE(key=K)/inner IP → strip outer+GRE, forward inner out the tunnel port."
+    - id: decap_distinct_key
+      generate: "A second tunnel Key → a different egress port."
+    - id: decap_preserves_inner
+      generate: "Assert the inner src/dst/ttl survive decap unchanged."
+  G2:
+    - id: drop_unknown_key
+      generate: "GRE Key not in the tunnel table → drop."
+    - id: drop_wrong_vtep
+      generate: "Outer dst ≠ local endpoint → drop."
+  G3:
+    - id: drop_non_gre
+      generate: "IPv4 to the endpoint but protocol ≠ 47 → drop."
+    - id: drop_non_ipv4
+      generate: "ARP / non-IPv4 → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_encap_direction
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} == D13.0_decap_only"
+    effect: "${faithfulness} ← D13.1_encap_decap (classify inner → push outer IPv4+GRE with the tunnel Key)"
+    d_axis_delta: {D2: +1, test_rigor: +1}
+  - id: enable_seq_checking
+    axis: strictness
+    direction: harden
+    applicable_when: "${faithfulness} != D13.2_seq_checked"
+    effect: "${faithfulness} ← D13.2_seq_checked (drop out-of-window sequence numbers, RFC 2890)"
+    d_axis_delta: {D7: +1, test_rigor: +1}
+
+bridging_notes: |
+  Canonical (decap-only) implementation:
+    - Parser: Ether/IPv4; if ipv4.protocol==47 parse GRE; if GRE flags indicate
+      a Key, parse the 32-bit Key; then parse the inner IPv4.
+    - Gate: ipv4.dst == local_vtep_ip && ipv4.protocol==47 && gre key present.
+    - tunnel table keyed on the GRE Key → action decap(port, port_mac,
+      next_hop_mac): set the outer IPv4 and GRE headers invalid (so the
+      deparser does not re-emit them), Ether rewrite, egress. The inner IPv4
+      becomes the head of the emitted packet.
+  Anti-patterns:
+    * Re-emitting the outer IPv4 / GRE headers (failing to setInvalid them).
+    * Decrementing the inner TTL (this is decap-and-deliver, not a routing hop).
+    * Keying on the outer src instead of the GRE Key.

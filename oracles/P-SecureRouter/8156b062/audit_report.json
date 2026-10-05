@@ -1,0 +1,97 @@
+{
+  "oracle_hash": "bfcf7b7b1075fcfa9e51eddb71c678fb218f79ea9f5c0a0fb9c9ac833f002b67",
+  "instance": "secure_router_anchor-default",
+  "ran_at": "2026-05-30T00:04:28.400687Z",
+  "canonical_examples": {
+    "passed": 6,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "acl_deny_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "outbound_nat_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "inbound_denat_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "unsolicited_inbound_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "deny_leaves_no_state",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "acl_precedes_nat": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "reverse_mapping_consistency": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "post_nat_routing": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "compound_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "acl_precedes_nat",
+      "reverse_mapping_consistency",
+      "post_nat_routing",
+      "compound_checksum_validity",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Jeyakumar et al., Millions of Little Minions (NAT/ACL pipelining), SIGCOMM 2014",
+      "RFC3022",
+      "RFC1812",
+      "RFC3198"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

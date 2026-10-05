@@ -1,0 +1,84 @@
+{
+  "oracle_hash": "705ba527cbda77dcfd1d96cb3e9545701dedafb0fe241b5ec06e255340be0d8c",
+  "instance": "l2_learning_bridge_anchor-default",
+  "ran_at": "2026-05-31T00:30:30.468462Z",
+  "canonical_examples": {
+    "passed": 8,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "unknown_unicast_floods",
+        "status": "pass"
+      },
+      {
+        "example_id": "broadcast_floods",
+        "status": "pass"
+      },
+      {
+        "example_id": "learn_then_forward_known_unicast",
+        "status": "pass"
+      },
+      {
+        "example_id": "known_unicast_not_flooded",
+        "status": "pass"
+      },
+      {
+        "example_id": "same_port_filter_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "widened_domain_floods",
+        "status": "pass"
+      },
+      {
+        "example_id": "degenerate_domain_floods_empty",
+        "status": "pass"
+      },
+      {
+        "example_id": "learn_on_move_forward_to_new_port",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "learned_unicast_to_one_port": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "flood_excludes_ingress": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "frame_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      }
+    },
+    "uncovered": [
+      "learned_unicast_to_one_port",
+      "flood_excludes_ingress"
+    ]
+  },
+  "grounding": {
+    "sources": [],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

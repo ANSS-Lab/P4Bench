@@ -1,0 +1,883 @@
+# P-StatefulFW — Stateful Zone-Based Firewall
+#
+# TPL v1.0 task pattern. Instances are produced by binding the
+# parameters below.
+
+pattern_id: P-StatefulFW
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking, D7:security]   # stateful firewall straddles flow-tracking and security (schema doc example)
+  prescriptive: [P3:flow-tracking]                          # mechanism is per-flow connection state + eviction; policy gate sits on top
+target_capability: scale_up                          # must agree with the prescriptive entries' target_capability column (P3 → scale_up)
+summary: >
+  Zone-based packet-filtering firewall that enforces a default-deny policy
+  on the untrusted side, optionally admits return traffic for flows
+  established from the trusted side, and at higher faithfulness levels
+  validates that admitted TCP flows follow the standard handshake
+  state machine.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: tea_sigcomm20
+      role: canonical_implementation
+      quote: "Programmable switches have been touted as an attractive alternative for deploying network functions (NFs) such as network address translators (NATs), load balancers, and firewalls."
+      quote_source: "TEA abstract (verbatim; cached at patterns/P-StatefulFW/grounding/tea_sigcomm20.txt). Grounds the firewall/connection-tracker as the canonical state-intensive NF and the 5-tuple → flow-state schema adopted at Tier-2+."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        TEA names the connection-tracker / stateful-firewall NF as the
+        canonical state-intensive workload that motivates external-memory
+        offload, and it ships a P4 connection-tracking implementation
+        (5-tuple key → flow-state attrs, RDMA fallback for the long tail).
+        Its key/attrs schema (5-tuple → {established, last_seen}) is the
+        terminology this pattern adopts for the `flow_state` entity at
+        Tier-2+.
+
+    - cite: ribosome_nsdi23
+      role: scaling_approach
+      quote: "In this work, we present RIBOSOME, a system that extends programmable switches with external memory (to store packets) and external general-purpose packet processing devices such as CPUs or FPGAs (to perform stateful operations)."
+      quote_source: "RIBOSOME abstract (verbatim; cached at patterns/P-StatefulFW/grounding/ribosome_nsdi23.txt). Grounds Tier-3 fast-path-on-switch + slow-path-on-host partition when ${state_capacity} exceeds on-chip SRAM."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        RIBOSOME generalises stateful packet processing on Tbps switches
+        and explicitly targets connection-trackers / stateful firewalls
+        as a representative workload. Informs Tier-3 instances where
+        ${state_capacity} exceeds on-chip SRAM and faithfulness lifts to
+        D5.2_partition (fast-path on switch + slow-path on host).
+
+    - cite: mantis_sigcomm20
+      role: optimisation
+      quote: "In this paper, we present Mantis, a framework for implementing fine-grained reactive behavior on today's programmable switches with the help of a specialized reactive control plane architecture."
+      quote_source: "Mantis abstract (verbatim; cached at patterns/P-StatefulFW/grounding/mantis_sigcomm20.txt). Grounds the compose_with_rate_limiter operator and the SYN-flood adversarial test (sub-RTT reactive enforcement)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        Mantis demonstrates sub-RTT reactive policy enforcement
+        (DoS / SYN-flood mitigation, table rewrites every 10s of µs)
+        from a switch-local control loop. Informs the
+        `compose_with_rate_limiter` mutation operator and the SYN-flood
+        adversarial test in G3 — where state-table exhaustion is the
+        attack surface this pattern must survive.
+
+  rfcs:
+    - id: RFC2979
+      sections: ["3", "4"]
+      role: canonical_spec
+      quote: >-
+        The introduction of a firewall and any associated tunneling or
+        access negotiation facilities MUST NOT cause unintended failures
+        of legitimate and standards-compliant usage that would work were
+        the firewall not present.
+      quote_source: "RFC 2979 §3 Firewall Requirements (verbatim; cached at patterns/P-StatefulFW/grounding/RFC2979.txt). The transparency rule grounds the transparent-firewall behaviour (TTL-decrement / L3-forward on permitted traffic); the cache also holds the §3 default-deny / explicit-permit framing (\"a firewall is entitled to block any sort of access that a site deems illegitimate\")."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        RFC 2979 ("Behavior of and Requirements for Internet Firewalls")
+        defines the stateful-inspection model this pattern realises: a
+        firewall MUST default-deny inbound traffic and MAY dynamically
+        admit return traffic that belongs to an outbound-initiated
+        session — the "reflexive admission" rule lifted at D5.1. It also
+        codifies the directional-policy / zone-based framing
+        (trusted ↔ untrusted) and the requirement that the firewall
+        MUST be transparent (TTL-decrement / L3-forward) on permitted
+        traffic.
+
+    - id: RFC5382
+      sections: ["4", "7"]
+      role: normative_behaviour
+      quote: >-
+        If a NAT cannot determine whether the endpoints of a TCP
+        connection are active, it MAY abandon the session if it has been
+        idle for some time.  In such cases, the value of the "established
+        connection idle-timeout" MUST NOT be less than 2 hours 4 minutes.
+        The value of the "transitory connection idle-timeout" MUST NOT be
+        less than 4 minutes.
+      quote_source: "RFC 5382 REQ-5 (verbatim; cached at patterns/P-StatefulFW/grounding/RFC5382.txt). Grounds the idle_timeout_s parameter range; the cache also holds the §5 \"A TCP connection passes through three phases: partially open, established, and closing.\" sentence and the §4 SYN/SYN-ACK/ACK initiation paragraph that ground tcp_handshake_order_enforced at D5.2_tcp_state_tracking."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        RFC 5382 specifies the TCP-state-tracking semantics required at
+        Tier-3 (`faithfulness == D5.2_tcp_state_tracking`): the SYN /
+        SYN-ACK / ESTABLISHED / closing transitions a NAT or firewall
+        MUST observe, the timeouts (REQ-5: 2 h 4 min idle for
+        established, 4 min for partially-open), and the requirement that
+        out-of-order or invalid handshake sequences be dropped rather
+        than silently advanced. Provides the ground truth for the
+        `tcp_handshake_order_enforced` test in G1 and the
+        `idle_timeout_s` parameter range.
+
+  tutorials:
+    - path: tutorials/exercises/firewall
+      role: baseline_topology
+      quote: "The objective of this exercise is to write a P4 program that implements a simple stateful firewall."
+      quote_source: "p4lang/tutorials exercises/firewall README (verbatim; cached at patterns/P-StatefulFW/grounding/tutorials_firewall.txt). Grounds the canonical internal-vs-external stateful-firewall exercise the Tier-1 instantiation mirrors. NOTE: the README's topology is the 4-host pod-topology (see cache), not a 2-host/1-switch layout."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        The p4lang/tutorials firewall exercise establishes the canonical
+        2-host / 1-switch internal-vs-external topology and the convention
+        of expressing inbound permissions as a control-plane-installed
+        connection table — directly reused by the Tier-1 instantiation.
+
+  # No knowledge-base entry is attached; the grounding block above is
+  # non-empty (papers + rfcs + tutorials).
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.l4.sport
+      - hdr.l4.dport
+      - hdr.ipv4.proto
+
+  acl_rule:
+    keyed_by: flow
+    attrs:
+      verdict: enum   # permit | drop
+    capacity: unbounded
+    eviction: none
+    notes: |
+      Static control-plane-installed 5-tuple ACL. At Tier-1 this is the
+      only state the data plane consults for inbound packets; at Tier-2+
+      it is consulted *before* `flow_state` and provides the explicit-
+      permit path that survives state-table eviction.
+
+  flow_state:
+    keyed_by: flow
+    attrs:
+      established:  bool
+      last_seen:    timestamp
+      tcp_state:    enum   # NEW | SYN_SENT | SYN_RECV | ESTABLISHED | CLOSING
+    capacity: ${state_capacity}
+    eviction: ${eviction_policy}
+    decay:    ${idle_timeout_s}
+    notes: |
+      Reflexive flow-state table. Only relevant when
+      ${faithfulness} ≥ D5.1_reflexive. At D5.1 only `established` and
+      `last_seen` are tracked; at D5.2 the `tcp_state` machine is also
+      enforced.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  internal_subnet:
+    type: address
+    constraint: ipv4_cidr
+
+  external_subnet:
+    type: address
+    constraint: ipv4_cidr
+    default: "0.0.0.0/0"
+
+  default_policy:
+    type: enum
+    values: [permit_out_deny_in, deny_all]
+    default: permit_out_deny_in
+
+  acl_rules:
+    type: list[function]
+    constraint: "every entry is a 5-tuple → {permit, drop} mapping"
+    default: []
+
+  state_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO, LRU, timeout]
+    default: none
+
+  idle_timeout_s:
+    type: int
+    range: "[30, 7440]"
+    default: 300
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_stateless_acl       # Tier-1 — twin baseline
+      - D5.1_reflexive           # Tier-2 — admit return traffic
+      - D5.2_tcp_state_tracking  # Tier-3 — enforce TCP handshake
+    default: D5.0_stateless_acl
+
+  reflexive_strict:
+    type: bool
+    default: false
+    notes: |
+      Implementation-hint axis. When true, the spec demands that reflexive
+      admission survive specific churn events (idle eviction with
+      live-flow refresh, state-table near-overflow); when false, only
+      the basic admit-return-traffic property is checked. Mirrors
+      P-StatefulLB's `persistence_strict`.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# Order matters: first matching `when` fires.
+
+rules:
+
+  - id: R1_non_ipv4_drop
+    when: |
+      ¬header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Non-IPv4 traffic is dropped unconditionally on both zones. ARP
+      / IPv6 / LLDP — all dropped. This is the G3 anchor that catches
+      the parser-edge cases in the twin task's `non_ipv4_drop` test.
+
+  - id: R8_ttl_too_low_drop
+    when: |
+      header_present(ipv4) ∧ value(hdr.ipv4.ttl, ≤, 1)
+    then:
+      - drop
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3 hardening: any IPv4 packet whose ingress TTL is ≤ 1 is
+      dropped *before* any forwarding step. Without this, the firewall
+      would decrement TTL to 0 and emit a packet a downstream router
+      would just drop — wasting the firewall's egress and breaking
+      the principle that the firewall should not produce malformed
+      packets. Forces the implementation to add a `hdr.ipv4.ttl > 1` guard
+      before LPM lookup at Tier-3.
+
+  - id: R9_fragment_drop
+    when: |
+      header_present(ipv4) ∧
+      (value(hdr.ipv4.flags.MF, ==, 1) ∨ value(hdr.ipv4.fragOffset, ≠, 0))
+    then:
+      - drop
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3 hardening: all IPv4 fragments are dropped. The firewall
+      cannot reliably inspect L4 headers on fragments (the L4 header
+      is only present on the first fragment, not subsequent ones), so
+      admitting fragments would let an attacker bypass the ACL by
+      fragmenting their TCP payload. Standard secure-firewall
+      practice; the implementation must check both the More-Fragments flag
+      and the fragmentOffset field.
+
+  - id: R7_outbound_urpf_drop
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      ¬match(hdr.ipv4.src, ${internal_subnet})
+    then:
+      - drop
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3 hardening: anti-spoofing on the trusted side. An IPv4
+      packet ingressing on the internal-zone port whose source address
+      is NOT within ${internal_subnet} is dropped unconditionally
+      (RFC 3704 / BCP 84 — strict reverse-path forwarding). Without
+      this, an attacker who has compromised a host on the internal
+      zone could spoof external addresses and bypass downstream
+      anti-spoofing controls. Logically fires before R2; declared
+      after R2 in the rule list because R2's `when:` already filters
+      on `match(src, internal_subnet)` so a spoofed packet cannot
+      match R2 — falling through to R7 is sufficient. The implementation,
+      however, must add an explicit srcAddr-vs-internal-subnet check
+      to *drop* (not just skip the LPM forwarding step).
+
+  - id: R2_outbound_forward
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      match(hdr.ipv4.src, ${internal_subnet})
+    given:
+      flow: deduce_from_packet
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      Outbound IPv4 is unconditionally permitted under
+      `permit_out_deny_in`. The L3-forward step (TTL decrement,
+      Ethernet-MAC rewrite via the next-hop table) is mandated by
+      RFC 2979 §4 (transparent firewall behaviour).
+
+  - id: R3_outbound_install_state
+    when: |
+      ingress(internal) ∧ header_present(ipv4) ∧
+      (header_present(tcp) ∨ header_present(udp)) ∧
+      ${faithfulness} ≥ D5.1_reflexive
+    given:
+      flow:       deduce_from_packet
+      flow_state: by_key(flow)
+    then:
+      - "bind(flow_state, flow.key, {established: true, last_seen: now(), tcp_state: NEW})"
+    enforced_when: "${faithfulness} ≥ D5.1_reflexive"
+    notes: |
+      Outbound TCP / UDP installs (or refreshes) a `flow_state` entry
+      keyed by the *outbound* 5-tuple. The reverse 5-tuple of an
+      inbound packet matches this entry under R5. This rule fires *in
+      addition to* R2's forward; the `then:` block executes after
+      R2's bindings (rule order is significant, but R3 is gated by
+      `enforced_when` so it is silently dropped at Tier-1).
+
+  - id: R4_inbound_acl_permit
+    when: |
+      ingress(external) ∧ header_present(ipv4) ∧
+      exists(acl_rule, flow.key) ∧
+      value(acl_rule[flow.key].verdict, ==, permit)
+    given:
+      flow: deduce_from_packet
+    then:
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    notes: |
+      Inbound packet matches an *explicit-permit* 5-tuple ACL entry.
+      This is the Tier-1 admission path and the twin task's
+      `connection_table` semantics. At Tier-2+ it remains the
+      explicit-permit override that survives state-table eviction.
+
+  - id: R5_inbound_reflexive_admit
+    when: |
+      ingress(external) ∧ header_present(ipv4) ∧
+      ${faithfulness} ≥ D5.1_reflexive ∧
+      exists(flow_state, reverse_5tuple(flow).key) ∧
+      value(flow_state[reverse_5tuple(flow).key].established, ==, true) ∧
+      (¬header_present(tcp) ∨ ${faithfulness} == D5.1_reflexive ∨
+       valid_tcp_transition(flow_state[reverse_5tuple(flow).key].tcp_state, hdr.tcp.flags))
+    given:
+      flow:       deduce_from_packet
+      flow_state: by_key(reverse_5tuple(flow))
+    then:
+      - "bind(flow_state, reverse_5tuple(flow).key, {last_seen: now()})"
+      - transition(flow_state[reverse_5tuple(flow).key], next_tcp_state(hdr.tcp.flags))
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(lookup_egress(hdr.ipv4.dst))
+    enforced_when: "${faithfulness} ≥ D5.1_reflexive"
+    notes: |
+      Reflexive admission: an inbound packet whose *reverse* 5-tuple
+      matches an established outbound flow is admitted. At
+      D5.2_tcp_state_tracking the predicate `valid_tcp_transition`
+      additionally requires the TCP flags to advance the state machine
+      legally (e.g., SYN-ACK only legal in SYN_SENT). Out-of-order
+      handshake → R6 (drop).
+
+  - id: R6_inbound_default_deny
+    when: |
+      ingress(external) ∧ header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Default-deny for inbound IPv4 that did not match an explicit ACL
+      permit (R4) and (Tier-2+) is not part of an established flow
+      (R5). Includes inbound TCP with no matching connection, inbound
+      UDP / ICMP without permit, and Tier-3 invalid TCP-handshake
+      transitions. RFC 2979 §3 mandates this default.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: default_deny_external
+    clause: stability
+    target: forward_decision
+    while: "ingress(external) ∧ ¬exists(acl_rule, flow.key) ∧ ¬reflexive_admit_applies(flow)"
+    free_under: []
+    enforced_when: "${default_policy} == permit_out_deny_in"
+    notes: |
+      The forward decision for any inbound packet without an explicit
+      permit (R4) and without a reflexive-admit match (R5) is drop —
+      stable across all rule orderings and state-table contents. This
+      is the master security invariant; G3 tests anchor on it.
+
+  - id: state_consistency_under_eviction
+    clause: stability
+    target: forward_decision
+    while: "ingress(external) ∧ flow.key was evicted from flow_state"
+    free_under: ["evict(flow_state, _)"]
+    enforced_when: "${faithfulness} ≥ D5.1_reflexive ∧ ${eviction_policy} ≠ none"
+    notes: |
+      Once an outbound flow's state has been evicted (capacity
+      pressure or idle-timeout), inbound packets keyed on its reverse
+      5-tuple MUST NOT be admitted by R5 — they fall through to the
+      default-deny R6. Without this, the eviction policy creates a
+      stale-permit window that adversaries can exploit.
+
+  - id: no_orphan_flow_state
+    clause: no_orphan
+    target: flow_state
+    enforced_when: "${state_capacity} ≠ unbounded ∧ ${faithfulness} ≥ D5.1_reflexive"
+    notes: |
+      Every `bind(flow_state, ...)` is eventually followed by an
+      `evict(...)` — either via capacity pressure under
+      ${eviction_policy} or via `decay: ${idle_timeout_s}`. Otherwise
+      the table fills and new flows are blackholed.
+
+  - id: no_loop
+    clause: no_loop
+    target: forward_decision
+    notes: |
+      A permitted packet egresses on a definite port; no packet
+      recirculates indefinitely. Standard.
+
+  - id: bounded_latency
+    clause: bounded_latency
+    target: packet
+    while: "header_present(ipv4)"
+    enforced_when: "true"
+    notes: |
+      Per-packet latency (parsing → match-action → deparsing) is
+      bounded by the pipeline depth. Forwarded packets must egress
+      within a deterministic number of stages.
+
+  - id: no_spoofed_outbound
+    clause: stability
+    target: forward_decision
+    while: "ingress(internal) ∧ ¬match(hdr.ipv4.src, ${internal_subnet})"
+    free_under: []
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: any IPv4 packet on the internal-zone port whose source
+      address falls outside ${internal_subnet} is dropped, regardless
+      of dstAddr or whether a matching reflexive entry exists. The
+      anti-spoofing decision is independent of forwarding state.
+
+  - id: no_zero_ttl_emission
+    clause: stability
+    target: forward_decision
+    while: "header_present(ipv4) ∧ value(hdr.ipv4.ttl, ≤, 1)"
+    free_under: []
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: a packet that would egress with TTL=0 after the
+      firewall's mandatory TTL decrement is dropped at ingress
+      instead. The firewall MUST NOT emit a TTL=0 packet onto the
+      wire.
+
+  - id: no_fragment_inspection
+    clause: stability
+    target: forward_decision
+    while: "header_present(ipv4) ∧ (value(hdr.ipv4.flags.MF, ==, 1) ∨ value(hdr.ipv4.fragOffset, ≠, 0))"
+    free_under: []
+    enforced_when: "${faithfulness} == D5.2_tcp_state_tracking"
+    notes: |
+      Tier-3: any fragmented IPv4 packet is dropped without consulting
+      the ACL or the reflexive table. Prevents fragmentation-based
+      ACL evasion (an attacker fragmenting their TCP header across
+      packets to hide ports from the firewall).
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Per-test format
+# conventions: TTL=64 warm-ups, TTL=1 test packet for stateful tests, etc.
+
+test_scaffolding:
+
+  G1:
+    - id: outbound_permit_forward
+      generate: |
+        Send a TCP SYN from a host in ${internal_subnet} to a host in
+        ${external_subnet} (TTL=64). Assert: behavior=forward,
+        output_port=external, IP.ttl decremented by 1, Ethernet
+        src/dst rewritten to the next-hop MACs.
+
+    - id: inbound_acl_permit_forward
+      generate: |
+        Pre-install an `acl_rule` permitting the inbound 5-tuple
+        (ext_ip, int_ip, ext_port, int_port, TCP). Send a TCP packet
+        on the external port matching that 5-tuple (TTL=64). Assert:
+        behavior=forward, output_port=internal, TTL decremented by 1.
+
+    - id: reflexive_return_admitted
+      requires: "${faithfulness} >= D5.1_reflexive"
+      generate: |
+        Warm-up: send TCP SYN from internal (TTL=64) — installs
+        flow_state for the outbound 5-tuple. Test packet: send TCP
+        SYN-ACK on external whose reverse-5-tuple matches the
+        warm-up's outbound 5-tuple (TTL=1). Assert: behavior=forward,
+        output_port=internal, TTL decremented.
+
+    - id: tcp_handshake_order_enforced
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Warm-up SYN outbound (TTL=64). Send inbound ACK (NOT SYN-ACK —
+        skipping a handshake step, TTL=1). Assert: behavior=drop —
+        the flow_state is in SYN_SENT, ACK is not a legal next
+        transition.
+
+  G2:
+    - id: state_capacity_eviction
+      requires: "${state_capacity} != unbounded ∧ ${eviction_policy} != none ∧ ${faithfulness} >= D5.1_reflexive"
+      generate: |
+        Warm-up: open ${state_capacity} + 1 distinct outbound flows
+        (TTL=64). Send a return packet for the oldest warm-up flow
+        (TTL=1). Under ${eviction_policy}=FIFO or LRU, the oldest
+        flow's state was evicted; the inbound return packet has no
+        matching flow_state and no acl_rule, so behavior=drop.
+        Anchors invariant `state_consistency_under_eviction`.
+
+    - id: capacity_boundary_no_eviction
+      requires: "${state_capacity} != unbounded ∧ ${faithfulness} >= D5.1_reflexive"
+      generate: |
+        Warm-up: open exactly ${state_capacity} distinct outbound
+        flows (TTL=64). Send a return packet for any one of them
+        (TTL=1). Assert behavior=forward — at capacity with no
+        overflow no eviction has occurred.
+
+    - id: idle_timeout_eviction
+      requires: "${eviction_policy} == timeout ∧ ${faithfulness} >= D5.1_reflexive"
+      generate: |
+        Warm-up: open one outbound flow (TTL=64). Wait
+        > ${idle_timeout_s}. Send the inbound return packet (TTL=1).
+        Assert behavior=drop — the flow_state was decayed by idle
+        timeout. (Materialisation may simulate the wait by emitting
+        ${idle_timeout_s}+1 second-spaced empty ticks per the
+        test-case generation guide.)
+
+  G3:
+    - id: outbound_urpf_spoofed_drop
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an outbound TCP packet from the internal port whose
+        srcIP is OUTSIDE ${internal_subnet} (e.g., src=10.0.99.99,
+        dst=10.0.2.2, sport=2000, dport=80, TTL=64). Assert
+        behavior=drop — R7_outbound_urpf_drop fires before R2.
+        Anchors invariant `no_spoofed_outbound`.
+
+    - id: outbound_ttl_one_dropped_at_d52
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an outbound TCP packet with TTL=1 (TTL=1 is exactly
+        the threshold: post-decrement would be TTL=0). Assert
+        behavior=drop — R8_ttl_too_low_drop fires. Distinguishes
+        Tier-3 from Tier-1/Tier-2, where the same packet is
+        forwarded with TTL=0.
+
+    - id: outbound_ttl_two_decrements_to_one
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an outbound TCP packet with TTL=2. Assert
+        behavior=forward, output_port=external, IP.ttl decremented
+        to 1. Boundary check: TTL > 1 must still forward; only
+        TTL ≤ 1 drops.
+
+    - id: inbound_fragment_offset_drop
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an inbound IPv4 packet whose fragmentOffset is non-zero
+        (a continuation fragment). The 4-tuple may match a permitted
+        ACL entry — irrelevant. Assert behavior=drop — R9_fragment_drop
+        fires before R4. Anchors invariant `no_fragment_inspection`.
+
+    - id: inbound_fragment_mf_flag_drop
+      requires: "${faithfulness} == D5.2_tcp_state_tracking"
+      generate: |
+        Send an inbound IPv4 packet with the More-Fragments flag set
+        (MF=1, fragOffset=0). Assert behavior=drop — R9 fires on the
+        MF flag independently of fragmentOffset.
+
+    - id: inbound_no_permit_drop
+      generate: |
+        Send an inbound TCP packet whose 5-tuple matches no
+        `acl_rule` and (Tier-2+) no established flow_state. Assert
+        behavior=drop. Anchors invariant `default_deny_external`.
+
+    - id: non_ipv4_drop
+      generate: |
+        Send an ARP request from either zone. Assert behavior=drop
+        (R1 catches non-IPv4 unconditionally).
+
+    - id: inbound_wrong_srcport_drop
+      generate: |
+        Pre-install an acl_rule permitting (ext_ip, int_ip, 80,
+        1000, TCP). Send an inbound TCP packet with the *wrong*
+        srcPort (e.g., 9999). Assert behavior=drop — exact-match
+        ACL must reject any 5-tuple variation.
+
+    - id: syn_flood_resilience
+      requires: "${faithfulness} >= D5.1_reflexive ∧ ${state_capacity} != unbounded"
+      generate: |
+        Send 2 × ${state_capacity} inbound TCP SYNs with distinct
+        random 5-tuples on the external port (no warm-up, no
+        matching ACL). Assert: every test packet is dropped, AND a
+        legitimate concurrently-warmed reflexive flow continues to
+        be admitted on its return packet (i.e., adversarial inbound
+        SYNs MUST NOT install state and MUST NOT evict legitimate
+        outbound-initiated state). G3 / D6 anchor.
+
+  coverage_floor:
+    G1: 2
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: enable_reflexive_admission
+    axis: feature-breadth
+    applicable_when: "${faithfulness} == D5.0_stateless_acl"
+    effect: "${faithfulness} ← D5.1_reflexive"
+    d_axis_delta: {D5: +1, D2: +1}
+    feasibility_postcondition: "${state_capacity} == unbounded ∨ ${state_capacity} ≥ 256"
+    notes: |
+      Lifts the spec from a static 5-tuple ACL to a stateful inspection
+      firewall (RFC 2979 reflexive admission). Tier-1 → Tier-2. Adds
+      the `flow_state` entity to the data-plane implementation and turns the
+      G2 capacity / eviction tests on.
+
+  - id: enable_tcp_state_tracking
+    axis: feature-breadth
+    applicable_when: "${faithfulness} == D5.1_reflexive"
+    effect: "${faithfulness} ← D5.2_tcp_state_tracking"
+    d_axis_delta: {D5: +2, D3: +1}
+    feasibility_postcondition: "${state_capacity} == unbounded ∨ ${state_capacity} ≥ 1024"
+    notes: |
+      Tier-2 → Tier-3. Demands the implementation realise a TCP-state-machine
+      transition table (NEW → SYN_SENT → SYN_RECV → ESTABLISHED), with
+      out-of-order or invalid-flag transitions dropped (RFC 5382).
+      Substantially harder in P4 (per-flow state machine inside a
+      single register entry).
+
+  - id: shrink_state_capacity_4x
+    axis: capacity
+    applicable_when: "${state_capacity} ≠ unbounded ∧ ${state_capacity} > 256 ∧ ${faithfulness} ≥ D5.1_reflexive"
+    effect: "${state_capacity} ← ${state_capacity} / 4"
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${state_capacity} ≥ 64"
+    notes: |
+      Tighten the state-capacity axis. Forces the implementation to engage the
+      eviction policy under realistic flow counts. At 256 → 64 the
+      working set won't fit; below 64 inbound return traffic for
+      legitimate outbound flows will be denied.
+
+  - id: swap_eviction_to_LRU
+    axis: strictness
+    applicable_when: "${eviction_policy} ≠ LRU ∧ ${state_capacity} ≠ unbounded ∧ ${faithfulness} ≥ D5.1_reflexive"
+    effect: "${eviction_policy} ← LRU"
+    d_axis_delta: {D5: +1, D2: +1}
+    notes: |
+      LRU requires per-flow recency tracking — substantially harder
+      than FIFO in P4 (no native timestamp arithmetic on registers).
+      Common implementation: approximate LRU via second-chance / aging
+      counters. Mirrors the same operator on P-StatefulLB.
+
+  - id: enable_idle_timeout
+    axis: strictness
+    applicable_when: "${eviction_policy} ≠ timeout ∧ ${faithfulness} ≥ D5.1_reflexive"
+    effect: "${eviction_policy} ← timeout"
+    d_axis_delta: {D3: +1, D5: +1}
+    feasibility_postcondition: "${idle_timeout_s} ≥ 30"
+    notes: |
+      Switch from capacity-driven eviction to time-driven eviction
+      (RFC 5382 §4 idle-timeout semantics). Adds a temporal predicate
+      to the implementation: the data plane must compare per-flow last_seen
+      against the current ingress timestamp.
+
+  - id: add_syn_flood_test
+    axis: hidden-coverage
+    applicable_when: "'syn_flood_resilience' ∉ test_scaffolding.G3 ∧ ${faithfulness} ≥ D5.1_reflexive"
+    effect: |
+      Add G3 test `syn_flood_resilience`: 2 × ${state_capacity}
+      adversarial inbound SYNs with distinct 5-tuples concurrent
+      with one legitimate outbound-initiated flow. Assert the
+      legitimate flow's return packet is admitted while every
+      adversarial SYN is dropped without consuming state slots
+      that belong to legitimate flows.
+    d_axis_delta: {D6: +1, test_rigor: +1}
+    notes: |
+      Mantis-style adversarial workload. Drives the implementation toward a
+      "outbound-only state install" implementation (R3 only fires
+      from the internal port, never from R5), otherwise the
+      adversarial SYNs evict legitimate state.
+
+  - id: enable_reflexive_strict
+    axis: strictness
+    applicable_when: "${reflexive_strict} == false ∧ ${faithfulness} ≥ D5.1_reflexive"
+    effect: "${reflexive_strict} ← true"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "${eviction_policy} ≠ none"
+    notes: |
+      Tightens reflexive admission: spec demands the implementation
+      survive idle-eviction with live-flow refresh and state-table
+      near-overflow. Adds churn-style G1 tests at instantiation.
+
+  - id: compose_with_rate_limiter
+    axis: algebra-breadth
+    applicable_when: "true"
+    effect: |
+      Compose this pattern with a per-source-IP rate limiter
+      (token-bucket meter) on the external ingress: inbound traffic
+      that passes the firewall MUST also pass the rate limiter
+      before forwarding. Adds a `rate_exceeds(meter, threshold)`
+      precondition to R4 / R5.
+    d_axis_delta: {D4: +1, D6: +1}
+    notes: |
+      Pattern-augmenting, not seed-rebinding — composes
+      P-StatefulFW with an implicit P-RateLimiter. Re-validation of
+      the reference template is required after applying this
+      operator. Inspired by Mantis / Poseidon's DDoS-mitigation
+      composition.
+
+  - id: inject_zipfian_attack_workload
+    axis: workload
+    applicable_when: "${faithfulness} ≥ D5.1_reflexive"
+    effect: |
+      Replace the G3 adversarial workload with a Zipfian (α=1.0)
+      distribution of inbound source IPs — the top 20% of source
+      IPs send 80% of the inbound traffic, simulating realistic
+      reflection-attack patterns. Assert per-source-IP fairness in
+      drop decisions: legitimate outbound-initiated flows from
+      within the heavy-tail subset still admit return traffic.
+    d_axis_delta: {D6: +1, test_rigor: +1}
+    notes: |
+      Workload-skew operator analogous to P-StatefulLB's
+      `inject_zipfian_workload`. Tests state-table behaviour under
+      realistic adversarial distributions rather than uniform random.
+
+  - id: noisify_spec_low
+    axis: input-form
+    applicable_when: "true"
+    effect: |
+      Rewrite task.yaml::description by injecting low-intensity presentation
+      noise. Inject exactly:
+        • 1 distractor clause — a statement about the deployment,
+          environment, or out-of-scope behaviour that is true (or at least
+          non-falsifiable by the test corpus) and does not bear on any
+          rule. It must read as if a real spec author wrote it.
+        • 1 irrelevant-field claim — assert that some artefact the spec
+          already names (a routing entry, an admit-list entry, the
+          operator interface, the topology) carries an additional field,
+          and state explicitly that the field plays no role in admission,
+          forwarding, or the in-scope-past-packets relation.
+      Hard constraints:
+        • Do not change the truth value of any rule (D1–D7, the in-scope-
+          past-packets bound, the forwarded-packet rewrite spec). The
+          regenerated test corpus must be byte-identical to the clean
+          baseline.
+        • The injections must reference task-specific entities (the actual
+          host names, subnets, ports, table names, section headings) and
+          match the voice and vocabulary of the surrounding prose.
+        • Place each injection in a section topically adjacent to its
+          subject — distractors near topology/environment text, irrelevant-
+          field claims near the section that introduces the artefact.
+      Post-conditions:
+        • Re-run the test generator and confirm the test count and
+          per-test expectations are unchanged.
+        • Append the verbatim text of every injection to
+          provenance.json::spec_noise.injected (list of strings, in order
+          of appearance) for audit.
+    d_axis_delta: {spec_comprehension: +1}
+    notes: |
+      Presentation-layer mutation; the seed bindings, simulator, and test
+      corpus are unchanged. Isolates spec-comprehension robustness from
+      algorithmic reasoning capability when paired with a clean baseline
+      at the same semantic config.
+
+  - id: noisify_spec_medium
+    axis: input-form
+    applicable_when: "true"
+    effect: |
+      Apply everything in noisify_spec_low, then additionally inject:
+        • 1 misleading implementation hint — a sentence or short passage,
+          framed as a "typical implementation" or "common practice" note,
+          that describes a concrete design choice (table-key shape,
+          register layout, state-install trigger, eviction strategy,
+          lookup direction, etc.) which would, if followed, produce an
+          implementation that violates at least one rule already stated in
+          the spec. The hint must be plausible — read as advice a real
+          engineer might give — and must be wrong about THIS task's
+          algorithm, not generically wrong.
+        • 1 restate-with-drift — choose one already-stated rule and add a
+          paraphrase elsewhere in the description. The paraphrase must be
+          semantically identical to the original but use different
+          vocabulary, units, or framing (e.g. an equivalent inequality, a
+          different reference frame, a different definition of the same
+          condition). The paraphrase must not be marked as a restatement.
+      Same hard constraints and post-conditions as noisify_spec_low.
+    d_axis_delta: {spec_comprehension: +2}
+    notes: |
+      Medium intensity targets: (a) ignoring decorative non-load-bearing
+      prose, (b) resisting implementation hand-holding that contradicts
+      the actual spec, (c) recognising paraphrased rules as identical to
+      their originals. The misleading hint must be task-specific — a
+      generic anti-pattern won't probe the comprehension gap.
+
+  - id: noisify_spec_high
+    axis: input-form
+    applicable_when: "true"
+    effect: |
+      Apply everything in noisify_spec_medium, then additionally inject:
+        • 1 additional restate-with-drift on a different rule than the
+          medium-level restate.
+        • 1 red-herring section — a well-formed section with its own
+          heading and declarative prose that looks normative but is
+          purely informational and non-behavioural. The section must
+          describe properties of the deployment, target operating
+          conditions, audit/telemetry, or context that does not
+          constrain packet-handling. It must not be marked as
+          informational ("note: ignore this section" disqualifies); a
+          careful reader must be able to infer its non-normativity from
+          the content alone.
+      Same hard constraints and post-conditions.
+    d_axis_delta: {spec_comprehension: +3}
+    notes: |
+      High intensity probes section-level signal-vs-noise discrimination.
+      Use sparingly: at this intensity, failures are harder to attribute
+      cleanly between comprehension friction and genuine reasoning gaps.
+      The discrimination analysis should compare (clean) vs (noisy@N)
+      head-to-head and attribute the deltas accordingly.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Tier-1 (faithfulness=D5.0_stateless_acl, state_capacity=unbounded):
+      - Single exact-match table on the inbound 5-tuple
+        (acl_rule.key) with `permit` / `drop` actions. Default
+        action = drop().
+      - L3 forwarding via a separate LPM table on hdr.ipv4.dstAddr
+        (rewrite Ether src/dst, decrement TTL, recompute checksum).
+      - Zone routing via if (ingress_port == INTERNAL_PORT) — the
+        twin task's structure exactly. No registers, no flow_state.
+
+    Tier-2 (faithfulness=D5.1_reflexive, state_capacity bounded):
+      - register<bit<W>>(N) flow_state with W ≥ 64 (last_seen +
+        established bit + spare). Index = hash(5-tuple) mod N.
+      - On outbound TCP/UDP: hash the *outbound* 5-tuple, write
+        last_seen + established=1.
+      - On inbound TCP/UDP: hash the *reverse* 5-tuple, read; if
+        established=1 and not aged-out → permit.
+      - Eviction: implicit FIFO via hash collisions (no explicit
+        evict step needed for the simplest implementation). Real LRU
+        requires aging counters incremented per pipeline tick.
+      - Implementation anti-pattern: hashing on the *forward* 5-tuple from
+        both directions — inbound packets won't match the outbound
+        install. The reverse-5-tuple computation is the load-bearing
+        symmetry trick.
+
+    Tier-3 (faithfulness=D5.2_tcp_state_tracking):
+      - flow_state register now also stores tcp_state (3 bits).
+      - Per-direction transition tables: on outbound SYN
+        → tcp_state=SYN_SENT; on inbound SYN-ACK in SYN_SENT
+        → tcp_state=SYN_RECV; on outbound ACK in SYN_RECV
+        → tcp_state=ESTABLISHED. Anything else → drop.
+      - Idle timeout via storing last_seen as a coarse timestamp
+        (1-second granularity from std.ingress_global_timestamp >>
+        20) and comparing against current ingress on read.
+      - For state_capacity > on-chip SRAM (D5.2_partition path):
+        Tiara / RIBOSOME-style hybrid — switch holds fast-path,
+        slow-path (simulator-only) holds long tail.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Installing flow_state from inbound packets (R3 firing on
+      ingress(external)) — a single inbound SYN-flood will
+      trivially evict all legitimate state and bypass the
+      firewall.
+    * Single-direction 5-tuple keying (no reverse-5-tuple
+      computation) — return traffic for established flows is
+      silently dropped.
+    * Using the static acl_rule table for return-traffic admission
+      at Tier-2+ (re-installing entries from the data plane on
+      every outbound packet) — collapses Tier-2 back to Tier-1
+      with churn and breaks `no_orphan_flow_state`.
+    * At Tier-3, advancing tcp_state on any TCP flag rather than
+      validating the legal transition — defeats the entire point
+      of state tracking and is undetectable unless the test suite
+      includes the `tcp_handshake_order_enforced` G1 case.

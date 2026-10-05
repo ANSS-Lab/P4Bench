@@ -1,0 +1,111 @@
+{
+  "oracle_hash": "047bfe9d9faeaeec137687ed901712bab87047e2143c3de97154f798e53fe47a",
+  "instance": "urpf_anchor_mut2-expand_to_feasible_path",
+  "ran_at": "2026-05-30T01:55:45.569563Z",
+  "canonical_examples": {
+    "passed": 8,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_strict_on_path_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_strict_off_path_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_unroutable_source_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_verified_no_forward_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_reverse_lpm_longest_match_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "urpf_mode_loose_off_path_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "exempt_default_route_forward",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "urpf_strict_port_match": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "urpf_loose_routability": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "drop_precedes_forward": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "lpm_longest_match_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ip_addr_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "urpf_strict_port_match",
+      "urpf_loose_routability",
+      "drop_precedes_forward",
+      "lpm_longest_match_correctness",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC 3704 (BCP 84) \u00a72.2 / \u00a72.3 / \u00a72.4",
+      "RFC2827"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

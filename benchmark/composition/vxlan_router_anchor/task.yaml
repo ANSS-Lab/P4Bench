@@ -1,0 +1,474 @@
+task_name: vxlan_router_anchor
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-VXLANRouter
+pattern_version: '1.0'
+
+seed:
+  access_port_bindings:
+    - {port: 1, access_vni: 100}
+  uplink_ports: [2, 3]
+  local_vtep_ip: "192.168.0.1"
+  vni_mac_remote_fib_entries:
+    - {vni: 100, inner_dmac: "00:00:00:00:0a:0a", remote_vtep_ip: "192.168.0.2"}
+    - {vni: 100, inner_dmac: "00:00:00:00:0b:0b", remote_vtep_ip: "172.16.9.9"}
+  vni_mac_local_fib_entries:
+    - {vni: 100, inner_dmac: "00:00:00:00:01:05", access_egress_port: 1}
+  routes:
+    - {prefix: "192.168.0.2", prefix_len: 32, port: 2,
+       port_mac: "02:00:00:00:00:02", nexthop_mac: "0a:00:00:00:00:02"}
+    - {prefix: "10.10.0.0", prefix_len: 16, port: 2,
+       port_mac: "02:00:00:00:00:02", nexthop_mac: "0a:00:00:00:00:02"}
+    - {prefix: "10.10.5.0", prefix_len: 24, port: 3,
+       port_mac: "02:00:00:00:00:03", nexthop_mac: "0a:00:00:00:00:03"}
+  outer_udp_dst_port: 4789
+  outer_udp_src_port_mode: fixed
+  outer_udp_src_port_fixed_value: 49152
+  outer_udp_checksum_mode: zero_on_tx
+  flag_strictness: lax
+  vni_isolation_strict: false
+  bum_handling: drop
+  mtu_enforcement: ignore
+  multipath_mode: none
+  martian_filter_enabled: false
+  default_action: drop
+  origination_ttl: 64
+  faithfulness: D5.0_static_encap_route
+
+description: |
+  A switch s1 is both a VXLAN tunnel endpoint (VTEP) for its own tenants
+  AND an IPv4 router for the underlay fabric it sits in. It has one tenant
+  access port (s1.p1, which faces a local virtual machine) and two underlay
+  uplink ports (s1.p2 and s1.p3, which face the routed fabric). The switch
+  has its own underlay IPv4 address — its "local VTEP address",
+  192.168.0.1.
+
+  Every tenant on the access port belongs to one tenant segment identified
+  by a 24-bit VXLAN Network Identifier (VNI). A VXLAN-encapsulated frame on
+  the wire looks like:
+
+    outer Ethernet / outer IPv4 / UDP / VXLAN / inner Ethernet / inner IPv4 / ...
+
+  where the outer UDP destination port is 4789 and the VXLAN header carries
+  the VNI (its first flags byte has bit 0x08 — the "I" flag — set to 1 to
+  mark the VNI valid).
+
+  The switch must classify every ingress frame into exactly one of the
+  cases below and act on it. Note that there are TWO IPv4 headers on an
+  encapsulated frame — an outer one (the underlay's) and an inner one (the
+  tenant's) — and they are independent: routing decisions and TTL handling
+  act on the OUTER header only; the inner frame is opaque tenant payload.
+
+  ## Frames arriving on the access port (s1.p1)
+
+  1. **Encapsulate and route.** The access port is bound to one tenant VNI.
+     Look up the inner destination MAC under that VNI in a pre-installed
+     remote-tenant table; it yields the underlay IPv4 address of the remote
+     VTEP that hosts the destination VM. Build the four outer headers
+     (Ethernet / IPv4 / UDP / VXLAN), where the outer IPv4 destination is
+     that remote VTEP address, the outer IPv4 source is this switch's local
+     VTEP address, the outer UDP destination port is 4789, and the VXLAN
+     VNI is the access port's tenant VNI. The outer IPv4 TTL is set to the
+     standard initial value 64 — the switch is ORIGINATING this datagram,
+     so it MUST NOT decrement on this step. Then route the freshly-built
+     packet by looking its outer destination up in the underlay forwarding
+     table (a longest-prefix-match IPv4 FIB): that lookup picks the egress
+     uplink port and the outer Ethernet rewrite (source MAC = the egress
+     port's MAC, destination MAC = the next-hop MAC). Forward out that port.
+
+  2. **Unknown tenant destination.** If the inner destination MAC is not in
+     the remote-tenant table for the access VNI, drop the frame.
+
+  3. **Unreachable remote VTEP.** If the remote-tenant table yields a remote
+     VTEP address that the underlay FIB has no route to, drop the frame.
+
+  ## Frames arriving on an uplink port (s1.p2 or s1.p3)
+
+  4. **Decapsulate (only frames addressed to this VTEP).** If the frame is a
+     VXLAN frame (outer UDP destination port 4789) AND its outer IPv4
+     destination equals this switch's local VTEP address (192.168.0.1),
+     then this switch is the terminating VTEP: strip the four outer headers
+     and deliver the inner frame. Look up the inner destination MAC under
+     the received VNI in a pre-installed local-delivery table to choose the
+     tenant access egress port; on a miss, drop. The inner Ethernet frame
+     and everything beneath it (including the inner IPv4 TTL) MUST be
+     delivered byte-for-byte unchanged.
+
+  5. **Transit-route (frames addressed to any other VTEP, or plain underlay
+     IPv4).** If the frame's outer IPv4 destination is NOT this switch's
+     local VTEP address, the switch is a transit router for it: forward it
+     by longest-prefix-match on its OUTER IPv4 destination, decrement the
+     OUTER IPv4 TTL by exactly one, recompute the outer IPv4 header
+     checksum, and rewrite the OUTER Ethernet (source = egress port MAC,
+     destination = next-hop MAC). A VXLAN transit frame keeps its full outer
+     stack — it is NOT decapsulated; the inner frame is untouched. If the
+     outer TTL is already 1 or 0, drop (the decrement would expire it). If
+     there is no route to the outer destination, drop.
+
+  ## Side requirements
+
+  - Non-IPv4 frames (e.g. ARP) are dropped.
+  - The two IPv4 headers (outer/underlay vs inner/tenant) are independent:
+    a transit or encapsulation step touches only the outer header; the
+    inner TTL and inner addresses are never modified.
+  - A VXLAN frame is decapsulated only when its outer destination is this
+    VTEP's own address; otherwise it is transit-routed with its outer stack
+    intact.
+  - On origination (encapsulation) the outer TTL is the initial value 64,
+    not decremented; on transit it is decremented by exactly one.
+
+  Grounding: RFC 7348 (VXLAN) for the overlay encap/decap; RFC 1812 (IPv4
+  router requirements) for the underlay longest-prefix-match forwarding,
+  TTL handling, and Ethernet rewrite.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.1.1/24", mac: "08:00:00:00:01:01", port: "s1.p1"}   # local tenant VM (VNI 100)
+  h2: {ip: "192.168.0.2/32", mac: "08:00:00:00:02:02", port: "s1.p2"}  # remote VTEP / underlay uplink
+  h3: {ip: "192.168.0.3/32", mac: "08:00:00:00:03:03", port: "s1.p3"}  # second underlay uplink
+
+test_cases:
+
+# ─── G1: functional correctness ─────────────────────────────────────────
+
+  - name: encap_then_underlay_lpm_route
+    visibility: public
+    description: |
+      Encap + underlay route. The local VM (s1.p1, VNI 100) sends an inner
+      IPv4/TCP frame to a remote VM hosted on VTEP 192.168.0.2. The switch
+      MUST wrap it in outer Ether/IPv4/UDP/VXLAN with outer dst =
+      192.168.0.2, outer src = 192.168.0.1, outer TTL = 64 (origination,
+      not decremented), VXLAN VNI = 100, and forward it out the uplink the
+      underlay FIB picks for 192.168.0.2 (s1.p2) with the outer Ethernet
+      rewritten from that next-hop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:0a:0a"}
+        - IP:    {src: "10.0.1.5", dst: "10.0.1.9", ttl: 64}
+        - TCP:   {sport: 40000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        layers[0].Ether.src:  {action: change_to, value: "02:00:00:00:00:02"}
+        layers[0].Ether.dst:  {action: change_to, value: "0a:00:00:00:00:02"}
+        layers[0].Ether.type: {action: change_to, value: 2048}
+        layers[1].IP.src:     {action: change_to, value: "192.168.0.1"}
+        layers[1].IP.dst:     {action: change_to, value: "192.168.0.2"}
+        layers[1].IP.ttl:     {action: change_to, value: 64}
+        layers[1].IP.proto:   {action: change_to, value: 17}
+        layers[2].UDP.dport:  {action: change_to, value: 4789}
+        layers[3].VXLAN.vni:  {action: change_to, value: 100}
+
+  - name: decap_only_for_local_vtep
+    visibility: public
+    description: |
+      Decap. A VXLAN frame arrives on uplink s1.p2 with outer dst =
+      192.168.0.1 (this VTEP), VNI 100, inner dst MAC = the local VM. The
+      switch MUST strip the four outer headers and deliver the bare inner
+      frame to the tenant access port s1.p1, byte-for-byte unchanged.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.2", dst: "192.168.0.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0a:0a", dst: "00:00:00:00:01:05"}
+        - IP:    {src: "10.0.1.9", dst: "10.0.1.5", ttl: 64}
+        - TCP:   {sport: 80, dport: 40000, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "00:00:00:00:0a:0a"}
+        Ether.dst: {action: change_to, value: "00:00:00:00:01:05"}
+        IP.src:    {action: change_to, value: "10.0.1.9"}
+        IP.dst:    {action: change_to, value: "10.0.1.5"}
+        IP.ttl:    {action: change_to, value: 64}
+
+  - name: transit_preserves_vxlan_and_decrements_outer_ttl
+    visibility: public
+    description: |
+      Transit. A VXLAN frame arrives on uplink s1.p2 with outer dst =
+      10.10.5.5 (NOT this VTEP). The switch MUST transit-route it on the
+      outer header: forward out s1.p3 (the /24 underlay route), decrement
+      the OUTER TTL 64→63, rewrite the outer Ethernet from the next-hop,
+      and keep the full outer VXLAN stack intact. The inner TTL (10) is
+      unchanged.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.9", dst: "10.10.5.5", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0c:0c", dst: "00:00:00:00:0d:0d"}
+        - IP:    {src: "10.0.1.20", dst: "10.0.1.21", ttl: 10}
+        - TCP:   {sport: 1234, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[0].Ether.src: {action: change_to, value: "02:00:00:00:00:03"}
+        layers[0].Ether.dst: {action: change_to, value: "0a:00:00:00:00:03"}
+        layers[1].IP.dst:    {action: change_to, value: "10.10.5.5"}
+        layers[1].IP.ttl:    {action: change_to, value: 63}
+        layers[3].VXLAN.vni: {action: change_to, value: 100}
+        layers[5].IP.ttl:    {action: change_to, value: 10}
+
+  - name: origination_outer_ttl_not_decremented
+    visibility: hidden
+    description: |
+      Origination TTL. Same encap path as encap_then_underlay_lpm_route but
+      asserts the outer TTL is EXACTLY 64 on egress (the switch originates
+      the datagram and must not decrement). Pairs with the transit case to
+      pin the origination-vs-transit TTL distinction.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:0a:0a"}
+        - IP:    {src: "10.0.1.5", dst: "10.0.1.9", ttl: 64}
+        - TCP:   {sport: 40001, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        layers[1].IP.dst: {action: change_to, value: "192.168.0.2"}
+        layers[1].IP.ttl: {action: change_to, value: 64}
+
+  - name: plain_underlay_ipv4_transit
+    visibility: hidden
+    description: |
+      Plain underlay transit. A non-VXLAN IPv4 frame arrives on uplink s1.p3
+      destined to 10.10.9.9 (matched only by the /16 route → s1.p2). The
+      switch routes it like a normal IPv4 hop: TTL 64→63, Ethernet rewrite,
+      forward out s1.p2.
+    input:
+      port: s1.p3
+      layers:
+        - Ether: {src: "0a:00:00:00:00:03", dst: "02:00:00:00:00:03"}
+        - IP:    {src: "8.8.8.8", dst: "10.10.9.9", ttl: 64}
+        - TCP:   {sport: 2222, dport: 443, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "02:00:00:00:00:02"}
+        Ether.dst: {action: change_to, value: "0a:00:00:00:00:02"}
+        IP.ttl:    {action: change_to, value: 63}
+        IP.dst:    {action: change_to, value: "10.10.9.9"}
+
+  - name: encap_all_outer_fields_set
+    visibility: hidden
+    description: |
+      Outer-header completeness check. After encap, every field of the four
+      new outer headers must carry a defined value. Asserts the full outer
+      field set plus the I flag and reserved blocks.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:0a:0a"}
+        - IP:    {src: "10.0.1.5", dst: "10.0.1.9", ttl: 64}
+        - TCP:   {sport: 40002, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        layers[0].Ether.type:      {action: change_to, value: 2048}
+        layers[1].IP.version:      {action: change_to, value: 4}
+        layers[1].IP.ihl:          {action: change_to, value: 5}
+        layers[1].IP.proto:        {action: change_to, value: 17}
+        layers[1].IP.ttl:          {action: change_to, value: 64}
+        layers[1].IP.src:          {action: change_to, value: "192.168.0.1"}
+        layers[1].IP.dst:          {action: change_to, value: "192.168.0.2"}
+        layers[2].UDP.dport:       {action: change_to, value: 4789}
+        layers[2].UDP.sport:       {action: change_to, value: 49152}
+        layers[3].VXLAN.flags:     {action: change_to, value: 8}
+        layers[3].VXLAN.vni:       {action: change_to, value: 100}
+        layers[3].VXLAN.reserved1: {action: change_to, value: 0}
+        layers[3].VXLAN.reserved2: {action: change_to, value: 0}
+
+# ─── G2: robustness / boundary ──────────────────────────────────────────
+
+  - name: encap_unknown_underlay_route_drop
+    visibility: hidden
+    description: |
+      Composite-specific: the inner dst MAC resolves to a known remote VTEP
+      (172.16.9.9) in the tenant table, but the underlay FIB has no route to
+      it. The encapsulated frame cannot be delivered — drop. Neither half
+      alone can express this failure (the standalone VTEP's static underlay
+      always resolved).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "00:00:00:00:0b:0b"}
+        - IP:    {src: "10.0.1.5", dst: "10.0.1.30", ttl: 64}
+        - TCP:   {sport: 40003, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: transit_ttl_one_drop
+    visibility: hidden
+    description: |
+      A VXLAN transit frame (outer dst 10.10.5.5, not this VTEP) arrives
+      with outer TTL = 1. The decrement would expire it, so it is dropped.
+      Distinguishes the transit path (outer TTL matters) from decap (where
+      the frame terminates and outer TTL is irrelevant).
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.9", dst: "10.10.5.5", ttl: 1, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0c:0c", dst: "00:00:00:00:0d:0d"}
+        - IP:    {src: "10.0.1.20", dst: "10.0.1.21", ttl: 10}
+        - TCP:   {sport: 1234, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: underlay_longest_prefix_priority
+    visibility: hidden
+    description: |
+      A plain underlay frame destined to 10.10.5.5 is covered by both the
+      /16 (→ s1.p2) and the /24 (→ s1.p3) underlay routes. Longest-prefix
+      match MUST pick the /24 → s1.p3. Ingress on s1.p2.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "8.8.4.4", dst: "10.10.5.5", ttl: 64}
+        - TCP:   {sport: 3333, dport: 443, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "02:00:00:00:00:03"}
+        Ether.dst: {action: change_to, value: "0a:00:00:00:00:03"}
+        IP.ttl:    {action: change_to, value: 63}
+
+  - name: decap_unknown_inner_mac_drop
+    visibility: hidden
+    description: |
+      A VXLAN frame for this VTEP (outer dst 192.168.0.1, VNI 100) carries
+      an inner dst MAC that is not in the local-delivery table. There is no
+      local VM to deliver to — drop.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.2", dst: "192.168.0.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0a:0a", dst: "00:00:00:00:99:99"}
+        - IP:    {src: "10.0.1.9", dst: "10.0.1.250", ttl: 64}
+        - TCP:   {sport: 80, dport: 40000, flags: "S"}
+    expected:
+      behavior: drop
+
+# ─── G3: security / bypass / bug-pattern ────────────────────────────────
+
+  - name: inner_ttl_untouched_on_transit
+    visibility: hidden
+    description: |
+      Inner-vs-outer TTL independence. A VXLAN transit frame (outer dst
+      10.10.5.5) with inner TTL = 7 and outer TTL = 64. The switch MUST
+      decrement only the OUTER TTL (→ 63) and leave the inner TTL = 7.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.9", dst: "10.10.5.5", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0c:0c", dst: "00:00:00:00:0d:0d"}
+        - IP:    {src: "10.0.1.20", dst: "10.0.1.21", ttl: 7}
+        - TCP:   {sport: 1234, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[1].IP.ttl: {action: change_to, value: 63}
+        layers[5].IP.ttl: {action: change_to, value: 7}
+
+  - name: decap_outer_fully_stripped
+    visibility: hidden
+    description: |
+      Information-leakage check. After decap the egress frame on the access
+      port MUST have NO outer headers — the first Ethernet/IPv4 the tenant
+      sees is the INNER one. Asserts the egress first IP carries the inner
+      addresses (10.0.1.9 → 10.0.1.5), confirming the outer stack was
+      stripped, not leaked.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.2", dst: "192.168.0.1", ttl: 64, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0a:0a", dst: "00:00:00:00:01:05"}
+        - IP:    {src: "10.0.1.9", dst: "10.0.1.5", ttl: 64}
+        - TCP:   {sport: 80, dport: 40000, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        IP.src: {action: change_to, value: "10.0.1.9"}
+        IP.dst: {action: change_to, value: "10.0.1.5"}
+
+  - name: non_ipv4_drop
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) on the access port is out of scope and dropped.
+      A dropped frame must produce no egress packet at all.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "00:00:00:00:01:05", dst: "ff:ff:ff:ff:ff:ff", type: 2054}
+        - ARP:   {op: 1, psrc: "10.0.1.5", pdst: "10.0.1.9"}
+    expected:
+      behavior: drop
+
+  - name: transit_outer_ether_rewrite
+    visibility: hidden
+    description: |
+      Outer L2-rewrite check. A VXLAN transit frame (outer dst 10.10.5.5,
+      NOT this VTEP) arrives on uplink s1.p2 with outer TTL 40. It is
+      transit-routed out s1.p3 (the /24 underlay route): the OUTER Ethernet
+      MUST be rewritten — source = egress port MAC (02:00:00:00:00:03),
+      destination = next-hop MAC (0a:00:00:00:00:03) — the outer TTL
+      decremented 40→39, and the outer VXLAN stack kept intact. Forwarding
+      on the correct port without rewriting the outer Ethernet is incorrect.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "0a:00:00:00:00:02", dst: "02:00:00:00:00:02"}
+        - IP:    {src: "192.168.0.9", dst: "10.10.5.5", ttl: 40, proto: 17}
+        - UDP:   {sport: 49152, dport: 4789, chksum: 0}
+        - VXLAN: {flags: 8, vni: 100, reserved1: 0, reserved2: 0}
+        - Ether: {src: "00:00:00:00:0c:0c", dst: "00:00:00:00:0d:0d"}
+        - IP:    {src: "10.0.1.20", dst: "10.0.1.21", ttl: 9}
+        - TCP:   {sport: 1234, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        layers[0].Ether.src: {action: change_to, value: "02:00:00:00:00:03"}
+        layers[0].Ether.dst: {action: change_to, value: "0a:00:00:00:00:03"}
+        layers[1].IP.ttl:    {action: change_to, value: 39}
+        layers[1].IP.dst:    {action: change_to, value: "10.10.5.5"}

@@ -1,0 +1,155 @@
+{
+  "oracle_hash": "00c02ab925b92cdb17e3db622fb62751e1afb1a1274a235f77d588a2f26cfc99",
+  "instance": "random_forest_infer_anchor_mut1-shrink_shallow",
+  "ran_at": "2026-06-17T13:56:00.793509Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "rf_classify_golden_class0",
+        "status": "pass"
+      },
+      {
+        "example_id": "rf_classify_golden_class1",
+        "status": "pass"
+      },
+      {
+        "example_id": "rf_majority_overrides_minority",
+        "status": "pass"
+      },
+      {
+        "example_id": "rf_majority_class0_minority_tree2",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_on_thresholds_majority_class0",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_at_bit_width_max",
+        "status": "pass"
+      },
+      {
+        "example_id": "unclassifiable_non_ipv4_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "tie_break_lowest_index_class0",
+        "status": "pass"
+      },
+      {
+        "example_id": "tie_break_reject_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_count_two_reads_second_feature",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_count_one_drops_second_feature",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_bit_width_8_full",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_bit_width_6_truncates_ttl",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_set_ttl_then_diffserv",
+        "status": "pass"
+      },
+      {
+        "example_id": "feature_set_diffserv_then_ttl",
+        "status": "pass"
+      },
+      {
+        "example_id": "vote_aggregation_majority_unit",
+        "status": "pass"
+      },
+      {
+        "example_id": "vote_aggregation_weighted_majority",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "vote_aggregation_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "boundary_classification_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inference_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "envelope_checksum_validity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "feature_read_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "vote_aggregation_fidelity",
+      "boundary_classification_fidelity",
+      "inference_determinism",
+      "payload_persistence",
+      "envelope_checksum_validity",
+      "feature_read_safety"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "planter_zheng_innetwork_ml",
+      "iisy_xiong_zilberman_hotnets19"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

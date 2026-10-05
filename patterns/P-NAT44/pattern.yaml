@@ -1,0 +1,630 @@
+# P-NAT44 — IPv4 Network Address (Port) Translation
+#
+# TPL v1.0 task pattern. Instances are produced by binding the
+# parameters below.
+
+pattern_id: P-NAT44
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking]               # per-connection mapping state
+  prescriptive: [P2:address-translation]                  # stateful rewrite at scale (NAT44/NAT64 row)
+target_capability: scale_up                          # must agree with the prescriptive entries' target_capability column (P2 → scale_up)
+summary: >
+  IPv4 NAPT (Network Address Port Translation) hiding an internal subnet
+  behind a single public address; supports static control-plane mappings
+  at Tier-1, dynamic data-plane port allocation at Tier-2, and timeout-
+  based eviction over a finite port pool at Tier-3.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: sailfish_sigcomm21
+      role: canonical_implementation
+      relevance: |
+        Sailfish documents NAT/SNAT alongside VPC and VxLAN as one of the
+        composable cloud-gateway NFs running on Tofino at Alibaba scale.
+        Establishes the "stateless on-chip / stateful off-chip" partition
+        that motivates the Tier-3 D5.2 partition mode (mapping_capacity
+        exceeds switch SRAM → slow-path overflow). Provides the working
+        vocabulary: SNAT table, public-IP pool, mapping symmetry under
+        churn.
+
+    - cite: sirius_nsdi24
+      role: scaling_approach
+      relevance: |
+        Sirius composes ~10 business NFs (SNAT among them) into a single
+        edge-gateway P4 program with explicit ASIC↔CPU partitioning when
+        the chain does not fit on chip. Informs the implementation guidance for
+        Tier-3: which NAT mappings live in TCAM (hot, recently-installed),
+        which spill to a register-array slow path, and which migrate to
+        the control-plane CPU under sustained pressure.
+
+  rfcs:
+    - id: RFC3022
+      sections: ["2", "3", "4"]
+      role: canonical_spec
+      relevance: |
+        Traditional NAT (Basic NAT and NAPT) — the binding specification
+        this pattern realises. Defines (a) the static-vs-dynamic mapping
+        distinction (§2.2 — `mode: static` Tier-1 vs `mode: dynamic`
+        Tier-2+); (b) the address-pool / port-pool model
+        (`port_pool_range`); (c) port translation for TCP/UDP only and
+        drop-on-miss for inbound traffic (R5 below); and (d) the
+        bidirectional-mapping symmetry invariant — every outbound binding
+        has a matching inbound binding so the return packet can be
+        restored.
+
+    - id: RFC4787
+      sections: ["4", "5"]
+      role: normative_behaviour
+      grounds: endpoint_independent_mapping
+      cached: grounding/RFC4787.txt
+      quote: |
+        REQ-1:  A NAT MUST have an "Endpoint-Independent Mapping" behavior.
+      relevance: |
+        UDP NAT behavioural requirements. Used at Tier-2/Tier-3 to pin
+        ambiguous behaviour: endpoint-independent mapping (REQ-1 / REQ-2)
+        — the same internal `(ip, port)` MUST map to the same external
+        port regardless of destination — and the address-pooling
+        constraint (REQ-2). Also informs the `idle_timeout_s` parameter
+        (binding lifetime). The verbatim REQ-1 clause (RFC4787 §4.1,
+        cached in grounding/RFC4787.txt) grounds the
+        `endpoint_independent_mapping` invariant / parameter directly.
+
+  tutorials:
+    - path: tutorials/exercises/basic_routing
+      role: baseline_topology
+      relevance: |
+        Two-host single-switch topology (one internal port + one external
+        port) and the IPv4 forwarding/TTL conventions reused here for
+        Tier-1 instances. NAT-specific bits (public IP, mapping tables,
+        L4 port rewrite) layer on top.
+
+  # No knowledge-base entry is attached; the grounding block above is
+  # non-empty (papers + rfcs + tutorials).
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+
+  nat_mapping_outbound:
+    keyed_by_tuple:
+      - hdr.ipv4.src        # internal IP
+      - meta.l4_srcPort     # internal L4 port
+      - hdr.ipv4.proto      # IP protocol (6 TCP, 17 UDP)
+    attrs:
+      public_ip: address
+      ext_port:  port
+    capacity: ${mapping_capacity}
+    eviction: ${eviction_policy}
+
+  nat_mapping_inbound:
+    keyed_by_tuple:
+      - hdr.ipv4.dst        # public IP
+      - meta.l4_dstPort     # external L4 port
+      - hdr.ipv4.proto
+    attrs:
+      internal_ip:   address
+      internal_port: port
+    capacity: ${mapping_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Mirror of nat_mapping_outbound. The pair_symmetry invariant ties
+      the two together: every outbound entry has a matching inbound
+      entry, and deletions are paired.
+
+  port_pool:
+    attrs:
+      free_ports: list[port]
+      range:      "[${port_pool_range}.low, ${port_pool_range}.high]"
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      Free-list of external L4 ports used by R2 (dynamic allocation).
+      Tier-1 (mode == static) does not materialise this entity — the
+      control plane installs both halves of every mapping itself.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  public_ip:
+    type: address
+    constraint: ipv4
+
+  internal_subnet:
+    type: address
+    constraint: "ipv4_cidr"
+
+  mapping_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+
+  port_pool_range:
+    type: tuple[int, int]
+    constraint: "low ≥ 1024 ∧ high ≤ 65535 ∧ low < high"
+    default: [10000, 65535]
+
+  mode:
+    type: enum
+    values: [static, dynamic]
+    default: static
+    notes: |
+      static  → control plane installs both directions of every mapping
+                (Tier-1; matches the twin task at synthesis/medium/nat44).
+      dynamic → data plane allocates ext_port from port_pool on first
+                outbound packet of an unseen flow (Tier-2+).
+
+  eviction_policy:
+    type: enum
+    values: [none, LRU, timeout]
+    default: none
+
+  idle_timeout_s:
+    type: int
+    range: "[1, 3600]"
+    default: 60
+    enforced_when: "${eviction_policy} == timeout"
+
+  faithfulness:
+    type: enum
+    values: [D5.0_static, D5.1_dynamic, D5.2_dynamic_with_eviction]
+    default: D5.0_static
+
+  endpoint_independent_mapping:
+    type: bool
+    default: true
+    notes: |
+      RFC4787 REQ-1: same internal `(ip, port)` MUST map to the same
+      ext_port regardless of dst. When true, an implementation cannot key the
+      port pool on the destination. Defaults true; loosened only by an
+      explicit operator.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# Order matters: first matching `when` fires.
+
+rules:
+
+  - id: R1_outbound_hit
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+    given:
+      flow:                 deduce_from_packet
+      nat_mapping_outbound: by_key((hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+    then:
+      - rewrite(hdr.ipv4.src, nat_mapping_outbound[*].public_ip)
+      - rewrite(meta.l4_srcPort, nat_mapping_outbound[*].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external_port)
+    notes: |
+      Outbound SNAT hit. The "rewrite L4 srcPort" postcondition resolves
+      to either hdr.tcp.srcPort or hdr.udp.srcPort according to the
+      header that was parsed (see meta.l4_srcPort).
+
+  - id: R2_outbound_miss_dynamic
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ ¬exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+        ∧ ${mode} == dynamic
+        ∧ ¬empty(port_pool.free_ports)
+    given:
+      flow:      deduce_from_packet
+      port_pool: singleton
+    then:
+      - "bind(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto), {public_ip: ${public_ip}, ext_port: alloc(port_pool)})"
+      - "bind(nat_mapping_inbound, (${public_ip}, nat_mapping_outbound[*].ext_port, hdr.ipv4.proto), {internal_ip: hdr.ipv4.src, internal_port: meta.l4_srcPort})"
+      - rewrite(hdr.ipv4.src, ${public_ip})
+      - rewrite(meta.l4_srcPort, nat_mapping_outbound[*].ext_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(external_port)
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      First packet of a new outbound flow under dynamic mode. Two
+      symmetric `bind`s install the mapping pair atomically — the
+      pair_symmetry invariant is a structural consequence of this rule.
+
+  - id: R3_outbound_miss_static_or_pool_empty
+    when: |
+      ingress(internal_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.src, ${internal_subnet})
+        ∧ ¬exists(nat_mapping_outbound, (hdr.ipv4.src, meta.l4_srcPort, hdr.ipv4.proto))
+        ∧ (${mode} == static ∨ empty(port_pool.free_ports))
+    then:
+      - drop
+    notes: |
+      Tier-1 path: no entry → drop. Also catches port-pool exhaustion
+      under dynamic mode (G2 test). RFC3022 §4.1: NAT MAY drop or
+      blackhole when no binding can be established; this pattern fixes
+      the choice at "drop" so behaviour is deterministic.
+
+  - id: R4_inbound_hit
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ match(hdr.ipv4.dst, ${public_ip})
+        ∧ exists(nat_mapping_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+    given:
+      nat_mapping_inbound: by_key((hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+    then:
+      - rewrite(hdr.ipv4.dst, nat_mapping_inbound[*].internal_ip)
+      - rewrite(meta.l4_dstPort, nat_mapping_inbound[*].internal_port)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(internal_port)
+    notes: |
+      Inbound DNAT — restores the original (internal_ip, internal_port)
+      onto the return packet.
+
+  - id: R5_inbound_miss
+    when: |
+      ingress(external_port) ∧ header_present(ipv4)
+        ∧ (header_present(tcp) ∨ header_present(udp))
+        ∧ (¬match(hdr.ipv4.dst, ${public_ip})
+           ∨ ¬exists(nat_mapping_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto)))
+    then:
+      - drop
+    notes: |
+      Default-deny on the external side (RFC3022 §4.1, also "fail-closed"
+      stance for unsolicited inbound). Two cases collapsed: dst ≠
+      public_ip (wrong-target) and dst == public_ip but no mapping
+      (unsolicited). Both drop.
+
+  - id: R6_non_l4_or_non_ipv4
+    when: |
+      ¬header_present(ipv4)
+        ∨ (¬header_present(tcp) ∧ ¬header_present(udp))
+    then:
+      - drop
+    notes: |
+      ICMP, ARP-mismatch, and any other non-TCP/UDP IPv4 packet are out
+      of scope for a NAPT (RFC3022 §4 limits NAPT to TCP/UDP).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: pair_symmetry
+    clause: no_orphan
+    target: nat_mapping_outbound
+    while: "true"
+    free_under: ["paired_bind(_)", "paired_evict(_)"]
+    notes: |
+      Every outbound mapping has a complementary inbound entry; every
+      eviction is paired. Realised structurally by R2 (the only rule
+      that creates mappings — both halves bound together) and by the
+      eviction discipline (free_under restricts unilateral deletion).
+
+  - id: port_uniqueness
+    clause: stability
+    target: "(public_ip, ext_port, proto) → flow"
+    while: "true"
+    notes: |
+      No two distinct outbound flows may share the same
+      (public_ip, ext_port, proto) at the same time. Without this, the
+      inbound DNAT rule R4 cannot uniquely reverse the mapping.
+
+  - id: bidirectional_translation
+    clause: stability
+    target: "rewrite-pair-of(flow)"
+    while: "flow ∈ live_mappings"
+    notes: |
+      For every established mapping, an outbound packet on flow F is
+      translated to (public_ip, ext_port) and the matching inbound
+      return is translated back to F's internal (ip, port). The two
+      directions agree at all times — i.e., R1 and R4 are inverse
+      transforms.
+
+  - id: endpoint_independent_mapping
+    clause: persistence
+    target: nat_mapping_outbound[*].ext_port
+    while: "flow.internal_ip ∧ flow.internal_port ∧ flow.proto fixed"
+    free_under: ["evict(nat_mapping_outbound, _)"]
+    enforced_when: "${endpoint_independent_mapping}"
+    notes: |
+      RFC4787 REQ-1: ext_port is a function of (internal_ip,
+      internal_port, proto) only — destination MUST NOT participate.
+
+  - id: no_orphan_mapping
+    clause: no_orphan
+    target: nat_mapping_outbound
+    enforced_when: "${mapping_capacity} ≠ unbounded ∧ ${mode} == dynamic"
+    notes: |
+      Bounded mapping table under dynamic allocation MUST have an
+      eviction policy that eventually removes stale entries — otherwise
+      the port pool drains and new flows are blackholed (R3).
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. NAT in this pattern uses no
+      recirculation; all rules forward or drop in one pipe pass.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: outbound_udp_snat_hit
+      generate: |
+        Send a UDP packet from an internal host (src in
+        ${internal_subnet}, sport mapped) to an external dst. Assert
+        IP.src ← ${public_ip}, UDP.sport ← ext_port, IP.ttl decremented
+        by 1, output_port = external_port.
+
+    - id: outbound_tcp_snat_hit
+      generate: |
+        Same as `outbound_udp_snat_hit` for TCP — confirms the L4-
+        agnostic rewrite path. Use a distinct (sport, ext_port) mapping.
+
+    - id: inbound_udp_dnat_return
+      generate: |
+        Send the symmetric return packet: IP.src = external host,
+        IP.dst = ${public_ip}, UDP.dport = ext_port from the outbound
+        mapping. Assert IP.dst ← internal_ip, UDP.dport ← internal_port,
+        IP.ttl decremented by 1, output_port = internal_port.
+
+    - id: inbound_tcp_dnat_return
+      generate: |
+        TCP analogue of `inbound_udp_dnat_return`.
+
+    - id: second_outbound_flow_distinct_mapping
+      generate: |
+        Send a second outbound flow from the same internal host with a
+        distinct internal sport. Assert it gets a distinct ext_port (no
+        collision with the first flow). Tests port_uniqueness.
+
+  G2:
+    - id: outbound_unmapped_drop
+      generate: |
+        Send an outbound TCP/UDP packet whose (src, sport, proto) is not
+        in nat_mapping_outbound (and either ${mode} == static, or the
+        port_pool is exhausted under dynamic). Assert drop.
+
+    - id: dynamic_allocation_first_packet
+      requires: "${mode} == dynamic"
+      generate: |
+        Send the first packet of a previously-unseen outbound flow.
+        Assert: a fresh mapping is installed, ext_port ∈ port_pool_range,
+        the symmetric inbound entry exists, and the packet is forwarded
+        with the new ext_port.
+
+    - id: port_pool_exhaustion_drops
+      requires: "${mode} == dynamic ∧ ${mapping_capacity} ≠ unbounded"
+      generate: |
+        Open ${mapping_capacity} distinct outbound flows (warm-up TTL=64)
+        to drain the port pool. Send one more new flow (test TTL=1).
+        Under ${eviction_policy} = none → assert drop. Under
+        ${eviction_policy} = LRU/timeout → assert forward + assert that
+        a stale mapping was evicted.
+
+    - id: timeout_eviction_releases_port
+      requires: "${eviction_policy} == timeout"
+      generate: |
+        Install a dynamic mapping. Wait > ${idle_timeout_s} with no
+        traffic on that flow. Send a different new flow; assert the
+        evicted ext_port is reusable (no stale binding).
+
+  G3:
+    - id: icmp_dropped
+      generate: |
+        Send an ICMP echo from the internal subnet. Assert drop. NAPT
+        scope is TCP/UDP only (R6 / RFC3022 §4).
+
+    - id: external_wrong_dst_dropped
+      generate: |
+        Send an inbound TCP/UDP packet whose IP.dst ≠ ${public_ip}.
+        Assert drop. Confirms the public-IP gate on R4.
+
+    - id: inbound_unsolicited_dropped
+      generate: |
+        Send an inbound TCP/UDP packet to ${public_ip} whose
+        (public_ip, dport, proto) is NOT in nat_mapping_inbound. Assert
+        drop. Confirms default-deny on the external side.
+
+    - id: endpoint_independent_mapping_check
+      requires: "${endpoint_independent_mapping}"
+      generate: |
+        Open outbound flow F1 = (i_ip, i_port, proto) → dst1, observe
+        ext_port_a. Open outbound flow F2 with the SAME (i_ip, i_port,
+        proto) but a different dst2. Assert ext_port_b == ext_port_a
+        (RFC4787 REQ-1).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: enable_dynamic_allocation
+    axis: feature-breadth
+    applicable_when: "${mode} == static"
+    effect: "${mode} ← dynamic ∧ ${faithfulness} ← D5.1_dynamic"
+    d_axis_delta: {D5: +1}
+    feasibility_postcondition: |
+      width(${port_pool_range}) ≥ max(${mapping_capacity}, 16)
+    notes: |
+      Lift Tier-1 → Tier-2: the data plane now allocates ext_port from
+      port_pool on each new outbound flow. Pair symmetry must still
+      hold (R2 binds both halves together).
+
+  - id: shrink_port_pool_4x
+    axis: capacity
+    applicable_when: |
+      ${mode} == dynamic ∧ width(${port_pool_range}) > 64
+    effect: |
+      ${port_pool_range} ← shrink_to_quarter_around_midpoint(
+                            ${port_pool_range})
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: |
+      width(${port_pool_range}) ≥ max(${mapping_capacity}, 16)
+    notes: |
+      Tighten the port-pool resource axis. As the pool narrows, an
+      implementation starts to need a real free-port allocator (bitmap or
+      free-list register) rather than a trivial monotonic counter.
+
+  - id: shrink_mapping_capacity_4x
+    axis: capacity
+    applicable_when: |
+      ${mapping_capacity} ≠ unbounded ∧ ${mapping_capacity} > 256
+    effect: "${mapping_capacity} ← ${mapping_capacity} / 4"
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${mapping_capacity} ≥ 64"
+    notes: |
+      Tighten the mapping-table capacity axis. Below ~256 an implementation
+      cannot rely on a "size everything generously" register strategy
+      and must engage real eviction.
+
+  - id: add_timeout_eviction
+    axis: strictness
+    applicable_when: |
+      ${mode} == dynamic ∧ ${eviction_policy} ≠ timeout
+    effect: |
+      ${eviction_policy} ← timeout ∧
+      ${faithfulness}    ← D5.2_dynamic_with_eviction
+    d_axis_delta: {D5: +1, D2: +1}
+    feasibility_postcondition: "${idle_timeout_s} ≥ 1"
+    notes: |
+      Add idle-timeout eviction over dynamic mappings. Common implementation:
+      per-mapping last-seen register read at lookup, compared to
+      standard_metadata.ingress_global_timestamp; entries past
+      idle_timeout_s are treated as evicted.
+
+  - id: swap_eviction_to_LRU
+    axis: strictness
+    applicable_when: |
+      ${eviction_policy} ∉ {LRU} ∧ ${mapping_capacity} ≠ unbounded
+        ∧ ${mode} == dynamic
+    effect: "${eviction_policy} ← LRU"
+    d_axis_delta: {D5: +1}
+    notes: |
+      LRU requires per-mapping recency tracking — substantially harder
+      than timeout in P4 (no native timestamp arithmetic on registers).
+      Common implementation: approximate LRU via second-chance or aging
+      counters.
+
+  - id: add_hairpin_test
+    axis: hidden-coverage
+    applicable_when: |
+      'hairpinning' ∉ test_scaffolding.G1
+    effect: |
+      Add G1 test `hairpinning`: two internal hosts hA and hB are both
+      in ${internal_subnet}; hA sends a packet to ${public_ip}:hB_ext_port
+      (i.e. addresses hB via the NAT public IP). Assert the switch
+      DNATs to hB and forwards back on the internal port (RFC4787 REQ-9
+      hairpinning behaviour). At Tier-1 with no hairpinning support,
+      the operator instead loosens the test to "drop is acceptable".
+    d_axis_delta: {test_rigor: +1, D6: +1}
+
+  - id: compose_with_ACL
+    axis: algebra-breadth
+    applicable_when: |
+      'inbound_acl' ∉ rules
+    effect: |
+      Overlay an inbound ACL: pre-R4, conjoin a clause requiring
+      ingress 5-tuple ∈ ${permitted_external_set}. Adds parameter
+      `permitted_external_set` (list[5-tuple-mask]) and a new G3 test
+      `inbound_acl_blocked`.
+    d_axis_delta: {D4: +1, test_rigor: +1}
+    feasibility_postcondition: |
+      |${permitted_external_set}| ≥ 1
+    notes: |
+      Pattern-augmenting (composes a small ACL pattern with NAT44).
+      Useful for Tier-3 cloud-gateway instances that look more like
+      Sailfish/Sirius than a textbook NAT.
+
+  - id: inject_workload_skew
+    axis: workload
+    applicable_when: true
+    effect: |
+      Replace G1 `outbound_udp_snat_hit` with skewed: 80% of outbound
+      traffic sourced from 20% of internal hosts (Zipfian α=1.0); assert
+      the NAT continues to bind/forward correctly under the imbalance
+      and that no host is starved of port allocations (G2 fairness
+      check on port_pool).
+    d_axis_delta: {D6: +1, test_rigor: +1}
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4:
+
+    Tier-1 (mode: static, mapping_capacity: unbounded, eviction: none):
+      - Two exact-match tables: snat (key: src_ip, src_port, proto;
+        action: do_snat(public_ip, ext_port)) and dnat (key: dst_ip,
+        dst_port, proto; action: do_dnat(internal_ip, internal_port)).
+      - default_action = drop on both tables — handles R3 and R5 misses.
+      - Control plane installs symmetric pairs in the entries file.
+      - L4 srcPort/dstPort extracted into `meta.l4_srcPort` /
+        `meta.l4_dstPort` after the L4 parser, so the table key is
+        protocol-agnostic.
+      - Re-compute IPv4, TCP, UDP checksums in MyComputeChecksum after
+        rewrite — packet drops on stale checksums in real deployments.
+
+    Tier-2 (mode: dynamic, bounded port pool, eviction: none/LRU):
+      - register<bit<16>>(N) port_pool with a head/tail pair; alloc on
+        miss + bind via a single ingress pass.
+      - Or: counter-mod-N with a "in-use" bitmap to skip allocated
+        ports (avoids collisions when traffic is uneven).
+      - The new mapping must be installed for both directions before
+        the packet egresses. A single-pass approach uses
+        update-on-miss in the snat table (digest to control plane)
+        plus a parallel register; a recirculation approach is also
+        legal but more expensive.
+
+    Tier-3 (mapping_capacity > on-chip SRAM, partition / timeout):
+      - Sailfish-style: hot mappings in TCAM, long tail in DRAM /
+        control-plane CPU; reachable via an explicit slow-path egress
+        port that the harness routes back. faithfulness: D5.2.
+      - Or: a per-flow last-seen register; on lookup miss, compare
+        global timestamp - last_seen against ${idle_timeout_s}; treat
+        as evicted if stale and reuse the slot.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Forgetting to update IPv4/TCP/UDP checksums after the rewrite —
+      most common silent bug; fails silently on real Linux peers.
+    * Keying the snat table on dst as well — violates
+      endpoint_independent_mapping (RFC4787 REQ-1).
+    * Treating `dst != public_ip` as forwardable when the inbound port
+      sees foreign traffic — leaks the internal subnet to the outside.
+    * Using the same ext_port for two distinct internal flows — violates
+      port_uniqueness; inbound DNAT becomes ambiguous.
+    * Decrementing TTL twice (once in MyIngress and once via an
+      inherited "router" library) — the test suite catches this.
+    * Allocating ext_port from a counter without a wraparound check
+      under bounded port_pool — produces ext_port == 0 at overflow,
+      which fails inbound DNAT.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must
+       all pass validation.
+
+    2. For instances of P-NAT44 grounded in the static
+       mapping faithfulness (D5.0_static), the resulting task SHOULD be
+       behaviourally equivalent to the canonical NAPT reference design
+       (RFC 6146 §3.5 forwarding semantics). Cross-check by hand-running
+       the public test set through the oracle for the seed and comparing
+       against the expected by-port mappings.

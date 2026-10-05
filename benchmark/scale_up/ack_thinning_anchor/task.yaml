@@ -1,0 +1,739 @@
+task_name: ack_thinning_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-AckThinning
+pattern_version: '1.0'
+seed:
+  thinning_direction: reverse_only
+  dup_ack_budget: 0
+  flow_table_capacity: unbounded
+  eviction_policy: none
+  faithfulness: D5.0_exact
+  default_action: forward
+  uplink_port: 1
+  forward_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: uplink
+    to: s1.p1
+  - from: s1.p2
+    to: sender
+hosts:
+  uplink:
+    note: asymmetric uplink carrying the TCP acknowledgement stream; ingress on s1.p1
+  sender:
+    note: data sender; forwarded acknowledgements egress on s1.p2
+description: |-
+  Implement a TCP acknowledgement-thinning proxy for BMv2 (v1model). On a
+  bandwidth-asymmetric link the reverse path is dominated by a flood of pure TCP
+  acknowledgements whose information is redundant, because TCP acknowledgements
+  are cumulative. The proxy reduces this reverse-path load by dropping the
+  redundant acknowledgements, while never withholding acknowledgement information
+  the sender still needs.
+
+  Topology: port 1 is the link on which packets arrive; packets that the proxy
+  forwards leave on port 2.
+
+  Required behaviour, per packet:
+
+  - Only pure acknowledgements are ever eligible to be dropped. A pure
+    acknowledgement is a TCP segment that has its ACK flag set, carries no payload
+    (no application data), and is not a connection setup, teardown, or reset
+    segment. Everything else is always forwarded: non-TCP traffic, TCP segments
+    that carry data, and the SYN / FIN / RST control segments that open, close, or
+    reset a connection — these must pass through so the proxy never breaks a
+    connection.
+
+  - The proxy tracks, per TCP connection, the most recent acknowledgement it has
+    already let through (a connection is identified by its source and destination
+    addresses and ports). For a pure acknowledgement:
+    * If the connection has not been seen before, forward it (there is nothing to
+      compare against yet).
+    * If the acknowledgement carries information beyond what the proxy has already
+      forwarded for that connection — i.e. it acknowledges more data than any
+      earlier one — it MUST be forwarded.
+    * Otherwise the acknowledgement is redundant (it acknowledges nothing new) and
+      is dropped.
+
+  The one rule that must never be violated: an acknowledgement that advances a
+  connection's cumulative acknowledgement is never dropped — dropping it would
+  stall the sender. When the proxy has no basis to decide (a connection it has
+  not seen), it forwards. The decision depends only on the packets received;
+  there is no timer or periodic packet generation.
+
+  Both the P4 program and any table entries it needs are yours to author. The
+  per-connection tracking state is yours to maintain in the data plane.
+test_cases:
+- name: first_ack_forwarded
+  visibility: public
+  goal_class: G1
+  description: The first pure acknowledgement seen for a connection has no earlier acknowledgement to compare against, so it is forwarded on the forward port unchanged; the connection's tracking state is established from it.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 5000
+        flags: A
+        ack: 1000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+- name: advancing_ack_forwarded
+  visibility: public
+  goal_class: G1
+  description: After a connection's first acknowledgement (1000) is forwarded, a later acknowledgement that acknowledges more data (1500) carries new information and is forwarded unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 5000
+        flags: A
+        ack: 1500
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 5000
+        flags: A
+        ack: 1000
+- name: redundant_dup_ack_dropped
+  visibility: public
+  goal_class: G1
+  description: After a connection's acknowledgement (2000) is forwarded, a second pure acknowledgement carrying the SAME number acknowledges nothing new and is dropped (thinned).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 81
+        dport: 5001
+        flags: A
+        ack: 2000
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 81
+        dport: 5001
+        flags: A
+        ack: 2000
+- name: stale_below_watermark_dropped
+  visibility: hidden
+  goal_class: G1
+  description: A connection advances from 3000 to 3600; a following acknowledgement below the advanced value (3400) is stale and dropped — it acknowledges nothing the proxy has not already let through.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 82
+        dport: 5002
+        flags: A
+        ack: 3400
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 82
+        dport: 5002
+        flags: A
+        ack: 3000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 82
+        dport: 5002
+        flags: A
+        ack: 3600
+- name: data_segment_never_thinned
+  visibility: hidden
+  goal_class: G1
+  description: A TCP segment carrying application data whose acknowledgement number equals the established value (would be redundant if it were a pure acknowledgement) is forwarded — data segments are never thinnable.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 83
+        dport: 5003
+        flags: A
+        ack: 4000
+    - Raw:
+        load: !!binary |
+          cGF5bG9hZC1ieXRlcw==
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 83
+        dport: 5003
+        flags: A
+        ack: 4000
+- name: fin_ack_forwarded
+  visibility: hidden
+  goal_class: G1
+  description: A payload-empty FIN-ACK whose acknowledgement number equals the established value is forwarded — teardown segments always pass through so the proxy never breaks a connection close.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 84
+        dport: 5004
+        flags: FA
+        ack: 5000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 84
+        dport: 5004
+        flags: A
+        ack: 5000
+- name: equal_watermark_is_redundant
+  visibility: hidden
+  goal_class: G2
+  description: An acknowledgement exactly equal to the connection's current value acknowledges nothing new and is dropped — the boundary that distinguishes advancing (greater) from redundant (equal-or-below).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 85
+        dport: 5005
+        flags: A
+        ack: 6000
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 85
+        dport: 5005
+        flags: A
+        ack: 6000
+- name: one_greater_advances
+  visibility: hidden
+  goal_class: G2
+  description: An acknowledgement exactly one greater than the connection's current value (6001 vs 6000) acknowledges new data and is forwarded — proves the comparison is strictly-greater, not greater-or-equal.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 86
+        dport: 5006
+        flags: A
+        ack: 6001
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 86
+        dport: 5006
+        flags: A
+        ack: 6000
+- name: watermark_does_not_lower
+  visibility: hidden
+  goal_class: G2
+  description: After advancing to 7500, a stale duplicate (7100) is dropped and does NOT lower the tracking value; a subsequent acknowledgement at 7300 (still below 7500) is also dropped — a redundant acknowledgement never re-opens already-thinned ground.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 87
+        dport: 5007
+        flags: A
+        ack: 7300
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 87
+        dport: 5007
+        flags: A
+        ack: 7000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 87
+        dport: 5007
+        flags: A
+        ack: 7500
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 87
+        dport: 5007
+        flags: A
+        ack: 7100
+- name: high_ackno_advances
+  visibility: hidden
+  goal_class: G2
+  description: 'A connection whose value is near the 32-bit acknowledgement-number boundary advances correctly: 4294967290 forwarded, then 4294967295 (one below the max) forwarded as advancing.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 88
+        dport: 5008
+        flags: A
+        ack: 4294967295
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 88
+        dport: 5008
+        flags: A
+        ack: 4294967290
+- name: ack_flag_clear_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A payload-empty segment with the ACK flag CLEAR but a low acknowledgement-number field is NOT a pure acknowledgement and is forwarded — a proxy that thins on the acknowledgement-number field alone, without checking the ACK flag, would wrongly drop it.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 89
+        dport: 5009
+        flags: 0
+        ack: 1
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 89
+        dport: 5009
+        flags: A
+        ack: 8000
+- name: cross_flow_isolation
+  visibility: hidden
+  goal_class: G3
+  description: 'A different connection (different source port) is tracked independently: after one connection advances to 9500, a brand-new connection''s first acknowledgement at 100 is forwarded as first-sight, NOT compared against the other connection''s value.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 91
+        dport: 5011
+        flags: A
+        ack: 100
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 90
+        dport: 5010
+        flags: A
+        ack: 9000
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 90
+        dport: 5010
+        flags: A
+        ack: 9500
+- name: syn_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A payload-empty SYN (connection setup) is forwarded even with a low acknowledgement-number field — handshake segments are never thinned.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 92
+        dport: 5012
+        flags: S
+        ack: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+      TCP.ack:
+        action: unchanged
+- name: non_tcp_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A non-TCP frame (UDP) is out of scope for thinning and forwarded unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 198.51.100.9
+        dst: 10.0.1.50
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 5013
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: unchanged
+- name: non_ipv4_forwarded
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is out of scope for thinning and forwarded unchanged — thinning only ever drops pure TCP acknowledgements.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 198.51.100.9
+        pdst: 10.0.1.50
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      ARP.psrc:
+        action: unchanged
+      ARP.pdst:
+        action: unchanged

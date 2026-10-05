@@ -1,0 +1,1243 @@
+# P-NetCacheKV — In-switch read cache for a key-value store (NetCache / DistCache)
+#
+# TPL v1.0 task pattern. Fills the
+# (D2:in-network-compute, P17:storage-acceleration) cell of the NF
+# design-space map — a `relocate` row that is a publication-record gap
+# (storage acceleration has "no descriptive counterpart in the
+# surveyed corpus" and its canonical NF, NetCache, is out of the
+# SIGCOMM/NSDI/CoNEXT target venues). The switch fronts a backend
+# key-value store with a small register-array read cache of hot items: a
+# GET that hits the cache is answered by the switch ITSELF (it originates
+# the response and never touches the backend — the read is relocated DOWN
+# into the pipeline); a GET that misses is forwarded to the backend; and a
+# write (PUT / DELETE) INVALIDATES the cached slot so the cache never
+# serves a stale value after the store has changed (cache coherence).
+# target_capability = relocate: the read-cache is the textbook host /
+# coordinator-side function being pulled into the switch (NetCache SOSP'17,
+# DistCache FAST'19), the structurally hardest LLM
+# frontier — the SUT must redesign a host-side data structure (a hash-
+# indexed cache with coherence) for match-action + register arrays with no
+# prior data-plane design to copy.
+#
+# Sibling of P-SwitchMLAgg under the same (D2:in-network-compute)
+# descriptive cell and the same `relocate` frontier, but differentiated on
+# three axes: (1) the state is a per-key register-array CACHE (valid bit +
+# stored key + value per slot) rather than an aggregation slot, so the
+# signature surface is hash-collision key-disambiguation and write-
+# invalidation coherence, not a barrier bitmap; (2) the switch ORIGINATES
+# a response on a cache hit (the P16 packet-origination mechanism in
+# service of a P17 storage NF — modelled but, in the v1.0 harness, the
+# originated response egresses the requesting client's port, so it is
+# scored through the observable hit-vs-miss backend-forward distinction,
+# the same convention P-SYNCookieGuard adopts for its originated SYN-ACK);
+# (3) coherence under interleaved read/write — a write must invalidate the
+# cached value so a subsequent read re-fetches — is a stateful-correctness
+# property no current pattern carries. Extracted from NetCache (SOSP'17,
+# canonical) + DistCache (FAST'19, scaling).
+
+pattern_id: P-NetCacheKV
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D2:in-network-compute]                       # in-pipeline KV cache — literally D2's representative NF ("in-pipeline KV cache") in the NF-category table
+  prescriptive: [P17:storage-acceleration]                    # NetCache, distributed-storage assist — the `relocate` storage row in the NF-category table
+
+target_capability: relocate                                   # the host/coordinator-side read cache is relocated into the switch pipeline (NetCache / DistCache)
+
+summary: >
+  An in-switch read cache for a backend key-value store (NetCache,
+  SOSP'17). The switch holds a small set of hot (key → value) items in a
+  register-array cache indexed by hash(key); each slot carries a validity
+  bit, the key currently occupying it, and the cached value. On a GET
+  whose key is present and valid in its slot (a cache HIT) the switch
+  ORIGINATES the response itself — rewriting the request into a response
+  carrying the cached value and returning it toward the client — and does
+  NOT forward to the backend: the read is served entirely in the pipeline.
+  On a GET that MISSES (slot invalid, or occupied by a DIFFERENT key that
+  collided on the same index) the request is forwarded to the backend
+  store. On a write (PUT / DELETE) whose key occupies its slot the switch
+  INVALIDATES the slot (clears the validity bit) before forwarding the
+  write to the backend, so a subsequent GET for that key re-fetches the
+  authoritative value rather than serving a stale one — the cache-
+  coherence contract. Cache contents are control-plane-installed (the
+  NetCache controller populates hot items reported by the data-plane
+  heavy-hitter detector); the data plane mutates only the validity bit, on
+  writes. The pattern's headline capabilities are (a) register-array hash
+  indexing with explicit stored-key disambiguation — two distinct keys
+  that hash to the same slot must NOT read each other's value, the
+  signature collision-correctness surface; (b) write-invalidation
+  coherence — no stale value is ever served after a write; and (c) hit-
+  path response origination with a fully-assigned response header (the
+  common v1model setValid()-without-assignment and conditional-deparser
+  bug surfaces). Faithfulness anchors at D5.0 (direct-mapped single-way cache,
+  exact key check, GET + PUT-invalidate) and ladders through D5.1 (W-way
+  set-associative lookup across all ways + DELETE) and D5.2 (per-slot
+  value versioning for coherence under interleaved updates, strict
+  everything, bounded cache capacity at realistic skew).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:                                                     # NetCache / DistCache are the canonical in-network KV-cache designs. Both are out of the SIGCOMM/NSDI/CoNEXT 2017–2026 survey venues (SOSP / FAST) — exactly the publication-record gap for the storage-acceleration (P17) row — but they are the textbook references for the NF and are catalogued as such in the NF literature survey (NF-2c, cluster C, storage row).
+
+    - cite: netcache_sosp17
+      title: "NetCache: Balancing Key-Value Stores with Fast In-Network Caching (Jin et al., SOSP '17)"
+      role: canonical_implementation
+      grounds: [R1_get_hit_respond, R3_write_invalidate_forward, write_invalidation_coherence]
+      cached: grounding/netcache_sosp17.txt
+      quote: |
+        queries for cached items are handled directly by switches
+        without having to visit a storage server. Write queries for
+        cached keys invalidate any copies stored in the switches on
+        the routes to storage servers, and the servers atomically update the switches with new values.
+      relevance: |
+        The textbook in-network KV read cache. NetCache puts a small cache
+        of the O(N·logN) hottest items in the switch's register arrays in
+        front of a cluster of storage servers, absorbing the highly-skewed
+        read load that would otherwise hot-spot a single server. The
+        design elements this pattern's rules preserve:
+
+          - Read-query handling — a GET for a cached key is answered BY THE
+            SWITCH (it reads the value register and reflects a response to
+            the client); a GET for an uncached key is forwarded to the
+            storage server that owns it. This is the source of R1
+            (get-hit → originate response, no backend forward) vs R2
+            (get-miss → forward to backend) split and the `relocate`
+            origination surface.
+
+          - Cache coherence on writes — NetCache keeps the cache coherent
+            by having the data plane INVALIDATE a cached key's slot when a
+            write (PUT/DELETE) for that key passes through, so the next
+            read misses and re-fetches the authoritative value from the
+            server; the controller later re-populates if the key stays
+            hot. This is the source of R3 (write-to-cached-key →
+            invalidate slot + forward) and the `write_invalidation_
+            coherence` invariant — the property that no stale value is
+            ever served after a write.
+
+          - Register-array layout — each cached item lives in a slot
+            addressed by a hash of the key; the slot stores a validity bit,
+            the key (so a lookup can confirm the slot actually holds the
+            queried key and not a colliding one), and the value. This is
+            the source of the `cache` bucket entity, the
+            `cache_hit_value_correct` / `no_cross_key_contamination`
+            invariants (the stored-key check), and the `cache_capacity` /
+            `hash_algo` parameters.
+
+          - Controller-managed population — the data-plane heavy-hitter
+            detector reports hot keys; the controller decides what to cache
+            and installs the (key, value) entries. The pattern models cache
+            population as control-plane-installed `cache_entries` (the seed
+            installs them, valid=1) and lets the DATA plane mutate only the
+            validity bit on writes — which is what keeps the v1.0 oracle
+            tractable while preserving the coherence property as a
+            data-plane-observable behaviour.
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model realisation — the custom NetCache application
+        header carried over UDP, `register<bit<W>>` arrays for the value /
+        stored-key / valid columns indexed by a `hash(... , key , ...)`
+        extern call, `setValid()` + per-field assignment to build the
+        response header, the response reflected to the ingress (client)
+        port via `standard_metadata.egress_spec = standard_metadata.
+        ingress_port`, and the conditional deparser that emits the response
+        header only on the hit path — is widely-known P4-on-v1model
+        practice rather than NetCache-paper-cited. These bridging notes are
+        flagged `[common-knowledge baseline]` in `bridging_notes:` rather
+        than re-attributed to the paper.
+
+    - cite: distcache_fast19
+      title: "DistCache: Provable Load Balancing for Large-Scale Storage Systems with Distributed Caching (Liu et al., FAST '19)"
+      role: scaling_approach
+      relevance: |
+        DistCache scales the single-switch NetCache cache to a multi-switch
+        / multi-rack hierarchy with a provably load-balanced two-layer
+        cache-allocation scheme (independent hash functions per layer so no
+        single cache hot-spots). For this single-switch v1 pattern DistCache
+        grounds two things: (1) the `workload_skew` axis — DistCache's
+        analysis is explicitly about Zipfian / adversarial key
+        distributions, which is what the `adversarial_collision` skew and
+        the collision-correctness tests stress; and (2) the
+        set-associative / multi-way cache organisation (D5.1) as the
+        realistic structure once a direct-mapped cache collides too often
+        under skew. The cross-switch hierarchy itself is OUT of scope for a
+        single-switch v1 pattern (it needs a `cross_switch_partitioning`
+        axis deferred to a TPL v2 variant — see bridging_notes); only the
+        single-switch organisation and workload model are borrowed.
+
+  rfcs: []                                                    # No IETF RFC defines an in-network KV cache; the KV wire protocol is application-defined (NetCache's custom header over UDP). Empty (nothing is cited without being read).
+  tutorials: []                                               # The upstream p4lang/tutorials repository ships no KV-cache exercise. Empty (nothing is cited without being read).
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:                                                     # the KV request / response carried in a custom application header over UDP
+    key:
+      - hdr.netcache.op                                       # 0=GET, 1=PUT, 2=DELETE, 3=GET_RESPONSE (origination)
+      - hdr.netcache.key                                      # the KV key (key_width_bits)
+    attrs:
+      value: int                                              # value_width_bits — present on PUT (request) and GET_RESPONSE (origination); ignored on GET / DELETE requests
+    notes: |
+      The on-the-wire KV message. The custom NetCache application header is
+      modelled as `hdr.netcache`; the implementation chooses the concrete wire
+      encoding (NetCache uses a custom header over UDP on a reserved port).
+      The op field selects GET / PUT / DELETE; the switch may rewrite a GET
+      request into a GET_RESPONSE on a hit (origination). No per-packet
+      state — all caching state lives in the `cache` bucket.
+
+  link:                                                       # port-keyed client-facing / backend-facing interface role
+    name: port_role
+    keyed_by: standard_metadata.ingress_port
+    attrs:
+      role: "enum {client_facing, backend_facing}"            # client_facing ports carry KV requests in and responses out; backend_facing ports reach the storage server(s)
+    populated_from:
+      client_rows: ${client_ports}                            # one row per client-facing port under role=client_facing
+      backend_rows: ${backend_ports}                          # one row per backend-facing port under role=backend_facing
+    notes: |
+      Maps every ingress port to either the client role (a KV request
+      arrives; a hit response is reflected back out the same client port)
+      or the backend role (a storage-server reply transits back toward the
+      client). Requests are expected on client_facing ports; the
+      backend_facing role exists so a server→client reply (and any non-KV
+      transit) is forwarded by the R0 passthrough rather than mis-parsed as
+      a cacheable request.
+
+  cache:                                                      # TPL `bucket` — register-array read cache, indexed by hash(key)
+    type: bucket
+    keyed_by_tuple: [slot_index]                              # slot_index = hash(hdr.netcache.key) mod ${cache_capacity}; ${ways} slots share an index at D5.1+
+    attrs:
+      valid:       bool                                       # 1 iff this slot currently holds a cached, coherent value
+      stored_key:  int                                        # the key currently occupying the slot — checked against the request key to disambiguate hash collisions
+      value:       int                                        # the cached value (value_width_bits)
+      version:     int                                        # per-slot coherence generation; dormant unless ${faithfulness} == D5.2_versioned_coherence
+    capacity: ${cache_capacity}
+    populated_from: ${cache_entries}                          # control-plane-installed (key → value) rows the seed installs with valid=1
+    notes: |
+      The read cache. A slot is addressed by hash(key) mod capacity (a SET
+      of ${ways} slots at the same index under D5.1 set-associative). The
+      `valid` bit and `stored_key` together decide a HIT: a request for key
+      K hits iff some way at hash(K) has valid==1 AND stored_key==K. The
+      `stored_key` check is load-bearing — two distinct keys that hash to
+      the same index must NOT read each other's value (the
+      `no_cross_key_contamination` invariant). The implementation realises this as
+      parallel `register<bit<W>>` arrays (valid, stored_key, value, and —
+      at D5.2 — version) indexed by the hashed slot index. Population is by
+      the control plane (`cache_entries`); the data plane writes only the
+      validity bit, on writes (R3), which is what makes the coherence
+      property data-plane-observable while keeping the oracle stateless in
+      the value column.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  client_ports:
+    type: list[int]
+    constraint: "every entry is a port number in [1, 511] (BMv2 simple_switch range); disjoint from backend_ports."
+    notes: |
+      Ingress ports configured as client-facing. Populate the `link`
+      entity's `role == client_facing` rows. KV requests arrive here and
+      hit responses are reflected back out the requesting client port.
+
+  backend_ports:
+    type: list[int]
+    constraint: "every entry is a port number in [1, 511]; disjoint from client_ports; non-empty."
+    notes: |
+      Ingress ports configured as backend-facing (toward the storage
+      server[s]). Populate the `link` entity's `role == backend_facing`
+      rows. GET misses and writes are forwarded to a backend port; server
+      replies transit back through R0.
+
+  backend_port:
+    type: int
+    constraint: "∈ backend_ports"
+    notes: |
+      The egress port toward the storage backend that GET misses (R2) and
+      writes (R3/R4) are forwarded on. At the anchor a single backend
+      server; multi-server backend partitioning (a hash/range FIB choosing
+      among backend_ports) is out of scope here — it composes with
+      P-IPv4Routing as the underlay (the storage-router composite), rather
+      than being re-encoded in this pattern.
+
+  cache_entries:
+    type: list[cache_entry]
+    constraint: |
+      every entry has key:int (the KV key, a fixed 64-bit field — NetCache
+      uses 128-bit keys; v1 narrows to 64 to keep the anchor header small);
+      value:int ∈ [0, 2^${value_width_bits} - 1]; key is unique across the
+      list; |entries| ≤ ${cache_capacity} * ${ways}. The seed installs each
+      row into the slot at hash(key) mod ${cache_capacity} with valid=1.
+    notes: |
+      The control-plane-installed (key → value) rows that populate the
+      `cache` bucket. Drives R1's hit lookup. Bound by the seed; the
+      NetCache controller's hot-set decision is modelled as this static
+      installation.
+
+  cache_capacity:
+    type: int
+    range: "[4, 1048576]"
+    default: 1024
+    notes: |
+      Number of cache slot indices. The capacity difficulty axis. Smaller
+      capacity → more distinct keys collide on the same index, stressing
+      the stored-key disambiguation. `shrink_cache_capacity_4x` exercises
+      this from the anchor baseline.
+
+  ways:
+    type: int
+    range: "[1, 8]"
+    default: 1
+    notes: |
+      Associativity — slots sharing one hashed index. `1` is the anchor's
+      direct-mapped cache (D5.0); D5.1 ladders to W-way set
+      associativity, where a lookup must check ALL ways at the index and a
+      write must invalidate the matching way. Moved by the feature ladder
+      (entailed binding) and by the associativity operators.
+
+  value_width_bits:
+    type: int
+    range: "[8, 512]"
+    default: 32
+    notes: |
+      Width of the cached value. NetCache supports variable-length values
+      across multiple slots; this pattern caches a single fixed-width value
+      per slot. Wider values pressure the register width and the response-
+      header construction. `widen_value_4x` exercises this axis.
+
+  cache_op_breadth:
+    type: enum
+    values: [get_only, get_put, get_put_delete]
+    default: get_put
+    notes: |
+      Which KV operations the cache handles. `get_only` is a read-only
+      cache with no coherence path (writes, if any, are plain passthrough
+      to the backend and never invalidate — there is nothing to keep
+      coherent because the value store is immutable in the test window).
+      `get_put` (anchor default) adds PUT-invalidation coherence (R3).
+      `get_put_delete` additionally treats DELETE as an invalidating write.
+      The feature-breadth difficulty axis; moved by the op-breadth operators.
+
+  coherence_policy:
+    type: enum
+    values: [invalidate_on_write, write_through]
+    default: invalidate_on_write
+    enforced_when: "${cache_op_breadth} != get_only"
+    notes: |
+      How a write to a cached key keeps the cache coherent.
+      `invalidate_on_write` (NetCache default, anchor) clears the slot's
+      validity bit so the next read misses and re-fetches — the data plane
+      never holds a value it cannot trust. `write_through` instead updates
+      the cached value in place from the PUT payload AND forwards the write
+      (the harder variant: the SUT must rewrite the value register
+      correctly, not merely invalidate). Both are coherent; write_through
+      is a feature-breadth lift, not a correctness foil.
+
+  in_band_revalidation:
+    type: bool
+    default: false
+    notes: |
+      Whether a backend GET_RESPONSE transiting back toward the client
+      RE-VALIDATES (re-caches) the responded key in the data plane — clearing
+      its invalidation so a subsequent GET hits again — modelling NetCache's
+      in-network cache-update path (the cache learns the authoritative value
+      from the server's reply). `false` (anchor): server replies are plain
+      passthrough (R0) and an invalidated key stays a miss until the control
+      plane re-populates it. `true` activates R6_revalidate — a stateful write
+      on the BACKEND-ingress path that the SUT must key to the SAME slot it
+      invalidates on a write, a second processing path distinct from the
+      request path. Difficulty axis: feature-breadth (an added protocol
+      mechanism), and the relocate magnet — the baseline must manage
+      cache state off a transiting reply, not just the request. Moved by the
+      `enable_in_band_revalidation` / `disable_in_band_revalidation` operators.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc32
+    notes: |
+      Hash function mapping a key to its slot index. `xor_fold` is the
+      cheapest but weakest — under a skewed / adversarial key distribution
+      it collapses many hot keys onto a few indices, maximising collisions
+      and stressing the stored-key disambiguation. `swap_hash_to_xor_fold`
+      hardens the panel against implementations that copy a textbook hash blindly.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision]
+    default: uniform
+    notes: |
+      Distribution of request keys the G1/G2 traffic tests draw from.
+      `uniform` is the anchor default; `zipfian` (the NetCache/DistCache
+      operating point — a few very hot keys) and `adversarial_collision`
+      (keys hand-picked to collide on slot indices) ladder the collision
+      pressure on the stored-key check. `raise_workload_skew` steps it up.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_direct_mapped, D5.1_set_associative, D5.2_versioned_coherence]
+    default: D5.0_direct_mapped
+    notes: |
+      The faithfulness/feature ladder for this pattern. D5.0 is a
+      direct-mapped (single-way) cache with an exact stored-key check,
+      GET + PUT-invalidate, fixed-width value, CRC hash, uniform workload.
+      D5.1 lifts to W-way set-associative lookup (check all ways; invalidate
+      the matching way) and adds DELETE as an invalidating write. D5.2 adds
+      per-slot value versioning for coherence under interleaved updates
+      (a write bumps the slot version; a stale in-flight populate carrying
+      an older version is rejected — NetCache's read-query/cache-update
+      ordering), plus strict everything under a bounded cache capacity at
+      skewed workload. Note: the D5.x rungs here mix exact↔stronger STATE
+      fidelity (versioning, D5.2) with feature-surface breadth (set
+      associativity, DELETE, D5.1) — the operators tag the rung they move
+      with the appropriate axis (`faithfulness` for versioning,
+      `feature-breadth` for associativity / op breadth).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+
+rules:
+
+  - id: R0_non_kv_passthrough
+    when: "¬header_present(netcache)"
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+    then:
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+    notes: |
+      Non-KV traffic (ordinary IPv4, ARP, and crucially the storage
+      server's REPLY transiting back toward a client on a backend_facing
+      port) is forwarded by the underlying L3/L2 path, untouched by the
+      cache. The cache only acts on packets carrying the NetCache
+      application header. Non-IPv4 with no forwarding entry is dropped by
+      the implementation default; the spec binds only the KV path.
+
+  - id: R1_get_hit_respond
+    when: |
+      header_present(netcache)
+        ∧ ingress(client_facing)
+        ∧ hdr.netcache.op == GET
+        ∧ exists(cache, slot_index)
+        ∧ value(cache.valid, ==, 1)
+        ∧ value(cache.stored_key, ==, hdr.netcache.key)
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+      cache:     by_key(hash(hdr.netcache.key) mod ${cache_capacity})    # at D5.1, the matching way within the set
+    then:
+      - "set(hdr.netcache.op, GET_RESPONSE)"                 # rewrite request → response (origination)
+      - "set(hdr.netcache.value, cache.value)"              # carry the cached value
+      - "rewrite(swap(ethernet.src, ethernet.dst))"         # reflect L2 back toward the client
+      - "rewrite(swap(ipv4.src, ipv4.dst))"                 # reflect L3 back toward the client
+      - "rewrite(swap(udp.src, udp.dst))"
+      - emit(get_response to client(standard_metadata.ingress_port))    # originate the response out the requesting client port
+    notes: |
+      NetCache read-hit: the queried key is present and valid in its slot
+      AND the slot's stored_key equals the request key (collision-safe).
+      The switch answers the GET itself — it rewrites the request into a
+      GET_RESPONSE carrying the cached value and reflects it back toward the
+      client — and does NOT forward to the backend. This is the `relocate`
+      origination surface: the read is served entirely in the pipeline.
+      The `value(cache.stored_key, ==, hdr.netcache.key)` conjunct is the
+      signature discriminating guard — an implementation that omits it serves a
+      colliding key's value (`no_cross_key_contamination` /
+      `cache_hit_value_correct`). v1.0-harness note: the originated
+      response egresses the ingress (client) port, which the v1.0 scorer
+      excludes from egress-port scoring (the same convention
+      P-SYNCookieGuard adopts); the hit is therefore SCORED as the
+      absence of a backend forward (contrast R2), and the response value /
+      header fields are asserted where the harness observes the reflected
+      packet. The implementation sets `standard_metadata.egress_spec =
+      standard_metadata.ingress_port`.
+
+  - id: R2_get_miss_forward
+    when: |
+      header_present(netcache)
+        ∧ ingress(client_facing)
+        ∧ hdr.netcache.op == GET
+        ∧ ( ¬exists(cache, slot_index)
+            ∨ value(cache.valid, ==, 0)
+            ∨ value(cache.stored_key, ≠, hdr.netcache.key) )
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+      cache:     by_key(hash(hdr.netcache.key) mod ${cache_capacity})
+    then:
+      - forward(${backend_port})
+    notes: |
+      NetCache read-miss: the slot is invalid, never populated, or occupied
+      by a DIFFERENT key that collided on the same index. The request is
+      forwarded UNCHANGED to the backend store (which owns the
+      authoritative value). R2 is the explicit disjoint partner of R1's hit
+      guard; the three disjuncts enumerate the three miss causes. The
+      collided-key disjunct (`stored_key ≠ key`) is what the
+      `collision_distinct_keys_miss` test pins — an implementation keying on the
+      index alone would (wrongly) treat a colliding key as a hit and serve
+      the wrong value via R1.
+
+  - id: R3_write_invalidate_forward
+    when: |
+      header_present(netcache)
+        ∧ ingress(client_facing)
+        ∧ ( hdr.netcache.op == PUT
+            ∨ ( hdr.netcache.op == DELETE ∧ ${cache_op_breadth} == get_put_delete ) )
+        ∧ exists(cache, slot_index)
+        ∧ value(cache.valid, ==, 1)
+        ∧ value(cache.stored_key, ==, hdr.netcache.key)
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+      cache:     by_key(hash(hdr.netcache.key) mod ${cache_capacity})
+    then:
+      - "set(cache.value, write_value(${coherence_policy}, hdr.netcache.value, cache.value))"   # write_through updates the value; invalidate_on_write leaves it (about to be invalid)
+      - "set(cache.valid, valid_after_write(${coherence_policy}))"   # invalidate_on_write → 0; write_through → 1 (still valid, value refreshed)
+      - "set(cache.version, cache.version + 1)"             # bump coherence generation (dormant unless D5.2)
+      - forward(${backend_port})
+    enforced_when: "${cache_op_breadth} != get_only"
+    notes: |
+      NetCache write-coherence: a write (PUT, or DELETE at
+      get_put_delete) whose key occupies its cache slot keeps the cache
+      coherent before forwarding the write to the backend. Under the
+      anchor `invalidate_on_write` policy the slot's validity bit is
+      cleared (the value column is left as-is but unreadable), so the next
+      GET for this key MISSES and re-fetches the authoritative value — the
+      `write_invalidation_coherence` invariant. Under `write_through` the
+      cached value is refreshed from the PUT payload and the slot stays
+      valid. Either way the write is also forwarded to the backend (the
+      source of truth). The `stored_key == key` guard ensures a write to
+      key K does NOT clobber a colliding key K' that happens to occupy
+      hash(K)'s slot (R4 handles that case as a plain forward). The version
+      bump is dormant unless `${faithfulness} == D5.2_versioned_coherence`.
+
+  - id: R4_write_no_cached_key_forward
+    when: |
+      header_present(netcache)
+        ∧ ingress(client_facing)
+        ∧ ( hdr.netcache.op == PUT
+            ∨ ( hdr.netcache.op == DELETE ∧ ${cache_op_breadth} == get_put_delete ) )
+        ∧ ( ¬exists(cache, slot_index)
+            ∨ value(cache.valid, ==, 0)
+            ∨ value(cache.stored_key, ≠, hdr.netcache.key) )
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+      cache:     by_key(hash(hdr.netcache.key) mod ${cache_capacity})
+    then:
+      - forward(${backend_port})
+    enforced_when: "${cache_op_breadth} != get_only"
+    notes: |
+      A write whose key is NOT cached in its slot (slot invalid, empty, or
+      occupied by a different colliding key) is forwarded to the backend
+      WITHOUT touching the cache state. R4 is R3's disjoint partner: the
+      `stored_key ≠ key` disjunct is the collision-on-write guard — a write
+      to K must never invalidate or overwrite a colliding key K''s valid
+      slot (`no_cross_key_contamination` on the write side). The
+      `no_cross_key_write_contamination` test pins this.
+
+  - id: R5_unsupported_write_passthrough
+    when: |
+      header_present(netcache)
+        ∧ ingress(client_facing)
+        ∧ hdr.netcache.op ∈ {PUT, DELETE}
+        ∧ ( ${cache_op_breadth} == get_only
+            ∨ ( hdr.netcache.op == DELETE ∧ ${cache_op_breadth} == get_put ) )
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+    then:
+      - forward(${backend_port})
+    notes: |
+      Writes the configured op breadth does not handle (any write under
+      get_only; DELETE under get_put) are passed through to the backend
+      without affecting cache state — they are outside the cache's coherence
+      contract for this seed. Keeps the op-breadth ladder clean: narrowing
+      the breadth turns an invalidating write into a plain forward rather
+      than changing the forwarding decision.
+
+  - id: R6_revalidate_on_server_reply
+    when: |
+      header_present(netcache)
+        ∧ ingress(backend_facing)
+        ∧ hdr.netcache.op == GET_RESPONSE
+        ∧ ${in_band_revalidation}
+        ∧ exists(cache, slot_index)
+    given:
+      port_role: by_key(standard_metadata.ingress_port)
+      cache:     by_key(hash(hdr.netcache.key) mod ${cache_capacity})
+    then:
+      - "set(cache.valid, true)"                            # re-validate: clear the invalidation for this key
+      - "set(cache.value, hdr.netcache.value)"             # re-cache the authoritative value from the server reply
+      - forward(client_port_for(hdr.netcache.key))
+    enforced_when: "${in_band_revalidation}"
+    notes: |
+      NetCache in-network cache-update path. When `${in_band_revalidation}`
+      is set, a GET_RESPONSE returning from the backend store re-validates
+      (re-caches) its key in the data plane — clearing the invalidation set
+      by an earlier write — and forwards the reply to the client. The next
+      GET for that key then HITS again. This is a SECOND processing path,
+      distinct from the client-side request path (R1–R5): the SUT must apply
+      its cache lookup on the BACKEND-ingress packet, locate the SAME slot it
+      invalidates on a write (consistent key→slot mapping across both paths),
+      and clear the invalidation. The signature relocate failure here is
+      managing cache state off a transiting reply — a baseline that only
+      processes client requests forwards the reply unchanged (R0) and the key
+      stays a miss. The `revalidate_after_miss_then_hit` test pins it.
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. A hit originates one response
+      and stops; a miss / write forwards once to the backend; passthrough
+      forwards once. The originated response is a single reflected packet,
+      not a recirculation.
+
+  - id: cache_hit_value_correct
+    clause: stability
+    target: "(hdr.netcache.value on GET_RESPONSE)"
+    while: "rule R1 fires ∧ egress(packet)"
+    notes: |
+      On a cache hit the originated response carries EXACTLY the value
+      stored for the queried key — `cache.value` of the slot whose
+      `stored_key` equals the request key. Never a different key's value,
+      never a stale (post-write) value, never a garbage register read.
+      Implementation anti-pattern: keying the value read on the slot index alone
+      without confirming `stored_key == key`, so a colliding key's value is
+      returned. `cache_hit_value_correct` and `collision_distinct_keys_miss`
+      catch it.
+
+  - id: no_cross_key_contamination
+    clause: stability
+    target: "(cache.value, cache.valid, cache.stored_key)"
+    while: "rule R1 fires ∨ rule R3 fires ∨ rule R4 fires"
+    notes: |
+      A request for key K never reads, invalidates, or overwrites the slot
+      state attributed to a DIFFERENT key K' that shares hash(K)'s index.
+      On the read side (R1) a colliding K is a miss, not a hit on K''s
+      value; on the write side (R3/R4) a write to K never clears or rewrites
+      K''s valid slot. This is the hash-collision disambiguation guarantee —
+      the pattern's signature correctness surface, pinned by the stored-key
+      check on every cache touch.
+
+  - id: write_invalidation_coherence
+    clause: persistence
+    target: "(GET-result for key K)"
+    while: "a write (R3) to key K has fired"
+    free_under: ["control-plane re-population of key K"]
+    enforced_when: "${cache_op_breadth} != get_only ∧ ${coherence_policy} == invalidate_on_write"
+    notes: |
+      After an invalidating write to a cached key K, every subsequent GET
+      for K MISSES (forwards to the backend) until the control plane
+      re-populates the slot — the cache never serves the stale pre-write
+      value. This is the NetCache coherence contract and the property a
+      `relocate`-frontier SUT most often gets wrong: it caches the value but
+      omits the data-plane invalidation, so reads keep returning the stale
+      value after a write. The `write_invalidates_then_miss` test pins it.
+      Under `write_through` the analogous contract is that the post-write
+      GET returns the NEW value (refreshed in place), not the old one.
+
+  - id: revalidation_coherence
+    clause: persistence
+    target: "(GET-result for key K)"
+    while: "a server GET_RESPONSE for key K has transited (R6)"
+    free_under: ["a later write (R3) to key K"]
+    enforced_when: "${in_band_revalidation}"
+    notes: |
+      Under `${in_band_revalidation}`, after a backend GET_RESPONSE for key K
+      transits the switch toward the client, every subsequent GET for K HITS
+      (served in-switch) until the next write to K invalidates it again — the
+      cache has re-learned the authoritative value. Pairs with
+      `write_invalidation_coherence` to make the full miss → re-fetch →
+      re-validate → hit cycle the data-plane contract. The SUT must perform
+      the re-validation write on the backend-ingress path, keyed to the same
+      slot as the request path.
+
+  - id: request_no_orphan
+    clause: no_orphan
+    target: any_kv_request
+    notes: |
+      Every KV request is resolved: a GET is either answered by an
+      originated response (hit, R1) or forwarded to the backend (miss, R2);
+      a write is forwarded to the backend (R3/R4/R5), invalidating its slot
+      where applicable. No KV request is silently dropped — a missing
+      backend forward on a miss is a lost read, the failure
+      `get_miss_forwards_backend` catches.
+
+  - id: hit_response_well_formed
+    clause: stability
+    target: "(hdr.netcache.op, hdr.netcache.key, hdr.netcache.value)"
+    while: "rule R1 fires ∧ egress(packet)"
+    notes: |
+      The originated GET_RESPONSE has every field explicitly assigned: op
+      set to GET_RESPONSE, the queried key echoed, the cached value
+      written, and the L2/L3/L4 addresses reflected toward the client. The
+      formal pin on the common v1model `setValid()`-/origination-without-
+      assignment bug — `response_header_well_formed` enumerates every response field.
+      The deparser must emit the response header conditionally on the hit
+      path only (`response_emit_conditional_deparser`).
+
+  - id: bounded_origination_latency
+    clause: bounded_latency
+    target: "(get_response, GET hit)"
+    while: "rule R1 fires"
+    notes: |
+      The hit response is originated within the SAME pipeline traversal as
+      the GET that hit — not deferred to a later packet, a periodic sweep,
+      or a recirculation. Lookup, value read, and response origination are
+      co-located on the querying packet.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: get_hit_serves_value_no_backend
+      generate: |
+        Pre-install (key=K, value=V) into `cache_entries` (slot at
+        hash(K), valid=1). Send a GET for key K on a client_facing port.
+        Assert (a) the request is NOT forwarded to ${backend_port} (the
+        read is served in-switch), and (b) where the harness observes the
+        reflected response on the client port, hdr.netcache.op ==
+        GET_RESPONSE and hdr.netcache.value == V. (Anchor — NetCache read
+        hit / origination; G1-P1-T3 hit action.)
+
+    - id: get_miss_forwards_backend
+      generate: |
+        Send a GET for a key K' that is NOT in `cache_entries` (its slot is
+        unpopulated/invalid). Assert the request is forwarded to
+        ${backend_port} unchanged (op still GET) and NO response is
+        reflected to the client. (Anchor — NetCache read miss; the
+        request_no_orphan invariant; G1-P1-T1 forwarding path.)
+
+    - id: write_invalidates_then_miss
+      requires: "${cache_op_breadth} != get_only ∧ ${coherence_policy} == invalidate_on_write"
+      generate: |
+        Pre-install (key=K, value=V) into the cache (valid=1). prior_inputs:
+        a PUT for key K (carrying a new value V') on a client_facing port —
+        forwarded to ${backend_port} and invalidating the slot. Test
+        packet: a GET for key K. Assert the GET now MISSES — it is forwarded
+        to ${backend_port} (not answered with the stale V). Probes the
+        write_invalidation_coherence invariant and register read-after-write
+        ordering (G1-P2-T4 persistence + G1-P2-T7 ordering).
+
+    - id: revalidate_after_miss_then_hit
+      requires: "${in_band_revalidation}"
+      generate: |
+        Full coherence cycle. Pre-install (K → V). prior_inputs: (1) a write
+        (PUT/DELETE) for K on the client port — invalidates K and forwards to
+        the backend; (2) a GET for K — now a miss, forwarded to the backend;
+        (3) a GET_RESPONSE for K arriving on the BACKEND port (the server's
+        reply) — the switch MUST re-validate K and forward the reply to the
+        client. Test packet: a GET for K on the client port. Assert it now
+        HITS again (served in-switch — no backend forward). Probes the
+        revalidation_coherence invariant and R6; discriminates a SUT that only
+        processes client requests and passes the server reply through
+        unchanged (K would stay a miss).
+
+    - id: unrelated_write_leaves_other_key_cached
+      requires: "${cache_op_breadth} != get_only"
+      generate: |
+        Pre-install two keys in DISTINCT slots: (K1→V1) and (K2→V2), both
+        valid. prior_inputs: a PUT for K2. Test packet: a GET for K1. Assert
+        K1 still HITS and returns V1 (its slot was untouched by the write to
+        K2) — verified via the no-backend-forward observable. Cross-key
+        independence (G1-P2-T3).
+
+  G2:
+    - id: collision_distinct_keys_miss
+      generate: |
+        Choose two distinct keys K1, K2 with hash(K1) mod cache_capacity ==
+        hash(K2) mod cache_capacity (a slot-index collision; under a small
+        ${cache_capacity} or weak ${hash_algo} these are easy to construct,
+        or stage via workload_skew=adversarial_collision). Pre-install only
+        (K1→V1, valid=1) so the shared slot holds K1. Send a GET for K2.
+        Assert the GET MISSES — forwarded to ${backend_port}, NOT answered
+        with V1. The signature collision-correctness probe (G2-P2-T2 hash
+        collision + the no_cross_key_contamination invariant); discriminates
+        an implementation that keys the hit on the index alone without the stored_key
+        check.
+
+    - id: value_width_boundary_bit_exact
+      generate: |
+        Pre-install (K → V) where V is the maximum value for
+        ${value_width_bits} (all-ones). Send a GET for K. Assert the
+        reflected response (where observable) carries V bit-exact with no
+        truncation or wrap. Probes value-register width handling (G2-P1-T4
+        boundary value).
+
+  G3:
+    - id: cold_start_uninitialised_slot_miss
+      generate: |
+        On a FRESH switch with `cache_entries` empty for the queried slot
+        (the value/valid registers were never written — BMv2 zero-inits but
+        the P4 spec does not guarantee it), send a GET for a key K whose
+        slot has never been populated. Assert the GET MISSES (forwarded to
+        ${backend_port}) and the switch never reflects a garbage value-
+        register read as a spurious hit. Probes the cold-start /
+        read-from-uninitialised-register bug (G1-P2-T1 + bug-taxonomy "read
+        from invalid / first-packet cold start") — the code must gate the
+        hit on `valid == 1`, not assume an unpopulated slot is empty by its
+        value alone.
+
+    - id: response_header_well_formed
+      generate: |
+        Pre-install (K → V). Send a GET for K. On the reflected response
+        (where the harness observes it) assert EVERY field individually:
+        hdr.netcache.op == GET_RESPONSE, hdr.netcache.key == K,
+        hdr.netcache.value == V, and the reflected ethernet/ipv4/udp src/dst
+        addresses (client-directed). Catches the common v1model setValid()/origination
+        -without-per-field-assignment bug — a response built but left with
+        garbage in the op or address fields. (G1-P4-T3 instance.)
+
+    - id: response_emit_conditional_deparser
+      generate: |
+        Run both paths against the same SUT in one run: one GET that HITS
+        (origination) followed by one GET that MISSES (backend forward).
+        Assert the hit produces a well-formed GET_RESPONSE on the client
+        side AND the miss produces a plain GET forwarded to ${backend_port}
+        with NO response header / no garbage trailer appended. Catches the
+        common v1model conditional-deparser bug where the response header is emitted
+        unconditionally (or the request mangled on the miss path) because
+        the deparser's emit is not guarded by the hit decision.
+
+    - id: no_cross_key_write_contamination
+      requires: "${cache_op_breadth} != get_only"
+      generate: |
+        Pre-install (K1 → V1, valid=1) in a slot. Choose K2 colliding on
+        the same index (hash(K2) == hash(K1)) that is NOT cached. prior_
+        inputs: a PUT for K2 (write to the colliding, non-cached key). Test
+        packet: a GET for K1. Assert K1 still HITS and returns V1 — the
+        write to colliding K2 did NOT invalidate or overwrite K1's slot
+        (R4, not R3). Probes no_cross_key_contamination on the write side.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Harden operators paired with ease counterparts; every operator declares
+# `direction` so difficulty recalibration can pick from the
+# matching pool depending on whether r > r* + δ (harden) or r < r* − δ (ease).
+
+mutation_operators:
+
+  - id: tighten_faithfulness
+    applicable_when: "${faithfulness} ∈ {D5.0_direct_mapped, D5.1_set_associative}"
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_set_associative then
+          ${ways} ← max(${ways}, 4) ∧
+          ${cache_op_breadth} ← get_put_delete ) ∧
+      ( if ${faithfulness}_post == D5.2_versioned_coherence then
+          ${cache_capacity} ← bounded_to_entries(${cache_entries}) ∧
+          ${workload_skew} ← zipfian )
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_direct_mapped ∧
+      ( ${faithfulness} ≠ D5.1_set_associative ∨ ${ways} ≥ 2 )
+    kind: parameter
+    notes: |
+      Lift the feature/faithfulness ladder by one rung. D5.0 → D5.1 turns on
+      W-way set associativity (the lookup must check all ways and a write
+      must invalidate the matching way) and adds DELETE as an invalidating
+      write. D5.1 → D5.2 turns on per-slot value versioning for coherence
+      under interleaved updates and tightens to a bounded capacity at
+      skewed workload. The associativity / op-breadth part of the D5.1 step
+      is feature-breadth and the versioning part of the D5.2 step is state
+      fidelity; the operator is tagged `faithfulness` as the ladder's
+      governing axis (the entailed feature bindings ride along, as in
+      P-GTPUEncap's faithfulness ladder).
+
+  - id: loosen_faithfulness
+    applicable_when: "${faithfulness} ∈ {D5.1_set_associative, D5.2_versioned_coherence}"
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_direct_mapped then
+          ${ways} ← 1 ∧
+          ${cache_op_breadth} ← get_put ∧
+          ${coherence_policy} ← invalidate_on_write ) ∧
+      ( if ${faithfulness}_post == D5.1_set_associative then
+          ${cache_capacity} ← ${cache_capacity} * 4 ∧
+          ${workload_skew} ← uniform )
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${faithfulness} ≠ D5.2_versioned_coherence"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the ladder
+      back one rung and reverts the entailed bindings (associativity to
+      direct-mapped, op breadth to get_put, capacity loosened), giving
+      difficulty recalibration a path back after an over-harden.
+
+  - id: shrink_cache_capacity_4x
+    applicable_when: "${cache_capacity} ≥ 16"
+    effect: "${cache_capacity} ← ${cache_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${cache_capacity} ≥ 4"
+    notes: |
+      Quarter the number of slot indices. More distinct keys collide on the
+      same index, so the stored-key disambiguation is exercised far more
+      often — an implementation with a weak or missing key check fails the collision
+      tests at higher rates. Pairs with `enlarge_cache_capacity_2x`.
+
+  - id: enlarge_cache_capacity_2x
+    applicable_when: "${cache_capacity} ≤ 524288"
+    effect: "${cache_capacity} ← ${cache_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${cache_capacity} ≤ 1048576"
+    notes: |
+      Paired ease counterpart of `shrink_cache_capacity_4x`. Doubles (not
+      quadruples) so the harden/ease asymmetry gives difficulty recalibration
+      a slow climb back after an over-harden.
+
+  - id: raise_associativity_2x
+    applicable_when: "${ways} ≤ 4 ∧ ${faithfulness} ≠ D5.0_direct_mapped"
+    effect: "${ways} ← ${ways} * 2"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${ways} ≤ 8"
+    notes: |
+      Double the associativity (D5.1+). The lookup must check more ways per
+      index and the write-invalidate must locate the matching way among
+      them, widening the per-index control flow the SUT must implement
+      correctly. Pairs with `lower_associativity_2x`.
+
+  - id: lower_associativity_2x
+    applicable_when: "${ways} ≥ 2"
+    effect: "${ways} ← ${ways} / 2"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${ways} ≥ 1"
+    notes: |
+      Paired ease counterpart of `raise_associativity_2x`. Fewer ways per
+      index; at ways==1 the cache is direct-mapped.
+
+  - id: widen_op_breadth
+    applicable_when: "${cache_op_breadth} ∈ {get_only, get_put}"
+    effect: "${cache_op_breadth} ← next_breadth(${cache_op_breadth})"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${cache_op_breadth} ∈ {get_put, get_put_delete}"
+    notes: |
+      Widen the handled op set (get_only → get_put → get_put_delete). Adding
+      PUT brings the write-invalidation coherence path online; adding DELETE
+      adds a second invalidating op the SUT must route through the same
+      coherence logic. Pairs with `narrow_op_breadth`.
+
+  - id: narrow_op_breadth
+    applicable_when: "${cache_op_breadth} ∈ {get_put, get_put_delete}"
+    effect: "${cache_op_breadth} ← prev_breadth(${cache_op_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${cache_op_breadth} ∈ {get_only, get_put}"
+    notes: |
+      Paired ease counterpart of `widen_op_breadth`. Narrowing to get_only
+      removes the coherence path entirely (writes become plain passthrough,
+      R5), the easiest read-only-cache variant.
+
+  - id: enable_write_through
+    applicable_when: "${cache_op_breadth} != get_only ∧ ${coherence_policy} == invalidate_on_write"
+    effect: "${coherence_policy} ← write_through"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${coherence_policy} == write_through"
+    notes: |
+      Switch coherence from invalidate-on-write to write-through: a PUT must
+      now correctly REWRITE the cached value register in place (and keep the
+      slot valid), rather than merely clearing the validity bit. Harder —
+      the SUT must read the PUT payload and update the value register, a
+      data-plane write it can omit under invalidate-only. Pairs with
+      `revert_to_invalidate_on_write`.
+
+  - id: revert_to_invalidate_on_write
+    applicable_when: "${coherence_policy} == write_through"
+    effect: "${coherence_policy} ← invalidate_on_write"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${coherence_policy} == invalidate_on_write"
+    notes: |
+      Paired ease counterpart of `enable_write_through`. Returns to the
+      simpler invalidate-on-write coherence (clear the valid bit; no value
+      rewrite).
+
+  - id: enable_in_band_revalidation
+    applicable_when: "${in_band_revalidation} == false ∧ ${cache_op_breadth} != get_only"
+    effect: "${in_band_revalidation} ← true"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${in_band_revalidation} == true"
+    kind: parameter
+    notes: |
+      Activate R6 (in-band cache re-validation on the server reply path) and
+      the `revalidate_after_miss_then_hit` test. The SUT must add a second
+      processing path that re-caches a key off a transiting backend
+      GET_RESPONSE, keyed to the same slot it invalidates on a write — the
+      relocate magnet (managing cache state off a reply, not just a
+      request). This mutation operator was added to give
+      the pattern a gradable harden lever beyond the v1.0-harness-unobservable
+      capacity/associativity/hash axes. Pairs with
+      `disable_in_band_revalidation`.
+
+  - id: disable_in_band_revalidation
+    applicable_when: "${in_band_revalidation} == true"
+    effect: "${in_band_revalidation} ← false"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${in_band_revalidation} == false"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `enable_in_band_revalidation`. Server replies
+      revert to plain passthrough (R0); an invalidated key stays a miss until
+      the control plane re-populates it. R6 and its test are gated off.
+
+  - id: swap_hash_to_xor_fold
+    applicable_when: "${hash_algo} ∈ {crc16, crc32}"
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_algo} == xor_fold"
+    notes: |
+      Weaker hash on the slot index. Under a skewed / adversarial key
+      distribution xor_fold collapses hot keys onto a few indices, raising
+      collision frequency and stressing the stored-key disambiguation.
+      Hardens the panel against implementations that copy a textbook hash blindly.
+      Pairs with `swap_hash_to_crc32`.
+
+  - id: swap_hash_to_crc32
+    applicable_when: "${hash_algo} ∈ {xor_fold, crc16}"
+    effect: "${hash_algo} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_algo} == crc32"
+    notes: |
+      Paired ease counterpart of `swap_hash_to_xor_fold`. CRC32 spreads
+      keys most evenly across slot indices, minimising collisions.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial_collision}"
+    notes: |
+      Raise the request-key distribution skew by one step (uniform →
+      zipfian → adversarial_collision). Combined with a weak ${hash_algo} or
+      a small ${cache_capacity} this drives the collision-on-the-stored-key
+      surface the discriminating tests exercise. Pairs with
+      `lower_workload_skew`.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial_collision}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: widen_value_4x
+    applicable_when: "${value_width_bits} ≤ 128"
+    effect: "${value_width_bits} ← ${value_width_bits} * 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${value_width_bits} ≤ 512"
+    notes: |
+      Quadruple the cached value width. Wider values pressure the value
+      register width and the response-header construction (more bytes to
+      assign on origination), and at large widths force the value across
+      multiple register cells. Pairs with `narrow_value_4x`.
+
+  - id: narrow_value_4x
+    applicable_when: "${value_width_bits} ≥ 32"
+    effect: "${value_width_bits} ← ${value_width_bits} / 4"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${value_width_bits} ≥ 8"
+    notes: |
+      Paired ease counterpart of `widen_value_4x`.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      The relocate-frontier default: no reference implementation, so the
+      SUT must redesign the host-side cache (hash indexing, stored-key
+      disambiguation, write-invalidation coherence, response origination)
+      from the behavioural spec alone — the relocate failure mode.
+      Pairs with `ladder_input_form_to_python_ref`. The default state for a
+      relocate-frontier ceiling instance.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source to task.description so the SUT sees a
+      host-side reference implementation in addition to the behavioural
+      spec — the heaviest difficulty lever, especially
+      load-bearing for a `relocate` pattern where the baseline
+      cannot redesign the host-side algorithm from a behavioural spec alone.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      Starter-library operator — laddering the input form from
+      behavioural-spec to host-side-reference EASES the SUT's job. Pairs
+      with `revert_input_form_to_behavioural`.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this pattern to v1model P4 (every entry below is
+  `[common-knowledge baseline]` rather than NetCache-paper-cited):
+
+    Anchor (D5.0_direct_mapped; ways=1, cache_op_breadth=get_put,
+                 coherence_policy=invalidate_on_write, hash_algo=crc32,
+                 workload_skew=uniform):
+      - Header: a custom `header netcache_t { bit<8> op; bit<K> key;
+        bit<V> value; }` parsed after UDP on a reserved port (NetCache uses
+        a custom app header over UDP). The implementation keys the parse on
+        udp.dstPort == the NetCache port.
+      - State: three parallel register arrays sized ${cache_capacity}:
+        `register<bit<1>>(C) cache_valid;`
+        `register<bit<K>>(C) cache_key;`
+        `register<bit<V>>(C) cache_val;`
+        (add `register<bit<32>>(C) cache_ver;` at D5.2). Index by
+        `idx = hash_result mod C`, where
+        `hash(idx, HashAlgorithm.crc32, 0, {hdr.netcache.key}, C)`.
+      - R1 hit: read cache_valid[idx], cache_key[idx], cache_val[idx]; HIT
+        iff valid==1 AND cache_key[idx]==hdr.netcache.key. On hit, set
+        hdr.netcache.op=GET_RESPONSE, hdr.netcache.value=cache_val[idx],
+        swap eth/ipv4/udp src↔dst, and set
+        standard_metadata.egress_spec = standard_metadata.ingress_port
+        (reflect to client). THE signature bug: omitting the
+        `cache_key[idx]==key` check → a colliding key reads the wrong value.
+        `collision_distinct_keys_miss` catches it.
+      - R2 miss: forward to ${backend_port} unchanged.
+      - R3 write-invalidate: on PUT for a key whose slot holds it (valid &&
+        key match), write cache_valid[idx]=0 (invalidate_on_write) — or
+        cache_val[idx]=hdr.netcache.value with valid kept 1 (write_through)
+        — then forward to ${backend_port}. THE coherence bug: caching the
+        value but never invalidating on write → stale reads.
+        `write_invalidates_then_miss` catches it.
+      - R4 write-no-match: PUT for a key NOT in its slot → forward only, do
+        NOT touch cache state (don't clobber a colliding key).
+        `no_cross_key_write_contamination` catches the clobber.
+      - Cold start: cache_valid is the source of truth, NOT the value
+        register — an unpopulated slot has valid==0 and must MISS even
+        though its value register reads 0 (or garbage on non-BMv2 targets).
+        `cold_start_uninitialised_slot_miss` catches a value-only hit test.
+      - MyDeparserMyComputeChecksum: recompute the UDP/IPv4 checksums on the
+        reflected response (the value and addresses changed); the deparser
+        emits the netcache header conditionally on the (rewritten-or-not)
+        request — `response_emit_conditional_deparser` checks the miss path
+        carries no spurious response.
+
+    D5.1 (set-associative + DELETE): cache_* registers become ${ways}
+    arrays (or one array of size C*ways with idx*ways+w addressing); R1
+    checks all ways for a (valid && key) match; R3 invalidates the matching
+    way; DELETE routes through R3 exactly as PUT.
+
+    D5.2 (versioned coherence): each slot carries a version; a write bumps
+    cache_ver[idx]; a control-plane (or in-band) populate carrying a version
+    older than cache_ver[idx] is rejected (stale fill), so an out-of-order
+    cache-update cannot resurrect a stale value. Bound the cache capacity to
+    the installed entry count and run at zipfian skew.
+
+  v1.0-harness note (origination scoring):
+    - The hit response is reflected out the requesting client's ingress
+      port. The v1.0 scorer excludes egress-on-ingress-port from egress-
+      port scoring (the same limitation P-SYNCookieGuard documents for its
+      originated SYN-ACK). Consequence: the cache HIT is scored primarily
+      through the OBSERVABLE behaviour — a hit produces NO forward to
+      ${backend_port}, a miss DOES — and the response value / header fields
+      are asserted where the harness can read the reflected packet. The
+      collision-correctness, coherence, and cross-key invariants are all
+      fully observable through the backend-forward channel, so the
+      discriminating power does not depend on scoring the reflected packet.
+      An instance that wants the response value scored directly can place
+      the client on a non-ingress egress (a response-collector port, as
+      P-SwitchMLAgg does with multicast) — an instantiation choice, not a
+      pattern constraint.
+
+  Anti-pattern implementations to reject during reference review:
+    * Keying the cache hit / value read on the slot INDEX alone, without
+      confirming cache_key[idx]==hdr.netcache.key — a colliding key reads
+      the wrong value. The signature bug; `collision_distinct_keys_miss`
+      and `cache_hit_value_correct` catch it.
+    * Caching values but never invalidating on a write — reads return the
+      stale pre-write value forever. `write_invalidates_then_miss` catches
+      it.
+    * A write to key K clobbering / invalidating a colliding key K''s valid
+      slot — `no_cross_key_write_contamination` catches it.
+    * Treating an unpopulated slot as a hit because its value register reads
+      0 — the valid bit, not the value, is the hit predicate.
+      `cold_start_uninitialised_slot_miss` catches it.
+    * Building the GET_RESPONSE but leaving the op / addresses / value
+      partly unassigned — the common v1model setValid/origination-
+      without-assignment bug. `response_header_well_formed` catches it.
+    * Emitting the response header unconditionally (or mangling the request
+      on the miss path) — the common v1model conditional-deparser bug.
+      `response_emit_conditional_deparser` catches it.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - R0's L3 passthrough for non-KV traffic and server→client replies is a
+      pipeline-conventional scaffold (the basic_forwarding structure);
+      NetCache assumes a co-resident forwarding path but does not specify
+      it, so the spec binds it for a deployable switch.
+    - Modelling cache POPULATION as control-plane-installed `cache_entries`
+      (rather than a data-plane cache-fill on the read-miss return path) is
+      an authoring choice that keeps the v1.0 oracle's value column
+      stateless and the coherence property data-plane-observable through the
+      validity bit alone. NetCache's controller-driven hot-set population is
+      faithfully control-plane; the in-band cache-fill variant is deferred
+      (see v2 notes).
+
+  v2 deferral notes (not enforceable at v1.0):
+    - In-band data-plane cache-fill on the read-miss return path (the switch
+      learns and populates a value from a server reply) — needs a stateful
+      write keyed off a transiting reply and a value-eviction policy; v1
+      models population as control-plane only.
+    - Cross-switch / multi-rack distributed caching (DistCache's two-layer
+      provably-balanced allocation) — single-switch only at v1; needs a
+      `cross_switch_partitioning` axis on a TPL v2 variant.
+    - Variable-length / multi-slot values (NetCache's real value layout) —
+      v1 caches a single fixed-width value per slot; the multi-slot value
+      reassembly is out of scope.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must all
+       pass validation.
+
+    2. For anchor instances (D5.0_direct_mapped, ways=1, get_put,
+       invalidate_on_write, uniform workload, generous capacity), the
+       resulting task SHOULD exercise a clean hit / miss / write-invalidate
+       cycle with no collisions — cross-check the public test set against
+       the oracle for the seed.
+
+    3. As a `relocate`-frontier pattern, expect the baseline to fail the
+       behavioural-spec form predictably: the ceiling instance is the
+       behavioural-only D5.1+ seed under skew; the
+       `ladder_input_form_to_python_ref` operator (host-side reference in
+       the prompt) is the documented lever that recovers it toward a
+       discriminating difficulty. The signature failure to look for is the
+       missing stored-key check (collision) and the missing write-
+       invalidation (coherence).
+
+    4. The pattern composes downstream with P-IPv4Routing on the backend
+       underlay (a GET miss / write forwarded to a backend chosen by a
+       hash/range FIB across multiple storage servers) — that composition
+       is the storage-router composite (P1 ∪ P17), not encoded here.

@@ -1,0 +1,495 @@
+task_name: secure_router_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-SecureRouter
+pattern_version: '1.0'
+seed:
+  acl_rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 10.0.1.66/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_acl_action: permit
+  inside_subnet: 10.0.1.0/24
+  nat_pool_ip: 203.0.113.1
+  nat_pool_port_base: 20000
+  nat_capacity: 256
+  nat_eviction: none
+  fib_capacity: 1024
+  pipeline_order: acl_nat_route
+  inside_port: 1
+  outside_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: inside
+    to: s1.p1
+  - from: s1.p2
+    to: outside
+hosts:
+  inside:
+    note: private clients in 10.0.1.0/24; ingress on s1.p1
+  outside:
+    note: external hosts in 198.51.100.0/24; ingress on s1.p2; NAT pool 203.0.113.1
+description: |-
+  Implement an edge security router for BMv2 (v1model) that enforces an access
+  policy, performs source network address translation, and forwards IPv4 traffic
+  — all in a single pass.
+
+  Topology: port 1 faces the inside network (private hosts in 10.0.1.0/24);
+  port 2 faces the outside (external hosts in 198.51.100.0/24). The router
+  presents a single public address 203.0.113.1 to the outside.
+
+  Required behaviour, per IPv4 packet:
+
+  - Access policy. A packet's original addressing is checked against an
+    administrator-defined permit/deny policy before anything else. A denied
+    packet is dropped and leaves no trace. Inside host 10.0.1.66 is denied;
+    everything else is permitted by default.
+
+  - Address translation. Traffic originating inside and destined outside has its
+    private source replaced by the router's public address 203.0.113.1 and by a
+    public source port the router assigns. Ports are assigned in ascending order
+    starting at 20000: the first new connection receives source port 20000, the
+    next new connection 20001, and so on; a connection keeps its assigned port for
+    all of its packets. Return traffic from the outside addressed to the public
+    address and an assigned port is translated back to the inside host and original
+    port that own that assignment. Outside traffic that does not correspond to any
+    connection an inside host opened is dropped.
+
+  - Forwarding. A packet that survives the policy and translation steps is
+    delivered toward its (translated) destination: it leaves on the correct port
+    toward the correct next hop, with its hop count decremented and its L2/L3
+    integrity preserved. A packet with an expired hop count, or with no known
+    route, is dropped.
+
+  Both the P4 program and its table entries are yours to author. The router must
+  behave correctly across the full request/reply exchange: a reply is delivered
+  to an inside host only if that host first initiated the connection.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: outbound_nat_forward
+  visibility: public
+  goal_class: G1
+  description: 'A permitted inside host (10.0.1.50:5000 -> 198.51.100.9:80) is source-NATed and routed out the outside port: IP.src becomes the public pool address, the L4 source port becomes an allocated pool port, TTL is decremented, and Ether.dst is rewritten to the outside next hop. The destination is unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+- name: inbound_denat_forward
+  visibility: public
+  goal_class: G1
+  description: 'The outside reply (198.51.100.9:80 -> 203.0.113.1:20000) for the established flow is reverse de-NATed and routed to the inside port: IP.dst and the L4 destination port are restored to the original inside host (10.0.1.50:5000), TTL-1, Ether.dst rewritten to the inside next hop. The source is unchanged.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 20000
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.50
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 5000
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: acl_deny_drop
+  visibility: public
+  goal_class: G1
+  description: A packet from the denied inside host (10.0.1.66) is dropped by the access policy before translation or forwarding.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: unsolicited_inbound_drop
+  visibility: hidden
+  goal_class: G2
+  description: An outside packet to the public pool address with no established connection (no inside host opened it) is dropped.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 20000
+  expected:
+    behavior: drop
+- name: nat_binding_reuse
+  visibility: hidden
+  goal_class: G2
+  description: 'The second packet of an already-established outbound flow reuses the SAME pool source port (no new binding is allocated): 10.0.1.50:5000 maps to pool port 20000 again.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: second_flow_distinct_port
+  visibility: hidden
+  goal_class: G2
+  description: A second distinct inside flow (10.0.1.51:5000) opened after the first is allocated a DIFFERENT pool port (20001), so the two flows remain demultiplexable on return.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.51
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20001
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: An outbound packet with ttl==1 is forwarded with egress ttl==0 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 198.51.100.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: change_to
+        value: 20000
+      TCP.dport:
+        action: unchanged
+- name: deny_leaves_no_state
+  visibility: hidden
+  goal_class: G3
+  description: A denied outbound flow (10.0.1.66) installs no NAT binding, so a subsequent outside reply addressed to the pool is dropped as unsolicited — the deny short-circuits before the NAT stage.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 20000
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+- name: udp_flow_roundtrip
+  visibility: hidden
+  goal_class: G3
+  description: A UDP outbound flow is source-NATed and its reply de-NATed exactly like TCP — translation keys on the 3-tuple (ip, port, proto), not the L4 type.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 80
+        dport: 20000
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.53
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 198.51.100.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+- name: inbound_no_route_after_denat
+  visibility: hidden
+  goal_class: G3
+  description: Reverse de-NAT restores the inside destination and the LPM lookup then keys on that restored address — the inbound reply for the established flow routes to the inside port (post-NAT routing).
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:22
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 198.51.100.9
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 20000
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.50
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 5000
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 198.51.100.9
+  expected:
+    behavior: drop

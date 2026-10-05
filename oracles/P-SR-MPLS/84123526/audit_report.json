@@ -1,0 +1,99 @@
+{
+  "oracle_hash": "7508973bad123559ab1624600044a13b7134e7d58d4b09ad22461088c92a4a22",
+  "instance": "sr_mpls_anchor_mut1-shallow_stack",
+  "ran_at": "2026-06-17T13:55:13.778362Z",
+  "canonical_examples": {
+    "passed": 5,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_mpls_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_mpls_udp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_mpls_icmp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_mpls_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_mpls_bare_ether_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "mpls_ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "completed_segments_popped": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stack_below_acted_segments_preserved": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "adj_sid_bypasses_fib": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "php_exposes_inner": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ether_rewrite_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "mpls_ttl_quantum_one",
+      "completed_segments_popped",
+      "stack_below_acted_segments_preserved",
+      "adj_sid_bypasses_fib",
+      "php_exposes_inner",
+      "ether_rewrite_correctness"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC 8660 \u00a72.5 / \u00a72.6 / \u00a72.10",
+      "RFC 8402 \u00a73.1 / \u00a73.4 / \u00a75.1"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

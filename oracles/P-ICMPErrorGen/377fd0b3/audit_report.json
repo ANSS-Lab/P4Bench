@@ -1,0 +1,99 @@
+{
+  "oracle_hash": "0b0eb42d2b8aa5e3b614cb1fda0de6b452675f3fd72e7f29b5c633d6134daa2a",
+  "instance": "icmp_error_gen_anchor-default",
+  "ran_at": "2026-05-29T23:41:57.081162Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_forward_live_ttl_port2",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_forward_live_ttl_ttl2_boundary",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_no_route_live_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_ttl1_originate_icmp",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_ttl0_originate_icmp",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_source_unreachable_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_no_icmp_to_icmp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_icmp_echo_is_not_error_originates",
+        "status": "pass"
+      },
+      {
+        "example_id": "cfg_injected_routes_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "cfg_injected_routes_default_dest_now_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "icmp_type_code": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "icmp_addressing": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_icmp_to_icmp": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "icmp_type_code",
+      "icmp_addressing",
+      "no_icmp_to_icmp"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC 792, Time Exceeded Message",
+      "RFC 1812 \u00a75.3.1 / \u00a74.3.2.7"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

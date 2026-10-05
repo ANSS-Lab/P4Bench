@@ -1,0 +1,503 @@
+task_name: http_header_route_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-HTTPHeaderRoute
+pattern_version: '1.0'
+seed:
+  http_tcp_port: 80
+  service_vip: 203.0.113.10
+  parse_window_bytes: 64
+  method_set:
+  - GET
+  - POST
+  host_match_enabled: false
+  path_match_enabled: false
+  action_breadth: route_only
+  malformed_handling: lax_default
+  default_action: forward_default
+  default_backend_port: 4
+  http_route_policy_entries:
+  - method: GET
+    action: route
+    egress_port: 2
+    backend_mac: 08:00:00:00:02:02
+    src_mac: 08:00:00:00:00:02
+  - method: POST
+    action: route
+    egress_port: 3
+    backend_mac: 08:00:00:00:03:03
+    src_mac: 08:00:00:00:00:03
+  route_policy_capacity: unbounded
+  workload_skew: uniform
+  faithfulness: D5.0_anchor_route
+  client_port: 1
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: clients
+    to: s1.p1
+  - from: s1.p2
+    to: backend_a
+  - from: s1.p3
+    to: backend_b
+  - from: s1.p4
+    to: backend_default
+hosts:
+  clients:
+    note: HTTP clients in 10.0.1.0/24; ingress on s1.p1; address the VIP 203.0.113.10
+  backend_a:
+    note: GET backend on s1.p2
+  backend_b:
+    note: POST backend on s1.p3
+  backend_default:
+    note: default/catch-all backend on s1.p4
+description: |-
+  Implement an HTTP request steerer for BMv2 (v1model) that inspects cleartext
+  HTTP/1.1 requests and forwards each one to the backend its request method
+  selects, dropping anything that is not a well-formed HTTP request on the HTTP
+  port.
+
+  Topology: port 1 faces the clients that send HTTP requests. Ports 2 and 3 face
+  two backend servers; port 4 faces a default backend. Clients address a single
+  service IP, 203.0.113.10, which this switch fronts.
+
+  A request arrives as a single TCP segment to TCP port 80 whose payload begins
+  with a cleartext HTTP/1.1 request line ("<METHOD> <target> HTTP/1.1", ending in
+  a carriage-return/line-feed). The recognised methods are GET and POST (method
+  tokens are case-sensitive). Only the first 64 bytes of the TCP payload are in
+  scope for parsing.
+
+  Required behaviour, per packet:
+
+  - Only a TCP segment to port 80 whose payload begins with one of the recognised
+    method tokens followed by a space is treated as an HTTP request. Everything
+    else is dropped: non-IPv4 frames, non-TCP traffic, TCP to any other port, a
+    TCP/80 segment with no payload (e.g. a connection-setup segment), a payload
+    whose leading bytes are not a recognised method token (e.g. an HTTP response
+    or an encrypted/TLS handshake), and a request whose method is not GET or POST.
+
+  - A recognised request whose request line terminates within the first 64 bytes
+    is steered by its method: a GET is forwarded to the backend on port 2, a POST
+    to the backend on port 3. Forwarding is an ordinary L3 forward — the next-hop
+    Ethernet addresses are rewritten, the IPv4 hop count is decremented by one,
+    and the IPv4 header checksum is left valid. The IPv4 destination (the service
+    IP 203.0.113.10) is NOT changed; a downstream tier handles the reply path. The
+    HTTP request payload — the request line, every header line, and any body bytes
+    carried in the segment — is delivered to the backend byte-for-byte identical
+    to what arrived. Only the L2/L3 envelope is edited.
+
+  - A recognised request whose method is GET or POST but whose request line does
+    NOT terminate within the first 64 bytes (an over-long request that overruns
+    the scan window), or any recognised request that does not match an installed
+    steering rule, is forwarded to the default backend on port 4 (the same kind of
+    L3 forward — MAC rewrite, hop-count decrement, valid checksum, destination
+    preserved). The decision must be deterministic and must not depend on any
+    bytes past the first 64.
+
+  ## Backend addressing
+
+  Every L3 forward rewrites the Ethernet source to the switch's egress-port
+  address and the Ethernet destination to the selected backend's address (the
+  IPv4 destination stays the service VIP 203.0.113.10 in every case):
+
+    | backend         | egress port | Ethernet source     | Ethernet destination |
+    |-----------------|-------------|---------------------|----------------------|
+    | GET backend     | s1.p2       | 08:00:00:00:00:02   | 08:00:00:00:02:02    |
+    | POST backend    | s1.p3       | 08:00:00:00:00:03   | 08:00:00:00:03:03    |
+    | default backend | s1.p4       | 08:00:00:00:00:0d   | 08:00:00:00:0d:0d    |
+
+  Both the P4 program and its table entries are yours to author. The steering
+  decision must key only on the parsed method, never on a per-packet-varying field
+  such as a TCP port or sequence number, so that every request of one method
+  always lands on the same backend.
+test_cases:
+- name: route_get_backend_a
+  visibility: public
+  goal_class: G1
+  description: 'A GET request on the HTTP port is steered to its backend on port 2: the next-hop Ethernet addresses are rewritten, the IPv4 hop count is decremented by one, the IPv4 checksum stays valid, the service IP destination is unchanged, and the HTTP request payload (request line + headers) is delivered byte-for-byte identical.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 474554202f20485454502f312e310d0a486f73743a206170692e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: method_discrimination_post
+  visibility: public
+  goal_class: G1
+  description: A POST request for the same target is steered to a DIFFERENT backend on port 3 — the steerer keys on the parsed request method, not a constant, so GET and POST diverge.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 504f5354202f20485454502f312e310d0a486f73743a206170692e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: payload_bytes_preserved_multiheader
+  visibility: public
+  goal_class: G1
+  description: A GET request with a distinctive multi-header payload (request line, Host, and two further header lines, all within the 64-byte window) is steered and the egress TCP payload is byte-for-byte identical to the input — no reordering, dropped byte, or fixed-width padding.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 474554202f20485454502f312e310d0a486f73743a20612e696f0d0a582d413a20310d0a582d423a20320d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: request_line_within_window_bound
+  visibility: hidden
+  goal_class: G2
+  description: A GET request whose request line terminates EXACTLY at the 64-byte scan-window edge (the last parseable byte the scanner must accept) is classified and steered correctly to the GET backend.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 474554202f61616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616120485454502f312e310d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: request_line_exceeds_window_default
+  visibility: hidden
+  goal_class: G2
+  description: A GET request whose request line is padded so its terminating CRLF falls JUST PAST the 64-byte window is malformed under the bounded scan; under the lax policy it is steered to the default backend on port 4, deterministically and without reading past the window.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 474554202f626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626220485454502f312e310d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:0d
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:0d:0d
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: unknown_method_dropped
+  visibility: hidden
+  goal_class: G2
+  description: A TCP/80 segment whose leading token is a valid HTTP method NOT in the recognised set (PUT) is not an HTTP request for this steerer and is dropped — it is never classified against any installed method row.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 505554202f20485454502f312e310d0a486f73743a206170692e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: drop
+- name: get_no_route_match_default
+  visibility: hidden
+  goal_class: G2
+  description: A well-formed GET to a target with no method-specific divergence still matches the GET row and steers to port 2 — confirms a recognised, well-formed request that maps to an installed row never falls to the default.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 474554202f6865616c746820485454502f312e310d0a486f73743a2063646e2e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.chksum:
+        action: checksum_valid
+      IP.dst:
+        action: unchanged
+      Raw.load:
+        action: unchanged
+- name: tls_handshake_dropped
+  visibility: hidden
+  goal_class: G3
+  description: 'A TCP/80 segment whose payload is a TLS ClientHello (binary, leading byte 0x16) — HTTPS on the HTTP port — is NOT steered as an HTTP request and is dropped: the leading bytes are not a recognised method token. Catches a steerer that gates only on the TCP port and forgets to verify the method token.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 160301002f0100000000000000000000
+  expected:
+    behavior: drop
+- name: http_response_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A TCP/80 segment carrying an HTTP RESPONSE (status line 'HTTP/1.1 200 OK', not a request method) is dropped — a response status-line is not a recognised method token.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a
+  expected:
+    behavior: drop
+- name: tcp80_no_payload_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A TCP/80 control segment with no payload (a SYN) carries no request line, so no method is parsed and it is dropped — the steerer never classifies on or forwards absent payload bytes.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: lowercase_method_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A segment whose leading token is 'get' (lowercase) is dropped — HTTP method tokens are case-sensitive, so 'get' is not the recognised 'GET' and must not be mis-accepted.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+    - Raw:
+        load_hex: 676574202f20485454502f312e310d0a486f73743a206170692e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: drop
+- name: non_ipv4_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) on the client port is dropped before any HTTP classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.10
+        pdst: 203.0.113.10
+  expected:
+    behavior: drop
+- name: wrong_tcp_port_dropped
+  visibility: hidden
+  goal_class: G3
+  description: A GET request sent to TCP port 8080 (not the configured HTTP port) is out of scope and dropped, even though its payload is a valid HTTP request line.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 203.0.113.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 8080
+    - Raw:
+        load_hex: 474554202f20485454502f312e310d0a486f73743a206170692e6578616d706c652e636f6d0d0a0d0a
+  expected:
+    behavior: drop

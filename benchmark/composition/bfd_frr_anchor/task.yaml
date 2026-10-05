@@ -1,0 +1,835 @@
+task_name: bfd_frr_anchor
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-BFDFastReroute
+pattern_version: '1.0'
+seed:
+  packet_format_faithfulness: D5.0_minimal_8byte
+  ttl_strictness: strict_255
+  session_lookup_key: both
+  frr_match_kind: exact
+  port_down: []
+  cascaded_backup: false
+  ttl_decrement_strict: true
+  default_action_on_miss: drop
+  faithfulness: D5.0_detect_then_reroute
+description: "A switch s1 protects traffic to two server destinations, each reachable\nover a PRIMARY and a BACKUP egress\
+  \ port, and uses a liveness-detection\nprotocol (BFD, RFC 5880) to decide when a destination's primary path has\nfailed.\
+  \ While a destination's primary port is considered up, its traffic\nleaves over the primary; once liveness detection declares\
+  \ that port down,\nthe destination's traffic must leave over the backup port instead \u2014 and\nreturn to the primary when\
+  \ liveness is restored. Liveness detection and the\nup/down path decision share a single source of truth: the up/down state\
+  \ the\ndetection protocol maintains is exactly what the forwarding decision reads.\n\n## Topology and roles\n\n  - s1.p1\
+  \ \u2014 the traffic source (a client / upstream router) sending IPv4\n    packets toward the protected destinations.\n\
+  \  - Two protected destinations, each reachable over a PRIMARY and a BACKUP\n    egress port. The \"next-hop MAC\" is the\
+  \ Ethernet destination to use on\n    that port:\n\n    | destination | address     | primary port | primary next-hop MAC\
+  \ | backup port | backup next-hop MAC |\n    |-------------|-------------|--------------|----------------------|-------------|---------------------|\n\
+  \    | D1          | 10.0.1.100  | s1.p2        | 08:00:00:00:02:01    | s1.p3       | 08:00:00:00:03:01   |\n    | D2 \
+  \         | 10.0.2.100  | s1.p4        | 08:00:00:00:04:01    | s1.p5       | 08:00:00:00:05:01   |\n\n## Liveness detection\
+  \ (BFD)\n\ns1 runs one BFD session that monitors the liveness of **D1's primary port\ns1.p2**. The session's peer (the next-hop\
+  \ reached over s1.p2) sends BFD\ncontrol packets that ingress on s1.p2:\n\n  - A BFD control packet is an IPv4/UDP datagram\
+  \ with UDP destination port\n    3784, carrying a BFD control message. The message carries, among other\n    fields: a 2-bit\
+  \ session **State** (0 = AdminDown, 1 = Down, 2 = Init,\n    3 = Up), a one-byte Detect Multiplier, a \"My Discriminator\"\
+  , a \"Your\n    Discriminator\", and the M (Multipoint) flag.\n  - s1's session has a local discriminator (its \"Your Discriminator\"\
+  \ as seen\n    by the peer). A received control packet is matched to the session by its\n    Your Discriminator field equal\
+  \ to s1's local discriminator.\n  - **Discard** (drop, change no state) any BFD control packet that is\n    malformed: Detect\
+  \ Multiplier == 0, My Discriminator == 0, the M flag set,\n    or \u2014 because this is a single-hop session \u2014 an\
+  \ IPv4 TTL other than 255.\n    (You need not validate the version or length fields at this level.)\n\ns1 maintains the\
+  \ session's local **State** and advances it on each valid\nreceived control packet per the standard BFD receive rules:\n\
+  \n  - From **Up**: a received State of Down or AdminDown \u2192 **Down**; otherwise\n    stays Up.\n  - From **Down**: a\
+  \ received State of Down \u2192 **Init**; AdminDown \u2192 stays\n    Down; otherwise stays Down.\n  - From **Init**: a\
+  \ received State of Init or Up \u2192 **Up**; a received\n    AdminDown \u2192 Down; otherwise stays Init.\n\nThe session\
+  \ begins **Up** (the monitored link is established at start-up).\n\n## The shared liveness signal\n\nMaintain a single up/down\
+  \ flag for the monitored port s1.p2, written ONLY by\nthe BFD session and read by the forwarding decision:\n\n  - Whenever\
+  \ the session's local State becomes **Down**, mark s1.p2 **down**.\n  - Whenever the session's local State is anything other\
+  \ than Down (Init or\n    Up), mark s1.p2 **up**.\n  - All other egress ports start **up** and are not monitored by any\
+  \ session\n    in this task \u2014 in particular D2's primary port s1.p4 is always up.\n\nA BFD control packet is consumed\
+  \ by s1 (it is the session's destination) \u2014 it\nupdates session state but is never forwarded out a destination's egress\
+  \ port.\n\n## Forwarding the protected traffic\n\nAn IPv4 data packet that is NOT a BFD control packet and whose destination\
+  \ is\none of the protected destinations (D1 or D2) is forwarded as follows. Read\nthe IPv4 TTL first: if TTL == 0 the packet\
+  \ is discarded (and changes no\nstate). Otherwise:\n\n  - **Egress port.** The packet leaves over the destination's PRIMARY\
+  \ port if\n    that port is currently up, otherwise over the destination's BACKUP port.\n    The choice depends ONLY on\
+  \ the monitored up/down flag above \u2014 a\n    destination whose primary port is up (or is not monitored) always uses\n\
+  \    its primary. Failing one monitored port over to its backup never changes\n    any other destination's path.\n\n  -\
+  \ **Ethernet rewrite.** The Ethernet source is set to the packet's prior\n    Ethernet destination, and the Ethernet destination\
+  \ is set to the next-hop\n    MAC of the chosen port (the primary next-hop MAC over the primary port,\n    the backup next-hop\
+  \ MAC over the backup port).\n\n  - **TTL.** The IPv4 TTL is decremented by EXACTLY one on egress; a packet\n    arriving\
+  \ with TTL == 1 leaves with TTL == 0 (decrement once, do not drop\n    it, do not decrement it twice). The datagram remains\
+  \ a well-formed IPv4\n    packet an unmodified downstream receiver would accept (the header\n    checksum is valid on egress).\n\
+  \n  - **Everything else preserved.** All other fields are byte-identical to the\n    received packet \u2014 in particular\
+  \ BOTH the IPv4 SOURCE and the IPv4\n    DESTINATION addresses are unchanged (this is plain forwarding, not address\n  \
+  \  translation). Only the Ethernet addresses and the TTL change.\n\nAn IPv4 data packet whose destination is none of the\
+  \ protected destinations\nis discarded. A frame that is not IPv4 (e.g. an ARP frame) is discarded.\nDiscarded packets produce\
+  \ no output and change no internal state.\n\n## Control plane\n\nThe destination \u2192 (primary port, backup port, next-hop\
+  \ MACs) bindings and the\nBFD session parameters (discriminators, the monitored port) are given above;\nyou choose how much\
+  \ lives in control-plane tables versus fixed switch logic.\n"
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+      p5: 5
+  links:
+  - from: source
+    to: s1.p1
+  - from: s1.p2
+    to: d1_primary
+  - from: s1.p3
+    to: d1_backup
+  - from: s1.p4
+    to: d2_primary
+  - from: s1.p5
+    to: d2_backup
+hosts:
+  source:
+    ip: 10.0.0.9/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  d1_primary:
+    ip: 10.0.1.100/24
+    mac: 08:00:00:00:02:01
+    port: s1.p2
+  d1_backup:
+    ip: 10.0.1.100/24
+    mac: 08:00:00:00:03:01
+    port: s1.p3
+  d2_primary:
+    ip: 10.0.2.100/24
+    mac: 08:00:00:00:04:01
+    port: s1.p4
+  d2_backup:
+    ip: 10.0.2.100/24
+    mac: 08:00:00:00:05:01
+    port: s1.p5
+test_cases:
+- name: data_to_d1_primary_when_session_up
+  visibility: public
+  description: 'Steady state: BFD session S1 (monitoring D1''s primary port s1.p2) is Up, so a data packet to D1 leaves over
+    D1''s PRIMARY port s1.p2 with the primary next-hop MAC, IPv4 src AND dst preserved, TTL decremented by one.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: detect_then_reroute_to_backup
+  visibility: public
+  description: "The peer signals a failure: a BFD control packet advertising state=Down (ingress s1.p2) drives S1 Up\u2192\
+    Down, marking D1's primary port down. The next data packet to D1 then reroutes to D1's BACKUP port s1.p3 with the backup\
+    \ next-hop MAC \u2014 same destination IP (plain forward, no NAT). The composition's signature detect\u2192reroute check:\
+    \ a switch whose FRR liveness is independent of BFD never reroutes here."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: recovery_restores_primary
+  visibility: public
+  description: "After a detected failure (S1 Down, D1 on backup), the session recovers via the handshake (Down\u2192Init\u2192\
+    Up); the monitored port clears to up and a data packet to D1 returns to its PRIMARY port s1.p2. Failover is reversible."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 3
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: data_to_d2_uses_primary
+  visibility: hidden
+  description: "A second protected destination D2 (no monitoring session, primary port s1.p4 up) forwards over its primary\
+    \ \u2014 the FRR demux serves multiple destinations."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.2.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: existing_reroute_consistent_under_unchanged_liveness
+  visibility: hidden
+  description: "With D1's primary down (S1 Down), two successive data packets to D1 both take the backup port s1.p3 \u2014\
+    \ the demux is a deterministic function of the (unchanged) liveness, not randomised per packet."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ttl_one_forwards_to_zero
+  visibility: hidden
+  description: A data packet to D1 (primary up) arriving with TTL=1 is forwarded over s1.p2 with egress TTL=0 (decrement once,
+    do not drop).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: ttl_zero_drop
+  visibility: hidden
+  description: A data packet to D1 with TTL=0 is dropped and changes no state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: frr_table_miss_drops
+  visibility: hidden
+  description: A data packet to an unprotected destination (10.0.9.9, no FRR group) is dropped (no default route installed).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: no_phantom_reroute_d2_primary_while_d1_down
+  visibility: hidden
+  description: "Isolation check: with D1's primary port down (S1 Down), a data packet to D2 still uses D2's PRIMARY\
+    \ port s1.p4 \u2014 D2's port has no monitoring session and is not down, so one monitored port's down state does not bleed\
+    \ into another destination's path."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.2.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: bfd_control_consumed_not_forwarded
+  visibility: hidden
+  description: "A well-formed BFD control packet (state=Up) ingressing s1.p2 is consumed by the detection stage \u2014 it\
+    \ updates session state but is NOT forwarded out any data egress."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 3
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  expected:
+    behavior: drop
+- name: malformed_bfd_does_not_reroute
+  visibility: hidden
+  description: "A malformed BFD control packet (detect_mult=0, a \xA76.8.6 discard) is dropped and does NOT poison the liveness\
+    \ register: a subsequent data packet to D1 still uses the primary port s1.p2."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 0
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: non_ipv4_arp_dropped
+  visibility: hidden
+  description: "An ARP frame is not IPv4 \u2192 dropped (no FRR demux, no state change)."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.0.1
+  expected:
+    behavior: drop
+- name: drop_does_not_corrupt_next_forward
+  visibility: hidden
+  description: A dropped non-IPv4 frame precedes a valid data packet to D1; the data packet still forwards normally over the
+    primary s1.p2 (the prior drop did not corrupt the per-packet decision via a std_metadata.drop misread).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.0.1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: checksum_after_ttl_on_reroute
+  visibility: hidden
+  description: "A data packet to D1 on the BACKUP path (S1 Down) arriving with TTL=10 leaves with TTL=9, IPv4 src and dst\
+    \ unchanged and a well-formed header \u2014 the most common silent-failure checksum check on the rerouted forward."
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.0.1
+        ttl: 255
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 3784
+    - BFD:
+        version: 1
+        diag: 0
+        state: 1
+        flag_P: 0
+        flag_F: 0
+        flag_C: 0
+        flag_A: 0
+        flag_D: 0
+        flag_M: 0
+        detect_mult: 3
+        length: 24
+        my_discr: 2964369584
+        your_discr: 168430090
+        desired_min_tx_interval: 1000000
+        required_min_rx_interval: 1000000
+        required_min_echo_rx_interval: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.1.100
+        ttl: 10
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1

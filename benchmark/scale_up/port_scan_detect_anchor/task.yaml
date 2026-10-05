@@ -1,0 +1,2175 @@
+task_name: port_scan_detect_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-PortScanDetect
+pattern_version: '1.0'
+seed:
+  scan_key: distinct_dst_ip
+  scan_threshold: 8
+  scanner_action: drop
+  source_table_capacity: 4096
+  bitmap_width: 1024
+  rows: 1
+  distinct_estimator: exact_set
+  hash_polynomial: crc32
+  window_packets: 65536
+  control_reset_enabled: true
+  workload_skew: uniform
+  persistence_strict: true
+  control_port: 511
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p511: 511
+  links:
+  - from: monitored
+    to: s1.p1
+  - from: s1.p2
+    to: uplink
+  - from: control
+    to: s1.p511
+hosts:
+  monitored:
+    note: monitored sources; ingress on s1.p1
+  uplink:
+    note: normal egress / next hop 08:00:00:00:02:02 on s1.p2
+  control:
+    note: operator control port s1.p511 (window reset)
+description: |-
+  Implement a per-source scan detector for BMv2 (v1model). The switch monitors
+  each IPv4 source address and blocks any source that fans out across too many
+  distinct destinations, while letting ordinary traffic through.
+
+  Topology: port 1 carries the monitored traffic; port 2 is the normal egress
+  toward next hop 08:00:00:00:02:02. Port 511 is the operator control port.
+
+  Required behaviour, per IPv4 packet (non-IPv4 frames are dropped):
+
+  - Distinct-destination tracking. For each source, count how many DISTINCT
+    destination IP addresses it has contacted in the current detection window.
+    Contacting the same destination repeatedly counts once — a source that only
+    ever talks to one destination is never a scanner, no matter how many packets
+    it sends.
+
+  - Block decision. A source whose number of distinct destinations grows beyond 8
+    is a scanner: the packet that takes the source past 8 distinct destinations,
+    and every later packet from that source, is dropped. A source that has
+    contacted 8 or fewer distinct destinations is not a scanner. The first 8
+    distinct destinations are allowed through; the source is blocked starting from
+    the destination that makes its distinct count exceed 8. Once a source is
+    blocked it stays blocked for the rest of the window — even packets to a
+    destination it already contacted are dropped.
+
+  - Forwarding. A packet from a source that is not (yet) blocked leaves on port 2
+    toward the next hop, with its hop count decremented and its header integrity
+    preserved. A packet with an expired hop count is dropped.
+
+  - Window reset. A packet arriving on the control port (port 511) is an operator
+    reset: it clears all per-source tracking and all block decisions, and is
+    itself consumed (not forwarded). A source blocked before the reset is allowed
+    through again afterwards. The detection window is measured in packets, not in
+    time.
+
+  Block decisions must be per-source: one source's behaviour must never cause a
+  different source to be blocked or allowed incorrectly. Both the P4 program and
+  its table entries are yours to author.
+test_cases:
+- name: benign_single_forward
+  visibility: public
+  goal_class: G1
+  description: A single packet from a fresh source to one destination is forwarded on the normal egress port with its hop count decremented and Ether.dst rewritten to the next hop — a source contacting one destination is never a scanner.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.1
+        dst: 10.0.9.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: scanner_crossing_drops
+  visibility: public
+  goal_class: G1
+  description: A source contacts 8 distinct destinations (all allowed through), then a 9th distinct destination. The 9th packet takes the source past 8 distinct destinations, so the source is now a scanner and that packet is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.99
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.2
+        dst: 10.0.9.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: at_eight_distinct_forwards
+  visibility: public
+  goal_class: G1
+  description: A source whose 8th distinct destination is this packet (8 distinct destinations total, exactly at the bar) is still forwarded — only growing beyond 8 distinct destinations makes a source a scanner.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.8
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.3
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: repeated_destination_forwards
+  visibility: hidden
+  goal_class: G1
+  description: A source sends many packets all to the SAME single destination; the test packet (also to that destination) is forwarded — repeated contact to one destination counts as a single distinct destination and never trips the detector.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.4
+        dst: 10.0.9.50
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: per_source_isolation_benign_forwards
+  visibility: hidden
+  goal_class: G1
+  description: While one source has already become a scanner, a DIFFERENT source that has contacted only two distinct destinations is still forwarded — one source's distinct-destination count must not contaminate another's verdict.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.11
+        dst: 10.0.9.3
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.11
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.11
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: control_reset_unblocks
+  visibility: hidden
+  goal_class: G1
+  description: A source becomes a scanner, then an operator control packet resets the detector; afterwards the same source's packet to a fresh destination is forwarded again — the reset cleared the block and the tracking state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.40
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.20
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p511
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:ff
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.0.254
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9
+        dport: 9
+- name: scanner_sticky_on_repeat
+  visibility: hidden
+  goal_class: G2
+  description: After a source has crossed and been blocked, a later packet from it to a destination it already contacted is STILL dropped — the block is sticky within the window and does not re-derive from a (possibly lower) current count.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.30
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: boundary_eighth_distinct_forwards
+  visibility: hidden
+  goal_class: G2
+  description: The packet that brings a source to exactly 8 distinct destinations is forwarded (8 is not beyond the bar); only the next distinct destination would cross. Pins the off-by-one boundary on the allow side.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.99
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.20
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.21
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.22
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.23
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.24
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.25
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.31
+        dst: 10.0.9.26
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: benign_ttl_zero_drops
+  visibility: hidden
+  goal_class: G2
+  description: A below-threshold packet that arrives with an already-expired hop count is dropped — the forwarding step still enforces the hop-count check.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.40
+        dst: 10.0.9.1
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: drop
+- name: many_sources_benign_forwards
+  visibility: hidden
+  goal_class: G2
+  description: After many distinct sources each contact a single destination, a fresh benign source's packet is still forwarded — per-source tracking must not let unrelated source activity flip a benign verdict.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.41.1
+        dst: 10.0.9.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.0
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.1
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.2
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.3
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.4
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.5
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.6
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.7
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.8
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.9
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.10
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.11
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.12
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.13
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.14
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.15
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.16
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.17
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.18
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.19
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.20
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.21
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.22
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.23
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.24
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.25
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.26
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.27
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.28
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.29
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.30
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.31
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.32
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.33
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.34
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.35
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.36
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.37
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.38
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.40.39
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: low_volume_below_threshold_not_flagged
+  visibility: hidden
+  goal_class: G3
+  description: A stealthy source that contacts only 8 distinct destinations across the whole window (staying at the bar, never beyond it) is never blocked; the test packet to its 8th distinct destination is forwarded. The detector must not false-positive below its configured bar.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.8
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.50
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+- name: no_verdict_leak_across_reset
+  visibility: hidden
+  goal_class: G3
+  description: 'A source flagged as a scanner before an operator reset is NOT permanently blocklisted: after the reset its packet to a brand-new destination is forwarded, proving no scanner verdict or tracking state leaks across the window boundary.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.200
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.4
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.5
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.6
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.5.60
+        dst: 10.0.9.11
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+  - port: s1.p511
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:ff
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.0.254
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 9
+        dport: 9
+- name: non_ipv4_drops
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) carries no source/destination to track and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.7.1
+        pdst: 10.0.9.1
+  expected:
+    behavior: drop

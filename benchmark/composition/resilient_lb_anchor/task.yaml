@@ -1,0 +1,602 @@
+task_name: resilient_lb_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-ResilientLB
+pattern_version: '1.0'
+seed:
+  bfd_udp_port: 3784
+  virtual_ip: 10.0.9.9
+  backend_pool:
+  - 10.0.2.11
+  - 10.0.2.12
+  - 10.0.2.13
+  backend_count: 3
+  hash_modulus: 3
+  pin_capacity: 256
+  pin_eviction: none
+  client_port: 1
+  backend_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: clients
+    to: s1.p1
+  - from: s1.p2
+    to: backends
+hosts:
+  clients:
+    note: client hosts in 10.0.1.0/24; ingress on s1.p1; VIP 10.0.9.9
+  backends:
+    note: backend pool 10.0.2.11/12/13 on s1.p2; BFD health on UDP 3784
+description: |-
+  Implement a health-checked load balancer for BMv2 (v1model) that tracks which
+  backends are alive, steers client connections to a live backend, and survives
+  backend failures — all in a single pass.
+
+  Topology: port 1 faces the clients (10.0.1.0/24); port 2 faces the backend pool
+  (10.0.2.0/24). The service is reached at a single virtual address 10.0.9.9. The
+  pool has three backends — 10.0.2.11, 10.0.2.12, 10.0.2.13 — considered in that
+  fixed order. Every backend starts healthy.
+
+  Required behaviour, per IPv4 packet:
+
+  - Health signalling. Each backend periodically announces whether it is healthy.
+    A health announcement is a UDP datagram sent from a backend address to UDP
+    destination port 3784, arriving on the backend-facing port (port 2). The
+    announcement encodes the backend's state in its UDP source port: a UDP source
+    port of zero means that backend is DOWN, and any non-zero UDP source port means
+    it is UP. The load balancer records that backend's current health from this
+    announcement and does not forward the announcement onward — it is consumed.
+
+  - Backend selection. A client connection addressed to the virtual address is
+    assigned a preferred backend by a fixed rule: take the connection's source IP,
+    destination IP, protocol number, source port and destination port each as an
+    integer, sum them, and reduce modulo 3; the result indexes the pool in its
+    fixed order [10.0.2.11, 10.0.2.12, 10.0.2.13]. Every packet of the same
+    connection goes to the same backend while that backend stays healthy. If a
+    connection's preferred backend is not healthy, the load balancer picks the
+    next healthy backend, scanning the pool forward from the preferred index in
+    that fixed order and wrapping around. If no backend is healthy, the packet is
+    dropped. A connection whose assigned backend later becomes unhealthy is moved
+    to the next healthy backend on its following packet.
+
+  - Delivery. A packet steered to a backend is delivered to that backend: its
+    destination is set to the chosen backend's address, it leaves on the backend
+    side toward the correct next hop, its hop count is decremented, and its L2/L3
+    integrity is preserved. A packet with an expired hop count is dropped.
+
+  Both the P4 program and its table entries are yours to author. The load balancer
+  must behave correctly across the full lifetime of a connection: a connection
+  sticks to its backend while healthy, fails over to the next healthy backend when
+  its backend dies, and is dropped only when the entire pool is down.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: lb_primary_forward
+  visibility: public
+  goal_class: G1
+  description: 'A client connection to the virtual address (10.0.1.10:40000) is assigned to its preferred healthy backend and delivered there: the destination is rewritten to that backend, the hop count is decremented, and the frame leaves on the backend side. All backends are healthy.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:12
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+- name: lb_failover_forward
+  visibility: public
+  goal_class: G1
+  description: A client connection (10.0.1.11:40001) whose preferred backend was just announced unhealthy is delivered to the next healthy backend in pool order.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:12
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:11
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+- name: bfd_down_update
+  visibility: public
+  goal_class: G1
+  description: A health announcement from a backend indicating it is down is recorded and not forwarded onward (consumed).
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:11
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+  expected:
+    behavior: drop
+- name: flow_pin_reuse
+  visibility: hidden
+  goal_class: G2
+  description: The second packet of an established connection (10.0.1.10:40000) is delivered to the SAME backend it was first assigned to, while that backend stays healthy.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:12
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+- name: all_backends_down_drop
+  visibility: hidden
+  goal_class: G2
+  description: When every backend has been announced unhealthy, a client connection to the virtual address is dropped (no healthy target).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:11
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:12
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:13
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.13
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+- name: ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A client packet with hop count 1 is delivered with egress hop count 0 (decremented exactly once, never twice).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:12
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+- name: ttl_zero_drop
+  visibility: hidden
+  goal_class: G2
+  description: A client packet with an expired hop count (0) is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: drop
+- name: established_failover_repin
+  visibility: hidden
+  goal_class: G3
+  description: An established connection (10.0.1.10:40000) pinned to a backend is moved to the next healthy backend on its following packet after its backend is announced unhealthy in between.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:13
+      IP.dst:
+        action: change_to
+        value: 10.0.2.13
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:12
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+- name: bfd_up_restores
+  visibility: hidden
+  goal_class: G3
+  description: 'A backend announced down and then announced up again is selectable once more: a client whose preferred backend is that restored backend is delivered to it.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.10
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:12
+      IP.dst:
+        action: change_to
+        value: 10.0.2.12
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:12
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:12
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 1
+        dport: 3784
+- name: primary_skips_two_dead
+  visibility: hidden
+  goal_class: G3
+  description: A client (10.0.1.11:40001) whose preferred backend and the next-in-ring backend are both down rings around to the third backend.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:13
+      IP.dst:
+        action: change_to
+        value: 10.0.2.13
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:11
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.11
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:12
+        dst: 08:00:00:00:02:01
+    - IP:
+        src: 10.0.2.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 0
+        dport: 3784
+- name: third_primary_forward
+  visibility: hidden
+  goal_class: G3
+  description: A client (10.0.1.12:40002) whose preferred backend is the third in the pool is delivered to that backend when it is healthy.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.12
+        dst: 10.0.9.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40002
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:13
+      IP.dst:
+        action: change_to
+        value: 10.0.2.13
+      IP.src:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before any stage.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.10
+        pdst: 10.0.9.9
+  expected:
+    behavior: drop

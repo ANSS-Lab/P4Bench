@@ -1,0 +1,914 @@
+task_name: netlock_anchor
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-NetLock
+pattern_version: '1.0'
+seed:
+  lock_ids:
+  - 0
+  - 1
+  - 2
+  - 3
+  lock_mode: exclusive
+  deny_mode: drop
+  waiter_fifo_depth: 0
+  grant_response: forward_to_port
+  release_check_holder: true
+  index_mode: direct
+  hash_algo: crc16
+  lock_table_capacity: 1024
+  faithfulness: D5.0_exclusive
+description: |
+  Implement an in-switch exclusive lock service on a single switch s1. A lock
+  manager that would normally live on a host/coordinator is relocated into the
+  data plane: the switch itself grants and releases locks, holding per-lock state
+  on the switch and driven entirely by the lock control messages it receives.
+  Grounded in NetLock (Yu et al., NSDI 2020).
+
+  ## Lock control messages
+
+  Clients coordinate by sending lock control messages. Each message is a small
+  header riding on UDP addressed to the lock-service UDP port (0xABCD). The header
+  carries:
+
+    - op         the operation: LOCK (1) or UNLOCK (2)
+    - mode       lock mode: EXCLUSIVE (0)  (this service is exclusive-only)
+    - status     a result marker the switch sets on a reply: REQ (0), GRANT (1),
+                 NACK (2). Requests arrive with status REQ.
+    - lock_id    which lock the message targets
+    - client_id  the id of the requesting client
+
+  The service manages four locks, with ids 0, 1, 2, and 3.
+
+  ## Topology
+
+  One switch s1 with four ports:
+    - s1.p1 — client A (10.0.0.1, MAC 08:00:00:00:00:01, client id 1)
+    - s1.p2 — client B (10.0.0.2, MAC 08:00:00:00:00:02, client id 2)
+    - s1.p3 — client C (10.0.0.3, MAC 08:00:00:00:00:03, client id 3)
+    - s1.p4 — the coordinator port (10.0.0.254), where the switch delivers every
+              GRANT and NACK reply.
+
+  Clients send their requests with the Ethernet destination set to the switch
+  MAC 08:00:00:00:00:fe.
+
+  ## Required behaviour
+
+  Each lock is either FREE or HELD by exactly one client. A lock starts FREE.
+  Process each received message in order; the per-lock state persists across
+  messages.
+
+   1. A frame that does not carry a lock-message header (e.g. ordinary UDP to a
+      different port, or ARP) is out of scope: it MUST be dropped and MUST NOT
+      change any lock state.
+
+   2. LOCK on a FREE lock: bind the requesting client as the holder of that lock
+      (the lock becomes HELD by that client), set the message status to GRANT,
+      and forward the reply out the coordinator port s1.p4.
+
+   3. LOCK on a lock already HELD by another client: the request is denied. It
+      MUST be dropped (no reply); the existing holder is unchanged. A lock that
+      is already held MUST NOT be granted to a second client — this is the
+      mutual-exclusion guarantee.
+
+   4. UNLOCK from the lock's current holder: release the lock (it returns to
+      FREE) and consume the message — an UNLOCK produces no reply of its own. The
+      release is observable only because a subsequent LOCK on that lock is now
+      granted.
+
+   5. UNLOCK from a client that is NOT the current holder: the release is rejected
+      and the message MUST be dropped; the lock stays HELD by its current holder.
+      Only the holder may release a lock.
+
+   6. UNLOCK on a lock that is already FREE: a no-op — drop the message; the lock
+      stays FREE.
+
+  Each lock is independent: holding one lock does not affect any other lock id.
+  There is no waiter queue — a request that cannot be granted immediately is
+  denied, not held pending. There is no lease or timeout: a lock is released only
+  by an explicit UNLOCK from its holder.
+
+  On every GRANT/NACK reply delivered to the coordinator port, the IPv4 Hop count
+  is decremented by one as the packet transits the switch (ordinary forwarding).
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: h2
+    to: s1.p2
+  - from: h3
+    to: s1.p3
+  - from: s1.p4
+    to: coord
+hosts:
+  h1:
+    ip: 10.0.0.1
+    mac: 08:00:00:00:00:01
+    port: s1.p1
+  h2:
+    ip: 10.0.0.2
+    mac: 08:00:00:00:00:02
+    port: s1.p2
+  h3:
+    ip: 10.0.0.3
+    mac: 08:00:00:00:00:03
+    port: s1.p3
+  coord:
+    ip: 10.0.0.254
+    mac: 08:00:00:00:00:fe
+    port: s1.p4
+test_cases:
+- name: lock_free_grant
+  visibility: public
+  description: Client A sends a LOCK request for lock 0, which is free. The switch binds A as the holder and forwards a GRANT (status set to GRANT) out the coordinator port s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: grant_then_deny_held_lock
+  visibility: public
+  description: 'After A holds lock 0 (prior LOCK), client B requests the SAME lock 0. The lock is held by another client, so B''s request is denied (dropped) — mutual exclusion: a second client never receives a held lock.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: drop
+- name: relock_after_holder_unlock
+  visibility: public
+  description: A holds lock 1 then releases it with an UNLOCK; B's subsequent LOCK on lock 1 must be GRANTed because the lock was actually freed (the holder binding was cleared on release).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: independent_lock_granted
+  visibility: public
+  description: With A holding lock 0, client C requests a DIFFERENT lock (lock 2). Per-lock state is isolated, so C is GRANTed lock 2 — holding one lock does not block an unrelated one.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 3
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: unlock_free_lock_noop_then_grant
+  visibility: hidden
+  description: An UNLOCK for lock 3 that was never locked is a no-op (consumed, no GRANT). A following LOCK on lock 3 is still GRANTed — the spurious unlock did not corrupt the free state.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 2
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: holder_unlock_consumed_no_output
+  visibility: hidden
+  description: A holds lock 0 then sends an UNLOCK for lock 0. The UNLOCK is consumed (the lock returns to free) and produces NO output packet of its own — release is silent; the freeing is observable only via a later LOCK.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  expected:
+    behavior: drop
+- name: same_client_relock_after_release
+  visibility: hidden
+  description: A locks lock 2, releases it, then locks it again. The second LOCK from A is GRANTed — a released lock is grantable to anyone, including the previous holder.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 1
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 2
+        client_id: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: spoofed_unlock_wrong_holder_rejected
+  visibility: hidden
+  description: A holds lock 0. Client B sends an UNLOCK for lock 0 (B is NOT the holder). Only the holder may release, so B's UNLOCK is rejected (dropped) and lock 0 stays held by A.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: drop
+- name: held_persists_after_spoofed_unlock
+  visibility: hidden
+  description: After A holds lock 0 and B's spoofed UNLOCK is rejected, a LOCK from B on lock 0 is STILL denied (dropped) — the failed release did not free the lock; A remains the holder (holder persistence).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  expected:
+    behavior: drop
+- name: out_of_set_lock_id_contended_denied
+  visibility: hidden
+  description: Lock id 9 is outside the provisioned lock-id set. After A acquires it, B's request for the same id 9 is denied (dropped) — out-of-set ids are still handled deterministically, never double-granted.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 9
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 9
+        client_id: 2
+  expected:
+    behavior: drop
+- name: non_lock_udp_dropped
+  visibility: hidden
+  description: A plain IPv4/UDP frame to an ordinary port (no lock-message header) is out of scope for the lock service and is dropped — and it must not mutate any lock state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 53
+  expected:
+    behavior: drop
+- name: non_lock_arp_dropped
+  visibility: hidden
+  description: 'An ARP frame carries no lock-message header and is dropped by the lock service (R0: only lock control messages are handled).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.0.1
+        pdst: 10.0.0.254
+        hwsrc: 08:00:00:00:00:01
+  expected:
+    behavior: drop
+- name: adversarial_steal_attempt_denied
+  visibility: hidden
+  description: A holds lock 1. A malicious client C repeatedly tries to LOCK it. Every steal attempt is denied (dropped); A stays the holder (mutual exclusion under adversarial load).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 1
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 1
+        client_id: 3
+  expected:
+    behavior: drop
+- name: double_lock_same_free_second_denied
+  visibility: hidden
+  description: 'Two clients race for the same free lock 3: A''s LOCK arrives first and is granted; B''s LOCK for the same lock is then denied (dropped). A correct read-test-write admits exactly ONE — no double-grant.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 1
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 3
+        client_id: 2
+  expected:
+    behavior: drop
+- name: deny_does_not_corrupt_then_release_relock
+  visibility: hidden
+  description: A holds lock 0; B is denied; A releases; C then LOCKs lock 0 and is GRANTed. The denied request must not have altered the holder, and the holder's release must still free the lock for the next client.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  - port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5002
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 2
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5001
+        dport: 43981
+    - LockMsg:
+        op: 2
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 1
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:03
+        dst: 08:00:00:00:00:fe
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.0.254
+        ttl: 2
+        proto: 17
+    - UDP:
+        sport: 5003
+        dport: 43981
+    - LockMsg:
+        op: 1
+        mode: 0
+        status: 0
+        lock_id: 0
+        client_id: 3
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      LockMsg.status:
+        action: change_to
+        value: 1
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

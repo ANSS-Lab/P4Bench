@@ -1,0 +1,961 @@
+# P-SketchHeavyHitter — Sketch-Based Heavy-Hitter / Frequency Estimator
+#
+# TPL v1.0 task pattern, extracted from the specified sources.
+# This pattern occupies the (D4:telemetry, P9:telemetry) cell of the NF
+# design-space map. It is the canonical `scale_up`
+# case study: programmability scales per-flow frequency tracking past the
+# ASIC TCAM-counter wall by sharing counter state under independent hash
+# rows, optionally with a bounded heavy-flowkey side table.
+
+pattern_id:        P-SketchHeavyHitter
+version:           "1.0"
+nf_categories:                          # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry]          # sketches, heavy-hitter detection, INT
+  prescriptive: [P9:telemetry]          # sketches, INT, heavy-hitter detection — `scale_up` row
+target_capability: scale_up             # programmability scales an ASIC NF that hits a counter-memory wall
+
+summary: >
+  Per-packet sketch update on a PISA pipeline, paired with optional
+  bounded heavy-flowkey tracking and threshold- or epoch-driven readout.
+  The pattern parameterises the sketch family (count_min, count_sketch,
+  hyperloglog, universal, elastic), the memory budget, the heavy-hitter
+  threshold, the eviction policy on the heavy table, and the readout
+  discipline. Difficulty moves primarily along the capacity axis: at low
+  memory budgets trivial per-flow counters no longer fit, forcing the
+  implementation into shared sketch storage where the algorithmic property
+  actually lives.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+grounding:
+
+  papers:
+
+    - cite: sonata_sigcomm18
+      role: canonical_implementation
+      relevance: |
+        Sonata operationalises the heavy-hitter / frequency-estimator NF
+        as a query-driven dataflow on PISA: filter → map → reduce-by-key
+        → threshold-filter compiled to match-action tables. The (key,
+        value) reduce-by-key uses a register array indexed by hash; the
+        threshold-triggered emit is a one-bit `report` field set when a
+        flow's running count exceeds T. This is the source of R1's
+        per-row hash-indexed `inc` shape and R4's one-shot threshold-emit
+        on the first packet that crosses the threshold.
+
+    - cite: sketchlib_nsdi22
+      role: canonical_implementation
+      relevance: |
+        SketchLib enumerates the sketch families this pattern parameterises
+        — Count-Min, Count-Sketch, HyperLogLog, UnivMon, R-HHH, MRAC,
+        multi-resolution bitmap — and identifies four switch resource
+        bottlenecks that the pattern's parameters and feasibility
+        postconditions reflect: hash calls (drives `${sketch_depth}`),
+        memory accesses (drives `${max_register_cells}`), pipeline stages
+        (caps `${sketch_depth}` at 8), and heavy-flowkey storage (drives
+        `${heavy_capacity}`).
+
+    - cite: elasticsketch_sigcomm18
+      role: scaling_approach
+      relevance: |
+        The scale_up case-study reference. Two-row design (heavy bucket +
+        light bucket) with carry-over on eviction: when a candidate is
+        heavy enough to displace the stored minimum, the displaced flow
+        is *demoted* to the light bucket rather than dropped. Informs
+        the `${sketch_type} == elastic` mode, the
+        `${heavy_eviction} == carry_over_on_evict` policy, the
+        `bucket_class` attribute on the `flow` entity, and the
+        `heavy_bucket_fairness` invariant's coverage of the top-2K
+        guarantee on elastic instances.
+      grounds: [R3_elastic_carry_over]
+      # DRAFT quote (pending GS2 human verdict). Verbatim from the AUTHORS'
+      # open-access PDF of the IEEE/ACM ToN EXTENDED journal version of this
+      # SIGCOMM '18 paper — Yang et al., "Adaptive Measurements Using One
+      # Elastic Sketch" — fetched from https://yangtonghome.github.io/uploads/ElasticToN.pdf
+      # (first author's academic site). NOTE: this is the journal extension,
+      # NOT the conference PDF; the carry-over mechanism that R3 grounds is
+      # identical across both. Cached at: grounding/elasticsketch_sigcomm18.txt
+      # (pdftotext extraction). Grounds R3_elastic_carry_over: a heavy entry
+      # displaced from the heavy part is inserted into the light part, not dropped.
+      quote: |-
+        Specifically, when a flow f
+        is evicted from the heavy part, in the basic version of Elastic,
+        f is supported to be inserted in the light part.
+
+    - cite: flymon_sigcomm22
+      role: scaling_approach
+      relevance: |
+        FlyMon's Composable Measurement Units decouple a measurement
+        task from its sketch realisation, with per-CMU task isolation
+        and epoch-driven readout. Informs the `${epoch_trigger}` enum
+        (packets / time / both) and the R6 epoch-boundary discipline of
+        snapshot-then-reset on the bucket and flow tables.
+
+    - cite: sketchovsky_nsdi23
+      role: optimisation
+      relevance: |
+        Extends SketchLib with cross-sketch reuse (shared hash results,
+        shared counter arrays, shared heavy-flowkey storage). Informs
+        the bridging notes only: an implementation may reuse hash plumbing across
+        co-located sketches without altering the reported semantics
+        (heavy-hitter membership, estimated counts). Not a rule-level
+        operator at v1; surfaced in `bridging_notes`.
+
+    - cite: heterosketch_nsdi22
+      role: optimisation
+      relevance: |
+        Coordinates sketch placement across heterogeneous devices. Out
+        of scope for v1's single-switch instantiation; recorded in
+        `bridging_notes` as a `cross_switch_partitioning` axis that a
+        TPL v2 variant would expose.
+
+  # No IETF RFC normatively defines in-network sketch behaviour, and the
+  # upstream p4lang/tutorials repository ships no sketch exercise — both
+  # lists are intentionally empty (nothing is cited without being read).
+  rfcs:      []
+  tutorials: []
+
+# ─── Entities (pick from the 8 entity types) ───────────────────────────────
+entities:
+
+  bucket:                       # sketch counter matrix; aggregate state
+    key:
+      - sketch_row_index        # 0 .. ${sketch_depth} - 1
+      - sketch_column_index     # 0 .. ${sketch_width} - 1, derived from h_r(flowkey) mod W
+    attrs:
+      count: int                # unsigned for count_min/elastic, signed for count_sketch
+    capacity: ${sketch_depth} × ${sketch_width}
+    notes: |
+      The R×W counter matrix. Index derivation, saturation arithmetic,
+      and (for count_sketch) sign application are implementation surface
+      that the implementation handles; what the spec requires is exactly one
+      `inc` per row per IPv4 packet under R1, and exactly one additional
+      `inc` per cascaded level under R5 when `${sketch_type} == universal`.
+
+  flow:                         # heavy flowkey table; per-flow state
+    key:
+      - hdr.ipv4.srcAddr        # 1-tuple in the default seed; can be lifted to 5-tuple via ${flowkey_fields}
+    attrs:
+      est_count:    int
+      first_seen:   timestamp
+      bucket_class: enum        # heavy | light — only meaningful when ${sketch_type} == elastic
+    capacity: ${heavy_capacity}
+    notes: |
+      Bounded set of flows whose estimated count crossed ${heavy_threshold}
+      in the current epoch. Materialised only when
+      `${faithfulness} ≥ D5.2_heavy_hitter`. Under the Elastic Sketch
+      mode a displaced heavy entry is `bucket_class: light` rather than
+      evicted entirely.
+
+  window:                       # epoch boundary; bounded-history accumulator
+    key:
+      - epoch_id
+    attrs:
+      n_packets:  int
+      start_time: timestamp
+    capacity: 1                 # only the current epoch is mutable
+    notes: |
+      The interval over which the sketch accumulates. Advances when
+      `n_packets ≥ ${epoch_packets}` or `now − start_time ≥
+      ${epoch_seconds}` (whichever is active per `${epoch_trigger}`).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+parameters:
+
+  flowkey_fields:
+    type: list[header_field]
+    constraint: "non-empty; every field is parseable on a v1model PISA pipeline"
+    default: [hdr.ipv4.srcAddr]
+
+  sketch_type:
+    type: enum
+    values: [count_min, count_sketch, hyperloglog, universal, elastic]
+    default: count_min
+
+  sketch_depth:
+    type: int
+    range: "[1, 8]"
+    default: 2
+    notes: |
+      Number of independent counter rows R. Capped at 8 because each row
+      costs one SALU/stage on Tofino (SketchLib §3). For Elastic this is
+      typically 2 (one heavy + one light) per the SIGCOMM '18 paper.
+
+  sketch_width:
+    type: int
+    range: "[8, 65536]"
+    default: 256
+    notes: |
+      Columns per row W. Drives the false-positive tail
+      P(estimate > true + ε·N) ≤ (1/W)^R for Count-Min. MUST be a power
+      of two so the hash output can be truncated by mod-2^k rather than
+      a divider.
+
+  max_register_cells:
+    type: int
+    range: "[8, 1048576]"
+    default: 4096
+    notes: |
+      Memory-budget axis. Hard upper bound on the total
+      number of register cells the implementation may use across all sketches in
+      the pipeline. `shrink_capacity_4x` divides this by four; at low
+      budgets trivial per-flow counter layouts no longer fit, forcing the
+      implementation into shared sketch storage.
+
+  counter_width_bits:
+    type: int
+    range: "[8, 64]"
+    default: 32
+
+  hash_polynomial:
+    type: enum
+    values: [crc16, crc32, crc32c, custom_lfsr]
+    default: crc32
+
+  hash_independence:
+    type: enum
+    values: [pairwise, four_wise]
+    default: pairwise
+    notes: |
+      Hash-family axis. `pairwise` (CRC-derived) suffices for Count-Min's
+      expected-error bound. `four_wise` is required by Count-Sketch's
+      variance bound and by UnivMon's universal-sketch guarantee at D5.3.
+
+  heavy_threshold:
+    type: int
+    range: "[1, 1000000]"
+    default: 1000
+
+  heavy_capacity:
+    type: int
+    range: "[0, 4096]"
+    default: 0
+    notes: |
+      Capacity of the heavy `flow` table. 0 = heavy storage disabled
+      (corresponds to `${faithfulness}` < `D5.2_heavy_hitter`).
+
+  heavy_eviction:
+    type: enum
+    values: [none, replace_min, no_evict, carry_over_on_evict]
+    default: none
+    notes: |
+      `replace_min`         — Space-Saving: new candidate replaces the
+                              entry with smallest est_count if its count
+                              is larger. Guarantees top-K completeness.
+      `no_evict`            — Strict: when full, refuse new entries.
+      `carry_over_on_evict` — Elastic Sketch: displaced heavy entry is
+                              demoted to a `light` slot rather than dropped.
+      `none`                — heavy storage disabled (only valid when
+                              `${faithfulness}` < `D5.2_heavy_hitter`).
+
+  epoch_packets:
+    type: int
+    range: "[1024, 16777216]"
+    default: 1048576
+
+  epoch_seconds:
+    type: int
+    range: "[1, 3600]"
+    default: 60
+
+  epoch_trigger:
+    type: enum
+    values: [packets, time, both]
+    default: both
+
+  readout_mode:
+    type: enum
+    values: [per_epoch_dump, threshold_emit, both]
+    default: threshold_emit
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_count_min          # basic CMS, unsigned counters, no heavy storage
+      - D5.1_count_sketch       # signed counters (Count-Sketch), no heavy storage
+      - D5.2_heavy_hitter       # heavy storage with threshold-T reporting
+      - D5.3_universal          # UnivMon-style cascaded sampling
+    default: D5.0_count_min
+
+  n_levels:
+    type: int
+    range: "[1, 16]"
+    default: 1
+    notes: |
+      Number of cascaded sketch levels L. Only meaningful when
+      `${sketch_type} == universal`. Pr(update level l) = 2^-l per
+      packet under binary sampling hashes.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision]
+    default: zipfian
+
+  forwarding_independence_strict:
+    type: bool
+    default: true
+    notes: |
+      When true (default), the `forwarding_independence` invariant is
+      enforced: the sketch / flow table MUST NOT influence the packet's
+      forwarding decision. The pattern is observe-only telemetry.
+      `relax_forwarding_independence` flips this to false to specialise
+      the instance to a drop-on-threshold DDoS-mitigation NF.
+
+# ─── Rules (first-match priority) ──────────────────────────────────────────
+# State writes inside `then` are visible to subsequent rules on subsequent
+# packets only.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Non-IPv4 frames contribute no counter updates. Matches Sonata's
+      and SketchLib's reference implementations' parser convention.
+
+  - id: R1_sketch_update_and_forward
+    when: "header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+      bucket: by_hash(flowkey, ${sketch_depth})
+    then:
+      - "inc(bucket[h(flowkey)])"
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+    notes: |
+      Canonical sketch update + underlying IPv4 forward. For each of the
+      ${sketch_depth} counter rows, increment the cell selected by an
+      independent hash of the flowkey. The implementation's choice of hash
+      polynomial, register layout, and saturating arithmetic is
+      implementation surface; the spec's contract is exactly one inc per
+      row per IPv4 packet. The forward decision is independent of the
+      sketch state — the `forwarding_independence` invariant binds this.
+
+  - id: R2_heavy_admission
+    when: |
+      header_present(ipv4) ∧
+      count_exceeds(bucket[h(flowkey)], ${heavy_threshold}) ∧
+      ¬exists(flow, flowkey)
+    given:
+      flow: by_key(flowkey)
+    then:
+      - "bind(flow, flowkey, {est_count: aggregate(bucket[h(flowkey)], min), first_seen: now, bucket_class: heavy})"
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter ∧ ${heavy_eviction} ≠ none"
+    notes: |
+      First-time admission into the heavy `flow` table. The estimator
+      `aggregate(bucket[h(flowkey)], min)` denotes the min-of-rows
+      Count-Min estimator; for Count-Sketch the implementation uses the
+      median-of-signed-rows variant.
+
+  - id: R3_elastic_carry_over
+    when: |
+      header_present(ipv4) ∧
+      count_exceeds(bucket[h(flowkey)], ${heavy_threshold}) ∧
+      ¬exists(flow, flowkey) ∧
+      value(flow.est_count, <, aggregate(bucket[h(flowkey)], min))
+    given:
+      flow: by_key(flowkey)
+    then:
+      - "evict(flow, argmin_key)"
+      - "bind(flow, argmin_key, {bucket_class: light, est_count: argmin_est})"
+      - "bind(flow, flowkey, {est_count: aggregate(bucket[h(flowkey)], min), first_seen: now, bucket_class: heavy})"
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter ∧
+                    ${sketch_type} == elastic ∧
+                    ${heavy_eviction} == carry_over_on_evict"
+    notes: |
+      Elastic Sketch carry-over: when the heavy table is at capacity and
+      the new candidate's est_count exceeds the stored minimum, the
+      displaced entry is demoted to a `light` slot rather than dropped.
+      `argmin_key` and `argmin_est` denote the key and est_count of the
+      flow with minimum est_count in the table (per Elastic Sketch §3).
+
+  - id: R4_threshold_emit
+    when: |
+      header_present(ipv4) ∧
+      exists(flow, flowkey) ∧
+      value(flow.first_seen, ==, now)
+    given:
+      flow: by_key(flowkey)
+    then:
+      - mirror(cpu)
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter ∧
+                    ${readout_mode} ≠ per_epoch_dump"
+    notes: |
+      Threshold-triggered emit. Fires on the packet whose arrival caused
+      the flowkey to be admitted to the heavy table (first_seen == now).
+      Subsequent packets of the same flow in the same epoch do not
+      re-emit — Sonata's one-bit `report` discipline.
+
+  - id: R5_universal_sample
+    when: "header_present(ipv4)"
+    given:
+      bucket: by_hash(flowkey, ${n_levels})
+    then:
+      - "inc(bucket[h(flowkey)])"
+    enforced_when: "${faithfulness} == D5.3_universal"
+    notes: |
+      UnivMon cascade. Level 0 (R1) always updates; this rule fires the
+      additional levels 1..${n_levels}-1, each gated by a 1-bit sampling
+      hash with geometrically decreasing P(update) = 2^-l. Encoded here
+      as a single `inc` postcondition; the implementation replicates this per
+      level (the TPL mini-DSL grammar allows builtin
+      `inc` to be repeated).
+
+  - id: R6_epoch_boundary
+    when: |
+      elapsed(window.start_time, ≥, ${epoch_seconds}) ∨
+      count_exceeds(window.n_packets, ${epoch_packets})
+    given:
+      window: by_key(epoch_id)
+      bucket: by_hash(flowkey, ${sketch_depth})
+      flow: by_key(flowkey)
+    then:
+      - "emit(heavy_storage_snapshot)"
+      - "evict(bucket, all)"
+      - "evict(flow, all)"
+      - "bind(window, epoch_id_next, {n_packets: 0, start_time: now})"
+    enforced_when: "${readout_mode} ∈ {per_epoch_dump, both} ∨ ${epoch_trigger} ≠ packets"
+    notes: |
+      Epoch tick. Snapshot is dumped (per readout_mode) then bucket and
+      flow tables are reset to their zero state. The snapshot is the
+      authoritative top-K list for the just-ended epoch.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: counter_persistence_within_epoch
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      The count attribute of every (row, column) cell in `bucket` is
+      monotonically non-decreasing across consecutive `inc` firings
+      within a single epoch. The only `free_under` operation is the
+      `evict(bucket, all)` at R6. (For `${sketch_type} == count_sketch`
+      this weakens to: count changes by exactly ±1 per `inc` firing.)
+    enforced_when: "true"
+
+  - id: heavy_storage_no_orphan
+    clause: no_orphan
+    binds: [flow]
+    statement: |
+      Every entry in the heavy `flow` table is removed by the next
+      epoch boundary. No entry persists across epochs.
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter"
+
+  - id: bounded_emit_latency
+    clause: bounded_latency
+    binds: [flow, packet]
+    statement: |
+      Under `${readout_mode}` ∈ {threshold_emit, both}: for every
+      flowkey f whose est_count crosses `${heavy_threshold}` on packet
+      p, a `mirror(cpu)` is observable within the same pipeline
+      traversal as p (i.e., before p's egress decision is committed).
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter ∧
+                    ${readout_mode} ≠ per_epoch_dump"
+
+  - id: heavy_bucket_fairness
+    clause: fairness
+    binds: [flow]
+    statement: |
+      Under `${heavy_eviction} == replace_min`: across an epoch, the
+      ${heavy_capacity} entries in `flow` are the ${heavy_capacity}
+      flowkeys with the largest est_counts observed so far in the epoch
+      (Misra-Gries / Space-Saving top-K completeness).
+      Under `${heavy_eviction} == carry_over_on_evict`: the union of
+      heavy + light slots covers the top-2K observed flowkeys at epoch
+      end (Elastic Sketch §3 guarantee).
+    enforced_when: "${faithfulness} ≥ D5.2_heavy_hitter ∧
+                    ${heavy_eviction} ∈ {replace_min, carry_over_on_evict}"
+
+  - id: no_packet_loop
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every packet traverses the pipeline at most twice (one optional
+      recirculation for multi-stage hash computation under Elastic /
+      UnivMon).
+    enforced_when: "true"
+
+  - id: forwarding_independence
+    clause: stability
+    binds: [packet]
+    statement: |
+      The bucket state and `flow` table state MUST NOT influence the
+      packet's normal forwarding decision (egress port, TTL decrement,
+      MAC rewrite, drop verdict). The pattern is observe-only telemetry:
+      it MAY `mirror(cpu)` (R4) but it MUST NOT alter the packet's
+      egress port relative to an identical no-sketch baseline.
+      Specialised instances that relax this invariant become DDoS-
+      mitigation NFs (Mantis / Poseidon lineage) — switched by the
+      `relax_forwarding_independence` operator (pattern-augmentation
+      lineage).
+    enforced_when: "${forwarding_independence_strict}"
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Authored against the G1/G2/G3 test-goal framework and the v1model bug
+# taxonomy.
+
+test_scaffolding:
+
+  G1:                                  # functional correctness
+
+    - id: single_flow_estimated_count_within_error
+      generate: |
+        Stage a sequence of N = 10·${sketch_width} IPv4 packets sharing
+        a single flowkey f via prior_inputs warmup (TTL=64); send the
+        Nth packet as the test (TTL=1). Reads the sketch via a CPU-port
+        readout packet (or per the implementation's snapshot mechanism). Assert
+        the implementation's est_count(f) reading is in [N, N + N/${sketch_width}]
+        with high probability under ${sketch_depth} ≥ 3.
+        Maps to test-rule G1-P2-T2 (state accumulation) + G1-P2-T7
+        (register read-after-write ordering — increment THEN check).
+
+    - id: forwarding_unchanged_under_sketch
+      generate: |
+        Send a single IPv4 packet with TTL=1 to a destination that has
+        a control-plane forwarding entry installed. Assert the packet
+        appears at the expected egress port with TTL decremented by 1
+        and MAC headers rewritten as a no-sketch baseline would do.
+        Maps to G1-P1-T1 (forwarding-path coverage) + G1-P1-T5 (explicit
+        transformation assertion). Probes the `forwarding_independence`
+        invariant.
+
+    - id: zero_state_at_epoch_start
+      generate: |
+        Establish a non-zero sketch state by sending K warmup packets
+        for flowkey f (prior_inputs, TTL=64). Force an epoch boundary
+        (either via the epoch_packets counter or simulated time
+        advance), then send 1 IPv4 packet for the same flowkey f
+        (TTL=1). Assert the implementation's est_count(f) reading reflects
+        ONLY the post-boundary packet (≤ ${sketch_depth}, not K + 1).
+        Maps to G1-P2-T1 (cold-start / register=0) + G1-P2-T4 (state
+        persistence after reset).
+
+    - id: cross_flow_isolation
+      generate: |
+        Send 5 warmup packets for flowkey f_A (prior_inputs, TTL=64),
+        then 1 test packet for a DIFFERENT flowkey f_B (TTL=1). Read
+        est_count(f_B); assert it equals 1, not 6 — f_A's counter
+        updates must not contaminate f_B's lookup. Maps to G1-P2-T3
+        (cross-flow independence).
+
+    - id: heavy_hitter_detection_above_threshold
+      requires: "${faithfulness} >= D5.2_heavy_hitter"
+      generate: |
+        prior_inputs: ${heavy_threshold} - 1 packets for flowkey f_hot
+        (TTL=64), plus T/10 packets each for ${heavy_capacity} - 1
+        background flows. Test packet: 1 more packet for f_hot
+        (TTL=1) that crosses the threshold. Assert R4 fires
+        (mirror(cpu) observable) and f_hot is bound in `flow` with
+        est_count ≥ ${heavy_threshold}. Maps to G1-P2-T2 (state
+        accumulation) on the threshold-crossing packet.
+
+    - id: elastic_carry_over_preserves_displaced
+      requires: "${sketch_type} == elastic ∧ ${heavy_eviction} == carry_over_on_evict"
+      generate: |
+        Fill the heavy bucket to ${heavy_capacity} via prior_inputs:
+        ${heavy_capacity} flows with est_counts evenly above
+        ${heavy_threshold}. Test packet: a fresh (K+1)-th flow that
+        crosses the threshold with strictly higher est_count than the
+        stored minimum. Assert the displaced entry now has
+        `bucket_class: light`, the (K+1)-th entry has
+        `bucket_class: heavy`, and the heavy total count is preserved.
+
+  G2:                                  # robustness / boundary
+
+    - id: capacity_pressure_heavy_storage_full
+      requires: "${faithfulness} >= D5.2_heavy_hitter ∧ ${heavy_eviction} == replace_min"
+      generate: |
+        Stage ${heavy_capacity} + 5 distinct flowkeys with est_counts
+        evenly above ${heavy_threshold} via prior_inputs. Test the
+        final heavy-table state. Assert the table contains the
+        ${heavy_capacity} flowkeys with the largest est_counts
+        (Space-Saving completeness). Maps to the G2 capacity-boundary
+        rule + the heavy_bucket_fairness invariant.
+
+    - id: counter_saturation_at_max_value
+      generate: |
+        Stage 2 · (2^${counter_width_bits}) packets for one flowkey f
+        via prior_inputs (TTL=64). Test packet: 1 more for f (TTL=1).
+        Assert: no counter wraps to 0 — the saturated counter holds
+        (2^${counter_width_bits}) − 1. The implementation MUST implement
+        saturating arithmetic, not modular wrap. Maps to the
+        counter-overflow G2 rule + bug-taxonomy "counter overflow"
+        item under INT/telemetry NF type.
+
+    - id: epoch_boundary_under_load
+      generate: |
+        Stage prior_inputs to cross ${epoch_packets} mid-test. Test
+        packet immediately after the crossing. Verify R6 fires exactly
+        once: the dumped snapshot reflects pre-boundary state; the
+        next packet's increment lands in a freshly-zeroed counter cell.
+
+  G3:                                  # security / bypass
+
+    - id: adversarial_collision_no_false_heavy
+      requires: "${faithfulness} >= D5.2_heavy_hitter ∧ ${sketch_depth} >= 2"
+      generate: |
+        Workload: ${workload_skew} == adversarial_collision. The
+        attacker crafts N flowkeys that all hash to the same column in
+        row 0, sending ${heavy_threshold} - 1 of each via prior_inputs.
+        Test packet: one more from any attacker key (TTL=1). Assert no
+        flowkey is admitted to `flow` — the min-across-rows estimator
+        clips the inflated row-0 estimate against the unaffected
+        row-1+ estimates. Probes hash-discipline robustness.
+
+    - id: spoofed_low_volume_no_emit
+      requires: "${faithfulness} >= D5.2_heavy_hitter"
+      generate: |
+        Adversary sends ${heavy_threshold} - 1 packets for one flowkey
+        across the entire epoch via prior_inputs. Test packet: a final
+        legitimate packet from a DIFFERENT flow. Assert no `mirror(cpu)`
+        emit on any packet of the spoofed flow; `flow` is empty for
+        the spoofed key at epoch end.
+
+    - id: epoch_boundary_no_state_leak
+      requires: "${faithfulness} >= D5.2_heavy_hitter"
+      generate: |
+        Stage a flow F that becomes heavy in epoch_k via prior_inputs,
+        then force an epoch boundary. Test packet: a single packet for
+        F in epoch_(k+1) (TTL=1). Assert `flow` does NOT contain F
+        (no_orphan invariant), and no `mirror(cpu)` fires on the test
+        packet because admission is a fresh act in the new epoch.
+
+    - id: hash_over_uninitialized_l4_no_garbage
+      requires: "len(${flowkey_fields}) > 1"
+      generate: |
+        Probes the v1model bug taxonomy's pattern "hash extern misuse" + rule
+        G1-P2-T9 (hash over uninitialized fields). The flowkey extends
+        to L4 ports, but the test packet is ICMP (proto=1), where
+        TCP/UDP headers are NOT extracted. Assert the implementation either
+        guards the hash with `isValid(hdr.tcp)` checks, or maps ICMP
+        to a deterministic non-garbage flowkey — but does NOT use
+        unspecified L4 fields. Otherwise the sketch counts ICMP
+        packets non-deterministically and a downstream test would
+        flake.
+
+    - id: conditional_emit_deparser_well_formed
+      requires: "${faithfulness} >= D5.2_heavy_hitter ∧ ${readout_mode} ≠ per_epoch_dump"
+      generate: |
+        Probes the v1model bug taxonomy's pattern "conditional deparser" —
+        emitting the mirrored packet must not corrupt the deparser
+        when the threshold-emit branch is taken. Stage exactly one
+        threshold crossing via prior_inputs; on the threshold-crossing
+        test packet, assert (a) the original packet still appears on
+        its expected egress port well-formed (forwarding_independence),
+        and (b) a mirrored copy (mirror_session bound to CPU) is
+        observable on the CPU port with bit-exact header layout. The
+        deparser MUST emit headers conditionally on `isValid()` and
+        MUST NOT emit garbage on the non-mirror path.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators (4 required fields each) ───────────────────────────
+
+mutation_operators:
+
+  # === Capacity axis =======================================================
+  - id: shrink_capacity_4x
+    applicable_when: "${max_register_cells} >= 32"
+    effect: "${max_register_cells} ← ${max_register_cells} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${max_register_cells} >= 8"
+
+  - id: enlarge_capacity_2x
+    applicable_when: "${max_register_cells} <= 524288"
+    effect: "${max_register_cells} ← ${max_register_cells} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${max_register_cells} <= 1048576"
+
+  # === Faithfulness ladder: D5.0 ↔ D5.1 ====================================
+  - id: lift_to_count_sketch
+    applicable_when: "${sketch_type} == count_min ∧ ${faithfulness} == D5.0_count_min"
+    effect: |
+      ${sketch_type}   ← count_sketch
+      ${faithfulness}  ← D5.1_count_sketch
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${hash_independence} ∈ {pairwise, four_wise}"
+
+  - id: revert_to_count_min
+    applicable_when: "${sketch_type} == count_sketch ∧ ${faithfulness} == D5.1_count_sketch"
+    effect: |
+      ${sketch_type}   ← count_min
+      ${faithfulness}  ← D5.0_count_min
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Strictness axis: heavy storage on/off ===============================
+  - id: enable_heavy_flowkey_storage
+    applicable_when: "${faithfulness} ∈ {D5.0_count_min, D5.1_count_sketch}"
+    effect: |
+      ${faithfulness}    ← D5.2_heavy_hitter
+      ${heavy_eviction}  ← replace_min
+      ${heavy_capacity}  ← max(${heavy_capacity}, 256)
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${heavy_threshold} >= ${sketch_width} / 100"
+
+  - id: disable_heavy_flowkey_storage
+    applicable_when: "${faithfulness} == D5.2_heavy_hitter"
+    effect: |
+      ${faithfulness}    ← D5.0_count_min
+      ${heavy_eviction}  ← none
+      ${heavy_capacity}  ← 0
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Faithfulness ladder: lift to D5.3 universal ↔ revert ================
+  - id: lift_to_universal_sketch
+    applicable_when: "${faithfulness} == D5.2_heavy_hitter ∧ ${sketch_type} == count_sketch"
+    effect: |
+      ${faithfulness} ← D5.3_universal
+      ${sketch_type}  ← universal
+      ${n_levels}     ← max(${n_levels}, 8)
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${sketch_width} >= 1024 ∧ ${sketch_depth} >= 3 ∧
+                                ${hash_independence} == four_wise"
+
+  - id: revert_universal_sketch
+    applicable_when: "${faithfulness} == D5.3_universal ∧ ${sketch_type} == universal"
+    effect: |
+      ${faithfulness} ← D5.2_heavy_hitter
+      ${sketch_type}  ← count_sketch
+      ${n_levels}     ← 1
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Sketch family: lift to / revert from Elastic ========================
+  - id: lift_to_elastic_sketch
+    applicable_when: "${faithfulness} >= D5.2_heavy_hitter ∧ ${sketch_type} ∈ {count_min, count_sketch}"
+    effect: |
+      ${sketch_type}     ← elastic
+      ${heavy_eviction}  ← carry_over_on_evict
+      ${sketch_depth}    ← 2
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${heavy_capacity} >= 8"
+
+  - id: revert_elastic_sketch
+    applicable_when: "${sketch_type} == elastic"
+    effect: |
+      ${sketch_type}     ← count_min
+      ${heavy_eviction}  ← replace_min
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${heavy_capacity} >= 1"
+
+  # === Hash-family axis ====================================================
+  - id: tighten_hash_independence
+    applicable_when: "${hash_independence} == pairwise"
+    effect: "${hash_independence} ← four_wise"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: relax_hash_independence
+    applicable_when: "${hash_independence} == four_wise ∧ ${faithfulness} ≠ D5.3_universal"
+    effect: "${hash_independence} ← pairwise"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+
+  - id: switch_hash_polynomial
+    applicable_when: "${hash_polynomial} ∈ {crc16, crc32}"
+    effect: "${hash_polynomial} ← custom_lfsr"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_polynomial} ∈ {crc16, crc32, crc32c, custom_lfsr}"
+    notes: |
+      Hash-family axis. custom_lfsr forces the implementation to
+      implement its own per-row polynomial rather than reusing a stock
+      CRC algorithm, which exposes hash-independence assumptions across
+      rows. Pairs with `revert_hash_polynomial_to_crc32`.
+
+  - id: revert_hash_polynomial_to_crc32
+    applicable_when: "${hash_polynomial} ≠ crc32"
+    effect: "${hash_polynomial} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Heavy-eviction strictness ===========================================
+  - id: switch_heavy_eviction_to_strict
+    applicable_when: "${heavy_eviction} == replace_min ∧ ${faithfulness} >= D5.2_heavy_hitter"
+    effect: "${heavy_eviction} ← no_evict"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: relax_heavy_eviction_to_replace_min
+    applicable_when: "${heavy_eviction} == no_evict"
+    effect: "${heavy_eviction} ← replace_min"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Heavy-threshold axis ================================================
+  - id: tighten_heavy_threshold_4x
+    applicable_when: "${heavy_threshold} >= 100"
+    effect: "${heavy_threshold} ← ${heavy_threshold} / 4"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${heavy_threshold} >= ${sketch_width} / 100"
+
+  - id: relax_heavy_threshold_2x
+    applicable_when: "${heavy_threshold} <= 500000"
+    effect: "${heavy_threshold} ← ${heavy_threshold} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Workload axis =======================================================
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← adversarial_collision"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} == adversarial_collision"
+    effect: "${workload_skew} ← zipfian"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Epoch-window axis ===================================================
+  - id: shrink_epoch_window_4x
+    applicable_when: "${epoch_packets} >= 4096"
+    effect: "${epoch_packets} ← ${epoch_packets} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${epoch_packets} >= 1024"
+
+  - id: enlarge_epoch_window_2x
+    applicable_when: "${epoch_packets} <= 8388608"
+    effect: "${epoch_packets} ← ${epoch_packets} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${epoch_packets} <= 16777216"
+
+  # === Pattern-augmenting axis: forwarding-independence =====================
+  - id: relax_forwarding_independence
+    applicable_when: "${faithfulness} >= D5.2_heavy_hitter ∧ ${forwarding_independence_strict} == true"
+    effect: |
+      ${forwarding_independence_strict} ← false
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${faithfulness} >= D5.2_heavy_hitter"
+
+  - id: enforce_forwarding_independence
+    applicable_when: "${forwarding_independence_strict} == false"
+    effect: |
+      ${forwarding_independence_strict} ← true
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+# ─── Bridging notes (advisory; not visible to the SUT) ─────────────────────
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Default seed (sketch_type=count_min, faithfulness=D5.0_count_min,
+                  heavy_capacity=0):
+      - ${sketch_depth} counter rows realised as
+        `register<bit<${counter_width_bits}>>(${sketch_width})`, one per
+        row (R writes spread across R consecutive stages).
+      - ${sketch_depth} hash calls — `hash(meta.h_r, HashAlgorithm.crc32,
+        0, {flowkey}, ${sketch_width})` — with a distinct CRC variant
+        per row.
+      - No `flow` table; R4 emit and R2 admission do not fire.
+      - Forwarding base: a simple ipv4_lpm table with `forward(port)`
+        and `drop` actions, independent of the sketch state.
+
+    sketch_type=count_sketch (D5.1):
+      - R additional 1-bit sign hashes; per-row update conditionally
+        adds or subtracts via a 2-branch SALU. R4's median across rows
+        is typically realised via a 3-stage sort network for R ≤ 5.
+
+    faithfulness=D5.2_heavy_hitter, heavy_eviction=replace_min:
+      - heavy `flow` table as K parallel register slots (typical K =
+        64–256). Associative argmin scan over K slots in one pipeline
+        traversal; recirculation needed when K exceeds the per-stage
+        comparator budget (SketchLib §4.3).
+      - R4 uses `clone3` or mirror-to-CPU sessions; the mirror session
+        binding is control-plane installed.
+
+    sketch_type=elastic (scale_up case study):
+      - Two per-stage rows: row 0 = heavy {flowkey, est_count, vote},
+        row 1 = light {flowkey, est_count}.
+      - On admission to heavy: if the per-row min slot < new candidate,
+        copy the displaced (flowkey, est_count) into the light row
+        before binding the new candidate to the heavy slot.
+
+    faithfulness=D5.3_universal:
+      - L cascaded count-sketches with 1-bit sampling hashes per level.
+        Per UnivMon, L = O(log N) ≈ 16 levels for billion-packet
+        epochs; per-pipeline this typically requires Tofino-2.
+
+    Cross-sketch reuse (Sketchovsky, NSDI '23):
+      - When two sketches share a flowkey, the implementation MAY reuse hash
+        results across them. This is an implementation surface only;
+        it does not alter what the spec requires the implementation to report.
+
+  v2 deferral notes (not enforceable at v1.0):
+    - Multi-switch sketch placement (HeteroSketch) — out of scope for
+      the single-switch v1 instantiation. Would require a
+      `cross_switch_partitioning` axis on a TPL v2 variant.
+    - Runtime sketch reconfiguration (FlyMon CMU swap) — needs a
+      runtime control-plane primitive not yet in TPL v1.0.
+    - Streaming join across two sketches (Sonata multi-query) — needs
+      a cross-NF join primitive not in TPL v1.0.
+
+  Common implementation bugs (anchors for G3 test design):
+    - Row hashes derived from identical seed → adversarial flows
+      collide in every row. Caught by `adversarial_collision_no_false_heavy`.
+    - Counter wrap on saturation → estimate wraps to 0, breaks
+      `est ≥ true` guarantee. Caught by `counter_saturation_at_max_value`.
+    - Stale heavy_storage carry-over → prior-epoch heavies pollute
+      the new epoch's report. Caught by `epoch_boundary_no_state_leak`.
+    - Missing `first_seen == now` check in R4 → emit fires on every
+      packet of an installed heavy flow, overwhelming CPU.
+    - FIFO eviction mistaken for replace_min → fails Space-Saving
+      completeness; heavy_bucket_fairness invariant violation.
+    - Hash over an unguarded TCP/UDP port when the test packet is
+      ICMP → P4-spec §8.25 unspecified value; caught by
+      `hash_over_uninitialized_l4_no_garbage`.
+    - Conditional deparser emits garbage on the mirror branch →
+      mirrored copy has wrong header layout; caught by
+      `conditional_emit_deparser_well_formed`.
+    - Sketch state used as a drop guard while
+      `forwarding_independence_strict` is true → caught by
+      `forwarding_unchanged_under_sketch` and the
+      `forwarding_independence` invariant. The
+      `relax_forwarding_independence` operator is required to
+      legitimately specialise the pattern to a drop-on-threshold
+      DDoS-mitigation lineage.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - R0_non_ipv4_drop and R1's forwarding-coupled update are
+      pipeline-conventional patterns adopted from the upstream
+      p4lang/tutorials' basic_forwarding exercise structure (no
+      sketch exercise exists, but the IPv4-LPM-forward scaffold is
+      shared with that exercise tree).
+    - The `forwarding_independence` invariant articulates the
+      observe-only contract that all four cited sketch papers
+      assume but do not state explicitly; flagging it lets the
+      `relax_forwarding_independence` operator carve out the
+      Mantis-lineage DDoS-mitigation NF cleanly.

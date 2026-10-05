@@ -1,0 +1,177 @@
+# P-SRv6Endpoint — SRv6 segment endpoint (End behaviour)
+#
+# TPL v1.0 task pattern. An SRv6 segment-endpoint node: when a
+# packet addressed to one of the node's local SIDs carries a Segment Routing
+# Header with Segments Left > 0, execute the End behaviour — decrement Segments
+# Left, update the IPv6 destination to the next segment, decrement Hop Limit,
+# and forward. Combines IPv6 datapath with an IPv6 extension-header edit (the
+# corpus's first SRH manipulation). RFC 8754 (SRH), RFC 8986 (End).
+
+pattern_id: P-SRv6Endpoint
+version: "1.0"
+nf_categories:
+  descriptive:  [D2:tunnel]
+  prescriptive: [P13:encap-decap]
+target_capability: relocate
+summary: >
+  SRv6 segment endpoint implementing the End behaviour (RFC 8986 §4.1). A
+  packet whose IPv6 destination equals a local SID and which carries an SRH
+  with Segments Left > 0 is processed: Segments Left is decremented, the IPv6
+  destination is set to Segment List[Segments Left] (the new active segment),
+  the Hop Limit is decremented, and the packet is forwarded toward the new
+  destination via the FIB. Packets to a non-local SID, without an SRH, or with
+  Segments Left == 0 are dropped. Mutation adds End.X (L3 cross-connect), PSP
+  (penultimate-segment pop), and deeper segment lists.
+
+grounding:
+  rfcs:
+    - id: RFC8754
+      sections: ["2", "4.1"]
+      role: canonical_spec
+      relevance: |
+        IPv6 Segment Routing Header (SRH) — the SRH format (Next Header, Hdr
+        Ext Len, Routing Type 4, Segments Left, Last Entry, Flags, Tag, and the
+        Segment List of 128-bit IPv6 addresses). The active segment is Segment
+        List[Segments Left]. Basis for the SRH parse and the segment-index
+        semantics.
+    - id: RFC8986
+      sections: ["4.1"]
+      role: normative_behaviour
+      grounds: R3_end
+      quote: |
+        S12.   Decrement IPv6 Hop Limit by 1
+           S13.   Decrement Segments Left by 1
+           S14.   Update IPv6 DA with Segment List[Segments Left]
+           S15.   Submit the packet to the egress IPv6 FIB lookup for
+                     transmission to the new destination
+      relevance: |
+        SRv6 Network Programming — the End behaviour: "IF Segments Left > 0:
+        decrement Segments Left; update the IPv6 DA with Segment List[Segments
+        Left]; ... decrement Hop Limit; submit the packet to the egress lookup."
+        Basis for R3. Segments Left == 0 is handled by other behaviours (USP /
+        delivery) out of scope at this rung.
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "IPv6 + SRH; the active segment is Segment List[Segments Left]."
+  local_sid:
+    keyed_by_tuple: [sid]
+    notes: "An IPv6 address bound to this node's End behaviour."
+  fib:                                      # the TPL `bucket` role
+    keyed_by_tuple: [dst]
+    attrs: {egress_port: port, next_hop_mac: address, port_mac: address}
+    notes: "Forwarding for the new IPv6 destination after the segment update."
+
+parameters:
+  local_sids:
+    type: list[ipv6]
+    constraint: "the node's End SIDs"
+  fib:
+    type: list[fib_entry]
+    constraint: "each has dst (ipv6), egress_port, MACs"
+  faithfulness:
+    type: enum
+    values: [D.end, D.end_x, D.end_psp]
+    default: D.end
+
+rules:
+  - id: R0_non_ipv6_or_no_srh_drop
+    when: "¬header_present(ipv6) ∨ ¬header_present(srh)"
+    then: [drop]
+  - id: R1_not_local_sid_drop
+    when: "header_present(ipv6) ∧ hdr.ipv6.dst ∉ ${local_sids}"
+    then: [drop]
+    notes: "Only packets addressed to a local SID are End-processed."
+  - id: R2_segleft_zero_drop
+    when: "is_local_sid ∧ srh.segments_left == 0"
+    then: [drop]
+    notes: "Segments Left == 0 (end of path) is out of scope at this rung."
+  - id: R3_end
+    when: "is_local_sid ∧ header_present(srh) ∧ srh.segments_left > 0"
+    given:
+      entry: by_key(srh.segment_list[srh.segments_left - 1], ${fib})
+    then:
+      - "dec(srh.segments_left, 1)"
+      - "set(hdr.ipv6.dst, srh.segment_list[srh.segments_left])   # new active segment after decrement"
+      - "dec(hdr.ipv6.hopLimit, 1)"
+      - set(hdr.ethernet.src, entry.port_mac)
+      - set(hdr.ethernet.dst, entry.next_hop_mac)
+      - forward(entry.egress_port)
+    notes: |
+      RFC 8986 End: decrement Segments Left, set the IPv6 destination to the
+      new active segment (Segment List[Segments Left] AFTER the decrement),
+      decrement the Hop Limit, and forward toward the new destination via the
+      FIB. The SRH segment list itself is preserved (only Segments Left and the
+      IPv6 DA change).
+
+invariants:
+  - id: segleft_decrement
+    clause: stability
+    target: srh.segments_left
+    while: "rule R3 fires"
+    notes: "Segments Left decremented by exactly one."
+  - id: da_is_new_segment
+    clause: stability
+    target: hdr.ipv6.dst
+    while: "rule R3 fires"
+    notes: "The new IPv6 destination equals Segment List[Segments Left] after the decrement."
+  - id: hoplimit_decrement
+    clause: stability
+    target: hdr.ipv6.hopLimit
+    while: "rule R3 fires"
+    notes: "RFC 8986 — Hop Limit decremented by one on End."
+  - id: segment_list_preserved
+    clause: persistence
+    target: srh.segment_list
+    while: "rule R3 fires"
+    notes: "The segment list addresses are not modified (only SL + DA change)."
+
+test_scaffolding:
+  G1:
+    - id: end_basic
+      generate: "DA=local SID, SRH segleft=1, 2-segment list → SL→0, DA→Segment List[0], hop-limit--, forward."
+    - id: end_multi_segment
+      generate: "3-segment list, segleft=2 → SL→1, DA→Segment List[1], forward to its route."
+    - id: end_decrements_hoplimit
+      generate: "Assert the IPv6 Hop Limit is decremented by one on End."
+  G2:
+    - id: drop_segleft_zero
+      generate: "SRH with Segments Left == 0 → drop."
+    - id: drop_not_local_sid
+      generate: "IPv6 DA is not a local SID → drop."
+  G3:
+    - id: drop_no_srh
+      generate: "Plain IPv6 to the local SID, no SRH → drop."
+    - id: drop_non_ipv6
+      generate: "IPv4 / non-IPv6 → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_end_x
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} == D.end"
+    effect: "${faithfulness} ← D.end_x (End.X: the SID binds a specific L3 next-hop / egress, bypassing the FIB)"
+    d_axis_delta: {D2: +1, test_rigor: +1}
+  - id: enable_psp
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} != D.end_psp"
+    effect: "${faithfulness} ← D.end_psp (PSP: pop the SRH when Segments Left reaches 0)"
+    d_axis_delta: {D2: +1, test_rigor: +1}
+
+bridging_notes: |
+  Canonical (End) implementation:
+    - Parse Ether/IPv6; if ipv6.nextHdr==43 (Routing) parse the SRH base, then
+      the segment list (fixed max depth, gated on Last Entry).
+    - my_sid table keyed on ipv6.dstAddr (the INCOMING DA) → hit ⇒ a local SID.
+    - End: nsl = segleft - 1; new DA = Segment List[nsl] (select on nsl over the
+      parsed segment headers); set ipv6.dstAddr = new DA; srh.segleft = nsl;
+      ipv6.hopLimit = ipv6.hopLimit - 1.
+    - fib keyed on the NEW ipv6.dstAddr → egress + L2 rewrite.
+  Anti-patterns:
+    * Indexing the segment list with the OLD Segments Left (off-by-one).
+    * Forgetting the Hop Limit decrement.
+    * Rewriting the segment list addresses.

@@ -1,0 +1,934 @@
+# P-ACL — Stateless Wildcard/Priority Classification (TCAM-style ACL)
+#
+# TPL v1.0 task pattern (rules, invariants, entities/state, parameters,
+# and mutation operators).
+# P-ACL is the substrate
+# every firewall / policer / ECN-marker layers on top of, distinct from
+# P-StatefulFW (which covers P3 flow-tracking, not P4 policy). Instances
+# are produced by binding the parameters below.
+
+pattern_id: P-ACL
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D7:security]                           # ACLs are listed under D7 in Table 1's representative NFs
+  prescriptive: [P4:policy]                             # composite-condition match-action; ACLs, classification
+target_capability: redesign                             # programmability redesigns the previously fixed-function ACL TCAM
+summary: >
+  Stateless wildcard/priority classification — the pure match-action
+  substrate every firewall, policer, and ECN-marker layers on top of.
+  A control-plane-installed first-match table with TCAM-style ternary
+  keys maps packet headers to one of {permit, deny, mark, redirect};
+  there is no per-flow state. Anchor instances exercise a single
+  /32-everywhere "deny-list of N rules over a permit-by-default
+  policy"; the parameter-rebinding mutation surface lifts rule count, match-field
+  breadth, priority depth, action breadth, and the default-action
+  policy independently, so the same audited oracle covers everything
+  from a 16-rule allow-list to a 4096-rule TCAM with mark+redirect
+  actions and 5-tuple+VRF+VLAN+DSCP keys.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers: []                                            # P4 ACLs are mature engineering — not a research-publication slot.
+                                                        # This is a publication-record gap; grounding
+                                                        # leans on the P4 spec + tutorial + RFC + bug taxonomy instead.
+
+  rfcs:
+    - id: RFC3198
+      sections: ["2.3", "2.4", "2.5"]
+      role: domain_concepts
+      grounds: priority_correctness
+      quote: "It is the binding\n   of a set of actions to a set of conditions - where the conditions\n   are evaluated to determine whether the actions are performed"
+      quote_source: "RFC 3198 §2.3 Policy Rule (verbatim; cached at patterns/P-ACL/grounding/RFC3198.txt)"
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        Terminology for Policy-Based Management. Establishes the
+        condition-action pair as the basic unit of a policy rule
+        (§2.3: "policy rule … binding of a set of actions to a set
+        of conditions") and separates the policy condition (the
+        match predicate) from the policy action (the consequence).
+        Two limits of RFC 3198 worth being explicit about: (i) it
+        does NOT mandate first-match vs all-matches semantics —
+        the pattern adopts first-match-by-priority because that is
+        what programmable-switch TCAMs realise (see P4-16 spec
+        cite below) and what the policy literature universally
+        deploys, not because RFC 3198 requires it; (ii) it does
+        NOT prescribe default-action behaviour — the pattern
+        treats `default_action` as a first-class parameter for
+        precisely this reason, so the seed picks default-permit
+        (CDN edge ACL) or default-deny (DMZ ACL) per deployment.
+
+  tutorials:
+    - path: tutorials/exercises/basic_tunnel
+      role: baseline_topology
+      relevance: |
+        The canonical p4lang/tutorials exercise that introduces a
+        control-plane-installed first-match table whose entries are
+        loaded from `sX-runtime.json` and whose default action is
+        `drop` on miss. The basic_tunnel exercise itself uses an
+        EXACT-match table on a single tunnel id rather than a
+        ternary key; P-ACL's anchor instance generalises the
+        topology and the control-plane-installed-entries
+        convention but swaps the match_kind to `ternary` and
+        introduces a `@priority` field, per the P4-16 spec cite
+        below. The exact-match → ternary lift is the SUT's
+        responsibility, and the implementation hint that "an ACL is one
+        ternary table with priority" lives in `bridging_notes`,
+        not in the rules.
+
+
+  posts:
+    - url: https://s3-us-west-2.amazonaws.com/p4runtime/docs/master/P4Runtime-Spec.pdf
+      role: normative_behaviour
+      relevance: |
+        P4Runtime Specification v1.3.0 §9.1 (TableEntry priority):
+        "The priority field must be set to a non-zero value if
+        the match key includes a ternary match (or any other
+        match type that allows multiple entries to match the
+        same field value, such as optional or range), or to
+        zero otherwise. A higher priority number indicates that
+        the entry must be given higher priority when performing
+        a table lookup." This is the normative basis for the
+        `priority_correctness` invariant and for the
+        `bit<1>` vs `bool` boundary on the `permit/deny`
+        decision in the implementation.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. All decisions are derived from
+      hdr.ethernet, hdr.vlan (when present), hdr.ipv4, hdr.tcp/udp,
+      and std.ingress_port. ACL is a pure match-action pattern —
+      no per-flow registers, no state writes — which is precisely
+      what distinguishes P-ACL from P-StatefulFW.
+
+  bucket:                                  # plays the TPL `bucket` role — aggregate state across a class
+    keyed_by_tuple: [rule_id]
+    attrs:
+      priority:    int
+      match_spec:  "dict[field, (value, mask)]"   # ternary key over the configured match_field_breadth
+      action:      "enum {permit, deny, mark, redirect}"
+      action_args: "dict[arg, value]"             # for mark: {dscp_or_color}; for redirect: {egress_port}
+    capacity: ${rule_count_capacity}
+    notes: |
+      The ACL rule set. One bucket holds the entire control-plane-
+      installed entry table. First-match semantics is BY PRIORITY,
+      not by list order: among all entries whose match_spec admits
+      the packet, the entry with the largest `priority` wins. Ties
+      on priority are forbidden by the priority_correctness
+      invariant (P4Runtime §9.1: "If a packet can match multiple
+      entries with the same priority, it is not deterministic in
+      the data plane which entry a packet will match" — the
+      pattern hardens against the non-determinism by requiring
+      ties be absent in the seed).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  rules:
+    type: list[acl_rule]
+    constraint: |
+      every entry has priority:int ∈ [1, 2^31 - 1], match_spec
+      well-formed over the fields configured by
+      ${match_field_breadth}, action ∈ allowed-by-${action_breadth};
+      no two entries share both (priority, match_spec) (uniqueness).
+    notes: |
+      Control-plane-installed ACL entries. The set of
+      (priority, match_spec, action) triples the data plane
+      consults; |rules| ≤ ${rule_count_capacity}.
+
+  rule_count_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: 256
+    notes: |
+      Maximum number of ACL entries the table can host. Realistic
+      production ACLs sit between 256 (edge / branch) and
+      4096–16384 (datacenter aggregation, per Tofino reference
+      designs). The shrink_capacity_4x mutation operator
+      exercises this axis under the assumption that the implementation
+      cannot rely on a TCAM-of-everything strategy at lower
+      bounds.
+
+  match_field_breadth:
+    type: enum
+    values: [tuple5, tuple5_vrf, tuple5_vrf_vlan, tuple5_vrf_vlan_dscp]
+    default: tuple5
+    notes: |
+      Width of the ternary key. tuple5 is the canonical 5-tuple
+      (eth_type, ipv4.src, ipv4.dst, ipv4.proto, l4_srcPort,
+      l4_dstPort — six fields by convention but ASIC vendors call
+      it "5-tuple" because src+dst MAC are usually omitted at L3
+      boundary). Each subsequent value adds one orthogonal field
+      (VRF id, VLAN tag, DSCP), which the implementation must include in
+      the ternary key and parse from the packet. Lift to
+      tuple5_vrf_vlan_dscp doubles the on-chip TCAM bit-width
+      requirement and exercises the parser at depth.
+
+  priority_depth:
+    type: int
+    range: "[1, 4096]"
+    default: 16
+    notes: |
+      Number of distinct priority levels the seed uses. Low
+      depth (e.g., 2) reduces the rule set to "broad permit-list +
+      specific exceptions" — easy to encode. High depth (≥256)
+      forces the implementation to think about TCAM priority-encoder
+      cost, since TCAM-management algorithm efficiency depends
+      linearly on the number of distinct priorities (per P4-spec
+      issue #794 discussion); a naive implementation of "one rule per
+      priority" runs out of priority bits or TCAM rows before
+      the ASIC does.
+
+  action_breadth:
+    type: enum
+    values: [permit_deny, permit_deny_mark, permit_deny_mark_redirect]
+    default: permit_deny
+    notes: |
+      The action set the data plane realises. permit_deny is the
+      pure-firewall ACL (the common v1model `bit<1>` vs `bool` boundary
+      case — a single decision bit). permit_deny_mark adds DSCP /
+      colour rewrite on permit (the substrate ECN-marker layers
+      on top of). permit_deny_mark_redirect adds policy-based
+      egress-port redirection on permit, the substrate every
+      service-chaining ACL extends.
+
+  default_action:
+    type: enum
+    values: [permit, deny]
+    default: permit
+    notes: |
+      Behaviour on table miss. `permit` is the canonical edge
+      ACL (deny-list-of-bads over an otherwise-permissive
+      default); `deny` is the canonical DMZ / zero-trust ACL
+      (allow-list over an otherwise-denied default). The
+      implementation MUST declare a `default_action` on the table —
+      omission is the common v1model bug "missing default_action crash"
+      compile-failure pattern. The flip_default_to_deny
+      operator activates the negative-policy semantics that
+      P-StatefulFW also exercises, but here without per-flow
+      state.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_first_match_priority, D5.1_partitioned_tcam, D5.2_compressed_rules]
+    default: D5.0_first_match_priority
+    notes: |
+      Implementation faithfulness ladder.
+      D5.0_first_match_priority: one ternary table, one priority,
+      action set. D5.1_partitioned_tcam: two-stage classification
+      (e.g., per-ingress-port pre-filter into a smaller TCAM
+      slice) — the realistic ASIC strategy when
+      `rule_count_capacity` is tight. D5.2_compressed_rules:
+      cross-product compression (merging mutually-exclusive
+      rules into a single wider mask) — the realistic strategy
+      when `priority_depth` is high.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The pattern's "first match" is by
+# priority within `rules`, not by declaration order of the rules below — the
+# rules below are the case split over the ACTION the matched ACL entry
+# carries.
+
+rules:
+
+  - id: R0_non_ipv4_default_deny
+    when: "¬header_present(ipv4) ∧ ${default_action} == deny"
+    then:
+      - drop
+    notes: |
+      Frames without an IPv4 header (ARP, IPv6, raw L2) are not
+      in the canonical 5-tuple ACL's match domain — for the
+      default-deny policy they are silently dropped, same as a
+      table miss on the IPv4 path. Seeds that need ARP-specific
+      handling lift `match_field_breadth` to include eth_type
+      and add explicit ARP rules.
+
+  - id: R0b_non_ipv4_default_permit
+    when: "¬header_present(ipv4) ∧ ${default_action} == permit"
+    then:
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Mirror of R0_non_ipv4_default_deny for the default-permit
+      policy: non-IPv4 frames pass through to the downstream
+      forwarder unchanged.
+
+  - id: R1_match_permit
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, permit)
+    given:
+      bucket: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - forward(std.ingress_port → routing_decision)            # pass to downstream forwarder unchanged
+    notes: |
+      Permit fires: the packet is admitted to the downstream
+      pipeline with NO header modification. This is the load-
+      bearing distinction between permit and mark/redirect.
+      "Forward" here means "do not drop"; the egress_port is
+      determined by whatever stage runs after the ACL (a
+      downstream LPM forwarder, typically). For anchor
+      instances the harness collapses this to "forward to the
+      seed-declared output port" so the assertion is concrete.
+
+  - id: R2_match_deny
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, deny)
+    given:
+      bucket: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - drop
+    notes: |
+      Deny fires: silent drop. Distinct from R0_non_ipv4_passthrough
+      because R2 only fires on an EXPLICIT denying entry — a
+      packet that misses the table entirely falls through to R5,
+      whose action depends on ${default_action}.
+
+  - id: R3_match_mark
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, mark)
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    given:
+      bucket: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - set(hdr.ipv4.diffserv, bucket.action_args.dscp)
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Mark fires: the matched rule rewrites the DSCP field
+      (hdr.ipv4.diffserv, upper 6 bits of the IPv4 TOS byte)
+      with a control-plane-supplied colour, then admits the
+      packet. The pattern uses DSCP rewrite specifically
+      because it is the substrate P-ECNMarker generalises;
+      seeds that want a different rewrite target (e.g., a
+      PCP field in 802.1Q) lift `match_field_breadth` and
+      bind the bucket.action_args.dscp to whichever field
+      the downstream pipeline reads.
+
+  - id: R4_match_redirect
+    when: |
+      header_present(ipv4)
+        ∧ exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ value(bucket.action, ==, redirect)
+    enforced_when: "${action_breadth} == permit_deny_mark_redirect"
+    given:
+      bucket: by_highest_priority(rules, packet, ${match_field_breadth})
+    then:
+      - forward(bucket.action_args.egress_port)
+    notes: |
+      Redirect fires: the packet is forwarded out the
+      control-plane-supplied egress_port, bypassing the
+      downstream forwarder's routing decision. This is the
+      substrate that service-chaining ACLs (e.g., "redirect
+      DNS to an IDS waypoint") and policy-based routing layer
+      on top of.
+
+  - id: R5_no_match_default_deny
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ ${default_action} == deny
+    then:
+      - drop
+    notes: |
+      Table miss on a default-deny ACL silently drops the
+      packet. The implementation MUST realise this via the table's
+      `default_action = drop;` / `const default_action`
+      property (P4-16 §14.2.1); an implementation that omits the
+      property declaration will fail compilation under
+      strict backends (the common v1model bug "missing
+      default_action crash").
+
+  - id: R5b_no_match_default_permit
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(bucket, highest_priority_match(rules, packet, ${match_field_breadth}))
+        ∧ ${default_action} == permit
+    then:
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Table miss on a default-permit ACL admits the packet to
+      the downstream forwarder unchanged. Catches implementations
+      that leave the table's default_action at NoAction
+      while the seed expects permit-to-routing — silently
+      benign at compile time but semantically wrong because
+      the SUT relied on a downstream stage that never sees
+      the packet.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: priority_correctness
+    clause: stability
+    target: chosen_rule
+    while: "R1..R4 fires"
+    notes: |
+      P4Runtime §9.1 — among all entries whose match_spec admits
+      the packet, the entry with the largest priority MUST win.
+      Implementation bug it catches: treating priority as list-order
+      (which works for the case where rules are sorted before
+      install but breaks the moment the control plane inserts
+      an out-of-order high-priority rule). Witness in the
+      oracle's invariant_log: (chosen_rule.priority,
+      candidates' priorities) on every R1..R4 firing.
+
+  - id: no_priority_ambiguity
+    clause: stability
+    target: chosen_rule
+    while: "R1..R4 fires"
+    notes: |
+      No two rules with the same priority match the same packet.
+      P4Runtime §9.1: ties are explicitly non-deterministic in
+      the data plane, so the pattern requires the seed's rule
+      set to be tie-free. The seed validator at instantiation
+      time rejects rule sets that contain two same-priority
+      entries with overlapping ternary masks; the
+      inject_overlapping_priority_rules harden operator
+      deliberately violates this to surface implementations that
+      survive overlap by luck.
+
+  - id: default_action_correctness
+    clause: stability
+    target: decision
+    while: "R5 fires"
+    notes: |
+      When no rule matches, the decision MUST equal the
+      ${default_action} setting. P4-16 §14.2.1: every table
+      MUST have a `default_action`, and the implementation MUST
+      declare it (omission is a compile-time failure under
+      most backends). Implementation bug it catches: setting the
+      default_action to `NoAction` (the P4-16 boilerplate
+      default) when the seed declares `deny` — a
+      default-deny ACL with `NoAction` as the default is a
+      silent default-permit, which the
+      default_action_correctness witness catches.
+
+  - id: permit_header_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.diffserv, hdr.ipv4.totalLen)"
+    while: "R1 fires (permit branch)"
+    free_under: []
+    notes: |
+      The permit action MUST NOT modify headers — distinguishes
+      permit from mark. The implementation bug this catches: bundling
+      a "mark" action's DSCP rewrite into the permit's action
+      body by accident (a copy-paste error from a previous
+      ACL), which silently colours every permitted packet.
+
+  - id: mark_only_modifies_dscp
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst, hdr.ipv4.totalLen, hdr.ipv4.ttl)"
+    while: "R3 fires (mark branch)"
+    enforced_when: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+    free_under: ["hdr.ipv4.diffserv"]
+    notes: |
+      The mark action MUST modify ONLY hdr.ipv4.diffserv — TTL,
+      total length, src/dst, checksum (post-recompute) all
+      preserved. Catches implementations that include the DSCP rewrite
+      in a generic "rewrite_header" action that also touches
+      TTL or src MAC.
+
+  - id: redirect_routes_to_named_port
+    clause: stability
+    target: egress_port
+    while: "R4 fires (redirect branch)"
+    enforced_when: "${action_breadth} == permit_deny_mark_redirect"
+    notes: |
+      The redirect action MUST drive the packet out the rule's
+      `action_args.egress_port`, NOT the downstream routing
+      decision. Catches implementations that compute egress_port via
+      the LPM forwarder AFTER the ACL hits redirect (a stage-
+      ordering bug — the ACL must override later stages, not
+      pass an advisory).
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No recirculation: a redirected packet MUST NOT re-enter
+      the ACL stage. The pattern is stateless and single-pass;
+      an implementation that recirculates a redirected packet through
+      ingress (e.g., to re-apply the ACL on the new egress
+      port) introduces a loop risk that the harness's
+      bounded-step trace cap surfaces.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+# Materialised into task.yaml::test_cases at instantiation. Each entry
+# names the behaviour to probe; the probes are drawn from the v1model
+# bug taxonomy.
+
+test_scaffolding:
+
+  G1:
+    - id: permit_explicit_rule
+      generate: |
+        Install a single permit rule at priority P matching the
+        packet's 5-tuple. Send the matching packet; assert
+        forward with all headers preserved (R1 fires;
+        permit_header_preservation witness).
+
+    - id: deny_explicit_rule
+      generate: |
+        Install a single deny rule at priority P matching the
+        packet's 5-tuple. Send the matching packet; assert
+        drop. (R2 fires.)
+
+    - id: priority_wins_over_overlap
+      generate: |
+        Install two rules with non-equal priorities whose
+        match_specs both admit the same packet
+        (e.g., low-priority deny on dst-prefix /24 +
+        high-priority permit on dst-prefix /32 covering one
+        host in that /24). Send the packet to the /32 host;
+        assert forward. Tests priority_correctness; implementation
+        bug it catches: ternary table installed without
+        @priority annotation, or with priority as list order.
+
+    - id: per_action_branch_coverage
+      requires: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+      generate: |
+        Install one rule per available action value
+        (permit, deny, mark, redirect — depending on
+        ${action_breadth}); send one matching packet per rule.
+        Assert each invokes its action's distinctive effect
+        (permit: forward unchanged; deny: drop; mark: DSCP
+        rewritten; redirect: egress on the rule's
+        action_args.egress_port). Mirrors G1-P1-T3 (one test
+        per table action).
+
+    - id: extended_field_match
+      requires: "${match_field_breadth} != tuple5"
+      generate: |
+        Install a rule that uses one of the extra match fields
+        (VRF id, VLAN, or DSCP). Send a packet that matches
+        on the standard 5-tuple bits but DIFFERS on the extra
+        field; assert the rule does NOT fire (the packet
+        either falls through to a different rule or to
+        ${default_action}). Probes that the implementation actually
+        keys on the extended field rather than silently
+        masking it off.
+
+  G2:
+    - id: default_action_on_table_miss
+      generate: |
+        Empty the rule set (or install only rules whose
+        match_specs are disjoint from the packet's
+        headers). Send a packet; assert the outcome equals
+        ${default_action} (permit ⇒ forward, deny ⇒ drop).
+        Tests default_action_correctness; implementation bug it
+        catches: omitting `default_action = drop;` (or
+        `permit_to_routing;`) on the table declaration —
+        a common v1model compile-failure case under strict backends,
+        a silent permit under others.
+
+    - id: rule_capacity_overflow
+      requires: "${rule_count_capacity} != unbounded"
+      generate: |
+        Install ${rule_count_capacity} distinct rules
+        successfully. Attempt to install one more; assert the
+        install is rejected (or the lowest-priority entry is
+        evicted, impl-defined — but observable through one
+        of: control-plane reject, packet that should now be
+        denied being permitted, or vice versa).
+
+    - id: priority_depth_stress
+      requires: "${priority_depth} >= 16"
+      generate: |
+        Install ${priority_depth} rules spanning all distinct
+        priority levels and overlapping on shared masks. Send
+        a sequence of packets each designed to hit a different
+        priority "stratum" (the strongest match at each
+        level). Assert each packet routes to its highest-
+        priority match's action. Probes TCAM priority-encoder
+        correctness end-to-end.
+
+  G3:
+    - id: overlapping_mask_priority_inversion
+      generate: |
+        Install rules with overlapping ternary masks at
+        non-equal priorities, deliberately constructed so a
+        naive list-order-wins implementation would fire the WRONG
+        rule. Example: priority 10 deny on src ipv4 /16,
+        priority 100 permit on (src ipv4 /32, dst port 443).
+        Send a packet matching both. Assert permit fires (the
+        higher priority). Common v1model bug: "Priority
+        inversion (ternary) — wrong TCAM priority ordering."
+
+    - id: default_deny_bypass_attempt
+      requires: "${default_action} == deny"
+      generate: |
+        Install a small permit allow-list. Send a packet that
+        differs from EVERY allow-list rule by exactly one bit
+        in a wildcard-masked field of one of those rules; the
+        intended outcome depends on the mask. For each, assert
+        the action equals ${default_action} when the
+        intended mask doesn't admit the packet (the allow-
+        list MUST NOT leak). Catches implementations that synthesise
+        a too-wide mask from a too-narrow seed value (e.g.,
+        a /24 entry compiled as a /16 mask).
+
+    - id: ipv4_dscp_only_marks_dscp
+      requires: "${action_breadth} ∈ {permit_deny_mark, permit_deny_mark_redirect}"
+      generate: |
+        Install a mark rule for a specific 5-tuple. Send the
+        matching packet; assert hdr.ipv4.diffserv is rewritten
+        to the rule's colour AND hdr.ipv4.ttl, totalLen, src,
+        dst are unchanged. Assert the IPv4 header checksum is
+        VALID on egress (DSCP rewrite requires checksum
+        recomputation; forgetting the
+        MyComputeChecksum update is the most-common silent
+        implementation bug per the v1model bug taxonomy). Tests
+        mark_only_modifies_dscp.
+
+    - id: redirect_overrides_routing
+      requires: "${action_breadth} == permit_deny_mark_redirect"
+      generate: |
+        Install a redirect rule that maps a specific 5-tuple
+        to egress port X; install a downstream forwarder
+        whose routing decision for that destination would be
+        egress port Y ≠ X. Send the matching packet; assert
+        the packet exits on X. Tests
+        redirect_routes_to_named_port; catches implementations that
+        compute routing before applying the ACL or treat
+        redirect as advisory.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: shrink_rule_capacity_4x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} > 64"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16 ∧ |${rules}| ≤ ${rule_count_capacity}"
+    notes: |
+      Tighten the rule-count axis. At 4096 → 1024 → 256, the
+      implementation can no longer rely on "one TCAM row per rule" and
+      must consider cross-product / overlap compression. Pairs
+      with `enlarge_rule_capacity_2x` (ease).
+
+  - id: enlarge_rule_capacity_2x
+    applicable_when: "${rule_count_capacity} ≠ unbounded ∧ ${rule_count_capacity} < 32768"
+    effect: "${rule_count_capacity} ← ${rule_count_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${rule_count_capacity} ≤ 65536"
+    notes: |
+      Loosen the rule-count axis. Mirror of
+      `shrink_rule_capacity_4x`; doubling rather than
+      quadrupling because the pass-rate response to capacity
+      is monotone-but-saturating, so smaller steps suffice for
+      ease.
+
+  - id: expand_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5_vrf_vlan_dscp"
+    effect: |
+      ${match_field_breadth} ← next of
+      {tuple5 → tuple5_vrf → tuple5_vrf_vlan → tuple5_vrf_vlan_dscp}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: |
+      Widen the ternary key. Each step adds an orthogonal
+      field the parser must extract and the table must key on.
+      The largest step (→ tuple5_vrf_vlan_dscp) doubles the
+      on-chip TCAM bit-width requirement and is the strongest
+      single harden operator on this axis. Pairs with
+      `shrink_match_field_breadth` (ease).
+
+  - id: shrink_match_field_breadth
+    applicable_when: "${match_field_breadth} ≠ tuple5"
+    effect: |
+      ${match_field_breadth} ← previous of
+      {tuple5 ← tuple5_vrf ← tuple5_vrf_vlan ← tuple5_vrf_vlan_dscp}
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every entry in ${rules} has match_spec well-formed over the new breadth"
+    notes: |
+      Narrow the ternary key one step. Pairs with
+      `expand_match_field_breadth`.
+
+  - id: inflate_priority_depth
+    applicable_when: "${priority_depth} < 1024"
+    effect: "${priority_depth} ← min(${priority_depth} * 4, 4096)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${priority_depth} ≥ 1 ∧ ${priority_depth} ≤ 4096"
+    notes: |
+      Lift the priority-depth axis. Implementations that bake "one rule
+      per priority slot" begin to overflow priority bits or
+      TCAM priority rows. The realistic-deployment threshold
+      is around 256 distinct priorities; beyond that, cross-
+      product compression (D5.2_compressed_rules) is the only
+      tractable strategy. Pairs with `flatten_priority_depth`.
+
+  - id: flatten_priority_depth
+    applicable_when: "${priority_depth} > 2"
+    effect: "${priority_depth} ← max(${priority_depth} / 4, 1)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${priority_depth} ≥ 1"
+    notes: |
+      Collapse the priority-depth axis. Pairs with
+      `inflate_priority_depth`.
+
+  - id: expand_action_breadth
+    applicable_when: "${action_breadth} ≠ permit_deny_mark_redirect"
+    effect: |
+      ${action_breadth} ← next of
+      {permit_deny → permit_deny_mark → permit_deny_mark_redirect}
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      every entry in ${rules} has action ∈ allowed-by-new-action_breadth
+    notes: |
+      Widen the action set. Each step adds invariants the implementation
+      must realise: `+mark` adds permit_header_preservation
+      and mark_only_modifies_dscp (now distinguishable); `+
+      redirect` adds redirect_routes_to_named_port (stage-
+      ordering correctness). Pairs with
+      `contract_action_breadth`.
+
+  - id: contract_action_breadth
+    applicable_when: "${action_breadth} ≠ permit_deny"
+    effect: |
+      ${action_breadth} ← previous of
+      {permit_deny ← permit_deny_mark ← permit_deny_mark_redirect}
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      every entry in ${rules} has action ∈ allowed-by-new-action_breadth
+    notes: |
+      Narrow the action set. Pairs with `expand_action_breadth`.
+
+  - id: flip_default_to_deny
+    applicable_when: "${default_action} == permit"
+    effect: "${default_action} ← deny"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${rules} contains ≥ 1 permit entry"
+    notes: |
+      Flip the default-action policy from permit to deny —
+      activates the negative-policy-by-default semantics and
+      requires the implementation to declare `default_action = drop`
+      (or equivalent) on the table. Catches implementations that
+      leave the default at NoAction and rely on the table
+      miss being benign. Pairs with `flip_default_to_permit`.
+
+  - id: flip_default_to_permit
+    applicable_when: "${default_action} == deny"
+    effect: "${default_action} ← permit"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${rules} contains ≥ 1 deny entry"
+    notes: |
+      Flip the default-action policy from deny to permit.
+      Pairs with `flip_default_to_deny`.
+
+  - id: tighten_faithfulness_to_partition
+    applicable_when: "${faithfulness} == D5.0_first_match_priority"
+    effect: |
+      ${faithfulness} ← D5.1_partitioned_tcam ∧
+      add G2 test `partitioned_tcam_correctness` that
+      verifies rules in DIFFERENT partitions cannot interfere
+      with each other's priority decisions.
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 256"
+    notes: |
+      Lift the faithfulness mode one step. Realistic ASIC
+      strategy when capacity is tight: route packets through
+      a per-ingress-port pre-filter into a smaller TCAM
+      slice. The implementation must realise the partition correctly
+      — a packet's hit in one partition must not leak across
+      to another. Pairs with `relax_faithfulness_to_exact`.
+
+  - id: relax_faithfulness_to_exact
+    applicable_when: "${faithfulness} ≠ D5.0_first_match_priority"
+    effect: |
+      ${faithfulness} ← previous of
+      {D5.0_first_match_priority ← D5.1_partitioned_tcam ← D5.2_compressed_rules}
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Step the faithfulness mode back one step. Pairs with
+      `tighten_faithfulness_to_partition` and (transitively)
+      with the cross-product compression harden when
+      `priority_depth` is high.
+
+  - id: inject_overlapping_priority_rules
+    applicable_when: |
+      'overlapping_mask_priority_inversion' ∉ test_scaffolding.G3
+        ∨ |${rules}| < 4
+    effect: |
+      Generate at least 4 rules whose ternary masks overlap
+      pairwise at non-equal priorities, deliberately
+      constructed to be confusable for an out-of-order rule
+      installation. Add the G3 test
+      `overlapping_mask_priority_inversion` if not already
+      present.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${rule_count_capacity} ≥ 16"
+    notes: |
+      Test-rigor harden. Pattern-augmenting: enriches the rule
+      set to stress priority_correctness. Catches the implementation
+      bug of installing the ternary table via a generic
+      "ordered list" CLI without explicit @priority — the
+      installation order then determines which rule wins, not
+      the priority field. Pairs with `simplify_to_disjoint_rules`.
+
+  - id: simplify_to_disjoint_rules
+    applicable_when: "|${rules}| > 4"
+    effect: |
+      Regenerate ${rules} so that no two entries' ternary
+      masks overlap (every packet matches at most one rule
+      regardless of priority). Remove G3
+      `overlapping_mask_priority_inversion` if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${rules}| ≥ 1"
+    notes: |
+      Test-rigor ease. Disjoint rule masks make priority
+      irrelevant, so the implementation passes priority_correctness
+      trivially. Pairs with `inject_overlapping_priority_rules`.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4:
+
+    Anchor (tuple5, permit_deny, default permit, capacity 256,
+            priority_depth ≤ 16, D5.0_first_match_priority):
+      - One ternary table on the configured 5-tuple key:
+          key = {
+            hdr.ipv4.srcAddr:  ternary;
+            hdr.ipv4.dstAddr:  ternary;
+            hdr.ipv4.protocol: ternary;
+            meta.l4_srcPort:   ternary;
+            meta.l4_dstPort:   ternary;
+          }
+        actions = { permit; deny; @defaultonly NoAction; }
+        size    = ${rule_count_capacity};
+        default_action = permit;            // or drop; per ${default_action}
+      - permit action: standard_metadata.egress_spec = (downstream
+        decision) — typically a separate forwarder table.
+      - deny action:   mark_to_drop(standard_metadata).
+      - Entries installed via simple_switch_CLI / P4Runtime carry
+        an explicit `priority` field (P4Runtime §9.1); the
+        implementation MUST NOT rely on insertion order.
+
+    +mark (action_breadth permit_deny_mark):
+      - Add `mark(bit<6> dscp)` action that does
+          hdr.ipv4.diffserv = dscp;
+        and let the permit action remain header-preserving.
+      - The MyComputeChecksum block MUST recompute the IPv4
+        header checksum on the mark path; forgetting it is the
+        single most common silent bug (G3-`ipv4_dscp_only_marks_dscp`
+        catches it).
+
+    +redirect (action_breadth permit_deny_mark_redirect):
+      - Add `redirect(bit<9> egress_port)` action that sets
+          standard_metadata.egress_spec = egress_port;
+        AND signals the downstream forwarder to skip its own
+        decision (typical: a metadata flag `meta.acl_overrode_route`
+        the forwarder consults before applying its own LPM).
+      - Stage ordering: the ACL must execute BEFORE the LPM
+        forwarder so its decision can override; an implementation that
+        chains LPM → ACL has the ACL's redirect ignored on the
+        downstream egress assignment.
+
+    Capacity-shrunk (rule_count_capacity at 16-64,
+                     D5.1_partitioned_tcam):
+      - Two-stage: ingress-port classifier table → per-port
+        TCAM slice. The classifier is exact-match on
+        std.ingress_port → action sets meta.tcam_slice_id;
+        the slice table is `key = { meta.tcam_slice_id: exact;
+        <5-tuple>: ternary; }` so each ingress port consumes
+        only its own rule budget.
+
+    Priority-high (priority_depth ≥ 256, D5.2_compressed_rules):
+      - Cross-product compression: merge K mutually-exclusive
+        rules at adjacent priorities into one wider mask. The
+        rule-compiler runs offline on the control plane; the
+        data-plane sees a smaller, flat rule set with
+        priorities still well-formed.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Omitting `default_action = ...;` on the table declaration —
+      the common v1model bug "missing default_action crash".
+      Some BMv2 versions allow it (defaulting to NoAction), but
+      a default-deny seed silently becomes default-permit and
+      fails default_action_correctness.
+
+    * Treating the permit/deny decision as a `bit<1>` flag in
+      metadata and applying it later, instead of letting the
+      table action issue the drop. Mark_to_drop in a metadata-
+      finalisation block is fine; reading the flag back via
+      `if (meta.acl_decision == 0) ...` is the common v1model `bit<1>` vs
+      `bool` boundary case — many backends will accept the
+      P4 source but the per-packet behaviour will differ across
+      implementations because the bit<1> read of an uninitialised
+      decision (e.g., on the default-action path) returns an
+      unspecified value.
+
+    * Installing the ternary table via an ordered-list CLI
+      without @priority — works for the seed's authored rule
+      order, breaks the moment the control plane inserts an
+      out-of-order high-priority rule. priority_correctness
+      catches it.
+
+    * Putting the ACL stage AFTER the LPM forwarder — `redirect`
+      is silently ignored because the egress_spec is already
+      assigned. redirect_routes_to_named_port catches it.
+
+    * Generic "rewrite_header" action shared between mark and
+      a downstream NAT — touches more fields than the mark
+      should. mark_only_modifies_dscp catches it.
+
+    * Including a deny rule's mask at lower priority than the
+      catch-all permit (a manual-priority-order mistake) —
+      surfaces as an unexpected permit in the
+      overlapping_mask_priority_inversion G3 case.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit
+       must all pass.
+
+    2. For anchor instances (tuple5, permit_deny, default
+       permit, capacity 256, priority_depth ≤ 16,
+       D5.0_first_match_priority), the resulting task SHOULD be
+       behaviourally equivalent to a one-ternary-table "drop a
+       small deny-list, default permit" ACL. Cross-check by
+       hand-running the public test set through the oracle for
+       the seed.
+
+    3. P-ACL is the substrate for downstream patterns (P-StatefulFW
+       reuses the 5-tuple match; P-ECNMarker reuses the mark
+       action's DSCP rewrite + checksum-recompute discipline).
+       When a mutation extends the rule set or action breadth,
+       check whether a sibling pattern would be more natural —
+       e.g., a "mark + classify-by-flow" extension is closer to
+       P-ECNMarker than to a deeper P-ACL.

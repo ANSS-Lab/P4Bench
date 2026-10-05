@@ -1,0 +1,558 @@
+# P-DHCPRelay — DHCP/BOOTP relay agent (giaddr/hops rewrite + bidirectional redirect)
+#
+# TPL v1.0 task pattern. A stateless, per-packet DHCP relay
+# agent: client→server BOOTREQUESTs arriving on an access link are stamped with
+# the relay interface IP in giaddr (if unset), have hops incremented, and are
+# unicast-forwarded (L2/L3 dst rewrite) to a configured DHCP server; server→client
+# BOOTREPLYs are relayed back toward the client, with the egress chosen from
+# giaddr. Malformed / wrong-direction / hops-exceeded messages are dropped.
+# Grounded in RFC 2131 §4.3.2 and RFC 1542. Instances bind the parameters below.
+#
+# IMPORTANT — relay, not origination. Despite the P16:packet-origination tag,
+# the REALISED data-plane mechanism is parse + field-rewrite + redirect (the
+# relay rewrites an EXISTING in-flight datagram and changes its egress), NOT the
+# `emit` primitive. The relay does not synthesise new DHCP messages; it is the
+# packet-origination *family* member whose mechanism is rewrite+forward. See
+# bridging_notes. The relay is stateless per packet — no lease-time / DHCP
+# binding state lives here (that is the server's job), so there is NO
+# `time_tick` and no `elapsed`/lease logic. Gradable purely on the rewritten
+# giaddr/hops fields and the redirect egress port for both directions under
+# BMv2 `--use-files`.
+
+pattern_id: P-DHCPRelay
+version: "1.0"
+nf_categories:                                          # NF-category tags (design-space table)
+  descriptive:  [D5:routing]                            # destination-rewriting relay/redirect of DHCP between subnets
+  prescriptive: [P16:packet-origination]                # relay-agent family (giaddr/hops stamping); mechanism is rewrite+forward, not emit
+target_capability: redesign                             # baked-in fixed-function relay-agent logic, opened to logic-level iteration
+summary: >
+  Stateless DHCP/BOOTP relay agent. A client→server message (BOOTREQUEST:
+  DISCOVER/REQUEST) arriving on an access port is relayed to the configured
+  DHCP server: if giaddr == 0 it is set to the relay interface IP, hops is
+  incremented, and the datagram is unicast-forwarded with its L2/L3 destination
+  rewritten to the server. A server→client message (BOOTREPLY: OFFER/ACK)
+  arriving from the server is relayed back toward the client: the egress is
+  selected from giaddr and the L2/L3 destination is rewritten toward the client
+  subnet. Malformed messages — hops exceeding the configured limit, a
+  BOOTREQUEST on the server-facing port, or a BOOTREPLY on an access port — are
+  dropped. The canonical instance is a single-server relay with a permissive
+  hops limit; mutation tightens the hops limit, widens to a multi-server
+  (giaddr-keyed) relay table, and adds Relay Agent Information (Option 82)
+  insertion as a feature-breadth lever.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC2131
+      sections: ["4.3.2"]
+      role: normative_behaviour
+      relevance: |
+        Dynamic Host Configuration Protocol (Droms) — the canonical relay-agent
+        data-plane requirements every rule realises:
+          - §4.3.2 "DHCP relay agents": on a BOOTREQUEST received from a client,
+            if giaddr is 0 the relay agent MUST set giaddr to the IP address of
+            the interface on which the request was received, then forward the
+            request to a DHCP server. Basis for R2 (giaddr stamp + forward).
+          - §4.3.2 / §3.1: the relay MUST increment the BOOTP hops field on each
+            relay hop and SHOULD discard a message whose hops count exceeds a
+            configured maximum (the BOOTP relay-loop guard). Basis for the
+            hops-inc in R2 and the hops-limit drop in R1.
+          - §4.3.2 "BOOTREPLY messages": a relay agent relays a server reply
+            toward the client using giaddr to determine the egress interface,
+            then unicast/broadcasts on that local subnet. Basis for R3 (reply
+            relay: egress selected from giaddr, L2/L3 rewrite toward client).
+          - DHCP rides on UDP/BOOTP; the message op (1 = BOOTREQUEST,
+            2 = BOOTREPLY) distinguishes the two relay directions. Basis for the
+            direction gating in R1/R2/R3 and the wrong-direction drops.
+    - id: RFC1542
+      sections: ["3", "4", "5"]
+      role: normative_behaviour
+      quote: "The value of the 'hops' field MUST be incremented."
+      relevance: |
+        Clarifications and Extensions for the Bootstrap Protocol (Wimer) — the
+        BOOTP relay-agent clauses that pin the field semantics:
+          - §4 "Relay agents": clarifies that the relay MUST NOT overwrite a
+            non-zero giaddr (a giaddr already set by an upstream relay is left
+            intact); only a zero giaddr is stamped. Basis for the giaddr==0
+            guard in R2 (giaddr is set once, by the first relay).
+          - §4 / §5: the relay increments hops and uses a configurable hop
+            limit to bound relay loops; messages whose hops would exceed the
+            limit are silently discarded. Basis for R1 (hops-limit drop) and the
+            ${hops_limit} parameter.
+          - §3: BOOTREPLY relay uses giaddr to identify the originating relay
+            interface so the reply is returned on the correct client subnet.
+            Basis for the giaddr-keyed egress selection in R3.
+
+  papers: []
+  tutorials: []
+  posts: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet/per-flow state. The relay is STATELESS per packet
+      (RFC 2131 §4.3.2): every decision derives from the BOOTP op field, the
+      hops/giaddr fields, std.ingress_port, and the control-plane-installed
+      relay configuration. There is NO lease binding, no DHCP transaction
+      table, and no time-driven state — those belong to the DHCP server, not
+      the relay. (Hence no `time_tick` entity and no `elapsed` precondition.)
+
+  relay_interface:                            # the TPL `bucket` role (config, not flow-state)
+    keyed_by_tuple: [ingress_port]
+    attrs:
+      giaddr_ip:    address                   # the relay interface IP stamped into giaddr
+      client_subnet: ipv4_cidr                # the access subnet this interface serves
+    notes: |
+      Per-access-interface relay configuration: which giaddr IP to stamp for a
+      BOOTREQUEST arriving on this port, and which client subnet it fronts (used
+      to select the egress for the reverse direction via giaddr). Control-plane
+      installed; not mutated by the data plane.
+
+  server_target:                              # also a `bucket` (config) role
+    keyed_by_tuple: [giaddr_ip]
+    attrs:
+      server_ip:    address                   # DHCP server IP (L3 dst rewrite, fwd direction)
+      server_mac:   address                   # next-hop MAC toward the server
+      server_port:  port                      # egress toward the server
+      relay_src_ip: address                   # relay's own IP used as L3 src toward server
+      relay_mac:    address                   # relay's MAC used as L2 src
+    notes: |
+      The configured DHCP server(s) the relay forwards toward, and the L2/L3
+      rewrite material for each direction. Keyed so a giaddr (set on the request
+      and echoed in the reply) selects both the forward server target and the
+      reverse client egress. A single-server canonical instance has one entry;
+      ${multi_server} lifts to several (giaddr-discriminated).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  relay_interfaces:
+    type: list[relay_interface_entry]
+    constraint: |
+      each has ingress_port:port, giaddr_ip:address, client_subnet:ipv4_cidr;
+      no two entries share an ingress_port.
+    notes: "Control-plane access-interface config. Drives the giaddr stamp (R2)."
+
+  server_targets:
+    type: list[server_target_entry]
+    constraint: |
+      each has giaddr_ip:address, server_ip:address, server_mac:address,
+      server_port:port, relay_src_ip:address, relay_mac:address; giaddr_ip values
+      are unique. |server_targets| == 1 in the canonical (single-server) seed.
+    notes: "DHCP server target(s) + per-direction L2/L3 rewrite material."
+
+  hops_limit:
+    type: int
+    range: "[1, 16]"
+    default: 16
+    notes: |
+      RFC 1542 §4 relay-loop guard. A message whose hops field already equals
+      or exceeds this limit is dropped (R1) — it cannot be relayed one more hop.
+      Canonical default 16 (the BOOTP maximum) is permissive; tighten_hops_limit
+      drives it down to discriminate.
+
+  multi_server:
+    type: bool
+    default: false
+    notes: |
+      false → exactly one server_target (canonical). true → several
+      giaddr-keyed server_targets, so the forward path must select the server
+      from the relay-interface's giaddr and the reverse path must select the
+      client egress from the reply's giaddr. feature-breadth axis.
+
+  option82_insert:
+    type: bool
+    default: false
+    notes: |
+      RFC 3046 Relay Agent Information (Option 82). false → giaddr/hops rewrite
+      only (canonical). true → the relay MUST additionally append a Circuit-ID
+      sub-option identifying the ingress access port on the forwarded
+      BOOTREQUEST (and the verifier checks its presence). feature-breadth axis;
+      a richer-protocol-surface lever, not a faithfulness change.
+
+  server_facing_port:
+    type: port
+    notes: |
+      The port toward the DHCP server side. A BOOTREQUEST arriving here (wrong
+      direction) and a BOOTREPLY arriving on an access port (wrong direction)
+      are dropped (R0). Distinguishes the two relay directions by ingress.
+
+  default_action:
+    type: enum
+    values: [drop]
+    default: drop
+    notes: "Behaviour on an unrelayable / malformed message. v1.0: drop."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_single_server, D5.1_multi_server, D5.2_option82]
+    default: D5.0_single_server
+    notes: "Feature-breadth ladder; co-moved by the multi_server / option82 operators."
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match-wins. Order matters.
+
+rules:
+
+  - id: R0_wrong_direction_or_non_dhcp_drop
+    when: |
+      ¬header_present(dhcp)
+        ∨ (header_present(dhcp) ∧ value(dhcp.op, ==, 1) ∧ ingress(server_facing))
+        ∨ (header_present(dhcp) ∧ value(dhcp.op, ==, 2) ∧ ¬ingress(server_facing))
+    then:
+      - "${default_action}"
+    notes: |
+      Direction / shape guard. Non-DHCP frames are out of scope. A BOOTREQUEST
+      (op 1) arriving on the server-facing port, or a BOOTREPLY (op 2) arriving
+      on an access (client-facing) port, is wrong-direction and dropped
+      (RFC 2131 §4.3.2 — the relay only forwards requests toward the server and
+      replies toward the client). `server_facing` is the port class
+      {${server_facing_port}}.
+
+  - id: R1_hops_limit_exceeded_drop
+    when: |
+      header_present(dhcp) ∧ value(dhcp.op, ==, 1) ∧ ¬ingress(server_facing)
+        ∧ value(dhcp.hops, >=, ${hops_limit})
+    then:
+      - "${default_action}"
+    notes: |
+      RFC 1542 §4 relay-loop guard. A BOOTREQUEST whose hops field already
+      equals/exceeds ${hops_limit} cannot be relayed one more hop (the inc in R2
+      would breach the limit), so it is discarded. Gated before R2 so the limit
+      is enforced on the pre-increment value.
+
+  - id: R2_request_relay_to_server
+    when: |
+      header_present(dhcp) ∧ value(dhcp.op, ==, 1) ∧ ¬ingress(server_facing)
+        ∧ value(dhcp.hops, <, ${hops_limit})
+        ∧ exists(relay_interface, by_key(ingress_port))
+    given:
+      iface:  by_key(ingress_port, ${relay_interfaces})
+      target: by_giaddr(iface.giaddr_ip, ${server_targets})   IF ${multi_server} ELSE the_single(${server_targets})
+    then:
+      - "set(dhcp.giaddr, iface.giaddr_ip)         # ONLY when dhcp.giaddr == 0 (RFC 1542 §4)"
+      - inc(dhcp.hops, 1)
+      - rewrite(hdr.ipv4.dstAddr, target.server_ip)
+      - rewrite(hdr.ipv4.srcAddr, target.relay_src_ip)
+      - set(hdr.ethernet.dst, target.server_mac)
+      - set(hdr.ethernet.src, target.relay_mac)
+      - "set(dhcp.option82_circuit_id, ingress_port)   IF ${option82_insert}   # RFC 3046 Relay Agent Info append"
+      - forward(target.server_port)
+    notes: |
+      Client→server relay (RFC 2131 §4.3.2). giaddr is stamped to the relay
+      interface IP ONLY if it is currently zero (RFC 1542 §4 — a non-zero giaddr
+      from an upstream relay MUST be preserved); the set is the conditional
+      giaddr-stamp. hops is incremented by EXACTLY one. The datagram is
+      redirected toward the configured DHCP server with its L2/L3 destination
+      (and relay-side source) rewritten. Under ${multi_server} the target is the
+      server keyed by the interface's giaddr; otherwise it is the single
+      configured server. Under ${option82_insert} a Circuit-ID sub-option naming
+      the ingress access port is appended. This is REWRITE+FORWARD, not `emit`.
+
+  - id: R3_reply_relay_to_client
+    when: |
+      header_present(dhcp) ∧ value(dhcp.op, ==, 2) ∧ ingress(server_facing)
+        ∧ value(dhcp.giaddr, !=, 0)
+        ∧ exists(server_target, by_giaddr(dhcp.giaddr))
+    given:
+      target: by_giaddr(dhcp.giaddr, ${server_targets})
+      iface:  by_giaddr_iface(dhcp.giaddr, ${relay_interfaces})
+    then:
+      - rewrite(hdr.ipv4.dstAddr, dhcp.giaddr)
+      - rewrite(hdr.ipv4.srcAddr, target.relay_src_ip)
+      - set(hdr.ethernet.src, target.relay_mac)
+      - "set(hdr.ethernet.dst, iface.client_mac)   # next-hop toward the client subnet"
+      - forward(iface.ingress_port)
+    notes: |
+      Server→client relay (RFC 2131 §4.3.2 BOOTREPLY handling). The reply echoes
+      the giaddr the relay stamped on the request; the relay uses giaddr to pick
+      the originating access interface (its egress port and client subnet), then
+      rewrites L2/L3 toward the client and forwards out the access port. hops is
+      NOT touched on the reply direction. The reverse egress is giaddr-selected,
+      which is what makes the reply gradable as a redirect.
+
+  - id: R4_unconfigured_request_drop
+    when: |
+      header_present(dhcp) ∧ value(dhcp.op, ==, 1) ∧ ¬ingress(server_facing)
+        ∧ ¬exists(relay_interface, by_key(ingress_port))
+    then:
+      - "${default_action}"
+    notes: |
+      A BOOTREQUEST arriving on an access port that has no relay-interface
+      configuration cannot be stamped (no giaddr IP to use) and is dropped.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: giaddr_stamp_correctness
+    clause: stability
+    target: dhcp.giaddr
+    while: "rule R2 fires"
+    notes: |
+      RFC 2131 §4.3.2 / RFC 1542 §4 — on a relayed BOOTREQUEST, giaddr equals
+      the relay interface IP when it arrived as 0, and is LEFT UNCHANGED when it
+      arrived non-zero (upstream relay preservation). Overwriting a non-zero
+      giaddr is the classic relay bug.
+
+  - id: hops_quantum_one
+    clause: stability
+    target: dhcp.hops_increment
+    while: "rule R2 fires"
+    notes: |
+      hops is incremented by EXACTLY one per relay hop (RFC 1542 §4). Double-inc
+      or no-inc are the implementation bugs; fwd_hops_inc_one and the hops-limit cases
+      pin it. The reply direction (R3) MUST NOT touch hops.
+
+  - id: forward_redirect_to_server
+    clause: stability
+    target: "(hdr.ipv4.dstAddr, egress_port)"
+    while: "rule R2 fires"
+    notes: |
+      A relayed request egresses toward the configured server: L3 dst == the
+      selected server_ip and egress == that server's server_port. Forwarding on
+      the ingress port (failing to redirect) is wrong.
+
+  - id: reply_redirect_to_client
+    clause: stability
+    target: "(hdr.ipv4.dstAddr, egress_port)"
+    while: "rule R3 fires"
+    notes: |
+      A relayed reply egresses toward the client subnet keyed by giaddr: L3 dst
+      == giaddr and egress == the giaddr-selected access interface's port. Using
+      the wrong (or the server-facing) egress is the reverse-direction bug.
+
+  - id: stateless_no_binding
+    clause: no_orphan
+    target: packet
+    notes: |
+      The relay holds NO per-transaction/per-lease state — every packet is
+      decided from its own header fields plus static config, so there is no
+      resource to orphan. Documents the deliberate absence of DHCP lease/binding
+      state (that lives on the server) and the absence of any time_tick.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: fwd_request_giaddr_stamp
+      generate: |
+        Send a BOOTREQUEST (op 1, DISCOVER) with giaddr == 0 in on an access
+        port. Assert: giaddr ← the relay interface IP; hops incremented by 1;
+        L2/L3 dst rewritten to the server; egress == server_port.
+    - id: fwd_request_preserve_nonzero_giaddr
+      generate: |
+        Send a BOOTREQUEST with a NON-zero giaddr (already stamped upstream) in
+        on an access port. Assert: giaddr UNCHANGED; hops still incremented by
+        1; still forwarded to the server (RFC 1542 §4 preservation).
+    - id: reply_relay_to_client
+      generate: |
+        Send a BOOTREPLY (op 2, OFFER) in on the server-facing port with giaddr
+        set to a configured relay interface IP. Assert: L3 dst ← giaddr; egress
+        == the giaddr-selected access port; hops UNCHANGED.
+    - id: fwd_hops_inc_one
+      generate: |
+        Send a BOOTREQUEST with hops == 0 well under the limit; assert egress
+        hops == 1 (incremented by exactly one, not two, not zero).
+    - id: fwd_multi_server_giaddr_select
+      requires: "${multi_server}"
+      generate: |
+        Two server_targets keyed by different relay-interface giaddrs. Send a
+        request in on each access interface; assert each is forwarded to ITS
+        server (giaddr-discriminated), and the matching reply returns to the
+        right client port.
+
+  G2:
+    - id: drop_hops_at_limit
+      generate: |
+        Send a BOOTREQUEST whose hops already equals ${hops_limit}; assert DROP
+        (cannot relay one more hop; R1). Then send hops == ${hops_limit} - 1 and
+        assert it is FORWARDED with egress hops == ${hops_limit}.
+    - id: drop_request_unconfigured_iface
+      generate: |
+        Send a BOOTREQUEST in on an access port with no relay-interface entry;
+        assert DROP (R4 — no giaddr IP to stamp).
+    - id: option82_circuit_id_present
+      requires: "${option82_insert}"
+      generate: |
+        Send a BOOTREQUEST; assert the forwarded message carries a Relay Agent
+        Information (Option 82) Circuit-ID sub-option naming the ingress port,
+        in addition to the giaddr/hops rewrite.
+
+  G3:
+    - id: drop_request_on_server_port
+      generate: |
+        Send a BOOTREQUEST (op 1) arriving on the server-facing port
+        (wrong direction); assert DROP (R0).
+    - id: drop_reply_on_access_port
+      generate: |
+        Send a BOOTREPLY (op 2) arriving on an access (client-facing) port
+        (wrong direction); assert DROP (R0).
+    - id: drop_non_dhcp
+      generate: |
+        Send a non-DHCP frame (plain IPv4/TCP, or a UDP packet on a non-DHCP
+        port that does not parse as BOOTP); assert DROP (R0 ¬header_present).
+    - id: bug_conditional_deparser_giaddr
+      generate: |
+        v1model bug probe (conditional-deparser / hash / drop-read taxonomy):
+        a request that takes the giaddr-stamp path and a reply that does NOT
+        touch giaddr must BOTH deparse the dhcp header identically — assert the
+        DHCP header is emitted on every forwarded packet regardless of which
+        branch rewrote it (a deparser that emits dhcp only on one branch
+        truncates the other). Probes the conditional-deparser compile bug.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden paired with an ease on the SAME axis.
+
+mutation_operators:
+
+  - id: tighten_hops_limit
+    axis: strictness
+    direction: harden
+    applicable_when: "${hops_limit} > 1"
+    effect: "${hops_limit} ← max(1, ${hops_limit} / 4)"
+    feasibility_postcondition: "${hops_limit} >= 1"
+    notes: |
+      Drives the relay-loop guard from the permissive BOOTP max (16) toward a
+      strict limit, so the hops-limit drop boundary (R1) is exercised on small
+      hops values and a one-off off-by-one in the >= comparison is caught.
+
+  - id: relax_hops_limit
+    axis: strictness
+    direction: ease
+    applicable_when: "${hops_limit} < 16"
+    effect: "${hops_limit} ← min(16, ${hops_limit} * 4)"
+    feasibility_postcondition: "${hops_limit} <= 16"
+    notes: "Ease pair of tighten_hops_limit: loosen the relay-loop guard back toward 16."
+
+  - id: enable_multi_server
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "¬${multi_server}"
+    effect: |
+      ${multi_server} ← true ∧
+      ${faithfulness} ← D5.1_multi_server (≥2 giaddr-keyed server_targets; the
+      forward path must select the server from the relay-interface giaddr and
+      the reverse path must select the client egress from the reply giaddr)
+    feasibility_postcondition: "${multi_server} == true ∧ |${server_targets}| >= 2"
+    notes: |
+      Widens from a single hard-wired server to a giaddr-discriminated relay
+      table in both directions. Activates fwd_multi_server_giaddr_select.
+
+  - id: disable_multi_server
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${multi_server}"
+    effect: |
+      ${multi_server} ← false ∧ ${faithfulness} ← D5.0_single_server
+      (collapse to one server_target; giaddr selection becomes trivial)
+    feasibility_postcondition: "${multi_server} == false"
+    notes: "Ease pair of enable_multi_server: collapse back to a single server."
+
+  - id: enable_option82
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "¬${option82_insert}"
+    effect: |
+      ${option82_insert} ← true ∧ ${faithfulness} ← D5.2_option82
+      (the forwarded BOOTREQUEST MUST additionally carry an Option 82 Circuit-ID
+      sub-option naming the ingress access port)
+    feasibility_postcondition: "${option82_insert} == true"
+    notes: |
+      Adds RFC 3046 Relay Agent Information insertion as a richer
+      protocol-surface lever on top of the giaddr/hops rewrite. Activates
+      option82_circuit_id_present. feature-breadth (more of the protocol
+      surface), NOT faithfulness (no exact↔approximate state change).
+
+  - id: disable_option82
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${option82_insert}"
+    effect: |
+      ${option82_insert} ← false ∧
+      ${faithfulness} ← (D5.1_multi_server IF ${multi_server} ELSE D5.0_single_server)
+      (drop the Option 82 requirement; giaddr/hops rewrite only)
+    feasibility_postcondition: "${option82_insert} == false"
+    notes: "Ease pair of enable_option82: revert to giaddr/hops rewrite only."
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  RELAY, NOT ORIGINATION (P16 mechanism note). P-DHCPRelay is tagged
+  P16:packet-origination because the relay agent is the canonical member of the
+  switch-originated/relay family (alongside gratuitous ARP, BFD probes). But the
+  realised v1.0 mechanism here is parse + field-rewrite + redirect: the relay
+  takes an EXISTING in-flight datagram, rewrites giaddr/hops + L2/L3 headers, and
+  changes its egress. The `emit` postcondition (synthesise a NEW packet) is NOT
+  required and is NOT used — every `then` action is set/rewrite/inc/forward/drop.
+  This keeps the pattern fully gradable under BMv2 `--use-files`: a single input
+  packet produces a single rewritten output packet on a deterministic egress, so
+  the verifier observes giaddr, hops, and egress_port directly.
+
+  Custom header REQUIRED at instantiation. DHCP/BOOTP is not a standard Scapy
+  layer the verifier's audit harness builds (IP/ARP only). Every instance MUST
+  ship a custom_headers.py defining the BOOTP/DHCP layer with at least: op (1B),
+  htype/hlen/hops (1B each), xid (4B), secs/flags (2B each), ciaddr/yiaddr/
+  siaddr/giaddr (4B each), chaddr (16B), sname (64B), file (128B), and (for
+  option82_insert) a minimal options field carrying the Circuit-ID sub-option.
+  giaddr and hops are the gradable transform targets; op selects direction.
+
+  Stateless / no time. There is deliberately NO lease/binding state and NO
+  time_tick: the relay decides each packet from its own headers + static config.
+  Lease lifetime, OFFER/ACK transaction tracking, and address allocation are the
+  DHCP SERVER's responsibility and are out of scope for the relay (and would be
+  ungradable under the harness, which injects no time ticks).
+
+  Canonical implementation (single-server, default seed):
+    - Parser: Ether → IPv4 → UDP (sport/dport 67/68) → BOOTP/DHCP. A frame that
+      does not parse as DHCP leaves dhcp invalid → R0 drops.
+    - Direction by ingress: a request (op==1) must arrive on an access port; a
+      reply (op==2) must arrive on the server-facing port. Mismatch → R0 drop.
+    - relay_interfaces table keyed on ingress_port → action set_giaddr_iface(
+      giaddr_ip, client_subnet, client_mac, ...).
+    - Forward (R2): if dhcp.giaddr == 0 then dhcp.giaddr = giaddr_ip;
+      dhcp.hops = dhcp.hops + 1; rewrite ipv4.dst = server_ip, ipv4.src =
+      relay_src_ip, eth.dst = server_mac, eth.src = relay_mac; egress = server_port.
+    - Reply (R3): pick the access interface from dhcp.giaddr; rewrite ipv4.dst =
+      giaddr, ipv4.src = relay_src_ip, eth toward the client; egress = that
+      access port. Do NOT touch hops on the reply.
+
+  Anti-pattern implementations to reject:
+    * Overwriting a NON-zero giaddr on a relayed request (RFC 1542 §4: stamp
+      only when giaddr == 0; preserve upstream giaddr).
+    * Incrementing hops twice (ingress + egress) or not at all; touching hops on
+      the reply direction.
+    * Forwarding the request out the ingress port instead of redirecting to the
+      server (failing the L2/L3 dst rewrite + egress change).
+    * Relaying a request whose hops already >= the limit (must drop, R1) — and
+      the off-by-one of using > instead of >= on the pre-increment value.
+    * Accepting a request on the server port or a reply on an access port
+      (wrong-direction; R0).
+    * Recomputing a (non-existent) DHCP checksum, or emitting a brand-new DHCP
+      message instead of rewriting the in-flight one.
+
+  v2-deferred gaps (out of v1.0 scope):
+    * DHCP lease/transaction state, address allocation, OFFER/ACK correlation —
+      server-side, stateful, time-driven; needs `session` + `time_tick` the
+      relay deliberately omits.
+    * Broadcast-flag-driven L2 handling of the reply (broadcast vs unicast to
+      the client based on the BROADCAST flag) — partially expressible but the
+      harness's single-egress model grades only the unicast redirect.
+
+post_instantiation_hooks: |
+  After instantiation: ship custom_headers.py (BOOTP/DHCP layer); the instance
+  must validate and the public tests must agree with
+  the oracle for the seed (both directions: request giaddr-stamp+forward, reply
+  giaddr-keyed redirect).

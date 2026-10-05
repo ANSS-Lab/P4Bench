@@ -1,0 +1,945 @@
+# P-INTMetadata — In-band Network Telemetry: per-hop metadata stamping
+#
+# TPL v1.0 task pattern. P-INTMetadata occupies
+# the (D4:telemetry, P9:telemetry) cell as the second P9 mechanism slice
+# (per-hop metadata stamping), structurally disjoint from
+# P-SketchHeavyHitter's sketch-aggregation slice. Instances are produced by
+# binding the parameters below.
+
+pattern_id: P-INTMetadata
+version: "1.0"
+nf_categories:                                  # NF-category tags (ID:name pairs)
+  descriptive:  [D4:telemetry]                  # telemetry (sketches, heavy-hitter detection, INT)
+  prescriptive: [P9:telemetry]                  # sketches, INT, heavy-hitter detection (scale_up)
+target_capability: scale_up                     # programmability scales up an asic telemetry primitive by per-packet metadata stamping
+summary: >
+  In-band Network Telemetry: per-hop metadata stamping with source /
+  transit / sink roles. The source pushes an INT shim + instruction
+  bitmap and the first hop's metadata onto an egress packet; transit
+  nodes append their own metadata and decrement the remaining-hop
+  budget; the sink extracts the accumulated stack, emits a telemetry
+  report on a configured port, strips the shim, and restores the
+  original payload to downstream consumers. No aggregation state —
+  every packet is its own telemetry vehicle. Anchor instances pin a
+  source+sink single-switch INT-MD topology with a 3-field metadata
+  set; the parameter-rebinding mutation surface lifts the role parameterisation,
+  metadata-field set breadth, max-hop-count budget, sample rate,
+  bit-width on time fields, conditional-emit branching, and the
+  faithfulness ladder (INT-MD → INT-MX → PINT-probabilistic),
+  reusing the same audited oracle across the family.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: pint_sigcomm20
+      role: scaling_approach
+      relevance: |
+        PINT (SIGCOMM 2020) reframes INT as a bit-budgeted problem:
+        per-packet telemetry overhead is bounded — as low as 1 bit
+        per packet — by using sampling, hashing, and randomized
+        coding to spread the requested information across many
+        packets rather than stamping every field on every packet.
+        Motivates the `faithfulness: D5.2_pint_probabilistic` mode
+        in this pattern, and the `sample_rate` parameter: a hardened
+        seed with a high sample rate and a wide metadata field set
+        forces the implementation to choose which fields to elide rather
+        than overflowing the MTU.
+
+    - cite: sonata_sigcomm18
+      role: scaling_approach
+      relevance: |
+        Sonata (SIGCOMM 2018) addresses the scale of telemetry data
+        by partitioning queries across a stream processor and the
+        data plane, with dynamic query refinement to fit limited
+        switch memory. Cited here as the canonical motivation for
+        the conditional-emit / sample-rate axis: a real-world
+        deployment cannot stamp every packet because either the
+        report-export bandwidth or the on-switch register budget
+        would be saturated, so the data plane must be selective.
+        The pattern's `conditional_emit_predicate` parameter
+        controls which subset of packets the sink reports on.
+
+    - cite: marple_sigcomm17
+      role: canonical_implementation
+      relevance: |
+        Marple (SIGCOMM 2017) defines a Linq-style functional
+        query language (map / filter / groupby / zip) and shows it
+        compiles to switch programs that aggregate per-flow
+        performance metrics at line rate. While Marple's aggregation
+        is closer to P-SketchHeavyHitter, the paper's per-packet
+        metadata harvesting — collecting ingress / egress times,
+        queue occupancies, hop latencies — is the exact set of
+        fields the INT spec also enumerates and grounds the
+        `metadata_fields` parameter's value list.
+
+  rfcs:
+    # INT itself is a P4.org dataplane spec, but its source/sink/transit role
+    # model and on-path data-field semantics are standardised by the IETF as
+    # IOAM (RFC 9197). We ground the role/encapsulation behaviour on RFC 9197 §3
+    # — a machine-checkable normative source for the source-push (encapsulating)
+    # / sink-strip (decapsulating) / transit roles this pattern's `role` knob
+    # selects.
+    - id: RFC9197
+      sections: ["3"]
+      role: normative_behaviour
+      quote: >-
+        A device that adds at least one IOAM-Option-Type to the packet is
+        called an "IOAM encapsulating node", whereas a device that removes an
+        IOAM-Option-Type is referred to as an "IOAM decapsulating node".
+      quote_source: patterns/P-INTMetadata/grounding/RFC9197.txt
+      relevance: |
+        IOAM (In Situ OAM) Data Fields — the IETF-standardised equivalent of
+        INT. §3 defines the IOAM encapsulating / transit / decapsulating node
+        roles: an encapsulating node ADDS the option-type (this pattern's source
+        push, R2/R3), a decapsulating node REMOVES it (the sink strip/report,
+        R5/R6), and a transit node reads/updates the data fields. Grounds the
+        `role` knob (source / sink / transit / source_and_sink / multi) and the
+        on-path stamp-then-strip behaviour.
+
+  tutorials: []                                   # tutorials/exercises/ has no INT exercise; the spec + papers carry the protocol grounding
+
+
+  posts:
+    - url: https://github.com/p4lang/p4-applications/blob/master/telemetry/specs/INT.mdk
+      role: normative_behaviour
+      section: "INT dataplane specification — roles, modes, hop-count, sink"
+      relevance: |
+        The p4.org INT dataplane specification (mdk source). Defines
+        the three roles (Source, Transit, Sink) and exactly what
+        each does to a packet: Source creates the INT-MD or INT-MX
+        header and seeds the remaining-hop-count; Transit appends
+        its own metadata slot in INT-MD mode and decrements the
+        remaining-hop-count, OR (INT-MX mode) follows the
+        instruction bitmap and exports metadata out-of-band; Sink
+        removes the INT headers + metadata stack and decides
+        whether to emit a telemetry report. Defines the per-hop
+        metadata field set (Node ID, ingress / egress interface,
+        ingress / egress timestamp, hop latency, egress TX link
+        utilisation, queue occupancy, buffer occupancy). The spec
+        is explicit that "the exact meaning [of each metadata
+        field] can vary from one device to another" — that
+        out-of-band semantic is what motivates the pattern's
+        `metadata_fields` enum (which fields a given seed stamps)
+        as a parameter, not as a bake-in. Quoted clause that
+        underpins the no_orphan invariant: "Each transit node must
+        decrement the *Remaining Hop Count* field in the INT
+        header appropriately."
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; the entire INT mechanism is per-packet stateless. The
+      pattern is "no aggregation state — every packet is its own
+      telemetry vehicle". Source rules
+      read std.ingress_global_timestamp / std.enq_qdepth /
+      std.egress_spec; transit rules read the same standard
+      metadata and the INT shim layered onto hdr; sink rules read
+      the assembled stack and emit a telemetry report.
+
+  link:                                         # plays the TPL `link` role — per-port state
+    keyed_by_tuple: [egress_port]
+    attrs:
+      tx_utilisation: int                       # set by the harness; consulted by the egress_tx_util field if enabled
+      port_alive:     bool                      # consulted only by some sink configurations; harness-supplied
+    notes: |
+      Per-egress-port state the data plane *reads* to populate
+      certain metadata fields (egress_tx_utilisation in particular).
+      Not written by the pattern — the harness provides it as
+      standard-metadata-equivalent attributes.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  role:
+    type: enum
+    values: [source, transit, sink, source_and_sink, multi]
+    default: source_and_sink
+    notes: |
+      Which INT role(s) this switch plays. Anchor topology is a
+      single switch in `source_and_sink` mode — it both stamps the
+      first hop's metadata onto outgoing packets and is responsible
+      for harvesting / reporting the eventual stack (degenerate
+      single-hop case, useful for testing the source / sink
+      conjunction). `transit` requires an upstream source; `multi`
+      requires the implementation to dispatch per-port. Per the INT spec, a
+      device "can play one or more roles".
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_int_md                             # classic eMbed Data: every hop appends metadata into the packet
+      - D5.1_int_mx                             # eMbed inStruct(X)ions: only source embeds, metadata exported out-of-band
+      - D5.2_pint_probabilistic                 # PINT-style bit-budgeted: per-packet overhead bounded by sampling
+    default: D5.0_int_md
+    notes: |
+      Implementation faithfulness ladder.
+      D5.0_int_md: classic hop-by-hop append; the canonical INT-MD
+      mode (INT.mdk §"INT-MD"). D5.1_int_mx: instruction-only
+      embedding, packet size stable, metadata exported out-of-band
+      via mirror to a telemetry collector. D5.2_pint_probabilistic:
+      PINT — randomized coding bounds per-packet overhead at a
+      configurable bit budget; the sink reconstructs population-
+      level statistics across many packets.
+
+  metadata_fields:
+    type: list[str]
+    constraint: |
+      non-empty list whose elements are each drawn from the
+      9-value field-set enum {switch_id, ingress_ts, egress_ts,
+      hop_latency, queue_id, queue_depth, egress_tx_util,
+      ingress_port, egress_port}; no duplicates; ordering is
+      the on-wire stamp order.
+    default: [switch_id, ingress_ts, egress_ts]
+    notes: |
+      Which per-hop metadata fields to stamp. The on-wire order is
+      the parameter's list order — this is what implementations hash on
+      to produce the source's instruction bitmap. Anchor uses the
+      classic 3-field set; the `expand_metadata_breadth` operator
+      adds more.
+
+  max_hop_count:
+    type: int
+    range: "[1, 16]"
+    default: 8
+    notes: |
+      Initial remaining-hop-count the source seeds into the INT
+      shim. When a transit decrements it to zero, that transit
+      MUST NOT append further metadata (INT.mdk: "to avoid
+      exhausting header space, ... limit the number of total INT
+      metadata fields added by Transit Hop nodes"). The
+      `no_orphan` invariant relies on this; the
+      `shrink_max_hop_count_2x` operator surfaces overflow
+      handling.
+
+  sample_rate:
+    type: int
+    range: "[1, 1024]"
+    default: 1
+    notes: |
+      Stamp every Nth packet at the source. `sample_rate = 1`
+      stamps every packet (anchor); higher values exercise the
+      conditional-emit-at-source branch that the common v1model
+      conditional-deparser bug surfaces against. The implementation must NOT stamp a
+      packet whose hash-based sample decision is "skip"; the
+      deparser MUST NOT emit the INT shim in that case either,
+      which is the load-bearing sink-leak test.
+
+  bit_width_timestamp:
+    type: enum
+    values: [32, 48]
+    default: 48
+    notes: |
+      Bit-width on the ingress_ts / egress_ts metadata fields.
+      v1model's standard_metadata.ingress_global_timestamp is 48
+      bits; implementations that truncate to 32 bits via `(bit<32>)`
+      cast silently drop the upper bits and the timestamps wrap
+      around on a real timescale. The `truncate_timestamp_to_32bit`
+      operator surfaces this with a corresponding G3 test.
+
+  conditional_emit_predicate:
+    type: enum
+    values: [always, hop_latency_exceeds_threshold, queue_depth_exceeds_threshold, none]
+    default: always
+    notes: |
+      What the SINK reports on. `always` (anchor): every packet
+      with a non-empty INT stack triggers a telemetry report.
+      `hop_latency_exceeds_threshold` / `queue_depth_exceeds_threshold`
+      lift to the realistic congestion-monitoring deployment
+      where reports are emitted only when a per-hop metric breaches
+      a configured threshold — exercises the conditional-deparser
+      surface (the report's INT-shim emit is gated on the
+      threshold check). `none` is a degenerate test fixture where
+      the sink strips but does not emit, useful for the
+      payload-restoration G1 case.
+
+  report_threshold:
+    type: int
+    range: "[0, 1000000000]"
+    default: 0
+    enforced_when: "${conditional_emit_predicate} ∈ {hop_latency_exceeds_threshold, queue_depth_exceeds_threshold}"
+    notes: |
+      Threshold value the conditional emit predicate compares
+      against. Units depend on the predicate
+      (nanoseconds for hop_latency, queue-depth cells for
+      queue_depth). The anchor pins this to 0 with predicate
+      `always` so it has no effect; mutated seeds drive it
+      together with the predicate.
+
+  report_port:
+    type: port
+    default: 99
+    notes: |
+      Egress port the sink emits the telemetry report on (a
+      special "collector" port the harness configures). Distinct
+      from the per-packet egress port the restored original
+      packet exits on. Implementations that conflate the two will fail
+      the G1 sink-emit-and-forward case (which asserts BOTH
+      outputs: the stripped packet on its routed egress port,
+      and the telemetry report on `${report_port}`).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics; rule order is the case split over the role the
+# switch is configured for and the INT-shim presence on the incoming packet.
+
+rules:
+
+  - id: R0_non_ipv4_passthrough
+    when: "¬header_present(ipv4)"
+    then:
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      The pattern is layered over IPv4 (the INT shim is inserted
+      between the L4 header and the application payload in the
+      INT-over-TCP/UDP encoding). Non-IPv4 frames bypass the INT
+      pipeline entirely and are passed through to whatever
+      downstream forwarder runs after this stage.
+
+  - id: R1_source_sample_skip
+    when: |
+      header_present(ipv4) ∧ ¬header_present(int_shim)
+        ∧ ${role} ∈ {source, source_and_sink, multi}
+        ∧ ¬match(hash(packet.5tuple) mod ${sample_rate}, 0)
+    enforced_when: "${sample_rate} > 1"
+    then:
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Source-role sampling: packets not selected for stamping are
+      forwarded unchanged. Crucially, the implementation MUST NOT emit
+      the INT shim header on this path — a conditional-deparser
+      bug here leaks an empty INT shim downstream. The anchor
+      case of that common v1model bug.
+
+  - id: R2_source_push
+    when: |
+      header_present(ipv4) ∧ ¬header_present(int_shim)
+        ∧ ${role} ∈ {source, source_and_sink, multi}
+        ∧ match(hash(packet.5tuple) mod ${sample_rate}, 0)
+    then:
+      - set(hdr.int_shim.remaining_hop_count, ${max_hop_count})
+      - set(hdr.int_shim.instruction_bitmap, bitmap_of(${metadata_fields}))
+      - emit(int_metadata_slot(${metadata_fields},
+                               std.ingress_global_timestamp,
+                               std.egress_spec,
+                               std.enq_qdepth))
+      - dec(hdr.int_shim.remaining_hop_count, 1)
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Source-role push: prepend the INT shim with the instruction
+      bitmap derived from ${metadata_fields}, seed the remaining-
+      hop-count to ${max_hop_count}, append this hop's metadata
+      slot, decrement the hop count by 1 (this hop is one of the
+      "metadata-added" hops). The metadata-slot emit uses standard-
+      metadata values; bit_width_timestamp determines whether the
+      timestamp is 48-bit (v1model native) or 32-bit (truncated).
+
+  - id: R3_transit_overflow_passthrough
+    when: |
+      header_present(ipv4) ∧ header_present(int_shim)
+        ∧ ${role} ∈ {transit, multi}
+        ∧ value(hdr.int_shim.remaining_hop_count, ==, 0)
+    then:
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      INT.mdk requires that when remaining_hop_count reaches zero,
+      a transit MUST NOT append additional metadata — the packet
+      passes through unchanged. The pattern's no_orphan invariant
+      depends on this; implementations that always append (decrementing
+      a value already at zero or wrapping) overflow the metadata
+      stack and corrupt the packet.
+
+  - id: R4_transit_append
+    when: |
+      header_present(ipv4) ∧ header_present(int_shim)
+        ∧ ${role} ∈ {transit, multi}
+        ∧ value(hdr.int_shim.remaining_hop_count, >, 0)
+    then:
+      - emit(int_metadata_slot(${metadata_fields},
+                               std.ingress_global_timestamp,
+                               std.egress_spec,
+                               std.enq_qdepth))
+      - dec(hdr.int_shim.remaining_hop_count, 1)
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Transit-role append: in INT-MD mode the transit appends its
+      own metadata slot to the stack and decrements the
+      remaining-hop-count. Only fires when remaining_hop_count > 0
+      (the overflow guard above takes precedence).
+
+  - id: R5_sink_emit_report
+    when: |
+      header_present(ipv4) ∧ header_present(int_shim)
+        ∧ ${role} ∈ {sink, source_and_sink, multi}
+        ∧ value(${conditional_emit_predicate}_witness(stack), ==, true)
+    then:
+      - emit(telemetry_report(hdr.int_metadata_stack))
+      - forward(${report_port})
+      - set(hdr.int_shim.is_valid, false)
+      - forward(std.ingress_port → routing_decision)
+    enforced_when: "${conditional_emit_predicate} ≠ none"
+    notes: |
+      Sink-role emit-and-strip: when the conditional emit predicate
+      fires (always / threshold-breach), the sink emits a separate
+      telemetry-report packet on ${report_port} containing the
+      assembled metadata stack, THEN strips the INT shim from the
+      original packet and forwards it on its downstream-routed
+      egress port. Two outputs from one input — this is the
+      cleanest test of the conditional-deparser surface, because
+      the deparser must emit the shim-stripped form on one port
+      and the telemetry-report form on another.
+
+  - id: R6_sink_strip_only
+    when: |
+      header_present(ipv4) ∧ header_present(int_shim)
+        ∧ ${role} ∈ {sink, source_and_sink, multi}
+        ∧ value(${conditional_emit_predicate}_witness(stack), ==, false)
+    then:
+      - set(hdr.int_shim.is_valid, false)
+      - forward(std.ingress_port → routing_decision)
+    notes: |
+      Sink-role strip-without-report: the predicate did not fire
+      (e.g., hop_latency below threshold). The sink still removes
+      the INT shim and stack — the downstream consumer must NOT
+      see the INT headers — but emits NO telemetry report. Catches
+      implementations that gate strip on the same predicate that gates
+      emit, leaking INT shims downstream when the threshold isn't
+      breached.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: no_orphan_hop_count
+    clause: no_orphan
+    target: hdr.int_metadata_stack
+    notes: |
+      The INT metadata stack MUST NOT grow beyond ${max_hop_count}
+      slots. Mechanism: remaining-hop-count is seeded at the source
+      and decremented at each transit; transit R3 refuses to
+      append once it reaches zero. INT.mdk: "each transit node
+      must decrement the Remaining Hop Count field appropriately".
+      Implementation bug it catches: wraparound on a `bit<8>` field with
+      unsigned underflow.
+
+  - id: sink_strips_shim
+    clause: persistence
+    target: hdr.int_shim.is_valid
+    while: "rule R5 fires ∨ rule R6 fires"
+    free_under: ["is_valid: false"]
+    notes: |
+      After the sink fires (either emit-and-strip or strip-only),
+      the downstream-egress packet MUST NOT carry a valid INT
+      shim. The shim's `is_valid` flag MUST be false on the
+      stripped-packet egress; any downstream consumer reading
+      hdr.int_shim would otherwise see stale data. Catches the
+      common v1model conditional-deparser bug where the deparser emits
+      hdr.int_shim regardless of its validity.
+
+  - id: payload_preservation
+    clause: persistence
+    target: "ipv4_payload_bytes_minus_int_layer"
+    while: "any rule fires"
+    free_under: []
+    notes: |
+      The original IPv4 payload (excluding the INT shim/stack
+      bytes that source/transit inserted and sink removes) MUST
+      be byte-identical on egress to ingress. Catches implementations that
+      accidentally rewrite payload bytes when re-emitting the
+      packet under the INT layer, or that double-decapsulate at
+      the sink and chop application data.
+
+  - id: timestamp_bit_width_fidelity
+    clause: stability
+    target: stamped_timestamp_high_bits
+    while: "rule R2 fires ∨ rule R4 fires"
+    enforced_when: "${bit_width_timestamp} == 48"
+    notes: |
+      When bit_width_timestamp == 48, the stamped timestamp MUST
+      preserve the full 48 bits of standard_metadata.ingress_global_timestamp.
+      Implementations that cast to bit<32> drop the upper 16 bits silently
+      — the field still parses, but real-world timestamps wrap
+      every ~1 ms instead of every ~71 minutes. The G3
+      `truncate_timestamp_drift` test surfaces this.
+
+  - id: hop_count_monotone
+    clause: stability
+    target: hdr.int_shim.remaining_hop_count
+    while: "rule R2 fires ∨ rule R4 fires"
+    notes: |
+      The remaining-hop-count MUST strictly decrease at each
+      hop that appends metadata. Implementations that read-stale
+      (read before write order bug) or skip the decrement on
+      the source path break this — visible as a stack with
+      more slots than the hop budget would allow.
+
+  - id: stack_length_matches_metadata_emits
+    clause: stability
+    target: hdr.int_metadata_stack.length
+    while: "egress(packet)"
+    notes: |
+      The length field in the INT shim MUST equal the number of
+      metadata slots actually emitted in the deparser. Implementations
+      that pre-compute the length before the per-hop append (or
+      that emit metadata via the deparser but forget to bump
+      the length) produce a corrupted stack that the sink
+      cannot decode.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      The INT pipeline is single-pass; no recirculation. An
+      implementation that recirculates the source-stamped packet to
+      re-enter the source role (e.g., to stamp it twice) is
+      forbidden — the remaining-hop-count would be decremented
+      from `${max_hop_count}` again on each pass, but the stack
+      would grow unbounded if R3's overflow guard fails.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-goal conventions and the v1model bug taxonomy for what to probe.
+
+test_scaffolding:
+
+  G1:
+    - id: source_push_three_field_anchor
+      requires: "${role} ∈ {source, source_and_sink, multi}"
+      generate: |
+        Send a non-INT IPv4 packet to a source-role switch. Assert
+        the egress packet carries an INT shim whose
+        remaining_hop_count == ${max_hop_count} - 1, instruction
+        bitmap matches ${metadata_fields}, and exactly one metadata
+        slot is present with switch_id == this switch's configured
+        id, ingress_ts present and non-zero, egress_ts > ingress_ts.
+        (R2 fires; payload_preservation + stack_length witnesses.)
+
+    - id: transit_append_increments_stack
+      requires: "${role} ∈ {transit, multi}"
+      generate: |
+        Send a packet already carrying an INT shim with one
+        metadata slot and remaining_hop_count == ${max_hop_count} - 1.
+        Assert the egress packet has TWO metadata slots, the second
+        one carrying this switch's id, and remaining_hop_count
+        decremented by 1. (R4 fires; hop_count_monotone witness.)
+
+    - id: sink_emit_report_and_strip
+      requires: "${role} ∈ {sink, source_and_sink, multi} ∧ ${conditional_emit_predicate} == always"
+      generate: |
+        Send a packet with a full INT shim + stack to a sink-role
+        switch. Assert TWO output packets: (a) a telemetry report
+        on ${report_port} containing the assembled stack, and
+        (b) the original packet on its downstream-routed egress
+        port with the INT shim STRIPPED (hdr.int_shim.is_valid ==
+        false; bytes match payload_preservation). (R5 fires;
+        sink_strips_shim witness.)
+
+    - id: metadata_field_breadth
+      requires: "len(${metadata_fields}) >= 4"
+      generate: |
+        Send a non-INT packet to a source-role switch configured
+        with a 4+ field metadata set. Assert the emitted metadata
+        slot carries values for EVERY listed field, in the order
+        declared by ${metadata_fields}. Catches implementations that only
+        emit the canonical 3 fields regardless of the instruction
+        bitmap.
+
+  G2:
+    - id: hop_count_overflow_passthrough
+      requires: "${role} ∈ {transit, multi}"
+      generate: |
+        Send a packet with INT shim where remaining_hop_count == 0
+        and the stack is already full (e.g., 8 slots when
+        max_hop_count == 8). Assert egress packet is UNCHANGED:
+        stack still has 8 slots, no new metadata added, no
+        wraparound on the hop-count field. (R3 fires; no_orphan
+        witness.)
+
+    - id: sample_rate_skips_unsampled
+      requires: "${role} ∈ {source, source_and_sink, multi} ∧ ${sample_rate} > 1"
+      generate: |
+        Send ${sample_rate} * 4 packets with distinct 5-tuples to a
+        source-role switch. Assert that exactly ~1/${sample_rate}
+        of them gain an INT shim, AND the others egress with NO
+        INT shim header present (deparser correctness — empty
+        shim must not be emitted). (R1 fires for the skipped
+        majority; conditional-deparser witness on the
+        non-stamping branch.)
+
+    - id: conditional_emit_below_threshold
+      requires: "${role} ∈ {sink, source_and_sink, multi} ∧ ${conditional_emit_predicate} ≠ always ∧ ${conditional_emit_predicate} ≠ none"
+      generate: |
+        Send a packet with INT shim + stack whose metrics all FALL
+        BELOW ${report_threshold}. Assert: NO telemetry report
+        emitted on ${report_port}; the original packet IS stripped
+        of the INT shim and forwarded on its downstream-routed
+        egress port. (R6 fires; sink_strips_shim still holds —
+        strip happens regardless of emit.)
+
+  G3:
+    - id: deparser_no_int_leak_on_non_int_path
+      generate: |
+        Send a plain IPv4 packet (no INT shim, sample_rate not
+        triggering, or non-source role). Assert the egress packet
+        is BYTE-IDENTICAL to ingress (no INT shim bytes emitted,
+        no metadata-slot bytes emitted). Probes the dominant
+        v1model bug: emitting an invalid header in the deparser.
+
+    - id: sink_emit_only_one_telemetry_report
+      requires: "${role} ∈ {sink, source_and_sink, multi} ∧ ${conditional_emit_predicate} == always"
+      generate: |
+        Send an INT-bearing packet to the sink. Assert EXACTLY
+        ONE telemetry-report packet on ${report_port} and EXACTLY
+        ONE stripped-packet on the downstream egress port — not
+        two reports, not zero. Catches conditional-deparser bugs
+        where the deparser fires twice on a single packet, or
+        where the strip path also emits a report.
+
+    - id: timestamp_full_48bit_preservation
+      requires: "${bit_width_timestamp} == 48"
+      generate: |
+        Send a non-INT packet to a source-role switch. Assert the
+        stamped timestamp field on the metadata slot equals
+        standard_metadata.ingress_global_timestamp's full 48-bit
+        value — including the upper 16 bits. An implementation that casts
+        to bit<32> would zero the upper 16 and the assertion
+        catches the silent truncation.
+        (timestamp_bit_width_fidelity witness.)
+
+    - id: stack_length_matches_emit_count
+      generate: |
+        After an INT-bearing packet traverses a source+1-transit
+        chain (or in the source_and_sink mode, after the source
+        side fires), assert the length field on hdr.int_shim
+        equals the number of metadata slots actually present in
+        the egress packet body. Catches implementations that compute
+        the length before the metadata-emit deparser stage runs.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+
+mutation_operators:
+
+  - id: expand_metadata_fields
+    applicable_when: "len(${metadata_fields}) < 6"
+    effect: |
+      ${metadata_fields} ← append(${metadata_fields},
+                                  next of {hop_latency, queue_id,
+                                           queue_depth, egress_tx_util,
+                                           ingress_port, egress_port})
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "len(${metadata_fields}) ≤ 9 ∧ no duplicates"
+    notes: |
+      Add the next metadata field to the stamping set. Each added
+      field widens the per-hop slot, pressures the deparser ordering,
+      and adds one more invariant witness to verify. Pairs with
+      `shrink_metadata_fields`.
+
+  - id: shrink_metadata_fields
+    applicable_when: "len(${metadata_fields}) > 1"
+    effect: "${metadata_fields} ← truncate_last(${metadata_fields})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "len(${metadata_fields}) ≥ 1"
+    notes: |
+      Drop the last metadata field. Pairs with `expand_metadata_fields`.
+
+  - id: shrink_max_hop_count_2x
+    applicable_when: "${max_hop_count} > 2"
+    effect: "${max_hop_count} ← ${max_hop_count} / 2"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${max_hop_count} ≥ 1"
+    notes: |
+      Halve the hop budget. Tighter budgets surface the overflow-
+      passthrough rule R3 earlier in mutation chains. Pairs with
+      `enlarge_max_hop_count_2x`.
+
+  - id: enlarge_max_hop_count_2x
+    applicable_when: "${max_hop_count} < 16"
+    effect: "${max_hop_count} ← ${max_hop_count} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${max_hop_count} ≤ 16"
+    notes: |
+      Double the hop budget. Pairs with `shrink_max_hop_count_2x`.
+
+  - id: enable_conditional_emit_hop_latency
+    applicable_when: "${conditional_emit_predicate} == always"
+    effect: |
+      ${conditional_emit_predicate} ← hop_latency_exceeds_threshold ∧
+      ${report_threshold} ← 1000000
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${role} ∈ {sink, source_and_sink, multi}"
+    notes: |
+      Lift the sink to a threshold-based report mode. Activates the
+      conditional-deparser surface: the report's emit is gated on
+      a per-packet predicate, which is the dominant v1model bug
+      pattern. Pairs with `disable_conditional_emit`.
+
+  - id: disable_conditional_emit
+    applicable_when: "${conditional_emit_predicate} ≠ always"
+    effect: |
+      ${conditional_emit_predicate} ← always ∧ ${report_threshold} ← 0
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Return to always-emit at sink. Pairs with the conditional-emit
+      harden operators.
+
+  - id: lift_faithfulness_to_int_mx
+    applicable_when: "${faithfulness} == D5.0_int_md"
+    effect: "${faithfulness} ← D5.1_int_mx"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Switch to INT-MX (eMbed Instructions) mode: the source
+      embeds only the instruction bitmap, transit nodes export
+      their metadata out-of-band via mirroring. Removes the
+      per-hop in-packet append step; tests the implementation's ability
+      to dispatch metadata into a mirror session rather than the
+      packet body. Pairs with `relax_faithfulness_to_int_md`.
+
+  - id: lift_faithfulness_to_pint
+    applicable_when: "${faithfulness} ∈ {D5.0_int_md, D5.1_int_mx}"
+    effect: "${faithfulness} ← D5.2_pint_probabilistic"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${sample_rate} ≥ 1"
+    notes: |
+      Switch to PINT probabilistic mode (SIGCOMM '20): per-packet
+      overhead bounded by a bit budget; only a randomly-selected
+      subset of metadata fields stamped per packet. The implementation
+      must implement the bit-allocation function — substantially
+      harder than INT-MD. Pairs with `relax_faithfulness_to_int_md`.
+
+  - id: relax_faithfulness_to_int_md
+    applicable_when: "${faithfulness} ≠ D5.0_int_md"
+    effect: "${faithfulness} ← D5.0_int_md"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Drop back to classic INT-MD. Pairs with the faithfulness-lift
+      operators.
+
+  - id: increase_sample_rate_4x
+    applicable_when: "${sample_rate} < 256"
+    effect: "${sample_rate} ← ${sample_rate} * 4"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${sample_rate} ≤ 1024"
+    notes: |
+      Stamp less frequently. Surfaces the conditional-deparser
+      bug on the non-stamping branch: implementations that always emit
+      the INT shim regardless of the sample decision leak shims
+      downstream. Pairs with `decrease_sample_rate_4x`.
+
+  - id: decrease_sample_rate_4x
+    applicable_when: "${sample_rate} > 1"
+    effect: "${sample_rate} ← ${sample_rate} / 4"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${sample_rate} ≥ 1"
+    notes: |
+      Stamp more frequently. Pairs with `increase_sample_rate_4x`.
+
+  - id: truncate_timestamp_to_32bit
+    applicable_when: "${bit_width_timestamp} == 48"
+    effect: "${bit_width_timestamp} ← 32"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Force the timestamp field to 32 bits. Implementations that simply
+      cast `(bit<32>) std.ingress_global_timestamp` silently lose
+      the upper 16 bits; a careful implementation documents and stamps
+      both halves. Pairs with `extend_timestamp_to_48bit`.
+
+  - id: extend_timestamp_to_48bit
+    applicable_when: "${bit_width_timestamp} == 32"
+    effect: "${bit_width_timestamp} ← 48"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Restore the full 48-bit timestamp. Pairs with
+      `truncate_timestamp_to_32bit`.
+
+  - id: lift_role_to_multi
+    applicable_when: "${role} ≠ multi"
+    effect: "${role} ← multi"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Lift the single-role anchor to a multi-role switch: source
+      on ingress port A, transit on ingress port B, sink on
+      ingress port C. Forces the implementation to dispatch per-port and
+      surfaces the rare bug where one role's deparser emits
+      another role's headers.
+
+  - id: collapse_role_to_source_and_sink
+    applicable_when: "${role} == multi"
+    effect: "${role} ← source_and_sink"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Collapse multi-role back to the single-switch source+sink
+      degenerate case. Pairs with `lift_role_to_multi`.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this pattern in v1model P4:
+
+    Anchor (role=source_and_sink, faithfulness=D5.0_int_md,
+            metadata_fields=[switch_id, ingress_ts, egress_ts],
+            max_hop_count=8, sample_rate=1, bit_width_timestamp=48,
+            conditional_emit_predicate=always):
+
+      - Parser:
+          header ipv4_t        — standard
+          header int_shim_t    — { remaining_hop_count: bit<8>;
+                                   instruction_bitmap: bit<16>;
+                                   length: bit<8>; reserved: bit<8>; }
+          header int_md_slot_t — { switch_id: bit<32>;
+                                   ingress_ts: bit<48>;
+                                   egress_ts: bit<48>; }
+          header_union int_metadata_stack_t — array of int_md_slot_t
+          parser transition: parse ipv4 → if ipv4.proto == INT_PROTO,
+                             extract int_shim → loop extract int_md_slot
+                             (max_hop_count - remaining_hop_count) times.
+
+      - Ingress:
+          if (!hdr.ipv4.isValid()) accept;
+          if (!hdr.int_shim.isValid()) {
+              // Source role
+              hdr.int_shim.setValid();
+              hdr.int_shim.remaining_hop_count = max_hop_count - 1;
+              hdr.int_shim.instruction_bitmap = INSTR_3FIELD;
+              hdr.int_shim.length = 1;
+              push_metadata_slot(switch_id, std.ingress_global_timestamp,
+                                 std.egress_global_timestamp);
+          } else {
+              // Sink role (since source_and_sink and shim already present)
+              clone_telemetry_report(${report_port}, hdr.int_metadata_stack);
+              hdr.int_shim.setInvalid();
+              hdr.int_metadata_stack.setInvalid();
+          }
+
+      - Deparser (LOAD-BEARING):
+          packet.emit(hdr.ethernet);
+          packet.emit(hdr.ipv4);
+          packet.emit(hdr.int_shim);              // ← gated on .isValid()
+          packet.emit(hdr.int_metadata_stack);    // ← gated on .isValid()
+          packet.emit(hdr.l4_payload);
+        The deparser MUST NOT emit int_shim or int_metadata_stack when
+        they are invalid (set by the sink path) — otherwise the
+        stripped output carries stale INT bytes. This is the dominant
+        v1model bug.
+
+    +int_mx (faithfulness=D5.1_int_mx):
+      - Source still embeds the instruction bitmap into the shim,
+        but transit nodes DO NOT modify the packet body — instead
+        they `clone3(telemetry_report, dst_port=COLLECTOR)` to
+        mirror a report packet to the collector with the per-hop
+        metadata in its body. Packet size stays constant.
+
+    +pint (faithfulness=D5.2_pint_probabilistic):
+      - Per-packet bit budget K (e.g., 16 bits). The source computes
+        `coin = hash(packet.5tuple, salt) mod num_fields`; only the
+        coin-selected field is stamped, with bit-width clipped to
+        K. Multiple packets reconstruct the population-level metric
+        at the collector. Implementation requires per-packet hash + arg-min
+        plus a careful bit-packing — substantially harder than
+        INT-MD.
+
+    +multi-role (role=multi):
+      - One ingress table keyed on std.ingress_port → action sets
+        meta.int_role ∈ {SOURCE, TRANSIT, SINK}. The downstream
+        case-split mirrors the rule structure above.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Deparser unconditionally emits hdr.int_shim — the
+      load-bearing conditional-deparser bug. Catches: the
+      `deparser_no_int_leak_on_non_int_path` G3 case asserts the
+      egress packet on a non-INT path is byte-identical to ingress;
+      any int_shim bytes will fail it.
+
+    * Casting std.ingress_global_timestamp to `bit<32>` to fit a
+      narrower metadata field — silently truncates the upper 16
+      bits. The `timestamp_full_48bit_preservation` G3 case fires.
+
+    * Pre-computing hdr.int_shim.length before the metadata-emit
+      stage runs — length and emit count diverge. Catches:
+      `stack_length_matches_emit_count` G3.
+
+    * Recirculating a source-stamped packet to add a second hop's
+      metadata locally — the remaining_hop_count would be reset on
+      each pass and the stack would grow unbounded. R3's overflow
+      guard is invariant-enforced via no_orphan_hop_count.
+
+    * Conflating the report port with the egress port: emitting the
+      telemetry report to the same downstream egress as the
+      stripped packet, or vice versa. The G1
+      `sink_emit_report_and_strip` test asserts TWO outputs on
+      DIFFERENT ports.
+
+    * Implementing INT-MX with the transit *still* modifying the
+      packet body — the mode is "embed instructions only"; bodies
+      stay constant. A transit that appends in INT-MX mode is
+      mis-implementing the faithfulness lift.
+
+  v2 deferrals:
+    * INT XD (eXport Data) mode — out-of-band reporting with no
+      in-packet headers — is deferred; the implementation's mirror /
+      digest configuration is substantially different from the
+      INT-MD implementation and would split the pattern into two.
+    * Cross-switch fragment reassembly when the INT stack pushes
+      a packet over the MTU mid-transit. Real INT deployments
+      do path-MTU-aware sampling; v1 of this pattern assumes
+      packets stay within MTU.
+    * Probabilistic IDs (a la PINT's coin flipping for which hop
+      to stamp) require a bit budget that exposes the
+      `hash` extern surface — included in the faithfulness ladder
+      but the corresponding hidden tests are deferred.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit
+       must all pass.
+
+    2. For anchor instances (role=source_and_sink, INT-MD,
+       3-field metadata, max_hop_count=8, sample_rate=1, full
+       48-bit timestamp, conditional_emit=always), the resulting
+       task SHOULD be behaviourally equivalent to a single-switch
+       INT-MD reference: every IPv4 packet on the source path
+       gains a one-slot stack, then on the sink path the stack
+       is harvested into a report on ${report_port} and the
+       original is delivered stripped on its routed egress.
+
+    3. P-INTMetadata pairs with P-SketchHeavyHitter as the P9
+       telemetry cell's two slices. Anchor instances of both
+       patterns make a useful side-by-side difficulty comparison —
+       they share the prescriptive cell but their failure modes
+       are structurally disjoint (this pattern's failures cluster
+       on conditional-deparser; P-SketchHeavyHitter's failures
+       cluster on hash-extern signature and register-cold-start).

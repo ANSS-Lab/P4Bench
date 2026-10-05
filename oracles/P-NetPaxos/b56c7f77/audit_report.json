@@ -1,0 +1,98 @@
+{
+  "oracle_hash": "ede22ad406f29f561e5c0e13761c479d2e057a0316d632542014151f589b88cf",
+  "instance": "netpaxos_acceptor_anchor-default",
+  "ran_at": "2026-05-29T23:43:24.799675Z",
+  "canonical_examples": {
+    "passed": 9,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_paxos_arp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_paxos_plain_ip_udp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_paxos_plain_ip_tcp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "paxos_port_no_payload_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_paxos_icmp_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "phase2a_accept_ge_on_equal_round",
+        "status": "pass"
+      },
+      {
+        "example_id": "phase2a_stale_gt_on_equal_round_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "phase1a_promise_fresh_slot",
+        "status": "pass"
+      },
+      {
+        "example_id": "inst_out_of_range_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "promise_round_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "accepted_pair_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "round_monotonic": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_orphan_slots": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "promise_round_safety",
+      "accepted_pair_persistence",
+      "round_monotonic",
+      "no_orphan_slots"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "dang_netpaxos_sosr15"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

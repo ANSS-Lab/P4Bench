@@ -1,0 +1,557 @@
+task_name: nat64_anchor_mut1
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-NAT64
+pattern_version: '1.0'
+seed:
+  wkp: 64:ff9b::/96
+  v4_base: 203.0.113.10
+  v6_client_subnet: 2001:db8:64::/64
+  mode: static
+  eviction_policy: none
+  binding_capacity: unbounded
+  l4_classes:
+  - tcp
+  - udp
+  faithfulness: D5.0_checksum_exact
+  checksum_strict: false
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8
+description: |
+  Implement a stateful NAT64 translator on a single switch s1 (RFC 6146 + RFC
+  6052) that bridges IPv6-only clients to IPv4-only servers. The switch has two
+  sides: an IPv6-facing client port (s1.client) and an IPv4-facing server port
+  (s1.server). It TRANSLATES between the two IP families — the IP header that
+  egresses is a different family from the one that ingressed.
+
+  ## Public addressing
+
+    - Well-known prefix (translation target): 64:ff9b::/96 (RFC 6052).
+    - Served IPv6 client subnet:              2001:db8:64::/64.
+    - Single public IPv4 source address:      203.0.113.10.
+
+  ## Binding table (control plane)
+
+  The control plane installs the following per-flow bindings. Each maps an IPv6
+  client transport tuple (its IPv6 address, L4 source port, and upper-layer
+  protocol) to a public IPv4 transport tuple on 203.0.113.10. Your submission's
+  control plane installs these as table entries.
+
+    | IPv6 client address | L4 src port | protocol | public IPv4 port |
+    |---------------------|-------------|----------|------------------|
+    | 2001:db8:64::a      | 5000        | UDP      | 14000            |
+    | 2001:db8:64::a      | 6000        | TCP      | 15000            |
+    | 2001:db8:64::a      | 7000        | UDP      | 16000            |
+    | 2001:db8:64::b      | 5000        | TCP      | 17000            |
+
+  Every binding is bidirectional: the same row also reverses an inbound IPv4
+  packet to 203.0.113.10 on the listed public port (matching protocol) back to
+  the IPv6 client address and L4 source port.
+
+  ## Required behaviour
+
+  ### IPv6 -> IPv4 (a packet arriving on s1.client)
+
+  A packet is translated when its IPv6 source is in 2001:db8:64::/64, its IPv6
+  destination is in 64:ff9b::/96, and a binding exists for (IPv6 source, L4 source
+  port, protocol). On a match the switch EMITS AN IPv4 PACKET (the IPv6 header is
+  replaced by an IPv4 header) out s1.server:
+
+    - IPv4 destination = the 32-bit IPv4 address embedded in the low 32 bits of
+      the IPv6 destination (RFC 6052 /96, e.g. 64:ff9b::203.0.113.9 -> 203.0.113.9).
+    - IPv4 source = 203.0.113.10.
+    - L4 source port = the bound public IPv4 port.
+    - IPv4 TTL = the incoming IPv6 Hop Limit minus one.
+    - Checksum correctness is NOT verified for this task: the grader ignores the
+      IPv4 header checksum and the TCP/UDP checksum fields, so you need not
+      recompute them.
+    - The L4 destination port and payload are unchanged.
+
+  A v6 packet that is NOT a translation candidate — IPv6 destination outside
+  64:ff9b::/96, IPv6 source outside 2001:db8:64::/64, or no installed binding for
+  its (source, source port, protocol) — is dropped.
+
+  ### IPv4 -> IPv6 (a packet arriving on s1.server)
+
+  An inbound IPv4 packet whose destination is 203.0.113.10 and whose (203.0.113.10,
+  L4 destination port, protocol) matches an installed binding is reversed. The
+  switch EMITS AN IPv6 PACKET (the IPv4 header is replaced by an IPv6 header) out
+  s1.client:
+
+    - IPv6 destination = the bound original IPv6 client address.
+    - L4 destination port = the bound original IPv6 client L4 source port.
+    - IPv6 source = 64:ff9b:: with the inbound IPv4 source embedded in its low 32
+      bits (RFC 6052, e.g. IPv4 203.0.113.9 -> 64:ff9b::203.0.113.9).
+    - IPv6 Hop Limit = the incoming IPv4 TTL minus one.
+    - Checksum correctness is NOT verified (see above); the L4 source port and
+      payload are unchanged.
+
+  An inbound IPv4 packet to any other destination, or to 203.0.113.10 with no
+  matching binding, is dropped (fail-closed).
+
+  ### General
+
+    - Only TCP and UDP are handled; any other frame (e.g. ARP, a non-IP frame) is
+      dropped.
+
+  ## Topology
+
+  One switch s1 with two hosts:
+    - h_v6 at s1.client (IPv6 side). IPv6 2001:db8:64::a, MAC 08:00:00:00:01:01.
+      s1.client MAC 08:00:00:00:01:00.
+    - h_v4 at s1.server (IPv4 side). IPv4 203.0.113.9, MAC 08:00:00:00:02:02.
+      s1.server MAC 08:00:00:00:02:00.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      client: 1
+      server: 2
+  links:
+  - from: h_v6
+    to: s1.client
+  - from: s1.server
+    to: h_v4
+hosts:
+  h_v6:
+    ip: 2001:db8:64::a
+    mac: 08:00:00:00:01:01
+    port: s1.client
+  h_v4:
+    ip: 203.0.113.9
+    mac: 08:00:00:00:02:02
+    port: s1.server
+test_cases:
+- name: v6_to_v4_udp_translate
+  visibility: public
+  description: |
+    A UDP-over-IPv6 packet from a served client (2001:db8:64::a, sport 5000) to a well-known-prefix destination 64:ff9b::203.0.113.9. The bound public transport is (203.0.113.10, 14000). EGRESS is an IPv4 packet.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 63
+      UDP.sport:
+        action: change_to
+        value: 14000
+- name: v6_to_v4_tcp_translate
+  visibility: public
+  description: |
+    TCP analogue: client 2001:db8:64::a sport 6000 -> 64:ff9b::203.0.113.9; bound to (203.0.113.10, 15000). EGRESS is an IPv4 TCP packet.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 63
+      TCP.sport:
+        action: change_to
+        value: 15000
+- name: v4_to_v6_udp_return
+  visibility: public
+  description: |
+    The symmetric UDP return: server -> 203.0.113.10 dport 14000. Reversed by binding lookup back to client 2001:db8:64::a port 5000. EGRESS is IPv6.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 64
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: forward
+    output_port: s1.client
+    transformations:
+      IPv6.src:
+        action: change_to
+        value: 64:ff9b::cb00:7109
+      IPv6.dst:
+        action: change_to
+        value: 2001:db8:64::a
+      IPv6.hlim:
+        action: change_to
+        value: 63
+      UDP.dport:
+        action: change_to
+        value: 5000
+- name: v4_to_v6_tcp_return
+  visibility: hidden
+  description: |
+    TCP return: server -> 203.0.113.10 dport 15000 -> client 2001:db8:64::a port 6000. EGRESS is IPv6 TCP.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 64
+    - TCP:
+        sport: 80
+        dport: 15000
+        flags: A
+  expected:
+    behavior: forward
+    output_port: s1.client
+    transformations:
+      IPv6.src:
+        action: change_to
+        value: 64:ff9b::cb00:7109
+      IPv6.dst:
+        action: change_to
+        value: 2001:db8:64::a
+      IPv6.hlim:
+        action: change_to
+        value: 63
+      TCP.dport:
+        action: change_to
+        value: 6000
+- name: second_v6_flow_distinct_v4_port
+  visibility: hidden
+  description: |
+    A second UDP flow from the same client host on a distinct sport (7000) uses a distinct public port (16000) — no collision with the sport-5000 flow. Tests v4-port uniqueness.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 7000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 63
+      UDP.sport:
+        action: change_to
+        value: 16000
+- name: v6_to_v4_distinct_client
+  visibility: hidden
+  description: |
+    A second client host (2001:db8:64::b, TCP sport 5000) bound to public port 17000 to a different WKP destination 64:ff9b::198.51.100.7.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::b
+        dst: 64:ff9b::198.51.100.7
+        hlim: 64
+    - TCP:
+        sport: 5000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 198.51.100.7
+      IP.ttl:
+        action: change_to
+        value: 63
+      TCP.sport:
+        action: change_to
+        value: 17000
+- name: v6_to_v4_hoplimit_decrement
+  visibility: hidden
+  description: |
+    Hop Limit becomes the IPv4 TTL minus one across the swap: hopLimit 5 -> egress TTL 4.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 5
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 4
+      UDP.sport:
+        action: change_to
+        value: 14000
+- name: v4_to_v6_ttl_decrement
+  visibility: hidden
+  description: |
+    IPv4 TTL becomes the IPv6 Hop Limit minus one on the return: TTL 5 -> egress hopLimit 4.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 5
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: forward
+    output_port: s1.client
+    transformations:
+      IPv6.src:
+        action: change_to
+        value: 64:ff9b::cb00:7109
+      IPv6.dst:
+        action: change_to
+        value: 2001:db8:64::a
+      IPv6.hlim:
+        action: change_to
+        value: 4
+      UDP.dport:
+        action: change_to
+        value: 5000
+- name: v4_inbound_no_binding_drop
+  visibility: public
+  description: |
+    An inbound IPv4 UDP packet to 203.0.113.10 on an UNBOUND public port (9999) has no reverse binding and MUST be dropped (RFC 6146 fail-closed).
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 64
+    - UDP:
+        sport: 53
+        dport: 9999
+  expected:
+    behavior: drop
+- name: v6_to_v4_unbound_flow_drop
+  visibility: hidden
+  description: |
+    A v6 client flow with no pre-installed binding (sport 8000) MUST be dropped under static control-plane binding (no data-plane allocation).
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 8000
+        dport: 53
+  expected:
+    behavior: drop
+- name: v4_inbound_wrong_proto_drop
+  visibility: hidden
+  description: |
+    Inbound to 203.0.113.10 dport 14000 but TCP — the binding for port 14000 is UDP, so the (addr, port, proto) reverse key misses and the packet drops.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 203.0.113.10
+        ttl: 64
+    - TCP:
+        sport: 80
+        dport: 14000
+        flags: A
+  expected:
+    behavior: drop
+- name: out_of_scope_v6_dst_drop
+  visibility: hidden
+  description: |
+    A v6 packet whose destination is a NATIVE IPv6 address (NOT in the well-known prefix) is not a translation candidate and MUST be dropped.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 2001:db8:99::9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: v4_wrong_dst_drop
+  visibility: hidden
+  description: |
+    An inbound IPv4 packet whose destination is not the public address (198.51.100.1, not 203.0.113.10) MUST be dropped — no leak of the v6 client side.
+  input:
+    port: s1.server
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 203.0.113.9
+        dst: 198.51.100.1
+        ttl: 64
+    - UDP:
+        sport: 53
+        dport: 14000
+  expected:
+    behavior: drop
+- name: v6_src_outside_client_subnet_drop
+  visibility: hidden
+  description: |
+    A v6 packet to the well-known prefix whose SOURCE is outside the served client subnet (2001:db8:99::a) MUST be dropped.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:99::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: checksum_recompute_probe
+  visibility: hidden
+  description: |
+    A v6->v4 translatable UDP packet (client 2001:db8:64::a, sport 5000): a regression check on the v6->v4 UDP translation path. Under this task's relaxed policy the IPv4 header and UDP checksums are NOT verified, so only the family swap, addresses, ports and TTL are graded.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:01:00
+    - IPv6:
+        src: 2001:db8:64::a
+        dst: 64:ff9b::203.0.113.9
+        hlim: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.server
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.10
+      IP.dst:
+        action: change_to
+        value: 203.0.113.9
+      IP.ttl:
+        action: change_to
+        value: 63
+      UDP.sport:
+        action: change_to
+        value: 14000
+- name: non_ip_frame_drop
+  visibility: hidden
+  description: |
+    A non-IP frame (ARP) is out of scope for a NAT64 translator and MUST be dropped.
+  input:
+    port: s1.client
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 203.0.113.10
+        psrc: 203.0.113.9
+  expected:
+    behavior: drop

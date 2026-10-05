@@ -1,0 +1,521 @@
+task_name: router_acl_anchor
+task_type: full_program
+complexity: low
+source: rfc
+pattern: P-RouterACL
+pattern_version: '1.0'
+seed:
+  acl_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  action_breadth: permit_deny
+  acl_default_action: permit
+  fib_capacity: unbounded
+  max_nexthop_group_size: 1
+  multipath_mode: none
+  hash_algo: crc16
+  martian_filter_enabled: false
+  faithfulness: D5.0_acl_then_static_route
+description: |
+  Implement an IPv4 access router on a single switch s1, per the router
+  requirements of RFC 1812. The switch applies an access-control policy to
+  each packet FIRST, and only packets the policy admits are then forwarded
+  by a longest-prefix-match lookup on the IPv4 destination. Both the policy
+  and the forwarding table are control-plane data (you choose the
+  representation).
+
+  The access policy precedes forwarding: a packet the policy denies is
+  dropped outright — it MUST NOT be looked up in the forwarding table, MUST
+  NOT be sent out any port, and MUST NOT have its headers modified.
+
+  ## Access-control policy
+
+  Install these policy rules. Each rule has a priority and a match over some
+  subset of the IPv4 5-tuple (source address, destination address, protocol,
+  L4 source port, L4 destination port); a field not listed in a rule matches
+  any value. When a packet matches more than one rule, the rule with the
+  HIGHEST priority decides it (priority order, NOT rule-list order). A packet
+  that matches no rule takes the default verdict, which is **permit**.
+
+    | priority | verdict | match                                        |
+    |----------|---------|----------------------------------------------|
+    | 100      | permit  | src = 10.0.1.5                               |
+    | 60       | deny    | dst = 10.0.2.2, protocol = TCP, dst port 23  |
+    | 40       | deny    | src in 10.0.1.0/24                           |
+    | (miss)   | permit  | (default verdict)                            |
+
+  Note the priority interaction: a packet from 10.0.1.5 matches both the
+  priority-100 permit and the priority-40 broad deny; the priority-100
+  permit wins, so 10.0.1.5 is admitted. Any other source in 10.0.1.0/24 is
+  denied by the priority-40 rule.
+
+  ## Forwarding table
+
+  An admitted packet is forwarded by longest-prefix match on its IPv4
+  destination. Each entry names the egress port, the next-hop's MAC address
+  (the new Ethernet destination), and the egress port's own MAC address (the
+  new Ethernet source):
+
+    | destination prefix | egress port | next-hop MAC      | egress-port MAC   |
+    |---------------------|-------------|-------------------|-------------------|
+    | 10.0.1.0/24         | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 10.0.2.0/24         | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.3.0/24         | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+    | 10.0.2.7/32         | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  When a destination is covered by more than one entry, the LONGEST matching
+  prefix wins — e.g. 10.0.2.7 matches both 10.0.2.0/24 and 10.0.2.7/32, and
+  the /32 entry decides it (egress s1.p3).
+
+  ## What the switch MUST do
+
+   1. **Non-IPv4 drop.** Any frame that is not IPv4 (ARP, IPv6, raw
+      Ethernet, etc.) MUST NOT be forwarded — it is dropped.
+
+   2. **TTL handling.** Read the IPv4 time-to-live:
+      a. If TTL == 0, the packet MUST be dropped.
+      b. Otherwise it is eligible, and (when admitted and forwarded) its TTL
+         MUST be decremented by EXACTLY one on egress. A packet arriving
+         with TTL == 1 is forwarded with egress TTL == 0 — decrement once,
+         do not drop it, and do not decrement it twice.
+
+   3. **Apply the access policy.** Determine the packet's verdict from the
+      policy table (highest-priority matching rule, or the default permit on
+      a miss).
+      a. **Deny verdict → drop.** The packet is dropped before any
+         forwarding-table lookup. This holds even when the destination is
+         present in the forwarding table — the policy decision comes first.
+      b. **Permit verdict → forward** by the forwarding rules below.
+
+   4. **Forward an admitted, routable packet.** For an admitted IPv4 packet
+      whose destination matches a forwarding entry by longest prefix, the
+      switch MUST:
+      a. send it out the matched egress port;
+      b. rewrite the Ethernet SOURCE to the egress port's own MAC (the
+         "egress-port MAC" column) — NOT a copy of the incoming Ethernet
+         destination;
+      c. rewrite the Ethernet DESTINATION to the next-hop MAC (the
+         "next-hop MAC" column);
+      d. leave the IPv4 source and destination addresses unchanged;
+      e. keep the IPv4 header checksum valid on egress (the TTL changed, so
+         the checksum must be updated accordingly).
+
+   5. **Admitted but no route → drop.** An admitted IPv4 packet whose
+      destination matches no forwarding entry MUST be dropped.
+
+   6. **Limited broadcast drop.** An IPv4 packet whose destination is
+      255.255.255.255 MUST be dropped (RFC 1812 §5.3.5.1).
+
+   7. **Directed broadcast drop.** An admitted IPv4 packet whose destination
+      is the all-ones host address of a configured subnet (for example
+      10.0.1.255, 10.0.2.255, or 10.0.3.255) MUST be dropped (RFC 1812
+      §5.3.5.2 default behaviour) rather than forwarded.
+
+  ## Topology
+
+  One switch s1 with three hosts (reuses the canonical p4lang basic-
+  forwarding topology):
+    - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+
+  Test traffic may carry source addresses outside these host subnets
+  (representing traffic transiting the router); such packets are still
+  subject to the policy and the forwarding table exactly as described.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+test_cases:
+- name: permit_routes_golden_path
+  visibility: public
+  description: Transit packet (10.0.5.5 → h2:80) matches no policy rule → default permit → routed out s1.p2 with L2 rewrite and TTL decrement.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: deny_not_routed
+  visibility: public
+  description: 10.0.5.5 → h2 TCP/23 is denied by the priority-60 telnet rule. h2 IS in the forwarding table, so a routing-only switch would forward it; the policy precedes forwarding, so it MUST drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 23
+  expected:
+    behavior: drop
+- name: default_permit_routes_on_miss
+  visibility: public
+  description: Transit packet (10.0.7.7 → h3:443) matches no rule → default permit → routed out s1.p3.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.7.7
+        dst: 10.0.3.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40002
+        dport: 443
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: admin_permit_overrides_broad_deny
+  visibility: hidden
+  description: Admin host 10.0.1.5 → h2:80 matches both the priority-100 permit and the priority-40 broad LAN deny; the higher-priority permit wins → routed out s1.p2. A list-order implementation that fires the broad deny fails.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40003
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: longest_prefix_on_routed_path
+  visibility: hidden
+  description: Admitted packet to 10.0.2.7 matches both 10.0.2.0/24 and the 10.0.2.7/32 override; the /32 wins → routed out s1.p3, not s1.p2.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.2.7
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40004
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: permit_route_distinct_prefix
+  visibility: hidden
+  description: Admitted packet to 10.0.1.10 (in 10.0.1.0/24) → routed out s1.p1.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:92
+        dst: 08:00:00:00:02:00
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.1.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40005
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:01:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ttl_one_forwards_to_zero
+  visibility: hidden
+  description: Admitted packet with TTL=1 to h3 → forwarded with egress TTL=0 (decrement once, do not drop).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.3.3
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40006
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: ttl_zero_drop
+  visibility: hidden
+  description: Packet with TTL=0 to h2 (otherwise admitted + routable) MUST drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.2.2
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 40007
+        dport: 80
+  expected:
+    behavior: drop
+- name: no_route_after_permit
+  visibility: hidden
+  description: 'Admitted packet (default permit) to 192.168.99.9 matches no forwarding entry → drop. Distinct from a policy deny: admitted but unroutable.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 192.168.99.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40008
+        dport: 80
+  expected:
+    behavior: drop
+- name: limited_broadcast_drop
+  visibility: hidden
+  description: IPv4 packet to 255.255.255.255 MUST drop (RFC 1812 §5.3.5.1).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 255.255.255.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40009
+        dport: 67
+  expected:
+    behavior: drop
+- name: broad_lan_deny_low_priority
+  visibility: hidden
+  description: Non-admin LAN host 10.0.1.9 → h2:80 matches only the priority-40 broad deny → drop. Confirms the deny fires for everyone except the admin.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.1.9
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40010
+        dport: 80
+  expected:
+    behavior: drop
+- name: directed_broadcast_drop
+  visibility: hidden
+  description: Admitted packet to the all-ones host 10.0.2.255 of the 10.0.2.0/24 subnet MUST drop (RFC 1812 §5.3.5.2) rather than forward.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.2.255
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 40011
+        dport: 9
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_drop
+  visibility: hidden
+  description: An ARP frame is not IPv4 → dropped (no policy or forwarding applies).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+  expected:
+    behavior: drop
+- name: permit_preserves_addresses
+  visibility: hidden
+  description: Admitted/routed packet (10.0.6.6 → h3) keeps IPv4 src and dst unchanged and only decrements TTL + rewrites Ethernet — no DSCP/address mangling.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:91
+        dst: 08:00:00:00:01:00
+    - IP:
+        src: 10.0.6.6
+        dst: 10.0.3.3
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40012
+        dport: 8080
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1

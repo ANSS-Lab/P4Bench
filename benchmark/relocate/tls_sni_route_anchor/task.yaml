@@ -1,0 +1,561 @@
+task_name: tls_sni_route_anchor
+task_type: full_program
+complexity: hard
+source: rfc
+pattern: P-TLSSNIRoute
+pattern_version: '1.0'
+seed:
+  sni_policy_entries:
+  - name_pattern: api.example.com
+    action: route
+    egress_port: 2
+    backend_ip: none
+    backend_mac: 08:00:00:00:02:02
+    src_mac: 08:00:00:00:00:02
+  - name_pattern: cdn.example.net
+    action: route
+    egress_port: 3
+    backend_ip: none
+    backend_mac: 08:00:00:00:03:03
+    src_mac: 08:00:00:00:00:03
+  max_clienthello_prefix_bytes: 128
+  max_extension_count: 4
+  name_match_breadth: exact_host
+  action_breadth: route_only
+  malformed_handling: lax_default
+  default_action: forward_default
+  default_backend_port: 4
+  case_normalization: false
+  tls_tcp_port: 443
+  local_vip: 10.0.0.99
+description: "A switch s1 fronts an HTTPS service reachable at the virtual IP\n10.0.0.99 on TCP port 443,\
+  \ and steers each client's TLS connection to a\nbackend server chosen by the server name the client\
+  \ requests. The server\nname travels in clear text in the very first message of the TLS handshake\n\u2014\
+  \ the ClientHello's Server Name Indication (SNI) extension (RFC 6066 \xA73)\n\u2014 so the switch can\
+  \ read it before any encryption begins and route the\nconnection accordingly. Clients reach s1 on port\
+  \ s1.p1; backend servers\nsit behind s1.p2, s1.p3, and s1.p4.\n\nThe switch is a stateless function:\
+  \ every decision follows from the\npacket's headers and a control-plane classification table you populate\n\
+  with the entries below. No per-connection state is kept \u2014 the switch\ninspects only the connection-opening\
+  \ ClientHello; the chosen backend\nshares the VIP and completes the handshake with the client directly.\n\
+  \n## What a TLS ClientHello looks like on the wire\n\nA connection attempt arrives as\n\n  Ethernet\
+  \ / IPv4 / TCP(destination port 443) / TLS-record\n\nThe bytes after the TCP header are a TLS record.\
+  \ For this task the\nClientHello arrives in a single record laid out at fixed offsets, as\nfollows (all\
+  \ multi-byte fields big-endian):\n\n  - TLS record header (5 bytes): a 1-byte content type, a 2-byte\
+  \ legacy\n    version, and a 2-byte length. A handshake record has content type 22.\n  - Handshake header\
+  \ (4 bytes): a 1-byte message type followed by a\n    3-byte length. A ClientHello has message type\
+  \ 1.\n  - ClientHello body, in order:\n      * legacy_version (2 bytes) and random (32 bytes);\n   \
+  \   * legacy_session_id \u2014 a 1-byte length followed by that many bytes\n        (here always 32);\n\
+  \      * cipher_suites \u2014 a 2-byte length followed by that many bytes\n        (here always 16);\n\
+  \      * legacy_compression_methods \u2014 a 1-byte length followed by that\n        many bytes (here\
+  \ always 1);\n      * extensions \u2014 a 2-byte total length, then a sequence of\n        extensions.\n\
+  \  - Each extension is a 2-byte extension type, a 2-byte extension length,\n    and that many bytes\
+  \ of extension data. The server_name extension has\n    type 0x0000. Its data is a ServerNameList: a\
+  \ 2-byte list length, then\n    a 1-byte name type (0 = host_name) and, for a host_name entry, a\n \
+  \   2-byte HostName length followed by the HostName bytes. The HostName\n    occupies a fixed 16-byte\
+  \ field; a name shorter than 16 bytes is\n    padded on the right with zero bytes, and the classification\
+  \ key is\n    this 16-byte zero-padded value.\n\nThe server_name extension is reachable within the first\
+  \ 128 bytes of the\nClientHello body and within the first 4 extensions; you do not need to\nparse beyond\
+  \ those bounds.\n\n## Per-packet behaviour\n\nProcess every ingress packet by the first matching rule\
+  \ below.\n\n 1. **Not a TLS ClientHello \u2192 drop.** If the packet is not TCP to port\n    443, or\
+  \ its TLS record content type is not 22 (handshake), or its\n    handshake message type is not 1 (ClientHello),\
+  \ drop it. This switch\n    handles only connection-opening ClientHellos; other traffic\n    (including\
+  \ later, encrypted records on the same port) is out of\n    scope.\n\n 2. **Classify and act.** For\
+  \ a ClientHello, read the first host_name\n    ServerName from its server_name extension, form the 16-byte\n\
+  \    zero-padded HostName key, and look it up in the classification table.\n    On a match, forward\
+  \ the segment to the entry's backend port: rewrite\n    the Ethernet source and destination MACs to\
+  \ the entry's values and\n    decrement the IPv4 TTL by one (an L3 hop toward the backend). DO NOT\n\
+  \    change the IPv4 destination address \u2014 it stays the VIP 10.0.0.99 so\n    the backend can complete\
+  \ the handshake with the client directly.\n    Recompute the IPv4 header checksum.\n\n    In every forwarding\
+  \ case the TLS payload \u2014 the record header, the\n    handshake header, the entire ClientHello including\
+  \ the server_name\n    extension and the HostName \u2014 MUST be delivered to the backend\n    byte-for-byte\
+  \ identical to what arrived. Only the Ethernet/IPv4\n    envelope may change.\n\n 3. **No usable SNI\
+  \ / no match \u2192 default backend.** A ClientHello that\n    carries no host_name server_name extension,\
+  \ or whose 16-byte\n    HostName key is not in the table, is forwarded to the default backend\n    port\
+  \ s1.p4. Decrement the TTL, recompute the IPv4 header checksum,\n    and leave the IPv4 destination\
+  \ and the TLS payload unchanged (MACs\n    unchanged).\n\n## Classification table (install as control-plane\
+  \ entries)\n\n| SNI HostName (16-byte zero-padded key) | Backend port | Ethernet src      | Ethernet\
+  \ dst      |\n|----------------------------------------|--------------|-------------------|-------------------|\n\
+  | api.example.com                        | s1.p2        | 08:00:00:00:00:02 | 08:00:00:00:02:02 |\n\
+  | cdn.example.net                        | s1.p3        | 08:00:00:00:00:03 | 08:00:00:00:03:03 |\n\n\
+  Any ClientHello whose HostName key is not one of these rows (or that has\nno host_name SNI) goes to\
+  \ the default backend s1.p4 with MACs unchanged.\n\nGrounding: RFC 6066 (TLS Extensions, \xA73 Server\
+  \ Name Indication) and\nRFC 8446 (TLS 1.3, \xA74.1.2 Client Hello / \xA75.1 Record Layer).\n"
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.1.0.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.1.0.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.1.0.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: sni_route_api_example_com
+  visibility: public
+  description: 'ClientHello with SNI api.example.com steers to backend A (s1.p2): MACs rewritten, TTL--,
+    VIP destination preserved, IPv4 checksum recomputed, TLS payload (incl. the server_name extension)
+    unchanged.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: &id001
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      TLSExtSNI.host_name:
+        action: unchanged
+- name: sni_classify_two_names
+  visibility: public
+  description: "A SECOND SNI cdn.example.net steers to a DIFFERENT backend (s1.p3) \u2014 the classifier\
+    \ keys on the parsed SNI, not a constant."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "cdn.example.net\0"
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations: &id003
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+      TLSExtSNI.host_name:
+        action: unchanged
+- name: clienthello_payload_preserved
+  visibility: public
+  description: 'Route-classified ClientHello: the full TLS payload incl. the HostName survives the parse-then-deparse
+    round-trip byte-for-byte.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: *id001
+- name: sni_at_key_width_bound
+  visibility: hidden
+  description: "SNI whose HostName fills the entire 16-byte key field exactly (svc.bound-edge.i, 16 bytes)\
+    \ is well-formed and parsed to its full 16-byte key; not in the table, so it goes to the default backend\
+    \ s1.p4 \u2014 the parser must read the whole bounded key, not a prefix."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 16
+        host_name: svc.bound-edge.i
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations: &id002
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: no_sni_extension_default
+  visibility: hidden
+  description: A well-formed ClientHello that omits the server_name extension has no usable SNI and goes
+    to the default backend s1.p4 (lax handling), VIP and payload unchanged, MACs unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 93
+    - TLSHandshake:
+        msg_type: 1
+        length: 89
+    - TLSClientHello:
+        extensions_len: 0
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations: *id002
+- name: unknown_sni_default
+  visibility: hidden
+  description: A ClientHello for a name not in the table (other.example) is well-formed but unmatched
+    and goes to the default backend s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 13
+        host_name: "other.example\0\0\0"
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations: *id002
+- name: non_handshake_record_dropped
+  visibility: hidden
+  description: "A TCP/443 record whose content type is application_data (23), NOT handshake (22), is NOT\
+    \ steered as a ClientHello \u2014 drop (R0). Catches a classifier that gates only on tcp.dst==443."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 23
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: drop
+- name: non_clienthello_handshake_dropped
+  visibility: hidden
+  description: A TCP/443 handshake record whose message type is NOT client_hello (msg_type=2, server_hello)
+    is dropped (R0).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 2
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: drop
+- name: non_tls_port_dropped
+  visibility: public
+  description: "A segment to a non-443 TCP port (8080) is out of scope and dropped \u2014 the switch handles\
+    \ only TCP/443 ClientHellos."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8080
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: drop
+- name: route_vip_preserved_high_ttl
+  visibility: hidden
+  description: 'Route-path discipline: with TTL 100, the IPv4 checksum is valid after TTL-- and the destination
+    stays the VIP (a classifier that DNATs in route mode breaks the VIP handshake-completion path).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 100
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "api.example.com\0"
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations: *id001
+- name: second_name_payload_preserved
+  visibility: hidden
+  description: Route to backend B preserves the cdn.example.net HostName byte-for-byte across the deparse.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.0.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: PA
+    - TLSRecord:
+        content_type: 22
+        length: 118
+    - TLSHandshake:
+        msg_type: 1
+        length: 114
+    - TLSClientHello:
+        extensions_len: 25
+    - TLSExtSNI:
+        ext_type: 0
+        ext_len: 21
+        sni_list_len: 19
+        name_type: 0
+        name_len: 15
+        host_name: "cdn.example.net\0"
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations: *id003

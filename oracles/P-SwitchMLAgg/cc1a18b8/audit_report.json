@@ -1,0 +1,151 @@
+{
+  "oracle_hash": "cb1dbc2a9e5676ea8734846182b3576dbf3f21e06ca87f217e19d580d83c9b8f",
+  "instance": "switchml_agg_disc-default",
+  "ran_at": "2026-06-17T04:04:05.966815Z",
+  "canonical_examples": {
+    "passed": 16,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_passthrough_ipv4_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_no_forward_entry_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_first_contribution_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_two_worker_sum_completes",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_two_worker_sum_value_width_16",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_partial_no_premature_emit",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_barrier_degree_boundary_4th_emits",
+        "status": "pass"
+      },
+      {
+        "example_id": "single_worker_immediate_emit",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_duplicate_worker_dedup_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "count_only_duplicate_not_deduped",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_collision_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_collision_server_fallback_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_max_reduction_completes",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_unicast_each_completes",
+        "status": "pass"
+      },
+      {
+        "example_id": "multi_slot_isolation_slot1_completes",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "exactly_once_per_worker": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_cross_job_contamination": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "barrier_monotonicity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "aggregate_completeness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "bounded_aggregation_latency": {
+        "kind": "timing",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "slot_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "finite_recirculation": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "exactly_once_per_worker",
+      "no_cross_job_contamination",
+      "barrier_monotonicity",
+      "aggregate_completeness",
+      "bounded_aggregation_latency",
+      "slot_no_orphan",
+      "finite_recirculation"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "switchml_nsdi21",
+      "atp_nsdi21"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

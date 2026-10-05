@@ -1,0 +1,157 @@
+{
+  "oracle_hash": "acf2f99782d6e0614124b681f4c94cae0d000f3570d0292667f256e2348d2d69",
+  "instance": "int_metadata_threshold_report-default",
+  "ran_at": "2026-06-17T01:05:35.465504Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_tcp_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_push_three_field_anchor",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_push_lpm_default_egress",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_push_no_route_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_no_shim_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_report_fires",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_strip_only",
+        "status": "pass"
+      },
+      {
+        "example_id": "sink_truncated_stack_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "source_port_with_existing_shim",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_predicate_always_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_bit_width_timestamp_32_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_max_hop_count_4_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_metadata_fields_three_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_report_threshold_low_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_sample_rate_two_source_push",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_role_sink_no_source_push_drop",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_orphan_hop_count": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "sink_strips_shim": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_preservation": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "timestamp_bit_width_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "hop_count_monotone": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stack_length_matches_metadata_emits": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "no_orphan_hop_count",
+      "sink_strips_shim",
+      "payload_preservation",
+      "timestamp_bit_width_fidelity",
+      "hop_count_monotone",
+      "stack_length_matches_metadata_emits",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "pint_sigcomm20",
+      "sonata_sigcomm18",
+      "marple_sigcomm17",
+      "RFC9197"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

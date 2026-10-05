@@ -1,0 +1,762 @@
+# P-NAT64 — Stateful IPv6↔IPv4 Network Address/Protocol Translation
+#
+# TPL v1.0 task pattern. The header-family-swap sibling of
+# P-NAT44: instead of rewriting addresses/ports WITHIN one IP family, P-NAT64
+# REPLACES the IP header itself — an IPv6 packet destined for the well-known
+# prefix 64:ff9b::/96 is reborn as an IPv4 packet (and the IPv4 return is
+# reborn as IPv6). Per-flow binding state (v6 src+port ↔ allocated v4 src
+# addr+port) is created on the v6→v4 path and consulted to reverse the v4→v6
+# path; an inbound packet with no binding is dropped. The defining mechanism
+# vs P-NAT44 is the IP-version swap (and the consequent IPv4-checksum
+# introduction); this is what lifts it out of the (D1,P2) "same-family port
+# rewrite" framing P-NAT44 occupies. Instances ship an IPv6 custom_headers.py
+# (see P-IPv6Router / P-SRv6Endpoint).
+
+pattern_id: P-NAT64
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking]               # per-flow v6↔v4 binding state
+  prescriptive: [P2:address-translation]                  # stateful rewrite at scale (NAT44/NAT64 row)
+target_capability: scale_up                          # P2 → scale_up (large-scale stateful translator behind a finite v4 pool)
+summary: >
+  Stateful NAT64 translating between IPv6-only clients and IPv4-only servers:
+  a v6 packet to 64:ff9b::/96 has its embedded IPv4 destination extracted
+  (RFC 6052), a per-flow binding (v6 src+port ↔ allocated v4 src addr+port
+  from a pool) is created, the IPv6 header is REPLACED by a freshly built
+  IPv4 header with rewritten addresses/ports and recomputed IPv4+L4 checksums,
+  and the packet is forwarded; the IPv4 return is reversed by binding lookup
+  back into an IPv6 packet, and an inbound packet with no binding is dropped.
+  The canonical instance does static control-plane bindings over an unbounded
+  v4 pool; mutation lifts to data-plane dynamic allocation, a finite v4
+  address/port pool with packet-driven eviction, the ICMP query class, and a
+  stricter checksum-faithfulness mode.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC6146
+      sections: ["1", "2", "3.1", "3.5"]
+      role: normative_behaviour
+      relevance: |
+        "Stateful NAT64: Network Address and Protocol Translation from IPv6
+        Clients to IPv4 Servers" (Bagnulo et al.) — the canonical normative
+        source this pattern realises:
+          - §2  Terminology / binding-state model: the "Binding Information
+                Base" (BIB) entry maps an IPv6 transport address to an IPv4
+                transport address; sessions are created on the IPv6→IPv4
+                direction and consulted on the IPv4→IPv6 direction. Basis for
+                the bind_outbound / bind_inbound entities and the v6→v4-creates,
+                v4→v6-consults rule split (R1/R2 vs R4/R5).
+          - §3.1 Determining the incoming tuple + §3.5 translating the packet:
+                the translator strips the IPv6 header and emits an IPv4 header
+                (and vice versa), rewriting addresses/ports and the protocol
+                field, then recomputes the IPv4 header checksum and the L4
+                checksum. Basis for the header-family-swap `set`/`rewrite`
+                action sequence in R1/R4 and the ipv4_checksum_validity +
+                version_swap_consistency invariants.
+          - §3.5  "If no BIB/session entry matches an inbound IPv4 packet, the
+                packet is discarded." Basis for R5 (inbound-miss drop) and the
+                no-orphan-binding fail-closed stance.
+          - The v4 transport-address pool is finite; the translator allocates
+                from it on session creation. Basis for the v4_pool entity,
+                ${v4_pool_range}, and the packet-driven eviction operators.
+
+    - id: RFC6052
+      sections: ["2.1", "2.2", "2.3", "2.4"]
+      role: normative_behaviour
+      relevance: |
+        "IPv6 Addressing of IPv4/IPv6 Translators" — how the IPv4 address is
+        embedded in / extracted from the IPv6 address:
+          - §2.1 The Well-Known Prefix is 64:ff9b::/96 — basis for the
+                ${wkp} default and the R0/R1 destination-prefix gate.
+          - §2.2 / §2.3  For a /96 prefix the 32-bit IPv4 address occupies the
+                last 32 bits of the IPv6 address (no checksum-neutral byte
+                skipping at /96). Basis for `extract_v4(hdr.ipv6.dst)` in R1 and
+                `embed_v4(addr, ${wkp})` when reconstructing the v6 dst in R4.
+          - §2.4  The reverse mapping (IPv4 → IPv6 via the prefix) used to
+                reconstruct the synthesised IPv6 destination on the return path.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The p4lang "basic" single-switch topology (one IPv6-facing client port
+        + one IPv4-facing server port) is the canonical two-sided shape reused
+        here: ingress(client_port) drives the v6→v4 path, ingress(server_port)
+        drives the v4→v6 path. The IPv6 parse + 128-bit field handling carries
+        over from the IPv6 forwarder exercises.
+
+  papers: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  flow:
+    key:
+      - hdr.ipv6.src
+      - hdr.ipv6.dst
+      - hdr.ipv6.nextHdr        # upper-layer protocol carried by the v6 packet
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    notes: |
+      The IPv6-side transport flow that a binding is keyed from on the
+      v6→v4 direction. Not materialised as data-plane state on its own; it
+      is the source tuple from which bind_outbound is derived (RFC 6146 §2).
+
+  bind_outbound:                  # the v6→v4 (BIB/session) half — created on egress to v4
+    keyed_by_tuple:
+      - hdr.ipv6.src              # IPv6 client source address
+      - meta.l4_srcPort           # IPv6 client source L4 port
+      - hdr.ipv6.nextHdr          # upper-layer protocol (6 TCP, 17 UDP, 58 ICMPv6)
+    attrs:
+      v4_src_addr: address        # allocated IPv4 source address from the pool
+      v4_src_port: port           # allocated IPv4 source L4 port (identifier for ICMP)
+    capacity: ${binding_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      RFC 6146 §2 BIB entry, IPv6→IPv4 lookup direction. Created by R2 (dynamic)
+      or pre-installed by the control plane (static). The translated v4 dst is
+      NOT stored here — it is derived from the v6 dst via RFC 6052 extraction
+      at translation time, so the binding only owns the source-side allocation.
+
+  bind_inbound:                   # the v4→v6 reverse half — consulted on ingress from v4
+    keyed_by_tuple:
+      - hdr.ipv4.dst              # the allocated public IPv4 address
+      - meta.l4_dstPort           # the allocated IPv4 L4 port / ICMP identifier
+      - hdr.ipv4.proto            # IP protocol (6 TCP, 17 UDP, 1 ICMP)
+    attrs:
+      v6_src_addr: address        # original IPv6 client address to restore
+      v6_src_port: port           # original IPv6 client L4 port to restore
+    capacity: ${binding_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Mirror of bind_outbound (RFC 6146 §2). The pair_symmetry invariant ties
+      the two halves: every bind_outbound has a matching bind_inbound, and
+      evictions are paired. An inbound v4 packet whose (dst, dport, proto) is
+      not present here is dropped (R5).
+
+  v4_pool:
+    attrs:
+      base_v4_addr: address       # the IPv4 source address(es) the pool draws on
+      free_ports:   list[port]    # free IPv4 L4 ports / ICMP identifiers
+      range:        "[${v4_pool_range}.low, ${v4_pool_range}.high]"
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      Finite IPv4 transport-address pool (RFC 6146). Used by R2 to allocate
+      (v4_src_addr, v4_src_port) on the first packet of a new v6 flow. Under
+      mode == static the control plane installs both binding halves itself and
+      this entity is not materialised.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  wkp:
+    type: address
+    constraint: "ipv6_cidr; default is the RFC 6052 Well-Known Prefix"
+    default: "64:ff9b::/96"
+    notes: |
+      RFC 6052 §2.1. Only v6 packets whose destination is in this /96 are
+      candidates for translation; everything else is out of scope (R0 drop).
+
+  v4_base:
+    type: address
+    constraint: ipv4
+    notes: "The public IPv4 source address(es) NAT64 translations are sourced from."
+
+  v6_client_subnet:
+    type: address
+    constraint: "ipv6_cidr"
+    notes: "IPv6 client prefix whose hosts the translator serves on the v6 side."
+
+  binding_capacity:
+    type: int | unbounded
+    range: "[64, 1048576]"
+    default: unbounded
+    notes: "Max live binding pairs. shrink_binding_capacity_4x exercises this axis."
+
+  v4_pool_range:
+    type: tuple[int, int]
+    constraint: "low ≥ 1024 ∧ high ≤ 65535 ∧ low < high"
+    default: [10000, 65535]
+    notes: "Allocatable IPv4 L4 port / ICMP-identifier range under dynamic mode."
+
+  mode:
+    type: enum
+    values: [static, dynamic]
+    default: static
+    notes: |
+      static  → control plane installs both binding halves of every mapping
+                (canonical instance).
+      dynamic → data plane allocates (v4_src_addr, v4_src_port) from v4_pool on
+                the first v6→v4 packet of an unseen flow.
+
+  eviction_policy:
+    type: enum
+    values: [none, LRU, teardown]
+    default: none
+    notes: |
+      Packet-driven only (no wall-clock timer — see bridging_notes). `teardown`
+      evicts a binding pair on an observed connection-close signal (TCP FIN/RST
+      on the flow); `LRU` evicts the least-recently-matched pair under capacity
+      pressure. `none` never evicts (canonical / static instances).
+
+  l4_classes:
+    type: list[enum]
+    values: [tcp, udp, icmp]
+    default: [tcp, udp]
+    notes: |
+      Which upper-layer classes the translator handles. icmp adds the
+      ICMPv6↔ICMPv4 query class (identifier rewrite) — RFC 6146 handles the
+      ICMP Query session class; enabling it is a feature-breadth harden.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_checksum_exact, D5.1_dynamic, D5.2_dynamic_with_eviction]
+    default: D5.0_checksum_exact
+    notes: |
+      D5.0 — static bindings, exact IPv4+L4 checksum recompute required.
+      D5.1 — data-plane dynamic allocation over the v4 pool.
+      D5.2 — dynamic allocation plus packet-driven eviction over a finite pool.
+
+  checksum_strict:
+    type: bool
+    default: true
+    notes: |
+      When true, the synthesised IPv4 header checksum AND the rewritten L4
+      checksum MUST be valid (RFC 6146 §3.5). The header-family swap introduces
+      an IPv4 header that has NO counterpart in the parsed IPv6 packet (IPv6
+      has no header checksum), so the translator must COMPUTE a fresh IPv4
+      checksum — a frequent omission. ipv4_checksum_validity is gated on this.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters.
+
+rules:
+
+  - id: R0_out_of_scope_drop
+    when: |
+      ¬header_present(ipv6) ∧ ¬header_present(ipv4)
+    then:
+      - drop
+    notes: |
+      Neither IP family present (ARP / raw frame / unsupported ether-type) →
+      out of scope for a NAT64 translator. Drop.
+
+  - id: R1_v6_to_v4_hit
+    when: |
+      ingress(client_port) ∧ header_present(ipv6)
+        ∧ match(hdr.ipv6.src, ${v6_client_subnet})
+        ∧ match(hdr.ipv6.dst, ${wkp})
+        ∧ exists(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+    given:
+      flow:          deduce_from_packet
+      bind_outbound: by_key((hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+    then:
+      # Header-family SWAP: the IPv6 header is replaced by a freshly built IPv4 header.
+      - set(hdr.ipv4.version, 4)
+      - "set(hdr.ipv4.proto, v4_proto_of(hdr.ipv6.nextHdr))"
+      - "rewrite(hdr.ipv4.dst, extract_v4(hdr.ipv6.dst, ${wkp}))"
+      - rewrite(hdr.ipv4.src, bind_outbound[*].v4_src_addr)
+      - rewrite(meta.l4_srcPort, bind_outbound[*].v4_src_port)
+      - "set(hdr.ipv4.ttl, hdr.ipv6.hopLimit)"
+      - dec(hdr.ipv4.ttl, 1)
+      - "set(hdr.ipv4.checksum, ipv4_hdr_checksum())"     # IPv4 header checksum has no v6 source
+      - "rewrite(meta.l4_checksum, recompute_l4_checksum())"
+      - forward(server_port)
+    notes: |
+      v6→v4 translation hit (RFC 6146 §3.5, RFC 6052 §2.2). The IPv4 dst is the
+      32-bit address embedded in the v6 dst; the IPv4 src/sport come from the
+      binding. Hop Limit becomes the IPv4 TTL, decremented by one. A NEW IPv4
+      header checksum is synthesised (IPv6 had none) and the L4 checksum is
+      recomputed over the rewritten pseudo-header. `meta.l4_srcPort` /
+      `meta.l4_checksum` resolve to the parsed L4 header's fields.
+
+  - id: R2_v6_to_v4_miss_dynamic
+    when: |
+      ingress(client_port) ∧ header_present(ipv6)
+        ∧ match(hdr.ipv6.src, ${v6_client_subnet})
+        ∧ match(hdr.ipv6.dst, ${wkp})
+        ∧ ¬exists(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+        ∧ ${mode} == dynamic
+        ∧ ¬empty(v4_pool.free_ports)
+    given:
+      flow:    deduce_from_packet
+      v4_pool: singleton
+    then:
+      - "bind(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr), {v4_src_addr: ${v4_base}, v4_src_port: alloc(v4_pool)})"
+      - "bind(bind_inbound, (${v4_base}, bind_outbound[*].v4_src_port, v4_proto_of(hdr.ipv6.nextHdr)), {v6_src_addr: hdr.ipv6.src, v6_src_port: meta.l4_srcPort})"
+      - set(hdr.ipv4.version, 4)
+      - "set(hdr.ipv4.proto, v4_proto_of(hdr.ipv6.nextHdr))"
+      - "rewrite(hdr.ipv4.dst, extract_v4(hdr.ipv6.dst, ${wkp}))"
+      - rewrite(hdr.ipv4.src, ${v4_base})
+      - rewrite(meta.l4_srcPort, bind_outbound[*].v4_src_port)
+      - "set(hdr.ipv4.ttl, hdr.ipv6.hopLimit)"
+      - dec(hdr.ipv4.ttl, 1)
+      - "set(hdr.ipv4.checksum, ipv4_hdr_checksum())"
+      - "rewrite(meta.l4_checksum, recompute_l4_checksum())"
+      - forward(server_port)
+    enforced_when: "${mode} == dynamic"
+    notes: |
+      First v6→v4 packet of a new flow under dynamic mode. Two symmetric binds
+      install the pair atomically (pair_symmetry is a structural consequence).
+      Then the same header-family-swap translation as R1 runs.
+
+  - id: R3_v6_to_v4_miss_static_or_pool_empty
+    when: |
+      ingress(client_port) ∧ header_present(ipv6)
+        ∧ match(hdr.ipv6.src, ${v6_client_subnet})
+        ∧ match(hdr.ipv6.dst, ${wkp})
+        ∧ ¬exists(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+        ∧ (${mode} == static ∨ empty(v4_pool.free_ports))
+    then:
+      - drop
+    notes: |
+      Static path: no pre-installed binding → drop. Also catches v4-pool
+      exhaustion under dynamic mode (G2 capacity test). RFC 6146: when no
+      binding can be established the packet is discarded — fixed at drop for
+      determinism.
+
+  - id: R4_v4_to_v6_hit
+    when: |
+      ingress(server_port) ∧ header_present(ipv4)
+        ∧ match(hdr.ipv4.dst, ${v4_base})
+        ∧ exists(bind_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+    given:
+      bind_inbound: by_key((hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto))
+    then:
+      # Header-family SWAP in reverse: rebuild the IPv6 header from the IPv4 packet.
+      - set(hdr.ipv6.version, 6)
+      - "set(hdr.ipv6.nextHdr, v6_nexthdr_of(hdr.ipv4.proto))"
+      - rewrite(hdr.ipv6.dst, bind_inbound[*].v6_src_addr)
+      - "rewrite(hdr.ipv6.src, embed_v4(hdr.ipv4.src, ${wkp}))"
+      - rewrite(meta.l4_dstPort, bind_inbound[*].v6_src_port)
+      - "set(hdr.ipv6.hopLimit, hdr.ipv4.ttl)"
+      - dec(hdr.ipv6.hopLimit, 1)
+      - "rewrite(meta.l4_checksum, recompute_l4_checksum())"
+      - forward(client_port)
+    notes: |
+      v4→v6 reverse translation (RFC 6146 §3.5, RFC 6052 §2.4). The original
+      IPv6 client address/port are restored from the binding; the synthesised
+      v6 source embeds the IPv4 server address under ${wkp}. IPv6 has NO header
+      checksum, so no IPv4-style checksum is recomputed on this side — only the
+      L4 checksum is recomputed over the new v6 pseudo-header. TTL→Hop Limit,
+      decremented by one.
+
+  - id: R5_v4_to_v6_miss
+    when: |
+      ingress(server_port) ∧ header_present(ipv4)
+        ∧ (¬match(hdr.ipv4.dst, ${v4_base})
+           ∨ ¬exists(bind_inbound, (hdr.ipv4.dst, meta.l4_dstPort, hdr.ipv4.proto)))
+    then:
+      - drop
+    notes: |
+      RFC 6146 §3.5 — an inbound IPv4 packet with no matching binding is
+      discarded (fail-closed). Two collapsed cases: dst ≠ ${v4_base}
+      (wrong-target) and dst == ${v4_base} but no binding (unsolicited).
+
+  - id: R6_teardown_evict
+    when: |
+      header_present(tcp) ∧ (value(hdr.tcp.flags.fin, ==, 1) ∨ value(hdr.tcp.flags.rst, ==, 1))
+        ∧ exists(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+    enforced_when: "${eviction_policy} == teardown"
+    then:
+      - evict(bind_outbound, (hdr.ipv6.src, meta.l4_srcPort, hdr.ipv6.nextHdr))
+      - "evict(bind_inbound, (bind_outbound[*].v4_src_addr, bind_outbound[*].v4_src_port, v4_proto_of(hdr.ipv6.nextHdr)))"
+    notes: |
+      Packet-driven eviction: a TCP FIN/RST on an established v6→v4 flow tears
+      down BOTH binding halves and returns the v4 port to the pool. This is the
+      eviction trigger when ${eviction_policy} == teardown — there is NO
+      wall-clock idle timer in the v1.0 harness (it injects only packets), so
+      binding release is observed only on a teardown packet or capacity
+      pressure (LRU under R2). The packet is still translated/forwarded by
+      whichever of R1/R4 also matched it in the same pass.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: version_swap_consistency
+    clause: stability
+    target: "(hdr.ipv4.version, hdr.ipv6.version)"
+    while: "rule R1 fires ∨ rule R2 fires ∨ rule R4 fires"
+    notes: |
+      The defining NAT64 property: a translated v6→v4 packet egresses as a
+      well-formed IPv4 packet (version == 4, IPv4 header present, no IPv6
+      header) and a translated v4→v6 packet egresses as IPv6 (version == 6).
+      The IP family on egress differs from the family parsed on ingress — this
+      is the header-family swap, distinct from P-NAT44's same-family rewrite.
+
+  - id: ipv4_checksum_validity
+    clause: stability
+    target: "(hdr.ipv4.checksum, meta.l4_checksum)"
+    while: "(rule R1 fires ∨ rule R2 fires)"
+    enforced_when: "${checksum_strict}"
+    notes: |
+      RFC 6146 §3.5 — the synthesised IPv4 header carries a freshly computed
+      checksum and the L4 checksum is recomputed over the rewritten
+      pseudo-header. Because the parsed IPv6 packet had NO header checksum, a
+      implementation that forgets to compute the IPv4 one (or leaves it zero) is wrong.
+
+  - id: address_embedding_correctness
+    clause: stability
+    target: "(hdr.ipv4.dst, hdr.ipv6.src)"
+    while: "rule R1 fires ∨ rule R2 fires ∨ rule R4 fires"
+    notes: |
+      RFC 6052 §2.2 / §2.4 — on v6→v4 the IPv4 dst is the 32-bit address
+      embedded in the last 32 bits of the v6 dst under ${wkp}; on v4→v6 the
+      synthesised v6 src embeds the IPv4 server src under ${wkp}. Extracting
+      from the wrong bit offset misroutes the translated packet.
+
+  - id: pair_symmetry
+    clause: no_orphan
+    target: bind_outbound
+    while: "true"
+    free_under: ["paired_bind(_)", "paired_evict(_)"]
+    notes: |
+      RFC 6146 §2 — every bind_outbound has a complementary bind_inbound and
+      evictions are paired. Realised structurally by R2 (the only creator —
+      both halves bound together) and R6 (paired teardown eviction).
+
+  - id: binding_reversibility
+    clause: stability
+    target: "rewrite-pair-of(flow)"
+    while: "flow ∈ live_bindings"
+    notes: |
+      For every established binding, the v6→v4 translation (R1/R2) and the
+      v4→v6 translation (R4) are inverse transforms: a return packet on the
+      allocated (v4_addr, v4_port) is restored to the original v6 client
+      (addr, port). R1/R2 and R4 must agree at all times.
+
+  - id: v4_port_uniqueness
+    clause: stability
+    target: "(v4_base, v4_src_port, proto) → flow"
+    while: "true"
+    notes: |
+      No two distinct live v6 flows may share the same (v4_base, v4_src_port,
+      proto) at once — otherwise the inbound R4 lookup cannot uniquely reverse
+      the binding (RFC 6146 §3.5 session uniqueness).
+
+  - id: no_orphan_binding
+    clause: no_orphan
+    target: bind_outbound
+    enforced_when: "${binding_capacity} ≠ unbounded ∧ ${mode} == dynamic"
+    notes: |
+      Under bounded dynamic allocation the binding table MUST have a
+      packet-driven eviction policy (teardown or LRU) that eventually frees
+      stale entries; otherwise the v4 pool drains and new flows are blackholed
+      by R3.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. NAT64 here translates-and-forwards
+      or drops in one pipe pass; no recirculation.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation.
+
+test_scaffolding:
+
+  G1:
+    - id: v6_to_v4_udp_translate
+      generate: |
+        Send a UDP-over-IPv6 packet from a ${v6_client_subnet} host to a
+        ${wkp} destination (e.g. 64:ff9b::203.0.113.9) with a bound src/sport.
+        Assert the EGRESS packet is IPv4 (version 4, no IPv6 header):
+        IP.dst == 203.0.113.9 (RFC 6052 extraction), IP.src == bound
+        v4_src_addr, UDP.sport == bound v4_src_port, IP.ttl == hopLimit-1,
+        output_port == server_port. (Header-family swap.)
+
+    - id: v6_to_v4_tcp_translate
+      generate: |
+        TCP analogue of v6_to_v4_udp_translate with a distinct
+        (sport → v4_src_port) binding. Confirms the L4-agnostic swap path.
+
+    - id: v4_to_v6_udp_return
+      generate: |
+        Send the symmetric return: a UDP-over-IPv4 packet with IP.dst ==
+        ${v4_base}, UDP.dport == the allocated v4_src_port from the outbound
+        binding. Assert the EGRESS packet is IPv6 (version 6): IPv6.dst ==
+        original v6 client address, UDP.dport == original v6 client port,
+        IPv6.src == embed_v4(server_v4_src, ${wkp}), hopLimit == ttl-1,
+        output_port == client_port.
+
+    - id: v4_to_v6_tcp_return
+      generate: |
+        TCP analogue of v4_to_v6_udp_return.
+
+    - id: second_v6_flow_distinct_v4_port
+      generate: |
+        Open a second v6→v4 flow from the same client host with a distinct
+        v6 sport. Assert it receives a distinct v4_src_port (no collision
+        with the first flow). Tests v4_port_uniqueness.
+
+  G2:
+    - id: v4_inbound_no_binding_drop
+      generate: |
+        Send an inbound IPv4 TCP/UDP packet to ${v4_base} whose
+        (dst, dport, proto) is NOT in bind_inbound. Assert DROP (R5,
+        RFC 6146 §3.5 fail-closed).
+
+    - id: dynamic_allocation_first_packet
+      requires: "${mode} == dynamic"
+      generate: |
+        Send the first v6→v4 packet of a previously-unseen flow under dynamic
+        mode. Assert: a fresh binding pair is installed, v4_src_port ∈
+        ${v4_pool_range}, the symmetric bind_inbound exists, and the packet is
+        translated + forwarded with the new v4_src_port.
+
+    - id: v4_pool_exhaustion_drops
+      requires: "${mode} == dynamic ∧ ${binding_capacity} ≠ unbounded"
+      generate: |
+        Open ${binding_capacity} distinct v6→v4 flows (warm-up hopLimit=64) to
+        drain the v4 pool, then send one more new flow (test hopLimit=2). Under
+        ${eviction_policy} == none → assert DROP (R3). Under teardown/LRU →
+        first free a slot (teardown packet, or capacity pressure) then assert
+        the new flow is translated + forwarded.
+
+    - id: teardown_releases_v4_port
+      requires: "${eviction_policy} == teardown"
+      generate: |
+        Establish a dynamic binding, then send a TCP FIN (or RST) on that v6
+        flow. Assert the binding pair is evicted (a subsequent inbound packet
+        on the freed (v4_addr, v4_port) is DROPPED by R5, and a new v6 flow may
+        reuse the freed v4_src_port). Packet-driven — no wall-clock timer.
+
+  G3:
+    - id: out_of_scope_v6_dst_drop
+      generate: |
+        Send a v6 packet whose destination is NOT in ${wkp} (a native IPv6
+        dst). Assert DROP — only ${wkp} destinations are translation
+        candidates (R0/R3 gate; native v6 forwarding is out of scope).
+
+    - id: v4_wrong_dst_drop
+      generate: |
+        Send an inbound IPv4 packet whose IP.dst ≠ ${v4_base}. Assert DROP.
+        Confirms the v4_base gate on R4 (no leak of the v6 client side).
+
+    - id: ipv4_checksum_recompute_probe
+      requires: "${checksum_strict}"
+      generate: |
+        Send a v6→v4 translatable packet and assert the EGRESS IPv4 header
+        checksum AND the L4 checksum are VALID over the synthesised header
+        (RFC 6146 §3.5). Probes the conditional-deparser / forgotten-checksum
+        v1model bug class: an implementation that emits the IPv4 header without a
+        MyComputeChecksum entry (or leaves checksum == 0) fails here. Also
+        a default-deny variant: a non-${wkp}, non-${v4_base} packet drops.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden paired with an ease on the SAME axis.
+
+mutation_operators:
+
+  # ── feature-breadth axis ──────────────────────────────────────────────────
+  - id: enable_dynamic_allocation
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${mode} == static"
+    effect: "${mode} ← dynamic ∧ ${faithfulness} ← D5.1_dynamic"
+    feasibility_postcondition: |
+      width(${v4_pool_range}) ≥ max(${binding_capacity}, 16)
+    notes: |
+      Lift static → dynamic: the data plane now allocates (v4_src_addr,
+      v4_src_port) from v4_pool on each new v6→v4 flow (R2). Pair symmetry must
+      still hold. Harder than static because the implementation needs a real free-port
+      allocator and a single-pass bind of both halves.
+
+  - id: revert_to_static_allocation
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${mode} == dynamic"
+    effect: "${mode} ← static ∧ ${eviction_policy} ← none ∧ ${faithfulness} ← D5.0_checksum_exact"
+    feasibility_postcondition: "${mode} == static"
+    notes: |
+      Ease counterpart of enable_dynamic_allocation: drop data-plane allocation
+      back to control-plane-installed static bindings, removing the allocator
+      and the eviction surface.
+
+  - id: enable_icmp_query_class
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "'icmp' ∉ ${l4_classes}"
+    effect: "${l4_classes} ← ${l4_classes} ∪ {icmp}"
+    feasibility_postcondition: "'icmp' ∈ ${l4_classes}"
+    notes: |
+      Add the ICMPv6↔ICMPv4 Query session class (RFC 6146): the ICMP
+      identifier takes the role of the L4 port for binding/rewrite, and the
+      ICMP type/code must be mapped across families. Widens the protocol
+      surface and adds an ICMP-identifier rewrite G1 test.
+
+  - id: drop_icmp_query_class
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "'icmp' ∈ ${l4_classes}"
+    effect: "${l4_classes} ← ${l4_classes} \\ {icmp}"
+    feasibility_postcondition: "'icmp' ∉ ${l4_classes} ∧ len(${l4_classes}) ≥ 1"
+    notes: |
+      Ease counterpart of enable_icmp_query_class: restrict to TCP/UDP only,
+      removing the ICMP type/code mapping and identifier-rewrite surface.
+
+  # ── capacity axis ─────────────────────────────────────────────────────────
+  - id: shrink_binding_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${binding_capacity} ≠ unbounded ∧ ${binding_capacity} > 256"
+    effect: "${binding_capacity} ← ${binding_capacity} / 4"
+    feasibility_postcondition: "${binding_capacity} ≥ 64"
+    notes: |
+      Tighten the binding-table capacity axis. Below ~256 the implementation cannot
+      size registers generously and must engage real packet-driven eviction.
+
+  - id: enlarge_binding_capacity_4x
+    axis: capacity
+    direction: ease
+    applicable_when: "${binding_capacity} ≠ unbounded ∧ ${binding_capacity} < 262144"
+    effect: "${binding_capacity} ← ${binding_capacity} * 4"
+    feasibility_postcondition: "${binding_capacity} ≤ 1048576"
+    notes: |
+      Ease counterpart of shrink_binding_capacity_4x: widen the binding table
+      so a generous register strategy works again.
+
+  - id: shrink_v4_pool_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${mode} == dynamic ∧ width(${v4_pool_range}) > 64"
+    effect: "${v4_pool_range} ← shrink_to_quarter_around_midpoint(${v4_pool_range})"
+    feasibility_postcondition: "width(${v4_pool_range}) ≥ max(${binding_capacity}, 16)"
+    notes: |
+      Narrow the allocatable IPv4 port pool. As it narrows the implementation needs a
+      real free-port allocator (bitmap / free-list) rather than a monotonic
+      counter, and pool-exhaustion drops become reachable.
+
+  - id: enlarge_v4_pool_4x
+    axis: capacity
+    direction: ease
+    applicable_when: "${mode} == dynamic ∧ width(${v4_pool_range}) < 16383"
+    effect: "${v4_pool_range} ← grow_to_quadruple_around_midpoint(${v4_pool_range})"
+    feasibility_postcondition: "high(${v4_pool_range}) ≤ 65535 ∧ low(${v4_pool_range}) ≥ 1024"
+    notes: |
+      Ease counterpart of shrink_v4_pool_4x: widen the port pool so allocation
+      never pressures and a trivial counter suffices.
+
+  # ── strictness axis ───────────────────────────────────────────────────────
+  - id: add_teardown_eviction
+    axis: strictness
+    direction: harden
+    applicable_when: "${mode} == dynamic ∧ ${eviction_policy} == none"
+    effect: "${eviction_policy} ← teardown ∧ ${faithfulness} ← D5.2_dynamic_with_eviction"
+    feasibility_postcondition: "${eviction_policy} == teardown"
+    notes: |
+      Add packet-driven (TCP FIN/RST) eviction over dynamic bindings (R6).
+      Activates no_orphan_binding. Common implementation: on a FIN/RST match, evict
+      both halves and return the v4 port to the free-list. NO wall-clock timer
+      — the v1.0 harness injects only packets.
+
+  - id: remove_teardown_eviction
+    axis: strictness
+    direction: ease
+    applicable_when: "${eviction_policy} == teardown"
+    effect: "${eviction_policy} ← none ∧ ${faithfulness} ← D5.1_dynamic"
+    feasibility_postcondition: "${eviction_policy} == none"
+    notes: |
+      Ease counterpart of add_teardown_eviction: drop the eviction discipline
+      so bindings persist for the run (no FIN/RST handling needed).
+
+  - id: relax_checksum_strictness
+    axis: strictness
+    direction: ease
+    applicable_when: "${checksum_strict} == true"
+    effect: "${checksum_strict} ← false"
+    feasibility_postcondition: "${checksum_strict} == false"
+    notes: |
+      Ease: stop enforcing ipv4_checksum_validity (the verifier ignores the
+      synthesised IPv4/L4 checksum), removing the forgotten-checksum failure
+      mode and the ipv4_checksum_recompute_probe G3 case.
+
+  - id: enforce_checksum_strictness
+    axis: strictness
+    direction: harden
+    applicable_when: "${checksum_strict} == false"
+    effect: "${checksum_strict} ← true"
+    feasibility_postcondition: "${checksum_strict} == true"
+    notes: |
+      Harden counterpart of relax_checksum_strictness: require a valid
+      synthesised IPv4 header checksum and recomputed L4 checksum (RFC 6146
+      §3.5). Re-activates ipv4_checksum_validity and the recompute G3 probe.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  HEADER-FAMILY SWAP — the defining mechanism (vs P-NAT44's same-family
+  port rewrite). The implementation EMITS A DIFFERENT IP HEADER than it parsed:
+
+    v6→v4 (R1/R2): the parsed packet has hdr.ipv6 valid and hdr.ipv4 invalid.
+      The implementation must set hdr.ipv6.setInvalid(), hdr.ipv4.setValid(), populate
+      every IPv4 field (version=4, ihl=5, ttl=hopLimit-1, proto mapped from
+      nextHdr, src/dst), and emit hdr.ipv4 in the deparser. Ether.etherType
+      flips 0x86DD → 0x0800.
+    v4→v6 (R4): the reverse — hdr.ipv4.setInvalid(), hdr.ipv6.setValid(),
+      populate version=6, payloadLen, nextHdr mapped from proto, hopLimit=
+      ttl-1, src/dst; etherType flips 0x0800 → 0x86DD.
+
+  CUSTOM HEADERS: this pattern needs a custom_headers.py at instantiation time
+  so the verifier can build and parse IPv6 packets (Scapy's IPv6 layer plus
+  the v1model deparse order). The audit harness builds IP/ARP natively; the
+  IPv6 side mirrors P-IPv6Router / P-SRv6Endpoint custom_headers.py. The
+  translated EGRESS family differs from the ingress family, so the verifier's
+  expected.layers must name the egress family (IPv4 for v6→v4 outputs, IPv6
+  for v4→v6 outputs), NOT the ingress family.
+
+  CHECKSUMS: because IPv6 has NO header checksum but IPv4 does, the v6→v4
+  direction must COMPUTE a fresh IPv4 header checksum (MyComputeChecksum with
+  an update_checksum over the IPv4 header) — there is no source checksum to
+  carry over. The L4 (TCP/UDP) checksum must be recomputed on BOTH directions
+  because the pseudo-header changes family. Forgetting the IPv4 checksum entry,
+  or guarding the IPv4 emit behind a stale validity check, is the conditional-
+  deparser / forgotten-checksum v1model bug class the G3 probe targets.
+
+  RFC 6052 EMBEDDING (at /96): the 32-bit IPv4 address is the last 32 bits of
+  the v6 address. extract_v4 = hdr.ipv6.dst[31:0]; embed_v4(a) = ${wkp}[127:32]
+  ++ a. (Other prefix lengths use checksum-neutral byte skipping; the canonical
+  /96 default avoids that.)
+
+  EVICTION IS PACKET-DRIVEN ONLY: the v1.0 harness injects no time_tick / wall
+  clock, so do NOT model an idle timer. Eviction fires on a TCP FIN/RST
+  teardown packet (R6) or on capacity pressure (LRU at R2 allocation time).
+
+  Anti-pattern implementations to reject during reference review:
+    * Rewriting addresses/ports WITHOUT swapping the IP version/header — that
+      is NAT44, not NAT64; the egress must change family.
+    * Forgetting the synthesised IPv4 header checksum (or leaving it 0) — IPv6
+      had none to carry over.
+    * Recomputing only one of the IPv4-header / L4 checksums.
+    * Extracting the embedded IPv4 address from the wrong bit offset (not the
+      last 32 bits at /96) — misroutes the translated packet.
+    * Reusing one v4_src_port for two live v6 flows — breaks the R4 reverse.
+    * Modelling an idle timeout via a wall clock — the harness has no tick.
+    * Treating dst ≠ ${v4_base} inbound traffic as forwardable — leaks the v6
+      client side.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. Author custom_headers.py for the IPv6 side (mirror P-IPv6Router /
+       P-SRv6Endpoint) so the verifier can build/parse v6 packets; confirm
+       expected.layers name the EGRESS family per direction.
+    2. The instance schema, parameter bindings, and oracle audit must all
+       pass validation.
+    3. Hand-run the public test set through the oracle for the seed and confirm
+       the v6→v4 outputs are IPv4 (version 4, embedded dst, valid checksums)
+       and the v4→v6 outputs are IPv6 (version 6, restored client addr/port).

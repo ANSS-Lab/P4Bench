@@ -1,0 +1,745 @@
+# P-PortKnocking — Single-Packet-Authorization Knock Gate
+#
+# TPL v1.0 task pattern. A stateful security state machine:
+# a protected service behind the switch is reachable only after a source IP
+# completes a correct ORDERED sequence of "knock" packets (each a packet to a
+# pre-agreed destination port). The data plane keeps per-source-IP knock-state
+# in a register; a knock to the EXPECTED next port advances the state, a knock
+# to a WRONG port resets it to zero, and once the final knock lands the source
+# is AUTHORIZED and its packets to the protected service are forwarded — until
+# then they are dropped (default-deny). This is the port-knocking / SPA
+# (Single Packet Authorization) NF, an engineering-mature redesign target with
+# no top-venue paper (grounding falls back to canonical concept sources).
+
+pattern_id: P-PortKnocking
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D7:security]                           # network-authentication / closed-port gate
+  prescriptive: [P4:policy]                             # composite-condition match-action over per-source state; redesign-class policy gate
+target_capability: redesign                             # programmability redesigns a baked-in stateful gate into iterable data-plane logic
+summary: >
+  A port-knocking / Single-Packet-Authorization gate in front of a protected
+  TCP service. Each source IP has a knock-state counter held in a register:
+  a knock packet (to a destination port) whose port equals the EXPECTED next
+  port in an ordered ${knock_sequence} advances the counter; a knock to any
+  WRONG knock-set port resets the counter to 0; when the counter reaches the
+  sequence length the source becomes AUTHORIZED. Packets addressed to the
+  protected service+port are FORWARDED only from authorized sources and
+  DROPPED otherwise (default-deny). The canonical instance is a short fixed
+  sequence with no expiry; mutation lifts the sequence length, tightens reset
+  strictness (any non-matching packet resets vs only wrong-knock-port resets),
+  adds a packet-count-driven knock-state expiry (no wall clock), widens to a
+  per-source authorized-session install, and shrinks the per-source state
+  table to force eviction. All timing is PACKET-COUNT driven — the harness
+  injects no time_tick, so expiry is measured in intervening non-advancing
+  packets, never seconds (see bridging_notes).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+#
+# Concept-source fallback: port
+# knocking / SPA is engineering-mature with no SIGCOMM/NSDI/CoNEXT paper and
+# no normative RFC. Grounding is therefore the canonical CONCEPT sources —
+# the originating article and the SPA literature it spawned — cited with role
+# `domain_concepts`. This block is post-only by necessity.
+
+grounding:
+
+  posts:
+    - url: "http://www.linuxjournal.com/article/6811"
+      cite: "Krzywinski, Port Knocking (Linux Journal, 2003)"
+      title: "M. Krzywinski, Port Knocking: Network Authentication Across Closed Ports (Linux Journal / SysAdmin, 2003)"
+      role: domain_concepts
+      quote: >-
+        Port knocking is a method of establishing a connection to a networked
+        computer that has no open ports. The server presents no open ports to the
+        network and is to all intents and purposes invisible, yet is able to
+        authenticate connection requests by monitoring connection attempts to a
+        sequence of closed ports. Once a correct sequence of connection attempts
+        is received the firewall opens the relevant port to the source IP address
+        that made the connection attempts. An incorrect knock returns the sequence
+        to its initial state.
+      grounds: [R1_advance, R3_reset, R4_authorized_forward, R5_default_deny, sequence_order_correctness]
+      relevance: |
+        The originating description of port knocking. Establishes every
+        behavioural element the pattern realises:
+          - the protected service is "closed" (default-deny) to all sources
+            until authentication completes — basis for R5 (drop service-bound
+            traffic from unauthorized sources) and the default_deny_protected
+            invariant;
+          - authentication is an ORDERED sequence of connection attempts to a
+            pre-agreed set of ports ("a sequence of connection attempts to
+            closed ports") — basis for ${knock_sequence}, R2 (advance on the
+            expected next port) and R3 (reset on a wrong knock-set port);
+          - the firewall is normally closed and is "opened" only for the
+            authenticated source IP — basis for the per-source-IP keying of
+            the knock_state entity and R4 (authorized → forward);
+          - a mistyped / out-of-order knock returns the source to the start —
+            basis for the counter-reset-to-0 semantics in R3.
+    - url: "https://www.cipherdyne.org/fwknop/docs/SPA.html"
+      title: "M. Rash, Single Packet Authorization (SPA) — fwknop design notes"
+      role: domain_concepts
+      relevance: |
+        SPA generalises and hardens port knocking. Informs three pattern
+        choices:
+          - the authorization is per-source-IP and grants access to a SPECIFIC
+            protected service/port rather than opening the whole host — basis
+            for ${protected_service} / ${protected_port} and the scoped
+            forward in R4;
+          - replay/expiry concerns motivate the OPTIONAL knock-state expiry —
+            implemented here as a PACKET-COUNT window (${expiry_window})
+            because the BMv2 --use-files harness injects no wall-clock tick
+            (see bridging_notes), not as the seconds-based timeout fwknop uses;
+          - the strict reset discipline (any stray packet from a source mid-
+            sequence aborts the attempt) is the ${reset_strict} axis.
+    - url: "https://wiki.archlinux.org/title/Port_knocking"
+      title: "Arch Linux Wiki — Port knocking (knockd sequence + ordered-port semantics)"
+      role: domain_concepts
+      relevance: |
+        Operational reference for the concrete sequence semantics knockd
+        implements: an ordered list of (port) knocks, advancing a per-source
+        counter, with the final knock toggling the firewall rule for that
+        source. Confirms the counter / expected-next-port mechanics encoded in
+        R1–R3 and the ${knock_sequence} parameter shape (an ordered list of
+        destination ports).
+
+  papers: []
+  rfcs: []
+  tutorials: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. Decisions derive from hdr.ipv4.src, the L4
+      destination port, std.ingress_port, and the per-source knock_state read
+      from the register.
+
+  knock_state:                              # the TPL `flow` role — per-source progress
+    type: flow
+    key:
+      - hdr.ipv4.src
+    attrs:
+      progress:    int                      # 0..|${knock_sequence}|; authorized when == |${knock_sequence}|
+      authorized:  bool                     # derived: progress == |${knock_sequence}|
+      since_advance: int                    # packet-count since last advance; drives ${expiry_window} (no wall clock)
+    capacity: ${state_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      Per-source-IP knock progress, held in a register indexed by a hash of
+      hdr.ipv4.src. `progress` is the count of correctly-ordered knocks the
+      source has landed so far; when it reaches the sequence length the source
+      is authorized. `since_advance` counts intervening packets and drives the
+      OPTIONAL packet-count expiry (NOT a wall-clock timer). At ${state_capacity}
+      != unbounded the table evicts under ${eviction_policy}; an evicted source
+      reverts to progress 0 (must re-knock).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  protected_service:
+    type: address
+    constraint: ipv4_addr
+    notes: "Destination IPv4 of the protected service the gate guards."
+
+  protected_port:
+    type: port
+    range: "[1, 65535]"
+    notes: |
+      The L4 destination port of the protected service (e.g. SSH 22). A packet
+      to (${protected_service}, ${protected_port}) is service-bound traffic
+      gated by R4/R5; it is NOT a knock.
+
+  knock_sequence:
+    type: list[port]
+    constraint: |
+      ordered list of distinct L4 destination ports, each ∈ [1,65535], none
+      equal to ${protected_port}; length ≥ 1.
+    notes: |
+      The secret ordered knock sequence. The expected next port for a source
+      at progress p is ${knock_sequence}[p]. lengthen/shorten operators move
+      |${knock_sequence}| along the feature-breadth axis.
+
+  knock_set:
+    type: list[port]
+    constraint: "the set of ports that count as knocks; default = set(${knock_sequence})"
+    default: "set(${knock_sequence})"
+    notes: |
+      Ports treated as knock attempts for reset purposes. Under
+      ${reset_strict}=false only a packet to a port in ${knock_set} that is the
+      WRONG next port resets progress; a packet to any other (non-knock,
+      non-service) port is ignored and leaves progress untouched. Under
+      ${reset_strict}=true ANY packet from the source that is neither the
+      expected next knock nor authorized service traffic resets progress.
+
+  reset_strict:
+    type: bool
+    default: false
+    notes: |
+      Reset strictness axis. false → only a wrong knock-set port resets
+      (lenient: stray unrelated packets don't abort the attempt). true → any
+      non-advancing, non-service packet from the source resets progress to 0
+      (single-packet-authorization-style: the sequence must be clean).
+
+  expiry_window:
+    type: int | unbounded
+    range: "[1, 1024]"
+    default: unbounded
+    notes: |
+      OPTIONAL packet-count knock-state expiry. unbounded → progress never
+      expires from inactivity. When bounded to N, if ${expiry_window}+? — i.e.
+      if `since_advance` reaches N intervening non-advancing packets before the
+      next correct knock, progress resets to 0 (the partial sequence times
+      out). Measured in PACKETS the switch processes, never in seconds: the
+      harness injects no time_tick (see bridging_notes). enable/disable_expiry
+      moves the strictness axis.
+
+  authorize_persists:
+    type: bool
+    default: true
+    notes: |
+      Whether authorization, once reached, persists for subsequent service
+      packets (true: SPA-style sticky grant) or must be re-earned every time
+      (false: progress decays after the grant is consumed). Drives the
+      authorized_grant_persistence invariant.
+
+  state_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: "Per-source knock_state register depth. shrink_state_capacity_4x exercises this axis."
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO, LRU]
+    default: none
+    enforced_when: "${state_capacity} != unbounded"
+    notes: "How knock_state entries are evicted under capacity pressure."
+
+  default_action:
+    type: enum
+    values: [drop]
+    default: drop
+    notes: "Behaviour for service-bound traffic from an unauthorized source. v1.0: drop."
+
+  faithfulness:
+    type: enum
+    values: [D5.0_fixed_sequence, D5.1_expiry, D5.2_session_scale]
+    default: D5.0_fixed_sequence
+    notes: |
+      D5.0 → short fixed sequence, no expiry, unbounded state (canonical).
+      D5.1 → packet-count expiry + strict reset turned on.
+      D5.2 → bounded per-source state with eviction (authorized-session scale).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters: the SERVICE gate (R4/R5) is consulted
+# before the knock state machine (R1–R3) so service-bound packets are never
+# mistaken for knocks, and authorized sources are forwarded immediately.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The gate operates on IPv4+L4 (TCP/UDP) traffic only. ARP / IPv6 / raw
+      frames are out of scope and dropped (default-deny posture).
+
+  - id: R4_authorized_service_forward
+    when: |
+      header_present(ipv4)
+        ∧ match(hdr.ipv4.dst, ${protected_service})
+        ∧ match(hdr.l4.dport, ${protected_port})
+        ∧ exists(knock_state, hdr.ipv4.src)
+        ∧ value(knock_state[hdr.ipv4.src].progress, ==, len(${knock_sequence}))
+    given:
+      knock_state: by_key(hdr.ipv4.src)
+    then:
+      - "set(knock_state[hdr.ipv4.src].progress, 0)   IF ¬${authorize_persists}"
+      - forward(lookup_egress(${protected_service}))
+    notes: |
+      Service-bound packet from an AUTHORIZED source (progress reached the
+      sequence length). Forwarded to the protected service. If
+      ${authorize_persists} is false the grant is single-use: progress is reset
+      to 0 so the source must re-knock for the next service packet.
+
+  - id: R5_unauthorized_service_drop
+    when: |
+      header_present(ipv4)
+        ∧ match(hdr.ipv4.dst, ${protected_service})
+        ∧ match(hdr.l4.dport, ${protected_port})
+        ∧ (¬exists(knock_state, hdr.ipv4.src)
+           ∨ value(knock_state[hdr.ipv4.src].progress, <, len(${knock_sequence})))
+    then:
+      - "${default_action}"
+    notes: |
+      Service-bound packet from a NON-authorized source (no state, or progress
+      short of the full sequence). Dropped — the protected port is closed until
+      the knock sequence completes. This is the master security rule; the
+      default_deny_protected invariant anchors on it.
+
+  - id: R1_knock_advance
+    when: |
+      header_present(ipv4)
+        ∧ ¬match(hdr.ipv4.dst, ${protected_service})
+        ∧ match(hdr.l4.dport, ${knock_sequence}[progress_of(hdr.ipv4.src)])
+    given:
+      knock_state: by_key(hdr.ipv4.src)
+    then:
+      - "bind(knock_state, hdr.ipv4.src, {progress: progress_of(hdr.ipv4.src) + 1, since_advance: 0})"
+      - drop
+    notes: |
+      The source knocked on its EXPECTED next port (${knock_sequence}[p] for a
+      source at progress p; p=0 for a source with no prior state). Advance the
+      per-source counter by one and reset its since_advance packet counter.
+      The knock packet itself is DROPPED (knocks never reach a real service —
+      the ports are closed). When the bind pushes progress to the sequence
+      length the source becomes authorized and R4 will forward its next
+      service-bound packet.
+
+  - id: R3_wrong_knock_reset
+    when: |
+      header_present(ipv4)
+        ∧ ¬match(hdr.ipv4.dst, ${protected_service})
+        ∧ ¬match(hdr.l4.dport, ${knock_sequence}[progress_of(hdr.ipv4.src)])
+        ∧ ( match(hdr.l4.dport, ${knock_set})
+            ∨ ${reset_strict}
+            ∨ ( ${expiry_window} ≠ unbounded
+                ∧ value(knock_state[hdr.ipv4.src].since_advance, ≥, ${expiry_window} − 1) ) )
+    given:
+      knock_state: by_key(hdr.ipv4.src)
+    then:
+      - "set(knock_state[hdr.ipv4.src].progress, 0)"
+      - "set(knock_state[hdr.ipv4.src].since_advance, 0)"
+      - drop
+    notes: |
+      Reset to the start of the sequence. Fires when the source sends a
+      non-service packet that is NOT its expected next knock AND one of:
+        - it is a WRONG knock-set port (a recognised knock, but out of order);
+        - ${reset_strict} is on (any stray non-advancing packet aborts the
+          attempt — SPA discipline);
+        - the packet-count expiry window has elapsed (since_advance reached
+          ${expiry_window}−1 intervening packets, so this packet tips it over).
+      Progress and the since_advance counter both reset to 0. Packet dropped.
+
+  - id: R2_knock_noise_ignore
+    when: |
+      header_present(ipv4)
+        ∧ ¬match(hdr.ipv4.dst, ${protected_service})
+    given:
+      knock_state: by_key(hdr.ipv4.src)
+    then:
+      - "inc(knock_state[hdr.ipv4.src].since_advance)   IF exists(knock_state, hdr.ipv4.src)"
+      - drop
+    notes: |
+      Fall-through for a non-service packet that neither advanced (R1) nor
+      triggered a reset (R3) — i.e. ${reset_strict} is off, the port is not in
+      ${knock_set}, and the expiry window has not elapsed. Progress is LEFT
+      INTACT (lenient mode tolerates unrelated traffic mid-sequence); only the
+      since_advance packet counter is incremented so the expiry window can
+      eventually fire. Packet dropped (it is not service-bound and not a valid
+      knock).
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: default_deny_protected
+    clause: stability
+    target: forward_decision
+    while: |
+      match(hdr.ipv4.dst, ${protected_service}) ∧ match(hdr.l4.dport, ${protected_port})
+        ∧ (¬exists(knock_state, hdr.ipv4.src)
+           ∨ value(knock_state[hdr.ipv4.src].progress, <, len(${knock_sequence})))
+    free_under: []
+    notes: |
+      The master security invariant: any service-bound packet from a source
+      that has NOT completed the full ordered knock sequence is dropped,
+      stable across all interleavings of other sources' traffic. Anchors the
+      G3 bypass tests. A correct solution can never forward service traffic
+      from an unauthorized source.
+
+  - id: sequence_order_correctness
+    clause: stability
+    target: knock_state.progress
+    while: "rule R1 fires"
+    notes: |
+      Progress advances by EXACTLY one and ONLY when the knock lands on the
+      expected next port ${knock_sequence}[p]. A solution that advances on any
+      knock-set port (order-insensitive) or by more than one is wrong — the
+      out_of_order_knock_no_advance G1 case pins it.
+
+  - id: wrong_knock_resets
+    clause: stability
+    target: knock_state.progress
+    while: "rule R3 fires"
+    notes: |
+      A wrong knock-set port (or, under ${reset_strict}, any stray packet)
+      drives progress back to 0. A solution that ignores wrong knocks (leaves
+      progress unchanged on an out-of-order knock-set port) is exploitable —
+      the reset_on_wrong_knock G1 case pins it.
+
+  - id: per_source_isolation
+    clause: stability
+    target: knock_state.progress
+    while: "header_present(ipv4)"
+    notes: |
+      One source's knocks MUST NOT advance another source's progress. The
+      knock_state register is keyed per hdr.ipv4.src; a solution that uses a
+      single global counter authorizes the wrong source. The
+      two_sources_interleaved_isolation G3 case pins it.
+
+  - id: knock_state_expiry
+    clause: persistence
+    target: knock_state.progress
+    while: "value(knock_state[hdr.ipv4.src].since_advance, ≥, ${expiry_window})"
+    free_under: ["set(knock_state, _, {progress: 0})"]
+    enforced_when: "${expiry_window} != unbounded"
+    notes: |
+      Packet-count expiry (NOT wall-clock): partial progress that sees
+      ${expiry_window} intervening non-advancing packets before its next
+      correct knock resets to 0. `free_under` records that the reset itself is
+      the legitimate mutation of progress here.
+
+  - id: authorized_grant_persistence
+    clause: persistence
+    target: knock_state.authorized
+    while: "value(knock_state[hdr.ipv4.src].progress, ==, len(${knock_sequence}))"
+    free_under: ["set(knock_state, _, {progress: 0})"]
+    enforced_when: "${authorize_persists}"
+    notes: |
+      Once authorized, a source stays authorized for subsequent service
+      packets (grant is sticky) until explicitly reset/evicted — not revoked
+      by an intervening unrelated packet. Only relevant when
+      ${authorize_persists} is true.
+
+  - id: no_orphan_knock_state
+    clause: no_orphan
+    target: knock_state
+    enforced_when: "${state_capacity} != unbounded"
+    notes: |
+      Under bounded ${state_capacity}, every bound knock_state entry is
+      eventually evicted under ${eviction_policy}; the register cannot fill and
+      blackhole new sources. An evicted source simply re-knocks from progress 0.
+
+  - id: no_loop
+    clause: no_loop
+    target: forward_decision
+    notes: |
+      Knocks and unauthorized service packets are dropped; authorized service
+      packets egress on a definite port. No packet recirculates indefinitely.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation. A test is a packet
+# TRAIN: prior_inputs warm up the per-source knock_state, the final input is
+# the graded packet. All "timing" is packet-count driven — NO seconds, NO
+# time_tick (harness injects none).
+
+test_scaffolding:
+
+  G1:
+    - id: full_sequence_then_service_forward
+      generate: |
+        Warm-up: from one source IP, send the complete ${knock_sequence} in
+        order — one packet per port (dst=any non-service host or the gate, the
+        knock dst is irrelevant beyond not being ${protected_service}). Then
+        send a packet to (${protected_service}, ${protected_port}) from the
+        same source. Assert: behavior=forward, output_port=the service egress.
+        Anchors the golden path.
+
+    - id: partial_sequence_service_drop
+      generate: |
+        Warm-up: send only the FIRST k−1 of the k knocks in ${knock_sequence}.
+        Then send a service-bound packet. Assert: behavior=drop — the source is
+        not yet authorized (progress < length). Anchors default_deny_protected.
+
+    - id: out_of_order_knock_no_advance
+      generate: |
+        Warm-up: send the FIRST correct knock, then send the THIRD sequence
+        port (skipping the second) — a knock-set port that is NOT the expected
+        next. Then send the second and remaining ports, then a service packet.
+        Assert: behavior=drop — the out-of-order knock reset progress, so the
+        completed run was not a clean in-order sequence. Anchors
+        sequence_order_correctness.
+
+    - id: reset_on_wrong_knock_then_recover
+      generate: |
+        Warm-up: send the full sequence EXCEPT after the first correct knock
+        inject one wrong knock-set port (resets to 0), then send the entire
+        sequence cleanly in order. Send a service packet. Assert:
+        behavior=forward — after the reset, a fresh clean run authorizes.
+        Anchors wrong_knock_resets + recovery.
+
+    - id: lenient_noise_does_not_reset
+      requires: "${reset_strict} == false"
+      generate: |
+        Warm-up: between two correct in-order knocks inject a packet to a port
+        that is NEITHER a knock-set port NOR the service port (e.g. an
+        unrelated UDP port). Complete the sequence, send a service packet.
+        Assert: behavior=forward — in lenient mode unrelated traffic does not
+        abort the attempt (R2 leaves progress intact). Distinguishes lenient
+        from strict reset.
+
+  G2:
+    - id: expiry_window_resets_partial
+      requires: "${expiry_window} != unbounded"
+      generate: |
+        Warm-up: send the first correct knock, then inject ${expiry_window}
+        non-advancing (noise) packets from the same source so since_advance
+        reaches the window, then send the remaining knocks in order and a
+        service packet. Assert: behavior=drop — the partial progress expired
+        (packet-count window elapsed) and the later knocks started from a
+        reset, so the run did not form a contiguous in-order sequence. Uses
+        PACKET COUNT only, no seconds.
+
+    - id: expiry_window_boundary_no_reset
+      requires: "${expiry_window} != unbounded"
+      generate: |
+        Same as expiry_window_resets_partial but inject exactly
+        ${expiry_window}−1 noise packets (one short of the window). Then
+        complete the sequence and send a service packet. Assert:
+        behavior=forward — the window did NOT elapse, progress survived.
+        Boundary check on the packet-count expiry.
+
+    - id: state_capacity_eviction_reknock
+      requires: "${state_capacity} != unbounded ∧ ${eviction_policy} != none"
+      generate: |
+        Warm-up: drive ${state_capacity}+1 distinct source IPs each through a
+        partial knock, evicting the oldest source's state under
+        ${eviction_policy}. Then have the evicted source attempt to finish its
+        sequence and send a service packet. Assert: behavior=drop — its state
+        was evicted, so the resumed knocks started from progress 0 and never
+        formed a full run. Anchors no_orphan_knock_state.
+
+  G3:
+    - id: cold_service_packet_drop
+      generate: |
+        With NO warm-up at all, send a service-bound packet to
+        (${protected_service}, ${protected_port}) from a fresh source. Assert:
+        behavior=drop — no knock_state exists, R5 default-denies. Anchors
+        default_deny_protected.
+
+    - id: two_sources_interleaved_isolation
+      generate: |
+        Source A completes the FULL sequence; source B sends only the first
+        knock; the two sources' knock packets are interleaved. Then B sends a
+        service packet. Assert: behavior=drop for B — A's progress must NOT
+        authorize B (per_source_isolation). Add a paired assertion that A's
+        own service packet forwards. Probes the single-global-counter bug.
+
+    - id: knock_packet_never_forwarded
+      generate: |
+        Send a single knock packet (to a ${knock_sequence} port, dst != the
+        protected service). Assert: behavior=drop — knock packets are control
+        signals, never forwarded to any service. Catches a solution that
+        forwards knock traffic. (Reachable v1model bug: conditional/partial
+        deparser emitting the knock onward; default-deny posture must drop.)
+
+    - id: wrong_dst_same_port_drop
+      generate: |
+        Authorize a source (full sequence), then send a packet to
+        ${protected_port} but to a DIFFERENT destination IP (not
+        ${protected_service}). Assert: behavior=drop — authorization is scoped
+        to the protected service, not to the port globally. Catches a solution
+        that gates on L4 port alone and ignores dst IP (a register-read /
+        match-key bug analogous to the standard_metadata.drop misuse family:
+        the gate decision must read BOTH dst IP and port, not a partial key).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden paired with an ease on the SAME axis.
+
+mutation_operators:
+
+  # ── feature-breadth: sequence length ───────────────────────────────────────
+  - id: lengthen_knock_sequence
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "len(${knock_sequence}) < 6"
+    effect: |
+      Append one more distinct knock port to ${knock_sequence} (and to the
+      default ${knock_set}), lengthening the ordered authentication sequence by
+      one. More state-machine stages for the implementation to track per source.
+    feasibility_postcondition: "len(${knock_sequence}) ≤ 6 ∧ all ports distinct ∧ ${protected_port} ∉ ${knock_sequence}"
+    notes: |
+      Each extra stage widens the per-source counter range and adds an
+      expected-next-port comparison. Longer sequences are harder to realise
+      correctly (more transitions, more reset edges).
+
+  - id: shorten_knock_sequence
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "len(${knock_sequence}) > 1"
+    effect: "Remove the last knock port from ${knock_sequence} (and ${knock_set}), shortening the sequence by one."
+    feasibility_postcondition: "len(${knock_sequence}) ≥ 1"
+    notes: "Ease counterpart of lengthen_knock_sequence; at length 1 the gate is a single-knock SPA."
+
+  # ── strictness: reset discipline ───────────────────────────────────────────
+  - id: enable_strict_reset
+    axis: strictness
+    direction: harden
+    applicable_when: "${reset_strict} == false"
+    effect: "${reset_strict} ← true"
+    feasibility_postcondition: "${reset_strict} == true"
+    notes: |
+      Tighten reset: ANY non-advancing, non-service packet from a source aborts
+      its in-flight sequence (SPA-style clean-run requirement). Forces the
+      implementation to reset on the catch-all path (R2 collapses into R3), and turns
+      OFF the lenient_noise_does_not_reset G1 case while making mid-sequence
+      noise a reset trigger.
+
+  - id: disable_strict_reset
+    axis: strictness
+    direction: ease
+    applicable_when: "${reset_strict} == true"
+    effect: "${reset_strict} ← false"
+    feasibility_postcondition: "${reset_strict} == false"
+    notes: |
+      Ease counterpart: only a wrong knock-SET port resets; unrelated stray
+      traffic is tolerated mid-sequence (R2 ignores). Re-enables the lenient
+      G1 case.
+
+  # ── strictness: packet-count expiry (NOT wall clock) ───────────────────────
+  - id: enable_expiry_window
+    axis: strictness
+    direction: harden
+    applicable_when: "${expiry_window} == unbounded"
+    effect: |
+      ${expiry_window} ← 8 ∧ ${faithfulness} ← max(${faithfulness}, D5.1_expiry).
+      Partial progress resets after 8 intervening non-advancing packets
+      (PACKET COUNT, never seconds — the harness injects no time_tick).
+    feasibility_postcondition: "${expiry_window} != unbounded ∧ ${expiry_window} ∈ [1, 1024]"
+    notes: |
+      Activates knock_state_expiry. Adds a per-source since_advance counter the
+      implementation must increment on every non-advancing packet and compare against
+      the window. Turns the expiry_window_resets_partial / boundary G2 cases on.
+
+  - id: disable_expiry_window
+    axis: strictness
+    direction: ease
+    applicable_when: "${expiry_window} != unbounded"
+    effect: "${expiry_window} ← unbounded ∧ ${faithfulness} ← min(${faithfulness}, D5.0_fixed_sequence)"
+    feasibility_postcondition: "${expiry_window} == unbounded"
+    notes: |
+      Ease counterpart of enable_expiry_window: partial progress never times
+      out from inactivity; removes the since_advance comparison and the G2
+      expiry cases.
+
+  # ── capacity: per-source state table depth ─────────────────────────────────
+  - id: shrink_state_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${state_capacity} != unbounded ∧ ${state_capacity} > 64"
+    effect: |
+      ${state_capacity} ← ${state_capacity} / 4 ∧
+      ${eviction_policy} ← (FIFO IF ${eviction_policy} == none ELSE ${eviction_policy}) ∧
+      ${faithfulness} ← max(${faithfulness}, D5.2_session_scale)
+    feasibility_postcondition: "${state_capacity} ≥ 16 ∧ ${eviction_policy} != none"
+    notes: |
+      Tighten the per-source state axis so concurrent in-flight knockers force
+      eviction. Activates no_orphan_knock_state and the
+      state_capacity_eviction_reknock G2 case.
+
+  - id: enlarge_state_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${state_capacity} != unbounded ∧ ${state_capacity} < 65536"
+    effect: "${state_capacity} ← min(${state_capacity} * 2, 65536)"
+    feasibility_postcondition: "${state_capacity} ≤ 65536"
+    notes: "Ease counterpart of shrink_state_capacity_4x; relaxes eviction pressure."
+
+  # ── strictness: grant stickiness ───────────────────────────────────────────
+  - id: enable_single_use_grant
+    axis: strictness
+    direction: harden
+    applicable_when: "${authorize_persists} == true"
+    effect: "${authorize_persists} ← false"
+    feasibility_postcondition: "${authorize_persists} == false"
+    notes: |
+      Authorization becomes single-use: each authorized service packet consumes
+      the grant (R4 resets progress to 0), so the source must re-knock for every
+      service packet. Adds a churn G1 (second service packet from an
+      already-authorized source must DROP). Distinct axis-strictness lever on
+      grant lifetime, separate from expiry.
+
+  - id: disable_single_use_grant
+    axis: strictness
+    direction: ease
+    applicable_when: "${authorize_persists} == false"
+    effect: "${authorize_persists} ← true"
+    feasibility_postcondition: "${authorize_persists} == true"
+    notes: |
+      Ease counterpart: authorization is sticky once earned (SPA grant
+      persists). Activates authorized_grant_persistence.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations to v1model P4 (canonical multipath off, fixed sequence):
+
+    State:
+      - register<bit<W>>(N) knock_progress indexed by hash(hdr.ipv4.src) % N,
+        W wide enough for progress (⌈log2(len+1)⌉ bits) plus, under expiry, a
+        since_advance counter (pack both into one register cell or use two
+        parallel register arrays).
+      - knock_sequence is a CONSTANT ordered list; the "expected next port for
+        progress p" is best a small exact-match table keyed on (progress) →
+        expected_port, or a chain of if-comparisons.
+
+    Per-packet logic (ingress):
+      - Compute idx = hash(hdr.ipv4.src). Read progress (and since_advance).
+      - SERVICE gate first: if dst==protected_service && dport==protected_port:
+          progress == len  → forward (and zero progress if grant is single-use);
+          else             → drop. (R4/R5)
+      - Else (a candidate knock):
+          dport == expected_next_port(progress) → progress += 1; since_advance=0;
+              drop. (R1)
+          else if (dport ∈ knock_set) || reset_strict ||
+                  (expiry && since_advance+1 >= expiry_window)
+                                                 → progress = 0; since_advance=0;
+              drop. (R3)
+          else                                   → since_advance += 1; drop. (R2)
+      - Write progress / since_advance back to the register.
+
+    PACKET-COUNT EXPIRY, not wall clock (CRITICAL — the harness
+    injects no time_tick):
+      - The BMv2 --use-files evaluation harness feeds ONLY packets; it never
+        injects a time_tick / wall-clock event. Knock-state expiry MUST be
+        driven by the since_advance PACKET counter, NOT by
+        std.ingress_global_timestamp deltas. A solution that expires progress
+        on a seconds-based timer is ungradable (and wrong for this pattern):
+        the oracle expires on intervening packet count only.
+
+    Default-deny posture:
+      - Knock packets are NEVER forwarded (they egress nowhere; mark_to_drop).
+        Only authorized service-bound packets forward.
+      - The gate decision MUST read BOTH hdr.ipv4.dst and hdr.l4.dport — a
+        port-only gate is bypassable by hitting protected_port on another host.
+
+  Anti-pattern implementations to reject during reference review:
+    * A single GLOBAL progress counter (not per-source) — one attacker's
+      knocks authorize everyone (breaks per_source_isolation).
+    * Advancing on any knock-set port regardless of order — defeats the
+      ordered-sequence requirement (breaks sequence_order_correctness).
+    * Forwarding the knock packets themselves to a service.
+    * Wall-clock / timestamp-delta expiry instead of packet-count expiry —
+      ungradable under the --use-files harness.
+    * Gating service traffic on the L4 port alone (ignoring dst IP).
+    * Conditional deparser emitting the knock onward (a recurring v1model
+      compile/logic bug) — the deparser must unconditionally emit the parsed
+      headers; the drop is via mark_to_drop, not by skipping emit.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance (schema, bindings, oracle audit)
+  and hand-run the public tests through the oracle for the seed. Confirm the oracle reads
+  every mutation_operators knob (knock_sequence length, reset_strict,
+  expiry_window, state_capacity, authorize_persists) from runtime state — never
+  baked as a source constant — so parameter rebinding reuses the audited
+  oracle (parametric-source contract).

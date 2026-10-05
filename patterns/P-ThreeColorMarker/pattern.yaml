@@ -1,0 +1,290 @@
+# P-ThreeColorMarker — RFC 2698 two-rate three-color marker (trTCM), deterministic
+#
+# TPL v1.0 task pattern. A DiffServ traffic conditioner
+# that METERS an IP packet stream against two rates — Peak Information Rate (PIR)
+# and Committed Information Rate (CIR), each with a burst size (PBS / CBS) — and
+# MARKS each packet green / yellow / red in the DS field (RFC 2474 codepoints),
+# per RFC 2698 §3 (color-blind metering) and §4 (marking).
+#
+# WHY THIS PATTERN EXISTS — language-feature coverage:
+# It is authored to force the **saturating-arithmetic** gap (`|+|` / `|-|`), which
+# is 0% across all 771 corpus programs. A correct token bucket MUST clamp the
+# refill at the bucket maximum (saturating add) and MUST NOT let the token-minus-
+# packet-size subtraction wrap below zero (saturating sub / strict pre-test). An
+# unclamped `+` overflows the bucket and diverges from the oracle; an unguarded
+# `-` underflows in unsigned arithmetic and mis-colors. The corpus hand-rolls
+# policers with registers + naive arithmetic precisely here.
+#
+# NOT the meter extern. BMv2's `meter`/`direct_meter` extern derives color from
+# WALL-CLOCK inter-packet timing; under the `--use-files` harness that is
+# non-deterministic and ungradable. This pattern therefore realises the trTCM with
+# a DETERMINISTIC, register-backed token bucket whose replenishment is a fixed
+# per-packet quantum (a discretisation of the per-second fill that is licensed by
+# RFC 2698 §3: "The actual implementation of a Meter doesn't need to be modeled
+# according to the above formal specification"). Same marking decisions, no
+# wall-clock, fully gradable.
+
+pattern_id: P-ThreeColorMarker
+version: "1.0"
+
+nf_categories:                                # NF-category tags (ID:name pairs)
+  descriptive:  [D8:transport-assistance]     # DiffServ conformance/congestion signalling on the data-plane path
+  prescriptive: [P6:congestion-control-assistance]   # P6 = "marking, AQM, feedback signalling"
+
+target_capability: scale_up                   # P6 row's column; programmability scales the metering law (rates/bursts/scope) beyond a fixed-function ASIC policer
+
+summary: >
+  Per-RFC-2698 two-rate three-color marker. The switch maintains two token
+  buckets, P (peak, max PBS) and C (committed, max CBS), shared across the
+  metered stream. On each packet of size B bytes it (1) replenishes both buckets
+  by a per-packet quantum, SATURATING at PBS / CBS; (2) in color-blind mode marks
+  the packet RED if B exceeds the peak bucket (Tp - B < 0), else YELLOW if it
+  exceeds the committed bucket (Tc - B < 0) — decrementing Tp by B — else GREEN —
+  decrementing both Tp and Tc by B; (3) writes the color into the IPv4 DS field
+  (green/yellow/red DSCP codepoints) and forwards (or, under the strict variant,
+  drops RED). The load-bearing contracts are the SATURATING bucket arithmetic
+  (clamp refill at max; never underflow on consume) and the RED-consumes-nothing
+  rule (a red packet must leave both buckets untouched).
+
+grounding:
+  rfcs:
+    - id: RFC2698
+      title: "A Two Rate Three Color Marker (trTCM)"
+      sections: ["2", "3", "4"]
+      role: normative_behaviour
+      quote: "If Tp(t)-B < 0, the packet is red, else if Tc(t)-B < 0, the packet is yellow and Tp is decremented by B, else the packet is green and both Tp and Tc are decremented by B."
+      relevance: >
+        The canonical specification. §2 fixes the four traffic parameters
+        (PIR/PBS/CIR/CBS, with PIR>=CIR); §3 gives the two-bucket color-blind and
+        color-aware metering algorithm this pattern's rules implement verbatim;
+        §4 fixes marking into the DS field. §3's closing note ("the actual
+        implementation ... doesn't need to be modeled according to the above
+        formal specification") licenses the deterministic per-packet-quantum
+        replenishment used for harness gradability.
+    - id: RFC2697
+      title: "A Single Rate Three Color Marker (srTCM)"
+      sections: ["3"]
+      role: domain_concepts
+      quote: "the packet is green and Tc is decremented by B down to the minimum value of 0"
+      relevance: >
+        The single-rate sibling; cited for its explicit SATURATING-subtract
+        semantics ("decremented by B down to the minimum value of 0"), which is
+        the floor invariant this pattern enforces, and as the reachable
+        single-rate faithfulness variant (one shared CIR, buckets C and E) named
+        in the mutation operators.
+
+entities:
+  meter:
+    type: bucket
+    key: [meter_index]            # aggregate: a single index 0; per_flow: hash(5-tuple) % meter_capacity
+    attrs: {tp: int, tc: int}     # peak-bucket and committed-bucket token counts (bytes)
+    capacity: ${meter_capacity}
+    eviction: none
+    init: "tp = ${pbs}, tc = ${cbs}   # RFC 2698 §3: buckets initially full"
+    notes: >
+      The trTCM's two token buckets P and C, held as one register pair per metered
+      stream. tp,tc are byte counts in [0, pbs] / [0, cbs]. Persist across the
+      whole packet sequence; replenished per packet, consumed by packet size B.
+
+parameters:
+  mode:            {type: enum, values: [color_blind, color_aware], default: color_blind}
+  peak_quantum:    {type: int, default: 1500, constraint: "peak_quantum >= committed_quantum"}    # PIR, discretised: bytes replenished to P per packet
+  committed_quantum: {type: int, default: 600, constraint: "committed_quantum >= 1"}                # CIR, discretised: bytes replenished to C per packet
+  pbs:             {type: int, default: 6000, constraint: "pbs >= cbs"}                              # Peak Burst Size = P bucket max (bytes)
+  cbs:             {type: int, default: 3000, constraint: "cbs >= 1"}                                # Committed Burst Size = C bucket max (bytes)
+  token_unit:      {type: enum, values: [bytes, packets], default: bytes}                            # B = IPv4 totalLen (bytes) or 1 (packets)
+  meter_scope:     {type: enum, values: [aggregate, per_flow], default: aggregate}
+  meter_capacity:  {type: int, default: 1, constraint: "meter_capacity >= 1"}                        # bucket-pairs; 1 when aggregate
+  green_dscp:      {type: int, default: 10, constraint: "0 <= green_dscp <= 63"}                      # AF11
+  yellow_dscp:     {type: int, default: 12, constraint: "0 <= yellow_dscp <= 63"}                     # AF12
+  red_dscp:        {type: int, default: 14, constraint: "0 <= red_dscp <= 63"}                        # AF13
+  red_action:      {type: enum, values: [remark, drop], default: remark}
+  faithfulness:    {type: enum, values: [D5.1_per_packet_quantum, D5.2_in_band_tick], default: D5.1_per_packet_quantum}
+  egress_port:     {type: int, default: 2}
+
+rules:
+  - id: R0_classify_ipv4
+    when: "ingress(pkt) ∧ header_present(ipv4)"
+    given: {match: "select the meter index — 0 when meter_scope=aggregate, else hash(5-tuple) % meter_capacity"}
+    then: ["bind(pkt -> meter[meter_index])"]
+    notes: non-IPv4 frames are out of scope (forwarded unmarked / dropped per topology); metering applies to the IPv4 stream.
+
+  - id: R1_replenish
+    when: "after R0"
+    given: {value: "B = (token_unit==bytes ? ipv4.totalLen : 1); refill both buckets by the per-packet quanta"}
+    then:
+      - "inc(meter.tp, peak_quantum) SATURATING at pbs        # tp = min(pbs, tp + peak_quantum)"
+      - "inc(meter.tc, committed_quantum) SATURATING at cbs   # tc = min(cbs, tc + committed_quantum)"
+    notes: >
+      The saturating-ADD contract. tp,tc MUST clamp at pbs,cbs — an unclamped add
+      overflows the bucket and the subsequent color decision diverges from the
+      oracle. Replenishment precedes the color test (RFC 2698 §3 order).
+
+  - id: R2_red
+    when: "value(meter.tp - B < 0)"                # color-aware: OR pkt pre-colored red
+    given: {action: "peak bucket cannot cover the packet"}
+    then:
+      - "rewrite(ipv4.dscp -> red_dscp)"
+      - "drop(pkt) if red_action==drop, else forward(pkt, egress_port)"
+    notes: >
+      RED. RFC 2698: neither bucket is decremented. The RED branch MUST NOT touch
+      tp,tc — the most common policer bug is decrementing-then-dropping, which
+      silently leaks committed tokens.
+
+  - id: R3_yellow
+    when: "¬R2 ∧ value(meter.tc - B < 0)"          # color-aware: OR pkt pre-colored yellow
+    given: {action: "committed bucket cannot cover the packet, peak can"}
+    then:
+      - "dec(meter.tp, B) SATURATING at 0           # tp = tp - B (tp >= B holds here)"
+      - "rewrite(ipv4.dscp -> yellow_dscp)"
+      - "forward(pkt, egress_port)"
+    notes: YELLOW. Decrement ONLY the peak bucket by B; the committed bucket is untouched.
+
+  - id: R4_green
+    when: "¬R2 ∧ ¬R3"
+    given: {action: "both buckets cover the packet"}
+    then:
+      - "dec(meter.tp, B) SATURATING at 0"
+      - "dec(meter.tc, B) SATURATING at 0"
+      - "rewrite(ipv4.dscp -> green_dscp)"
+      - "forward(pkt, egress_port)"
+    notes: >
+      GREEN. Decrement BOTH buckets by B. The saturating-SUB contract: the
+      pre-test in R2/R3 guarantees tp,tc >= B here, but a correct program proves
+      non-negativity rather than relying on unsigned wrap (RFC 2697: "down to the
+      minimum value of 0").
+
+invariants:
+  - id: bucket_saturation
+    clause: stability
+    target: "0 <= meter.tp <= pbs and 0 <= meter.tc <= cbs at all times"
+    notes: the saturating clamp on both refill (upper) and consume (lower); the pattern's reason to exist.
+  - id: red_consumes_nothing
+    clause: stability
+    target: "a RED packet leaves meter.tp and meter.tc unchanged"
+    notes: RFC 2698 §3 — tokens are spent only on the color they admit; a red packet spends none.
+  - id: peak_dominates_committed
+    clause: stability
+    target: "peak_quantum >= committed_quantum and pbs >= cbs (PIR>=CIR); a GREEN packet is necessarily also peak-conforming"
+    notes: config invariant from RFC 2698 §2; a yellow/green packet always satisfied the peak test first.
+  - id: color_downgrade_only
+    clause: stability
+    enforced_when: "mode == color_aware"
+    target: "a pre-colored packet is only ever (re)marked to an equal-or-worse color (green->{green,yellow,red}, yellow->{yellow,red}, red->red)"
+    notes: RFC 2698 §3 color-aware mode; metering may downgrade but never upgrade a pre-colored packet.
+
+test_scaffolding:
+  G1:
+    - id: green_path
+      generate: "first small packet (B <= cbs, buckets full) -> GREEN: egress ipv4.dscp==green_dscp, both buckets decremented by B"
+    - id: yellow_path
+      generate: "a packet that overruns the committed bucket but not the peak bucket -> YELLOW: dscp==yellow_dscp, only tp decremented"
+    - id: red_path
+      generate: "a packet (or burst) that overruns the peak bucket -> RED: dscp==red_dscp, forwarded (remark) or dropped (drop), buckets unchanged"
+  G2:
+    - id: saturating_refill_clamp
+      generate: "a long run of tiny/zero-consume packets must NOT raise tp/tc above pbs/cbs; the bucket caps and a subsequent large packet colors as if bucket==max, not max+overflow"
+    - id: exact_token_boundary
+      generate: "packet with B == tp exactly: Tp - B == 0 is NOT < 0, so the packet is not RED (off-by-one on the strict-less-than test)"
+  G3:
+    - id: red_leaks_no_tokens
+      generate: "after a RED packet, a following conforming packet is still GREEN — proves the RED branch decremented nothing (mark_to_drop / drop-state bug pattern: dropping must not also consume)"
+    - id: per_flow_isolation
+      requires: "meter_scope == per_flow"
+      generate: "two distinct 5-tuples meter independently; flow A exhausting its bucket does not color flow B red (hash-index bug pattern: shared vs per-index register)"
+  coverage_floor: {G1: 3, G2: 2, G3: 2}
+
+mutation_operators:
+  - id: shrink_burst_4x
+    direction: harden
+    kind: parameter
+    axis: capacity
+    effect: "${pbs} ← ${pbs} / 4 and ${cbs} ← ${cbs} / 4 (smaller buckets -> RED/YELLOW reached sooner; the saturating clamp dominates behaviour)"
+    applicable_when: "pbs >= 4 and cbs >= 4"
+    feasibility_postcondition: "pbs >= cbs >= 1"
+  - id: enlarge_burst_2x
+    direction: ease
+    kind: parameter
+    axis: capacity
+    effect: "${pbs} ← ${pbs} * 2 and ${cbs} ← ${cbs} * 2 (larger buckets -> more packets stay GREEN; bucket pressure relaxes)"
+    feasibility_postcondition: "pbs >= cbs >= 1"
+  - id: enable_color_aware
+    direction: harden
+    kind: parameter
+    axis: feature-breadth
+    effect: "${mode} ← color_aware: the SUT must read the incoming DS field and add the downgrade-only branch to R2/R3 (RFC 2698 §3 color-aware)"
+    feasibility_postcondition: "mode == color_aware"
+  - id: disable_color_aware
+    direction: ease
+    kind: parameter
+    axis: feature-breadth
+    effect: "${mode} ← color_blind: ignore incoming color; mark purely on the metering result"
+    feasibility_postcondition: "mode == color_blind"
+  - id: per_flow_meters
+    direction: harden
+    kind: parameter
+    axis: capacity
+    effect: "${meter_scope} ← per_flow with ${meter_capacity} bucket-pairs keyed by hash(5-tuple); adds register-array indexing and collision handling"
+    feasibility_postcondition: "meter_capacity >= 2"
+  - id: aggregate_meter
+    direction: ease
+    kind: parameter
+    axis: capacity
+    effect: "${meter_scope} ← aggregate (${meter_capacity} ← 1, single shared bucket pair)"
+    feasibility_postcondition: "meter_capacity == 1"
+  - id: tighten_faithfulness_tick
+    direction: harden
+    kind: parameter
+    axis: faithfulness
+    effect: "${faithfulness} ← D5.2_in_band_tick: replenishment becomes rate * (arrival_tick - last_tick) read from an in-band per-packet tick field; needs delta-time arithmetic + last-tick state, still deterministic. Oracle regenerated."
+    feasibility_postcondition: "faithfulness == D5.2_in_band_tick"
+  - id: coarsen_faithfulness_quantum
+    direction: ease
+    kind: parameter
+    axis: faithfulness
+    effect: "${faithfulness} ← D5.1_per_packet_quantum: fixed per-packet quantum, no tick field. Oracle regenerated."
+    feasibility_postcondition: "faithfulness == D5.1_per_packet_quantum"
+  - id: red_drop
+    direction: harden
+    kind: parameter
+    axis: strictness
+    effect: "${red_action} ← drop: RED packets are dropped (not forwarded with a codepoint); the SUT must drop WITHOUT consuming tokens (R2 still touches no bucket)"
+    feasibility_postcondition: "red_action == drop"
+  - id: red_remark
+    direction: ease
+    kind: parameter
+    axis: strictness
+    effect: "${red_action} ← remark: RED packets forwarded with red_dscp (visible on egress, easier to verify)"
+    feasibility_postcondition: "red_action == remark"
+
+bridging_notes: |
+  - DETERMINISTIC TIME (the gradability crux). RFC 2698's buckets fill at PIR/CIR
+    *per second*; wall-clock time is not gradable under the `--use-files` harness
+    and the BMv2 `meter` extern is wall-clock-driven. The canonical instance therefore replenishes by a fixed per-packet
+    quantum (D5.1) — a discretisation RFC 2698 §3 explicitly permits. The marking
+    DECISIONS (green/yellow/red against the two buckets) are unchanged; only the
+    "how fast tokens arrive" clock is discretised to packet arrivals. The
+    D5.2_in_band_tick faithfulness rung restores rate*Δt fidelity by reading a
+    monotonic tick carried IN each packet (no harness time_tick needed), keeping
+    determinism.
+  - SATURATING ARITHMETIC is the load-bearing feature this pattern forces and the
+    coverage gap it closes: refill clamps at pbs/cbs (|+| saturate), consume floors
+    at 0 with a strict pre-test (|-| saturate). A v1model register holds tp,tc;
+    `tp + peak_quantum` without `min(pbs, .)` overflows, and `tp - B` with tp<B
+    wraps in unsigned. A correct program clamps both. The corpus emits neither
+    `|+|`/`|-|` nor the manual clamps consistently — this is the discrimination.
+  - MARKING TARGET. Color is written to the 6-bit IPv4 DS field (DSCP), defaults
+    AF11/AF12/AF13 (green/yellow/red drop precedence, RFC 2474/2597 family). No
+    header is added or removed, so the deparser stays unconditional (the
+    conditional-deparser bug pattern is NOT reachable here — by design, to keep
+    the focus on the arithmetic).
+  - PACKET SIZE B = ipv4.totalLen when token_unit=bytes (the RFC's byte-rate
+    semantics), or 1 when token_unit=packets (a simpler packet-rate variant). The
+    byte mode is what makes variable-size packets exercise the buckets.
+  - AGGREGATE vs PER_FLOW. The canonical meter is a single shared bucket pair over
+    the whole IPv4 stream (RFC 2698 meters "an IP packet stream"). per_flow scope
+    (a harden mutation) keys a register array by hash(5-tuple) % meter_capacity,
+    which is where the `hash`-extern bug pattern becomes reachable.
+  - COMMON-KNOWLEDGE gap-fills (not from the cited RFCs): the choice of AF1x
+    DSCP defaults, the per-packet-quantum discretisation, and the per_flow hash
+    indexing are standard P4-policer practice, recorded here for audit.

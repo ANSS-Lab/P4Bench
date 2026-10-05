@@ -1,0 +1,1641 @@
+task_name: upf_router_ceiling
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-UPFRouter
+pattern_version: '1.0'
+seed:
+  n3_ports:
+  - 1
+  n6_ports:
+  - 2
+  upf_n3_ip: 192.168.10.254
+  ul_session_entries:
+  - teid: 256
+    qfi: 9
+  dl_bearer_entries:
+  - ue_ip: 10.45.0.1
+    egress_teid: 512
+    gnb_ip: 192.168.10.1
+    qfi: 9
+  - ue_ip: 10.45.0.2
+    egress_teid: 513
+    gnb_ip: 192.168.10.1
+    qfi: 5
+  - ue_ip: 10.45.0.3
+    egress_teid: 514
+    gnb_ip: 172.16.9.9
+    qfi: 7
+  routes:
+  - prefix: 192.168.10.0
+    prefix_len: 24
+    port: 1
+    port_mac: aa:bb:cc:00:00:01
+    nexthop_mac: 5e:00:00:00:00:01
+  - prefix: 10.0.6.0
+    prefix_len: 24
+    port: 2
+    port_mac: aa:bb:cc:00:00:02
+    nexthop_mac: 08:00:00:00:00:02
+  - prefix: 10.0.0.0
+    prefix_len: 8
+    port: 3
+    port_mac: aa:bb:cc:00:00:03
+    nexthop_mac: 0a:00:00:00:00:03
+  - prefix: 192.168.20.0
+    prefix_len: 24
+    port: 3
+    port_mac: aa:bb:cc:00:00:03
+    nexthop_mac: 0a:00:00:00:00:03
+  outer_udp_dst_port: 2152
+  outer_udp_src_port_mode: hash_inner_5tuple
+  outer_udp_src_port_fixed_value: 2152
+  outer_udp_checksum_mode: computed_on_tx
+  gtpu_ext_header_handling: pdu_session_container
+  qfi_policy: set_from_bearer
+  dscp_copy_policy: copy_inner_to_outer
+  teid_validation_strict: true
+  end_marker_handling: drop
+  mtu_enforcement: strict_drop_oversize
+  multipath_mode: ecmp_hash_5tuple
+  martian_filter_enabled: true
+  emit_transit_icmp_errors: true
+  default_action: send_icmp_unreachable
+  origination_ttl: 64
+  faithfulness: D5.2_full_validation_ecmp
+description: |
+  A switch s1 is the user-plane function (UPF) of a 4G/5G mobile core AND
+  an IPv4 router for the transport fabric it sits in. Port s1.p1 faces the
+  base station (gNB) and the transport underlay; it carries both
+  GTP-U-encapsulated traffic and plain transit IPv4. Port s1.p2 faces the
+  data network and carries bare IP traffic. Port s1.p3 is a second
+  transport-fabric uplink. The switch has its own GTP-U endpoint IPv4
+  address on the gNB-facing side — 192.168.10.254.
+
+  A 5G GTP-U user-data packet on the wire looks like:
+
+    outer Ethernet / outer IPv4 / UDP / GTP-U / GTP-U optional field /
+      PDU Session Container / inner IPv4 / inner payload
+
+  where the outer UDP destination port is 2152 and the GTP-U header's first
+  8 octets are mandatory: a flags byte (the high 3 bits are the Version and
+  MUST be 1; the next bit is the Protocol Type and MUST be 1; the next bit
+  is the Extension-header flag; the low 2 bits are the Sequence-number and
+  N-PDU flags, 0 here), a 1-octet Message Type (255 for a user-data G-PDU,
+  254 for an End Marker), a 2-octet Length, and a 4-octet Tunnel Endpoint
+  Identifier (TEID).
+
+  This is a 5G deployment, so every encapsulated G-PDU carries a **PDU
+  Session Container** extension header conveying the QoS Flow Identifier
+  (QFI). When an extension header is present the GTP-U Extension-header
+  flag (E) is set to 1, and two 4-octet blocks follow the mandatory 8
+  octets before the inner IP packet:
+
+    - a 4-octet optional field — a 2-octet Sequence Number (0 here), a
+      1-octet N-PDU Number (0 here), and a 1-octet Next-Extension-Header
+      Type whose value is 0x85 (PDU Session Container);
+    - a 4-octet PDU Session Container — a 1-octet Extension-Header Length
+      (value 1, i.e. 4 octets), a 1-octet PDU-type/spare byte (DL PDU
+      Session Information, value 0), a 1-octet byte whose low 6 bits are
+      the QFI, and a 1-octet Next-Extension-Header Type of 0x00 (no
+      further extension headers).
+
+  The **Length** field counts the octets that follow the first 8 mandatory
+  octets — so with the optional field + PDU Session Container present it is
+  the inner IP packet length PLUS 8, NOT the inner length alone and NOT the
+  whole outer packet length. The payload carried inside a G-PDU (a "T-PDU")
+  is an IP packet — there is no inner Ethernet header inside the tunnel.
+
+  This deployment also carries an unrelated operations VLAN on another
+  rack. That VLAN never reaches s1 and plays no role in any forwarding
+  decision here.
+
+  Note that an encapsulated packet has TWO IPv4 headers — an outer
+  (transport) one and an inner (subscriber) one — and which one a step
+  reads or rewrites depends on the step. The switch classifies every
+  ingress packet into exactly one of the cases below.
+
+  ## Configuration available to the switch (control-plane provisioned)
+
+  The control plane has provisioned this switch with the concrete tables
+  below; your control plane must install entries that realise them.
+
+    - This UPF's GTP-U endpoint IP on the gNB-facing side is 192.168.10.254.
+
+    - **Per-port source MAC** — the source MAC this switch stamps into the
+      Ethernet header when it rewrites L2 on egress out a port:
+        - port s1.p1: aa:bb:cc:00:00:01
+        - port s1.p2: aa:bb:cc:00:00:02
+        - port s1.p3: aa:bb:cc:00:00:03
+
+    - **Uplink tunnel set** — the TEIDs of tunnels that terminate at this
+      UPF (the admission set for decapsulation). A G-PDU whose TEID is not
+      in this set is dropped. Provisioned members: TEID 256.
+
+    - **Downlink bearer table** — maps a destination subscriber (UE) IPv4
+      address to that bearer's egress TEID, the gNB's IPv4 address, and the
+      bearer's QoS Flow Identifier (QFI):
+        - UE 10.45.0.1 -> egress TEID 512, gNB 192.168.10.1, QFI 9
+        - UE 10.45.0.2 -> egress TEID 513, gNB 192.168.10.1, QFI 5
+        - UE 10.45.0.3 -> egress TEID 514, gNB 172.16.9.9, QFI 7
+
+    - **Transport forwarding table** — a longest-prefix-match IPv4 FIB; each
+      entry maps an IPv4 prefix to an egress port and the next-hop MAC used
+      for the L2 rewrite (the source MAC is the egress port's MAC listed
+      above, the destination MAC is this next-hop MAC):
+        - 192.168.10.0/24 -> port s1.p1, next-hop MAC 5e:00:00:00:00:01
+        - 10.0.6.0/24     -> port s1.p2, next-hop MAC 08:00:00:00:00:02
+        - 192.168.20.0/24 -> port s1.p3, next-hop MAC 0a:00:00:00:00:03
+        - 10.0.0.0/8      -> port s1.p3, next-hop MAC 0a:00:00:00:00:03
+
+  ## Packets arriving on the data-network port (s1.p2) — downlink
+
+  1. **Encapsulate, then route.** Look up the packet's destination IP (a
+     UE address) in the downlink bearer table. On a miss, drop. The bearer
+     yields the egress TEID, the gNB IP, and the QFI. Build the outer
+     headers (outer IPv4 / UDP / GTP-U / optional field / PDU Session
+     Container in front of the arriving packet, which becomes the inner
+     T-PDU), with:
+
+       - Outer IPv4: version 4, IHL 5, DSCP copied from the inner IPv4
+         packet and ECN 0; total-length covers the whole outer packet; DF
+         set; fragment-offset 0; TTL = the standard initial value 64;
+         protocol 17 (UDP); source = this UPF's endpoint IP
+         (192.168.10.254); destination = the gNB IP. The outer IPv4 header
+         checksum MUST be correctly computed.
+       - UDP: destination port 2152; source port is a deterministic hash
+         of the inner 5-tuple in the dynamic/private range 49152..65535;
+         length covering the UDP header and everything after it; checksum
+         MUST be correctly computed, not left as zero.
+       - GTP-U: Version 1, Protocol Type 1, Extension-header flag (E) = 1
+         (a PDU Session Container follows), Sequence-number and N-PDU flags
+         0, Message Type 255, TEID = the bearer's egress TEID, and Length =
+         the inner IP packet length PLUS 8 (the optional field + the PDU
+         Session Container).
+       - GTP-U optional field: Sequence Number 0, N-PDU Number 0,
+         Next-Extension-Header Type 0x85.
+       - PDU Session Container: Extension-Header Length 1, PDU-type/spare
+         byte 0 (DL PDU Session Information), QFI = the bearer's QFI in the
+         low 6 bits, Next-Extension-Header Type 0x00.
+
+     Then **route the freshly-built packet by longest-prefix match on its
+     OUTER destination** (the gNB IP): that lookup picks the egress port
+     and the outer Ethernet rewrite (source MAC = egress port MAC,
+     destination MAC = next-hop MAC). Forward out that port. The switch is
+     ORIGINATING this outer datagram, so it MUST NOT decrement the outer
+     TTL on this step. The inner T-PDU — including its IPv4 TTL, addresses,
+     and checksum — MUST NOT be modified (the tunnel is transport).
+
+  2. **Unreachable gNB.** If the bearer's gNB IP has no route in the
+     transport FIB, the packet cannot be delivered — drop. If the
+     encapsulated packet would exceed the configured outer MTU of 1500
+     octets, drop rather than emitting an oversize outer datagram.
+
+  ## Packets arriving on the gNB / transport port (s1.p1)
+
+  3. **Decapsulate, then route the inner packet (only G-PDUs addressed to
+     this UPF).** If the packet is a GTP-U user-data G-PDU (outer UDP
+     destination 2152, Message Type 255) AND its outer IPv4 destination
+     equals this UPF's endpoint IP (192.168.10.254), this switch terminates
+     the tunnel. Validate the GTP-U header — a G-PDU whose Version is not 1
+     or whose Protocol Type bit is not 1 is malformed and MUST be dropped.
+     Verify the TEID is in the uplink tunnel set (on a miss, drop). Strip
+     the outer IPv4, UDP, and GTP-U headers (including any optional field
+     and extension headers). The packet that
+     emerges is the inner IP T-PDU; this switch is now the first-hop IPv4
+     router for it toward the data network: **route it by longest-prefix
+     match on its INNER destination**, decrement the inner IPv4 TTL by
+     exactly one, recompute the inner IPv4 header checksum, rewrite the
+     (single, now-outermost) Ethernet header from the chosen next hop, and
+     forward. If the inner TTL is already 1 or 0, drop. If the inner
+     destination has no route, drop. A GTP-U End Marker (Message Type 254)
+     is tunnel signalling — drop it; it MUST NOT be delivered to the data
+     network.
+
+  4. **Transit-route (anything addressed to any other endpoint).** If the
+     packet's outer IPv4 destination is NOT this UPF's endpoint IP — a
+     GTP-U packet bound for a different gNB/UPF, or plain transit IPv4 —
+     the switch is a transit router for it: forward it by longest-prefix
+     match on its OUTER IPv4 destination, decrement the OUTER IPv4 TTL by
+     exactly one, recompute the outer IPv4 header checksum, and rewrite the
+     OUTER Ethernet (source = egress port MAC, destination = next-hop MAC).
+     A GTP-U transit packet keeps its full outer stack — it is NOT
+     decapsulated, and the inner T-PDU is untouched. Before forwarding, the
+     following exception cases are evaluated IN THIS ORDER; the first one
+     that applies decides the outcome, and in every exception case the
+     transit packet itself is NOT forwarded:
+
+       - **Martian source.** If the OUTER source address is a martian
+         (127.0.0.0/8, 0.0.0.0/8, multicast 224.0.0.0/4, or
+         255.255.255.255), drop the packet silently — no ICMP is emitted.
+       - **Expired TTL.** Otherwise, if the outer TTL is already 1 or 0 (it
+         cannot survive this hop), do not forward the packet; instead
+         originate an ICMP Time Exceeded message (type 11, code 0) back to
+         the outer source.
+       - **No route.** Otherwise, if there is no longest-prefix-match route
+         for the outer destination, originate an ICMP Destination
+         Unreachable message (type 3, code 0) back to the outer source.
+
+     Otherwise (none of the exceptions apply) the packet is forwarded as
+     described above. Each originated ICMP message is itself a bare IPv4
+     packet whose source address is this UPF's endpoint IP (192.168.10.254),
+     whose destination is the original outer source address, with TTL 64 and
+     IP protocol 1 (ICMP); it is routed by longest-prefix match back toward
+     that source and its Ethernet header is rewritten from the chosen
+     next hop.
+
+  ## Side requirements
+
+  - Non-IPv4 packets are dropped.
+  - The inner TTL is treated DIFFERENTLY by direction: on encapsulation
+    (downlink origination) the inner TTL is preserved (the tunnel is
+    transport); on decapsulation (uplink termination) the now-exposed inner
+    packet IS routed by this switch, so its TTL is decremented by one.
+  - A GTP-U packet is decapsulated only when its outer destination is this
+    UPF's own endpoint; otherwise it is transit-routed with its outer stack
+    intact.
+  - On origination (encapsulation) the outer TTL is the initial value 64,
+    not decremented; on transit it is decremented by exactly one.
+
+  Grounding: 3GPP TS 29.281 (GTPv1-U) for the tunnel encap/decap; RFC 1812
+  (IPv4 router requirements) for the longest-prefix-match forwarding, TTL
+  handling, and Ethernet rewrite. P4-UPF (ONF Aether / SD-Fabric) for the
+  UPF deployment model.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+hosts:
+  h1:
+    ip: 192.168.10.1/24
+    mac: 5e:00:00:00:00:01
+    port: s1.p1
+  h2:
+    ip: 10.0.6.6/24
+    mac: 08:00:00:00:00:02
+    port: s1.p2
+  h3:
+    ip: 192.168.20.9/24
+    mac: 0a:00:00:00:00:03
+    port: s1.p3
+test_cases:
+- name: decap_then_route_inner
+  visibility: hidden
+  description: 'decap_then_route_inner.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.1
+        dst: 192.168.10.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 10
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.dst:
+        action: change_to
+        value: 10.0.6.6
+      IP.ttl:
+        action: change_to
+        value: 9
+- name: encap_then_underlay_lpm_route
+  visibility: hidden
+  description: 'encap_then_underlay_lpm_route.'
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:02
+        dst: aa:bb:cc:00:00:02
+    - IP:
+        src: 10.0.6.6
+        dst: 10.45.0.1
+        ttl: 64
+    - TCP:
+        sport: 80
+        dport: 44000
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      layers[1].IP.dst:
+        action: change_to
+        value: 192.168.10.1
+      layers[3].GTPU.teid:
+        action: change_to
+        value: 512
+      layers[3].GTPU.length:
+        action: change_to
+        value: 48
+      layers[2].UDP.sport:
+        action: change_to_range
+        min: 49152
+        max: 65535
+      layers[2].UDP.chksum:
+        action: change_to_range
+        min: 1
+        max: 65535
+      layers[6].IP.dst:
+        action: change_to
+        value: 10.45.0.1
+- name: plain_underlay_ipv4_transit
+  visibility: hidden
+  description: 'plain_underlay_ipv4_transit.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 8.8.8.8
+        dst: 192.168.20.9
+        ttl: 64
+    - TCP:
+        sport: 40000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.dst:
+        action: change_to
+        value: 192.168.20.9
+      IP.ttl:
+        action: change_to
+        value: 63
+- name: non_ipv4_drop
+  visibility: hidden
+  description: 'non_ipv4_drop.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+        type: 2054
+  expected:
+    behavior: drop
+- name: icmp_te_plain_00
+  visibility: public
+  description: 'icmp_te_plain_00.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.50
+        dst: 192.168.20.5
+        ttl: 0
+    - TCP:
+        sport: 41000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.50
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_01
+  visibility: hidden
+  description: 'icmp_te_plain_01.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.51
+        dst: 192.168.20.7
+        ttl: 1
+    - TCP:
+        sport: 41001
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.51
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_02
+  visibility: hidden
+  description: 'icmp_te_plain_02.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.50
+        dst: 10.0.6.9
+        ttl: 0
+    - TCP:
+        sport: 41002
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.50
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_03
+  visibility: hidden
+  description: 'icmp_te_plain_03.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.51
+        dst: 10.0.6.8
+        ttl: 1
+    - TCP:
+        sport: 41003
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.51
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_04
+  visibility: hidden
+  description: 'icmp_te_plain_04.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.70
+        dst: 192.168.10.50
+        ttl: 0
+    - TCP:
+        sport: 41004
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.70
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_05
+  visibility: hidden
+  description: 'icmp_te_plain_05.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.71
+        dst: 192.168.10.40
+        ttl: 1
+    - TCP:
+        sport: 41005
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.71
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_06
+  visibility: hidden
+  description: 'icmp_te_plain_06.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.52
+        dst: 192.168.20.11
+        ttl: 0
+    - TCP:
+        sport: 41006
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.52
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_07
+  visibility: hidden
+  description: 'icmp_te_plain_07.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.52
+        dst: 10.0.6.13
+        ttl: 1
+    - TCP:
+        sport: 41007
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.52
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_plain_08
+  visibility: hidden
+  description: 'icmp_te_plain_08.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.73
+        dst: 192.168.10.33
+        ttl: 0
+    - TCP:
+        sport: 41008
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.73
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_gtpu_00
+  visibility: hidden
+  description: 'icmp_te_gtpu_00.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.20
+        dst: 192.168.20.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.20
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_gtpu_01
+  visibility: hidden
+  description: 'icmp_te_gtpu_01.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.80
+        dst: 192.168.20.6
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.80
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_te_gtpu_02
+  visibility: hidden
+  description: 'icmp_te_gtpu_02.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.72
+        dst: 10.0.6.30
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.72
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 11
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_00
+  visibility: public
+  description: 'icmp_du_plain_00.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.30
+        dst: 203.0.113.50
+        ttl: 64
+    - TCP:
+        sport: 42000
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.30
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_01
+  visibility: hidden
+  description: 'icmp_du_plain_01.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.31
+        dst: 203.0.113.77
+        ttl: 64
+    - TCP:
+        sport: 42001
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.31
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_02
+  visibility: hidden
+  description: 'icmp_du_plain_02.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.40
+        dst: 198.51.100.9
+        ttl: 64
+    - TCP:
+        sport: 42002
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.40
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_03
+  visibility: hidden
+  description: 'icmp_du_plain_03.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.41
+        dst: 198.51.100.23
+        ttl: 64
+    - TCP:
+        sport: 42003
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.41
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_04
+  visibility: hidden
+  description: 'icmp_du_plain_04.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.90
+        dst: 100.64.7.7
+        ttl: 64
+    - TCP:
+        sport: 42004
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.90
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_05
+  visibility: hidden
+  description: 'icmp_du_plain_05.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.91
+        dst: 100.64.8.8
+        ttl: 64
+    - TCP:
+        sport: 42005
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.91
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_06
+  visibility: hidden
+  description: 'icmp_du_plain_06.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.32
+        dst: 203.0.113.99
+        ttl: 64
+    - TCP:
+        sport: 42006
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.32
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_07
+  visibility: hidden
+  description: 'icmp_du_plain_07.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.42
+        dst: 198.51.100.55
+        ttl: 64
+    - TCP:
+        sport: 42007
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.42
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_plain_08
+  visibility: hidden
+  description: 'icmp_du_plain_08.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.92
+        dst: 100.64.12.12
+        ttl: 64
+    - TCP:
+        sport: 42008
+        dport: 443
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.92
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_gtpu_00
+  visibility: hidden
+  description: 'icmp_du_gtpu_00.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.60
+        dst: 100.64.5.5
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:01
+      Ether.dst:
+        action: change_to
+        value: 5e:00:00:00:00:01
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.10.60
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_gtpu_01
+  visibility: hidden
+  description: 'icmp_du_gtpu_01.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 10.0.6.70
+        dst: 203.0.113.200
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:02
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 10.0.6.70
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: icmp_du_gtpu_02
+  visibility: hidden
+  description: 'icmp_du_gtpu_02.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.20.70
+        dst: 100.64.9.9
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 256
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: aa:bb:cc:00:00:03
+      Ether.dst:
+        action: change_to
+        value: 0a:00:00:00:00:03
+      IP.src:
+        action: change_to
+        value: 192.168.10.254
+      IP.dst:
+        action: change_to
+        value: 192.168.20.70
+      IP.proto:
+        action: change_to
+        value: 1
+      ICMP.type:
+        action: change_to
+        value: 3
+      ICMP.code:
+        action: change_to
+        value: 0
+- name: decap_unknown_teid_drop
+  visibility: public
+  description: 'decap_unknown_teid_drop.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 5e:00:00:00:00:01
+        dst: aa:bb:cc:00:00:01
+    - IP:
+        src: 192.168.10.1
+        dst: 192.168.10.254
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 2152
+        dport: 2152
+        chksum: 0
+    - GTPU:
+        version: 1
+        pt: 1
+        e: 1
+        msgtype: 255
+        teid: 4242
+        length: 48
+    - GTPUOpt:
+        seqnum: 0
+        npdu: 0
+        next_ext: 133
+    - GTPUPduSession:
+        ext_len: 1
+        pdu_type: 0
+        qfi: 9
+        next_ext: 0
+    - IP:
+        src: 10.45.0.1
+        dst: 10.0.6.6
+        ttl: 30
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

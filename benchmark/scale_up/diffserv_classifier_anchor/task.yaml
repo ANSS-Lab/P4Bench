@@ -1,0 +1,212 @@
+task_name: diffserv_classifier_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-DiffServClassifier
+pattern_version: '1.0'
+
+seed:
+  classifier_capacity: unbounded
+  default_dscp: 0
+  preserve_ecn: true
+  faithfulness: D6.0_be_ef_af
+
+description: |
+  Implement a DiffServ boundary node (multi-field classifier + marker) on a
+  single switch s1, per RFC 2474 / RFC 2597 / RFC 3246. The switch classifies
+  each IPv4 packet, remarks its DSCP to the matched class's codepoint while
+  preserving the packet's ECN, and forwards it per the policy below.
+
+  ## Classifier (multi-field key → class, DSCP, egress)
+
+  Match on (IPv4 destination, IP protocol, L4 destination port); the control
+  plane installs these as table entries.
+
+    | dst        | proto | L4 dport | class | DSCP | egress port | next-hop MAC      | egress-port MAC   |
+    |------------|-------|----------|-------|------|-------------|-------------------|-------------------|
+    | 10.0.2.2   | UDP   | 5060     | EF    | 46   | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.3.3   | TCP   | 80       | AF31  | 26   | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+   - A frame that is not IPv4 is dropped.
+   - On a classifier match the packet's DSCP is set to the class codepoint while
+     its ECN is left unchanged; the Ethernet source is set to the egress port's
+     own MAC and the destination to the next-hop MAC; the packet is forwarded out
+     the class's egress port.
+   - An IPv4 packet matching no classifier entry falls to Best-Effort: its DSCP
+     is set to 0 and it is forwarded out the default egress s1.p2 with its
+     Ethernet addresses unchanged.
+   - This is an edge marker, not a routing hop: the IPv4 source, destination, and
+     TTL are not modified.
+
+  ## Topology
+
+  One switch s1, three ports. s1.p2 MAC 08:00:00:00:02:00, s1.p3 MAC
+  08:00:00:00:03:00.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.1.1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "10.0.2.2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "10.0.3.3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: classify_ef_voice
+    visibility: public
+    description: |
+      A UDP packet to 10.0.2.2:5060.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0}
+        - UDP:   {sport: 40000, dport: 5060}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos:    {action: change_to, value: 184}
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+
+  - name: classify_af31_web
+    visibility: public
+    description: |
+      A TCP packet to 10.0.3.3:80.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", ttl: 64, tos: 0}
+        - TCP:   {sport: 40000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.tos:    {action: change_to, value: 104}
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+
+  - name: classify_default_be
+    visibility: public
+    description: |
+      A flow matching no classifier entry.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.5.5", ttl: 64, tos: 0}
+        - TCP:   {sport: 40000, dport: 9999, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+        IP.dst: {action: unchanged}
+
+  - name: preserve_ecn_on_remark
+    visibility: hidden
+    description: |
+      A classified EF packet arriving with ECN=01 (TOS byte 1) is remarked to
+      DSCP 46 but its ECN bits are preserved → TOS byte 185 (184 | 1).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 1}
+        - UDP:   {sport: 40000, dport: 5060}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: change_to, value: 185}
+
+  - name: classify_af31_remark_l2_p3
+    visibility: hidden
+    description: |
+      A TCP packet to 10.0.3.3:80 arriving with ECN=01 (TOS byte 1) matches the
+      AF31 class: its DSCP is remarked to 26 while ECN is preserved (TOS byte
+      105 = 104 | 1), its Ethernet source/destination are rewritten to the
+      egress-port and next-hop MACs, and it is forwarded out the class egress
+      (the non-default port). IP source/destination/TTL are unchanged.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:0a:0a", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.7", dst: "10.0.3.3", ttl: 64, tos: 1}
+        - TCP:   {sport: 51000, dport: 80, flags: "A"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.tos:    {action: change_to, value: 105}
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+        IP.ttl:    {action: unchanged}
+
+# --- G2: multi-field specificity ---
+
+  - name: mf_specificity_wrong_port
+    visibility: hidden
+    description: |
+      Same destination as the EF rule (10.0.2.2) but L4 port 1234 ≠ 5060 → it
+      does NOT match EF; it falls to Best-Effort (DSCP stays 0), forward p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0}
+        - UDP:   {sport: 40000, dport: 1234}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+  - name: mf_specificity_wrong_proto
+    visibility: hidden
+    description: |
+      TCP to 10.0.2.2:5060 — the EF rule keys on UDP, so a TCP packet does NOT
+      match it and falls to Best-Effort (DSCP stays 0).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64, tos: 0}
+        - TCP:   {sport: 40000, dport: 5060, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.tos: {action: unchanged}
+
+# --- G3 ---
+
+  - name: drop_non_ipv4
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) is not classified → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.2", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop

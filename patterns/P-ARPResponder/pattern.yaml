@@ -1,0 +1,146 @@
+# P-ARPResponder — Data-plane proxy-ARP responder (ARP reply origination)
+#
+# TPL v1.0 task pattern. A data-plane proxy-ARP gateway:
+# answer ARP requests for IPs in its resolution table by ORIGINATING an ARP
+# reply (op flip, fill the resolved hardware address, swap sender/target) and
+# forwarding it toward the requester via the L2 FIB. The corpus's first
+# request/reply data-plane origination. Grounded in RFC 826.
+
+pattern_id: P-ARPResponder
+version: "1.0"
+nf_categories:
+  descriptive:  [D10:address-resolution]
+  prescriptive: [P1:forwarding]
+target_capability: redesign
+summary: >
+  Data-plane proxy-ARP responder. ARP requests (op 1) for a target IP in the
+  resolution table are answered by ORIGINATING an ARP reply (op 2) whose sender
+  hardware address is the resolved MAC and whose sender/target fields are the
+  request's target/sender swapped. The reply is forwarded toward the requester
+  via an L2 MAC→port table. Requests for unknown targets, non-request ARP, and
+  non-ARP frames are dropped. Mutation adds per-subnet proxying and gratuitous
+  ARP handling.
+
+grounding:
+  rfcs:
+    - id: RFC826
+      sections: ["Packet format", "Packet Reception"]
+      role: canonical_spec
+      grounds: R1_arp_reply_origination
+      quote: "?Is the opcode ares_op$REQUEST?  (NOW look at the opcode!!)\n      Yes:\n\tSwap hardware and protocol fields, putting the local\n\t    hardware and protocol addresses in the sender fields.\n\tSet the ar$op field to ares_op$REPLY\n\tSend the packet to the (new) target hardware address on\n\t    the same hardware on which the request was received."
+      relevance: |
+        An Ethernet Address Resolution Protocol — the ARP packet format
+        (hardware/protocol type, op, sender/target hardware+protocol
+        addresses) and the request→reply transform: on a request whose target
+        protocol address is one this node can answer, swap sender↔target, set
+        the sender hardware address to the resolved address, set op to reply,
+        and send it back to the requester. Basis for R1 (reply origination).
+  papers: []
+  tutorials: []
+
+entities:
+  packet:
+    notes: "ARP request triggers an originated ARP reply."
+  arp_table:                                # the TPL `bucket` role
+    keyed_by_tuple: [target_ip]
+    attrs: {resolved_mac: address}
+    notes: "IP → MAC resolution table the proxy answers from."
+  l2_fib:
+    keyed_by_tuple: [requester_mac]
+    attrs: {egress_port: port}
+    notes: "Where to send the reply (requester MAC → port)."
+
+parameters:
+  arp_table:
+    type: list[arp_entry]
+    constraint: "each has target_ip, resolved_mac"
+  l2_fib:
+    type: list[l2_entry]
+    constraint: "each has requester_mac, egress_port"
+  faithfulness:
+    type: enum
+    values: [D.table_proxy, D.subnet_proxy]
+    default: D.table_proxy
+
+rules:
+  - id: R0_non_arp_or_non_request_drop
+    when: "¬header_present(arp) ∨ arp.op ≠ 1"
+    then: [drop]
+    notes: "Only ARP requests are answered; non-ARP and ARP replies are dropped."
+  - id: R1_arp_reply_origination
+    when: "header_present(arp) ∧ arp.op == 1 ∧ exists(arp_table, by_key(arp.pdst)) ∧ exists(l2_fib, by_key(arp.hwsrc))"
+    given:
+      resolved: by_key(arp.pdst, ${arp_table})
+      egress:   by_key(arp.hwsrc, ${l2_fib})
+    then:
+      - "set(arp.op, 2)"
+      - "set(arp.psrc, arp.pdst)        # sender protocol ← the resolved target IP"
+      - "set(arp.pdst, orig.arp.psrc)   # target protocol ← the requester IP"
+      - "set(arp.hwsrc, resolved.mac)   # sender hardware ← the resolved MAC"
+      - "set(arp.hwdst, orig.arp.hwsrc) # target hardware ← the requester MAC"
+      - "set(hdr.ethernet.src, resolved.mac)"
+      - "set(hdr.ethernet.dst, orig.arp.hwsrc)"
+      - forward(egress.egress_port)
+    notes: |
+      Originate the ARP reply per RFC 826: flip the op to 2, swap sender↔target
+      protocol addresses, set the sender hardware address to the resolved MAC,
+      set the target hardware address to the requester's MAC, rewrite Ethernet,
+      and forward toward the requester (via the L2 FIB).
+  - id: R2_unknown_target_drop
+    when: "header_present(arp) ∧ arp.op == 1 ∧ ¬exists(arp_table, by_key(arp.pdst))"
+    then: [drop]
+    notes: "The proxy does not answer for IPs outside its resolution table."
+
+invariants:
+  - id: reply_op_and_sender
+    clause: stability
+    target: "(arp.op, arp.hwsrc, arp.psrc)"
+    while: "rule R1 fires"
+    notes: "The reply is op 2 with sender = (resolved MAC, target IP)."
+  - id: reply_to_requester
+    clause: stability
+    target: "(arp.pdst, arp.hwdst, egress_port)"
+    while: "rule R1 fires"
+    notes: "The reply targets the requester's (IP, MAC) and egresses its port."
+
+test_scaffolding:
+  G1:
+    - id: arp_reply_basic
+      generate: "ARP request for a known target IP → reply (op 2, resolved MAC) to the requester's port."
+    - id: arp_reply_distinct_requester
+      generate: "A request from a different requester → reply egresses that requester's port."
+    - id: arp_reply_fields
+      generate: "Assert the full reply field set (op/hwsrc/psrc/hwdst/pdst + Ethernet)."
+  G2:
+    - id: arp_drop_unknown_target
+      generate: "Request for an IP not in the table → drop."
+    - id: arp_drop_unknown_requester
+      generate: "Request from a requester MAC not in the L2 FIB → drop (cannot deliver)."
+  G3:
+    - id: arp_drop_reply_op
+      generate: "An ARP reply (op 2) arriving → drop (only requests are answered)."
+    - id: drop_non_arp
+      generate: "A non-ARP frame (IPv4) → drop."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_subnet_proxy
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${faithfulness} == D.table_proxy"
+    effect: "${faithfulness} ← D.subnet_proxy (answer for any IP in a configured subnet, one shared MAC)"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+
+bridging_notes: |
+  Canonical implementation:
+    - Parse Ether(0x0806)/ARP. Gate on arp.op==1.
+    - arp_table keyed on arp.pdst (target IP) → action set_resolved(mac).
+    - l2_fib keyed on arp.hwsrc (requester MAC) → action set_egress(port).
+    - Build the reply in place: save the requester IP (psrc) and MAC (hwsrc);
+      set op=2; psrc=pdst (target IP); pdst=saved requester IP; hwsrc=resolved;
+      hwdst=saved requester MAC; ethernet.src=resolved; ethernet.dst=requester
+      MAC; egress.
+  Anti-patterns:
+    * Answering for IPs not in the table (over-broad proxy).
+    * Forgetting to swap sender/target protocol addresses.
+    * Sending the reply with the requester's MAC as sender (op flip only).

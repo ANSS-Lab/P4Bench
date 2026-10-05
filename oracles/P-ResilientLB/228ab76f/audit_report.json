@@ -1,0 +1,97 @@
+{
+  "oracle_hash": "edd733f06be2ab1978aff449ef07d3aa4f9d04715733cd350d8f0574923eed58",
+  "instance": "resilient_lb_anchor-default",
+  "ran_at": "2026-06-16T21:55:09.571037Z",
+  "canonical_examples": {
+    "passed": 6,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "bfd_down_update",
+        "status": "pass"
+      },
+      {
+        "example_id": "lb_primary_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "lb_failover_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "all_backends_down_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "established_failover_repin",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "liveness_gated_selection": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "flow_pin_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "failover_repin": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "all_dead_drop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "liveness_gated_selection",
+      "flow_pin_persistence",
+      "failover_repin",
+      "all_dead_drop",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "Eisenbud et al., Maglev: A Fast and Reliable Software Network Load Balancer, NSDI 2016",
+      "Chiesa et al., PURR: a primitive for reconfigurable fast reroute, CoNEXT 2019",
+      "RFC5880",
+      "RFC1812"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

@@ -1,0 +1,146 @@
+{
+  "oracle_hash": "218d328af1d249ab6602dd09f70234c7ef9723445fb063fcc9201c652a2a8dd3",
+  "instance": "decision_tree_infer_anchor-default",
+  "ran_at": "2026-06-17T04:03:35.006532Z",
+  "canonical_examples": {
+    "passed": 17,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "r0_unclassifiable_forward_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_unclassifiable_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_missing_upper_layer_feature",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_forward_class0_left_branch",
+        "status": "pass"
+      },
+      {
+        "example_id": "r3_forward_class2_right_right_branch",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_ttl_eq_64_tie_break_le",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_ttl_eq_64_tie_break_lt_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "r1_class_drop_anomaly",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_class_mark_dscp",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_class_fallback_no_action_row",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_class_fallback_drop_when_unclassified_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "forest_majority_vote",
+        "status": "pass"
+      },
+      {
+        "example_id": "forest_majority_vote_to_drop_class",
+        "status": "pass"
+      },
+      {
+        "example_id": "forest_weighted_majority_vote_to_drop_class",
+        "status": "pass"
+      },
+      {
+        "example_id": "forest_sum_threshold_vote_to_forward_class",
+        "status": "pass"
+      },
+      {
+        "example_id": "quantise_low_byte_folds_into_left_branch",
+        "status": "pass"
+      },
+      {
+        "example_id": "quantise_4bit_folds_low_nibble",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "inference_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "boundary_classification_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "envelope_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "feature_read_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "inference_determinism",
+      "boundary_classification_fidelity",
+      "payload_persistence",
+      "feature_read_safety"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "iisy_automating_innetwork_ml"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

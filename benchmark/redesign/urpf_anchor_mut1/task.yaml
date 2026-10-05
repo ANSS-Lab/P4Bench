@@ -1,0 +1,519 @@
+task_name: urpf_anchor_mut1
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-uRPF
+pattern_version: '1.0'
+seed:
+  urpf_mode: loose
+  exempt_default_route: false
+  default_action: drop
+  reverse_routes:
+  - prefix: 10.0.1.0
+    prefix_len: 24
+    expected_ingress_ports:
+    - 1
+  - prefix: 10.0.2.0
+    prefix_len: 24
+    expected_ingress_ports:
+    - 2
+  - prefix: 10.0.3.0
+    prefix_len: 24
+    expected_ingress_ports:
+    - 3
+  - prefix: 10.1.0.0
+    prefix_len: 16
+    expected_ingress_ports:
+    - 1
+  - prefix: 10.1.5.0
+    prefix_len: 24
+    expected_ingress_ports:
+    - 3
+  forward_routes:
+  - prefix: 10.0.1.0
+    prefix_len: 24
+    port: 1
+    port_mac: 08:00:00:00:01:00
+    nexthop_mac: 08:00:00:00:01:01
+  - prefix: 10.0.2.0
+    prefix_len: 24
+    port: 2
+    port_mac: 08:00:00:00:02:00
+    nexthop_mac: 08:00:00:00:02:02
+  - prefix: 10.0.3.0
+    prefix_len: 24
+    port: 3
+    port_mac: 08:00:00:00:03:00
+    nexthop_mac: 08:00:00:00:03:03
+  - prefix: 10.1.0.0
+    prefix_len: 16
+    port: 3
+    port_mac: 08:00:00:00:03:00
+    nexthop_mac: 08:00:00:00:03:03
+  reverse_fib_capacity: unbounded
+  forward_fib_capacity: unbounded
+  faithfulness: D5.0_strict_single_homed
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+description: |-
+  Implement loose unicast Reverse Path Forwarding (uRPF) anti-spoofing ingress
+  filtering on a single switch s1, per RFC 3704 (BCP 84) loose mode and the
+  RFC 2827 (BCP 38) ingress-filtering threat model. The switch first validates
+  each IPv4 packet's SOURCE address for routability, dropping traffic from
+  unroutable (bogon) sources, and then performs ordinary destination-based
+  forwarding on the packets that pass.
+
+  ## Reverse-path policy (routable source prefixes)
+
+  The control plane installs these reverse-path entries (you choose the
+  control-plane representation; matched by longest prefix on the IPv4 SOURCE
+  address). A source address is considered ROUTABLE if it is covered by any of
+  these prefixes:
+
+    | source prefix |
+    |---------------|
+    | 10.0.1.0/24   |
+    | 10.0.2.0/24   |
+    | 10.0.3.0/24   |
+    | 10.1.0.0/16   |
+    | 10.1.5.0/24   |
+
+  In loose mode the verification depends ONLY on whether the source resolves to a
+  reverse-path entry; the interface the packet arrived on is NOT examined. (The
+  entries may still carry per-prefix expected-ingress-port information, but loose
+  mode does not consult it.)
+
+  ## Forwarding table (destination prefix -> egress)
+
+  For packets that pass the reverse-path check, install these forwarding entries
+  (matched by longest prefix on the IPv4 DESTINATION address). Each entry names
+  the egress port, the next-hop's MAC address (the new Ethernet destination), and
+  the egress port's own MAC address (the new Ethernet source):
+
+    | destination prefix | egress port | next-hop MAC      | egress-port MAC   |
+    |--------------------|-------------|-------------------|-------------------|
+    | 10.0.1.0/24        | s1.p1       | 08:00:00:00:01:01 | 08:00:00:00:01:00 |
+    | 10.0.2.0/24        | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.3.0/24        | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+    | 10.1.0.0/16        | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## What the switch MUST do
+
+   1. Non-IPv4 drop. Any frame that is not IPv4 (ARP, IPv6, raw Ethernet, etc.)
+      MUST NOT be forwarded -- it is dropped (not emitted on any port).
+
+   2. Reverse-path (loose routability) check. For an IPv4 packet, find the longest
+      reverse-path entry matching its SOURCE address.
+      a. If NO reverse entry matches the source (the source is unroutable), the
+         packet MUST be dropped.
+      b. If a reverse entry matches, the packet PASSES to forwarding REGARDLESS of
+         the interface it arrived on. The packet is NOT dropped merely because it
+         arrived on an interface other than the one the source "homes" on -- loose
+         mode does not enforce the ingress-port match.
+      A packet that fails this check (unroutable source) MUST NOT be emitted on ANY
+      egress port, even if its destination has a valid forwarding entry.
+
+   3. Forward on a matching route. For a packet that passed the reverse-path
+      check and whose DESTINATION matches a forwarding entry by longest prefix,
+      the switch MUST:
+      a. send it out the matched egress port;
+      b. rewrite the Ethernet SOURCE address to the egress port's own MAC (the
+         "egress-port MAC" column) -- NOT a copy of the incoming Ethernet
+         destination;
+      c. rewrite the Ethernet DESTINATION address to the next-hop MAC (the
+         "next-hop MAC" column);
+      d. leave the IPv4 source and destination addresses unchanged (this is a
+         filter, not address translation);
+      e. decrement the IPv4 time-to-live by exactly one, keeping the IPv4 header
+         checksum valid on egress.
+
+   4. No route -> drop. A packet that passed the reverse-path check but whose
+      destination matches no forwarding entry MUST be dropped (there is no
+      default route). This is an ordinary no-route miss, distinct from the
+      unroutable-source drop in rule 2.
+
+  ## Topology
+
+  One switch s1 with three hosts:
+    - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+test_cases:
+- name: pass_routable_golden_forward
+  visibility: public
+  goal_class: G1
+  description: Golden path. An IPv4 packet whose source 10.0.1.1 is routable (in 10.0.1.0/24) arrives on s1.p1 to destination 10.0.2.2. It passes the loose reverse-path (routability) check and is forwarded out s1.p2 with the s1.p2 / h2 MAC rewrite and TTL decremented by one.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_loose_off_path_forward
+  visibility: public
+  goal_class: G1
+  description: Loose-mode off-path FORWARD (the strict<->loose discriminator). Source 10.0.1.1 is routable (in 10.0.1.0/24) but arrives on s1.p2 — an interface other than the one it homes on. Under STRICT uRPF this is a spoof and drops; under LOOSE uRPF (RFC 3704 §2.4) the ingress port is NOT examined, so the routable source PASSES and forwards out s1.p2 (dst 10.0.2.2). This switch MUST forward it.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_distinct_prefix_forward
+  visibility: public
+  goal_class: G1
+  description: A routable source 10.0.3.3 (in 10.0.3.0/24) arrives on s1.p3 to destination 10.0.1.50; it passes and forwards out s1.p1 with the s1.p1 / h1 MAC rewrite.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.3.3
+        dst: 10.0.1.50
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:01:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_routable_via_covering_prefix
+  visibility: hidden
+  goal_class: G1
+  description: Source 10.1.5.9 is routable (covered by 10.1.0.0/16 and 10.1.5.0/24). Arriving on s1.p3 it passes and forwards out s1.p3 (its destination 10.0.3.3 routes to s1.p3). Loose mode forwards on routability alone.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.1.5.9
+        dst: 10.0.3.3
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_loose_off_path_overlapping_forward
+  visibility: hidden
+  goal_class: G1
+  description: Loose forwards the overlapping source regardless of port. Source 10.1.5.9 (routable) arrives on s1.p1 — NOT the s1.p3 it strictly homes on. STRICT uRPF would drop this as a spoof; LOOSE uRPF forwards it by destination 10.0.3.3 out s1.p3, proving the ingress-port match is NOT consulted in loose mode.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.1.5.9
+        dst: 10.0.3.3
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_on_path_udp_independence
+  visibility: hidden
+  goal_class: G1
+  description: The reverse-path verdict is L4-agnostic. A UDP packet from a routable source 10.0.2.2 arriving on s1.p2 to 10.0.1.1 passes and forwards out s1.p1 exactly like the TCP golden path.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.1.1
+        ttl: 64
+    - UDP:
+        sport: 5353
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:01:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_urpf_then_no_route
+  visibility: hidden
+  goal_class: G2
+  description: Routable source 10.0.1.1 passes the loose reverse-path check on s1.p1, but its destination 10.0.9.9 matches NO forwarding entry (no default route). It is dropped by the ordinary no-route miss — a drop distinct from the unroutable-source drop, confirming the verdict gate and the dst-FIB miss are separable.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.9.9
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: pass_covering_prefix_forward
+  visibility: hidden
+  goal_class: G2
+  description: Source 10.1.9.9 matches only the covering 10.1.0.0/16 (routable); arriving on s1.p1 it passes and forwards by its destination 10.0.2.2 out s1.p2.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.1.9.9
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:02:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: pass_loose_forged_routable_source
+  visibility: hidden
+  goal_class: G3
+  description: Threat-model boundary (RFC 3704 §2.4). An attacker on s1.p2 forges a source 10.0.1.7 in 10.0.1.0/24 (which homes on s1.p1). LOOSE uRPF does NOT catch this off-path forgery — the forged source is still routable, so it FORWARDS out s1.p3 (dst 10.0.3.3). This is the documented weakness of loose mode that strict mode closes; the switch MUST forward.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.3.3
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:03:00
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:03:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      IP.chksum:
+        action: checksum_valid
+- name: drop_unroutable_source
+  visibility: hidden
+  goal_class: G3
+  description: Source 203.0.113.7 matches NO reverse-path entry (unroutable / bogon). It MUST be dropped in LOOSE mode too — loose still drops the unroutable even though its destination 10.0.2.2 has a valid route.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: 00:00:00:00:00:bb
+    - IP:
+        src: 203.0.113.7
+        dst: 10.0.2.2
+        ttl: 64
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: drop_non_ipv4_arp
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) MUST NOT be forwarded — the anti-spoofing filter does not pass unparsed traffic to the forwarder.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 00:00:00:00:00:aa
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+  expected:
+    behavior: drop

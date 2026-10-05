@@ -1,0 +1,585 @@
+task_name: netpaxos_acceptor_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-NetPaxos
+pattern_version: '1.0'
+seed:
+  n_slots: 1
+  round_width: 16
+  value_width: 32
+  round_zero: 0
+  value_none: 0
+  accept_predicate: ge
+  enforce_round_monotonic: false
+  faithfulness: D5.0_single_slot
+  ingress_port: 1
+  promise_egress: 2
+  learner_egress: 3
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: proposer
+    to: s1.p1
+  - from: s1.p2
+    to: proposer
+  - from: s1.p3
+    to: learner
+hosts:
+  proposer:
+    note: proposer/coordinator; sends prepare/accept on s1.p1; receives promise on s1.p2
+  learner:
+    note: learners; receive accepted on s1.p3
+description: |-
+  Implement a single-instance consensus ACCEPTOR for BMv2 (v1model). The switch
+  takes over the acceptor role of a Paxos-style agreement protocol: it remembers,
+  for one consensus instance, the most recent proposal it has agreed to consider
+  and the last value it has accepted, and it reacts to the protocol's request
+  messages — all in the data plane.
+
+  Topology: proposers send their requests to the acceptor on port 1. The
+  acceptor's reply to a "prepare" request leaves toward the proposer side on
+  port 2; its reply to an "accept" request leaves toward the learner side on
+  port 3.
+
+  The protocol's messages are carried in a small application header riding a UDP
+  datagram on destination port 34952. The header carries, in this order and with
+  these widths (big-endian):
+    - a message-type byte (8 bits): prepare = 0, accept = 1, promise = 2,
+      accepted = 3;
+    - an instance id (16 bits): which consensus instance the message concerns
+      (this task uses a single instance, id 0);
+    - a round number (16 bits): the proposal's ballot;
+    - an accepted-round field (16 bits);
+    - a value field (32 bits).
+
+  The acceptor keeps three pieces of per-instance state, all starting at zero:
+  the highest round it has agreed to (call it the promised round), the round at
+  which it last accepted a value, and that last accepted value.
+
+  Required behaviour, per packet:
+
+  - A frame that is not a valid protocol message — anything with no such header,
+    including plain IP/UDP traffic, ARP, ICMP, or a UDP datagram to port 34952
+    that carries no protocol payload — is dropped. The switch serves the acceptor
+    role only.
+
+  - A prepare request offering a round STRICTLY GREATER than the promised round
+    is honoured: the acceptor adopts that round as its new promised round and
+    replies with a promise message (message-type 2) toward the proposer on
+    port 2. The promise must report back the acceptor's currently stored
+    accepted-round and accepted-value (which are the initial zeros if nothing has
+    been accepted yet) — agreeing to a new round must NOT change the stored
+    accepted value. A prepare whose round is not strictly greater than the
+    promised round is stale and is dropped, leaving all state unchanged.
+
+  - An accept request whose round is NOT LESS THAN the promised round is
+    honoured: the acceptor records the request's round as both its promised round
+    and its accepted-round, stores the request's value as its accepted value, and
+    replies with an accepted message (message-type 3, with its accepted-round set
+    to the request's round) toward the learner side on port 3. An accept request
+    whose round is less than the promised round is stale and is dropped, leaving
+    all state unchanged.
+
+  - A promise or accepted message arriving as input is dropped — these are the
+    acceptor's own outputs, never its inputs — and no state changes.
+
+  Both the P4 program and any table entries are yours to author. The protocol
+  header may only be emitted on a forwarded reply; a dropped non-protocol frame
+  must not carry it on egress. The decisive behaviour is the agreement boundary:
+  which requests advance the promised round, and the rule that agreeing to a new
+  round never disturbs a value already accepted.
+test_cases:
+- name: promise_fresh_slot
+  visibility: public
+  goal_class: G1
+  description: 'A prepare request offering round 5 to an untouched instance is honoured: the acceptor adopts round 5 and replies with a promise on the proposer-side port, reporting back the initial (still-unaccepted) accepted-round 0 and value 0.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 2
+      Paxos.vrnd:
+        action: change_to
+        value: 0
+      Paxos.vvalue:
+        action: change_to
+        value: 0
+- name: accept_after_promise
+  visibility: public
+  goal_class: G1
+  description: 'After the instance has promised round 5, an accept request for round 5 carrying value 42 is honoured: the acceptor stores (accepted-round 5, value 42) and replies with an accepted message on the learner-side port, its accepted-round set to 5.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 1
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 42
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 3
+      Paxos.vrnd:
+        action: change_to
+        value: 5
+      Paxos.vvalue:
+        action: change_to
+        value: 42
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 0
+- name: promise_echoes_prior_accept
+  visibility: public
+  goal_class: G1
+  description: After value 42 has been accepted at round 5, a higher prepare (round 8) is honoured and the promise reply reports back the previously accepted pair (accepted-round 5, value 42), not the initial zeros — so the proposer can choose the already-accepted value.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 8
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 2
+      Paxos.vrnd:
+        action: change_to
+        value: 5
+      Paxos.vvalue:
+        action: change_to
+        value: 42
+  prior_inputs:
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 0
+  - port: s1.p1
+    layers: &id003
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 1
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 42
+- name: accept_at_equal_round_ge
+  visibility: hidden
+  goal_class: G1
+  description: 'With the instance having promised round 5, an accept request at round 5 (equal to the promised round) is accepted under the not-less-than rule: an accepted message is forwarded and value 7 is stored.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 1
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 7
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 3
+      Paxos.vrnd:
+        action: change_to
+        value: 5
+      Paxos.vvalue:
+        action: change_to
+        value: 7
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+- name: accept_at_higher_round
+  visibility: hidden
+  goal_class: G1
+  description: 'An accept request at round 9 to an instance that previously accepted (5,42) supersedes it: the acceptor stores (accepted-round 9, value 77), advances the promised round to 9, and forwards an accepted message to the learner side.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 1
+        inst: 0
+        rnd: 9
+        vrnd: 0
+        vvalue: 77
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 3
+      Paxos.vrnd:
+        action: change_to
+        value: 9
+      Paxos.vvalue:
+        action: change_to
+        value: 77
+  prior_inputs:
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+- name: drop_stale_prepare_equal
+  visibility: hidden
+  goal_class: G2
+  description: A prepare request at round 8 to an instance whose promised round is already 8 is NOT strictly newer and is dropped; the promised round stays 8.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 8
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers: &id004
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 8
+        vrnd: 0
+        vvalue: 0
+- name: drop_stale_prepare_lower
+  visibility: hidden
+  goal_class: G2
+  description: A prepare request at round 3 to an instance whose promised round is 8 is stale and dropped, leaving all state unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 3
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers: *id004
+- name: drop_stale_accept
+  visibility: hidden
+  goal_class: G2
+  description: An accept request at round 3 to an instance whose promised round is 8 is older than the promise and is dropped — the acceptor promised a later proposer not to accept it — leaving the accepted value unchanged.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 1
+        inst: 0
+        rnd: 3
+        vrnd: 0
+        vvalue: 99
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers: *id004
+- name: prepare_does_not_corrupt_value
+  visibility: hidden
+  goal_class: G3
+  description: 'An instance holding accepted value 42 (round 5) receives a winning prepare at round 9: the promise reply echoes the still-intact accepted pair (5,42); a subsequent prepare must never overwrite the accepted value register.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 0
+        inst: 0
+        rnd: 9
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Paxos.msg_type:
+        action: change_to
+        value: 2
+      Paxos.vrnd:
+        action: change_to
+        value: 5
+      Paxos.vvalue:
+        action: change_to
+        value: 42
+  prior_inputs:
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+- name: drop_reply_accepted_loopback
+  visibility: hidden
+  goal_class: G3
+  description: An accepted message (an acceptor output) arriving as input is dropped and leaves no state behind — the acceptor never re-processes its own replies.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 3
+        inst: 0
+        rnd: 5
+        vrnd: 5
+        vvalue: 42
+  expected:
+    behavior: drop
+- name: drop_reply_promise_loopback
+  visibility: hidden
+  goal_class: G3
+  description: A promise message (an acceptor output) arriving as input is dropped; no state changes.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 34952
+    - Paxos:
+        msg_type: 2
+        inst: 0
+        rnd: 5
+        vrnd: 0
+        vvalue: 0
+  expected:
+    behavior: drop
+- name: drop_non_paxos_arp
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) carries no consensus message and is dropped before any acceptor logic runs.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.1.1
+  expected:
+    behavior: drop
+- name: drop_non_paxos_plain_udp
+  visibility: hidden
+  goal_class: G3
+  description: A plain UDP datagram to an unrelated port carries no consensus message and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.7
+        dst: 10.0.1.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 9999
+  expected:
+    behavior: drop

@@ -1,0 +1,4760 @@
+task_name: stateful_l4_lb_bounded
+task_type: full_program
+complexity: high
+source: synthesis
+pattern: P-StatefulLB
+pattern_version: '1.0'
+seed:
+  vip: 10.0.100.1
+  backends:
+  - 10.0.2.10
+  - 10.0.2.20
+  - 10.0.2.30
+  assign: round_robin
+  flow_table_capacity: 256
+  eviction_policy: FIFO_collision_displace
+  faithfulness: D5.0_exact
+  persistence_strict: false
+failure_modes:
+- miss_branch_does_not_check_resident_identity
+- counter_does_not_advance_on_displacement
+- displacement_in_one_bucket_corrupts_another
+- modn_via_bitmask_with_non_power_of_two
+- eviction_silently_drops_instead_of_reassigning
+- identity_zero_sentinel_collision
+description: |
+  A switch s1 fronts a single virtual service address with three real
+  back-end servers, distributing TCP connections across them while
+  preserving the connection-to-server binding for the life of each
+  connection — within a bounded amount of per-connection state.
+
+  ## Topology and roles
+
+    - s1.p1 — connection point facing clients.
+    - s1.p2 — connection point facing back-end server B0
+              (address 10.0.2.10, hardware 08:00:00:00:02:01).
+    - s1.p3 — connection point facing back-end server B1
+              (address 10.0.2.20, hardware 08:00:00:00:02:02).
+    - s1.p4 — connection point facing back-end server B2
+              (address 10.0.2.30, hardware 08:00:00:00:02:03).
+    - The advertised service address is 10.0.100.1; no host owns it
+      directly — the switch terminates and re-targets traffic to it.
+
+  ## Eligibility
+
+  A packet is eligible for admission only when ALL of the following hold,
+  in this short-circuited order; failing an earlier check means later
+  checks are not consulted and no internal state changes:
+
+    1. The packet is an IPv4 datagram.
+    2. The packet's IPv4 destination address equals the service address.
+    3. The IPv4 payload is TCP.
+
+  A frame that fails any of these (e.g. an ARP frame, an IPv4 packet to a
+  non-service address, or an IPv4 packet to the service address that is
+  not TCP) must be discarded.
+
+  ## Connection identity
+
+  Two TCP packets are considered to belong to the SAME connection if and
+  only if they agree on the 5-tuple
+  (IPv4 source, IPv4 destination, TCP source port, TCP destination port,
+  IPv4 protocol). Any difference in any of those five components produces
+  a different connection.
+
+  ## Backend assignment
+
+  The switch keeps an internal record of which back-end each connection
+  has been bound to. The first time a packet of a given connection is
+  admitted, the switch chooses a back-end as follows:
+
+    - The switch maintains a single integer "selector" that begins at zero
+      on power-on and advances by exactly one immediately after each
+      first-of-a-connection admission. The selector advances ONLY on
+      first-of-a-connection admissions; never on subsequent packets of an
+      already-admitted connection, and never on packets that were
+      discarded as ineligible.
+    - A first-of-a-connection packet is bound to back-end (selector value
+      AT THE TIME OF THIS ADMISSION, taken modulo three).
+
+  ## Per-connection state — bounded with deterministic slot assignment
+
+  The switch maintains EXACTLY 256 binding slots, indexed 0..255. The
+  slot index assigned to a connection is determined by the connection's
+  5-tuple via the following time-invariant function:
+
+      slot(c) = ( srcAddr  XOR  dstAddr
+                XOR  ((sport << 16) | dport)
+                XOR  proto ) & 0xFF
+
+  That is, take the bitwise XOR (over 32-bit words) of the IPv4 source
+  address, the IPv4 destination address, the 32-bit value formed by
+  placing the TCP source port in the high 16 bits and the TCP destination
+  port in the low 16 bits, and the IPv4 protocol number; then keep only
+  the low 8 bits. Two distinct connections may map to the same slot.
+
+  Each slot holds AT MOST ONE connection's binding at any instant.
+
+  ## Per-collision displacement (eviction)
+
+  A first-of-a-connection admission proceeds as follows:
+
+    - Compute the new connection's slot via the function above.
+    - If the slot is empty, install the new binding there.
+    - If the slot already holds a DIFFERENT connection's binding (i.e.
+      one whose 5-tuple differs from the arriving connection's), that
+      resident binding is forgotten (evicted) and the new binding takes
+      its place. The evicted connection's next arriving packet — should
+      one arrive — is treated as a first-of-a-connection packet again,
+      advancing the selector and being assigned a fresh back-end (which
+      may differ from its original).
+    - The selector advances exactly once, regardless of whether the slot
+      was empty or held a colliding resident.
+
+  Subsequent packets of a STILL-RESIDENT connection (one whose binding has
+  not been evicted) must always reach the SAME back-end the connection
+  was originally bound to. The implementation must distinguish "this
+  slot holds the arriving connection's binding" from "this slot holds a
+  DIFFERENT connection's binding that happens to map to the same slot":
+  the former is a hit (no eviction, no selector advance); the latter is
+  a miss (eviction, selector advance).
+
+  Two independence properties follow from the rule above and are probed
+  by the test suite:
+
+    (i)  As long as no two admitted connections have been mapped to the
+         same slot, every admitted connection remains bound to its
+         originally-assigned back-end on replay.
+    (ii) A displacement at slot K must not perturb the binding stored at
+         any other slot J ≠ K.
+
+  ## On admission
+
+  When a packet is admitted, the packet observed at the bound back-end's
+  connection point must satisfy ALL of:
+
+    - Its IPv4 destination address has been replaced by the bound
+      back-end's address.
+    - Its Ethernet destination address has been replaced by the bound
+      back-end's hardware address.
+    - Its IPv4 hop count is exactly one less than on ingress, and the
+      datagram remains a well-formed IPv4 packet that an unmodified
+      downstream receiver would accept.
+    - All other fields of the packet are byte-identical to the received
+      packet (including the IPv4 source address and the TCP ports).
+
+  Discarded packets produce NO output and MUST NOT alter any of the
+  switch's internal state — neither the per-connection bindings nor the
+  selector.
+
+  ## Control plane
+
+  No control-plane configuration is supplied; the entire VIP / back-end
+  relationship and the round-robin policy are determined by the switch's
+  internal state and the constants above.
+topology:
+  switches:
+  - name: s1
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: client
+    to: s1.p1
+  - from: s1.p2
+    to: b0
+  - from: s1.p3
+    to: b1
+  - from: s1.p4
+    to: b2
+hosts:
+  client:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  b0:
+    ip: 10.0.2.10/24
+    mac: 08:00:00:00:02:01
+    port: s1.p2
+  b1:
+    ip: 10.0.2.20/24
+    mac: 08:00:00:00:02:02
+    port: s1.p3
+  b2:
+    ip: 10.0.2.30/24
+    mac: 08:00:00:00:02:03
+    port: s1.p4
+test_cases:
+- name: first_new_flow_lands_on_backend_zero
+  visibility: public
+  description: Fresh switch. First eligible TCP packet is a new flow; the round-robin counter is 0 so the flow is bound to backend B0.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: existing_flow_sticky_under_non_colliding_traffic
+  visibility: public
+  description: Flow A is admitted (bucket 0x56, B0). Two unrelated flows in different buckets are admitted in between (B1, B2). Re-sending flow A's 5-tuple must hit the existing-flow path and forward to B0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: evicted_flow_reassigned_after_bucket_collision
+  visibility: public
+  description: 'Bucket-collision eviction: flow A is admitted (bucket 0x56, B0); a second flow that shares bucket 0x56 but has a different 5-tuple identity is admitted next (B1, displacing flow A). Re-sending flow A is now a MISS — its binding was evicted — so the round-robin counter advances again and flow A is bound to B2 on this second admission. The fact that the second admission differs from the first is what makes eviction observable.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+- name: non_vip_destination_dropped
+  visibility: public
+  description: TCP/IPv4 to a non-VIP destination must be dropped without consuming any state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.99.99
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: icmp_to_vip_dropped
+  visibility: public
+  description: An ICMP echo request to the VIP must be dropped (non-TCP).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: fourth_new_flow_wraps_to_backend_zero
+  visibility: hidden
+  description: Three distinct non-colliding flows admitted (B0, B1, B2). The fourth distinct flow wraps the round-robin selector → B0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.4
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4003
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: counter_does_not_advance_on_existing_flow_replay
+  visibility: hidden
+  description: Flow A admitted, then re-sent four times (each is R2 hit, no counter advance). The next NEW flow is therefore the second distinct flow → B1.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: ineligible_priors_do_not_advance_counter
+  visibility: hidden
+  description: A long sequence of ineligible packets (ICMP to VIP, UDP to VIP, TCP to non-VIP, ARP) must NOT consume the counter or any bucket. The first eligible flow that follows is therefore the first distinct flow → B0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 80
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.3
+        dst: 10.0.99.99
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.4
+        pdst: 10.0.100.1
+        hwsrc: 08:00:00:00:01:01
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 1
+    - ICMP: {}
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: udp_to_vip_dropped
+  visibility: hidden
+  description: A UDP packet to the VIP must be dropped (non-TCP).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 4000
+        dport: 53
+  expected:
+    behavior: drop
+- name: arp_frame_dropped
+  visibility: hidden
+  description: An ARP frame on the client port (non-IPv4) must be dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.100.1
+        hwsrc: 08:00:00:00:01:01
+  expected:
+    behavior: drop
+- name: triple_displacement_third_eviction_reassigns
+  visibility: hidden
+  description: Three distinct flows that all share bucket 0x56 are admitted in sequence; each displaces the previous resident. After three admissions the bucket holds X3's binding. Re-sending X2 finds X3's identity in the bucket → miss → counter (now 3) advances and X2 is bound to B0 on this second admission. (X2's first admission was at counter=1 → B1; its re-admit lands on B0.)
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: collision_in_one_bucket_isolates_other_bucket
+  visibility: hidden
+  description: Bucket 0x56 takes three colliding admissions (X1, X2, X3). Flow B in bucket 0x55 is admitted between X1 and X2 and is never displaced. Re-sending flow B must still hit R2 and forward to the backend it was originally bound to (B1, since it was the second distinct flow admitted).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: resident_after_storm_still_hits
+  visibility: hidden
+  description: Bucket 0x56 sees three colliding admissions (X1, X2, X3) and the bucket now holds X3. Re-sending X3 must HIT (its identity is still in the bucket) and forward to its bound backend (B2).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.30
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:03
+- name: capacity_boundary_no_displacement
+  visibility: hidden
+  description: 256 distinct flows are admitted, each in its own unique bucket (no collisions). The flow admitted as the 100th distinct flow (counter=99 at its admission, 99 mod 3 = 0 → bound to B0) is re-sent. It must still be in its bucket and forward to B0.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.0
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.3
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.4
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.5
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.6
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.7
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.8
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.9
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.10
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.11
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.12
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.13
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.14
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.15
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.16
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.17
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.18
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.19
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.20
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.21
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.22
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.23
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.24
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.25
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.26
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.27
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.28
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.29
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.30
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.31
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.32
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.33
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.34
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.35
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.36
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.37
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.38
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.39
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.40
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.41
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.42
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.43
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.44
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.45
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.46
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.47
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.48
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.49
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.50
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.51
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.52
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.53
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.54
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.55
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.56
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.57
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.58
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.59
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.60
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.61
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.62
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.63
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.64
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.65
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.66
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.67
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.68
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.69
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.70
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.71
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.72
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.73
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.74
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.75
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.76
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.77
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.78
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.79
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.80
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.81
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.82
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.83
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.84
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.85
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.86
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.87
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.88
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.89
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.90
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.91
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.92
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.93
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.94
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.95
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.96
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.97
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.98
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.99
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.100
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.101
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.102
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.103
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.104
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.105
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.106
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.107
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.108
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.109
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.110
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.111
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.112
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.113
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.114
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.115
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.116
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.117
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.118
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.119
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.120
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.121
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.122
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.123
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.124
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.125
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.126
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.127
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.128
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.129
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.130
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.131
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.132
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.133
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.134
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.135
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.136
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.137
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.138
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.139
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.140
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.141
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.142
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.143
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.144
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.145
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.146
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.147
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.148
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.149
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.150
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.151
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.152
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.153
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.154
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.155
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.156
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.157
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.158
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.159
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.160
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.161
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.162
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.163
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.164
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.165
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.166
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.167
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.168
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.169
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.170
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.171
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.172
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.173
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.174
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.175
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.176
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.177
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.178
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.179
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.180
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.181
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.182
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.183
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.184
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.185
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.186
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.187
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.188
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.189
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.190
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.191
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.192
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.193
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.194
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.195
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.196
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.197
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.198
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.199
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.200
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.201
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.202
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.203
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.204
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.205
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.206
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.207
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.208
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.209
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.210
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.211
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.212
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.213
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.214
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.215
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.216
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.217
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.218
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.219
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.220
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.221
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.222
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.223
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.224
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.225
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.226
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.227
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.228
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.229
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.230
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.231
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.232
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.233
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.234
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.235
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.236
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.237
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.238
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.239
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.240
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.241
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.242
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.243
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.244
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.245
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.246
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.247
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.248
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.249
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.250
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.251
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.252
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.253
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.254
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.255
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.99
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: distinct_sport_same_bucket_distinct_flows
+  visibility: hidden
+  description: Two flows share bucket 0x56 (same src_ip, sport differs) but have distinct identities. The second flow is treated as new and its admission DISPLACES the first — confirming the bucket lookup checks the stored flow identity, not just bucket occupancy. After the displacement, re-sending the SECOND flow is a hit and forwards to its bound backend (B1).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: two_buckets_double_eviction_independent
+  visibility: hidden
+  description: Two unrelated buckets each take a displacement. Flow A in bucket 0x56 and flow B in bucket 0x55 are admitted; collision flows X2 (same src as A, different sport) and Y2 (same src as B, different sport) then each displace their bucket's resident. Re-sending flow A is a miss → R1 fires; counter is now 4, so flow A is re-bound to B1 on this second admission.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4001
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.2
+        dst: 10.0.100.1
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 4002
+        dport: 80
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 4000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.20
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: malformed_zero_sport_admitted_deterministically
+  visibility: hidden
+  description: TCP to VIP with sport=0 (RFC-invalid but syntactically valid) is admitted as the first new flow → B0. The flow-identity fingerprint must include sport=0 without short-circuiting.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.100.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 0
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+- name: admit_full_dnat_and_ttl_decrement
+  visibility: hidden
+  description: On admission the packet's IP.dst, Ether.dst, egress port, and decremented TTL must all be set correctly; observe TTL=10 → TTL=9 for a fresh-switch admit to B0.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.100.1
+        ttl: 10
+        proto: 6
+    - TCP:
+        sport: 4321
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: change_to
+        value: 10.0.2.10
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:01
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

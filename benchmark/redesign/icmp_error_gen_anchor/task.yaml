@@ -1,0 +1,227 @@
+task_name: icmp_error_gen_anchor
+task_type: full_program
+complexity: medium
+source: rfc
+pattern: P-ICMPErrorGen
+pattern_version: '1.0'
+
+seed:
+  router_ip: "10.0.0.254"
+  emit_dest_unreachable: false
+  faithfulness: D.time_exceeded
+
+description: |
+  Implement an IPv4 forwarding router on a single switch s1 that ORIGINATES an
+  ICMP error when a packet's TTL expires, per RFC 792 and RFC 1812. The router
+  IP is 10.0.0.254.
+
+  ## Forwarding policy (longest-prefix on the IPv4 destination)
+
+  The control plane installs these as table entries.
+
+    | prefix       | egress port | next-hop MAC      | egress-port MAC   |
+    |--------------|-------------|-------------------|-------------------|
+    | 10.0.5.0/24  | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 10.0.6.0/24  | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+   - A frame that is not IPv4 is dropped.
+   - An IPv4 packet with a live TTL (> 1) whose destination matches a route is
+     forwarded out the matched port with the TTL decremented by one, the
+     Ethernet source set to the egress port's own MAC, and the destination set
+     to the next-hop MAC. A live packet matching no route is dropped.
+   - When a packet's TTL has expired (TTL ≤ 1) it is not forwarded; instead the
+     switch originates an ICMP Time Exceeded message (type 11, code 0) sourced
+     from the router's own IP (10.0.0.254) and addressed back to the original
+     packet's source, carrying the standard RFC 792 quotation of the offending
+     packet. This generated message is itself routed back toward that source
+     using the forwarding policy above (with the matching Ethernet rewrite).
+   - An inbound ICMP error does not itself trigger a new ICMP error.
+
+  ## Topology
+
+  Transit packets arrive on s1.p1; sources in 10.0.5.0/24 are reachable via
+  s1.p2 and destinations in 10.0.6.0/24 via s1.p3.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "10.0.1.1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "10.0.5.5", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "10.0.6.6", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: ttl_expiry_originates_icmp
+    visibility: public
+    description: |
+      A transit packet from 10.0.5.5 to 10.0.6.6 arriving with TTL 1.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.6.6", ttl: 1}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.src:    {action: change_to, value: "10.0.0.254"}
+        IP.dst:    {action: change_to, value: "10.0.5.5"}
+        IP.proto:  {action: change_to, value: 1}
+        ICMP.type: {action: change_to, value: 11}
+        ICMP.code: {action: change_to, value: 0}
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: normal_forward_live_ttl
+    visibility: public
+    description: |
+      A packet from 10.0.5.5 to 10.0.6.6 with TTL 64.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.6.6", ttl: 64}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.dst:    {action: unchanged}
+        IP.src:    {action: unchanged}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+
+  - name: ttl_expiry_distinct_source
+    visibility: public
+    description: |
+      A TTL-1 packet from a different source 10.0.5.20.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.20", dst: "10.0.6.6", ttl: 1}
+        - UDP:   {sport: 1234, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.src:    {action: change_to, value: "10.0.0.254"}
+        IP.dst:    {action: change_to, value: "10.0.5.20"}
+        ICMP.type: {action: change_to, value: 11}
+
+# --- G2 ---
+
+  - name: ttl_zero_originates_icmp
+    visibility: hidden
+    description: |
+      A packet arriving with TTL 0 also triggers an ICMP Time Exceeded to its
+      source, out s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.6.6", ttl: 0}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.src:    {action: change_to, value: "10.0.0.254"}
+        IP.dst:    {action: change_to, value: "10.0.5.5"}
+        IP.proto:  {action: change_to, value: 1}
+        ICMP.type: {action: change_to, value: 11}
+        ICMP.code: {action: change_to, value: 0}
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: normal_forward_to_p3
+    visibility: hidden
+    description: |
+      A live packet to 10.0.6.6 forwards out s1.p3 with TTL decrement.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.7.7", dst: "10.0.6.6", ttl: 64}
+        - TCP:   {sport: 2222, dport: 443}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+
+  - name: drop_no_route_live
+    visibility: hidden
+    description: |
+      A live-TTL packet to 10.0.9.9 (no route) is dropped (no ICMP at this
+      band).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.9.9", ttl: 64}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: drop
+
+  - name: normal_forward_to_p2
+    visibility: hidden
+    description: |
+      A live packet to 10.0.5.5 forwards out s1.p2 with TTL decrement.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.6.6", dst: "10.0.5.5", ttl: 64}
+        - TCP:   {sport: 1234, dport: 80}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IP.ttl:    {action: decremented_by, delta: 1}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+
+# --- G3 ---
+
+  - name: no_icmp_for_inbound_icmp_error
+    visibility: hidden
+    description: |
+      A TTL-1 packet that is itself an ICMP error (type 11) from a routable
+      source is dropped without originating a new ICMP error.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.5.5", dst: "10.0.6.6", ttl: 1, proto: 1}
+        - ICMP:  {type: 11, code: 0}
+    expected:
+      behavior: drop
+
+  - name: drop_non_ipv4
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.6.6", psrc: "10.0.5.5"}
+    expected:
+      behavior: drop

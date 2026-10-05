@@ -1,0 +1,164 @@
+# P-L2LearningBridge — Self-learning Ethernet bridge (data-plane MAC learning)
+#
+# TPL v1.0 task pattern. A transparent learning bridge: learn
+# each frame's source MAC → ingress port in data-plane state, forward known
+# unicast to its learned port, and FLOOD unknown-unicast / broadcast to all
+# other ports (BUM via multicast). The corpus's first self-learning L2 NF.
+# Grounded in IEEE 802.1D textbook transparent bridging.
+
+pattern_id: P-L2LearningBridge
+version: "1.0"
+nf_categories:
+  descriptive:  [D9:bridging]
+  prescriptive: [P3:flow-state]
+target_capability: scale_up
+summary: >
+  Transparent self-learning Ethernet bridge. On every frame the switch learns
+  (source MAC → ingress port) into a data-plane MAC table. Forwarding: a frame
+  whose destination MAC is known egresses the learned port; a frame whose
+  destination is unknown-unicast or broadcast is FLOODED to all ports except
+  the ingress port (BUM replication via a multicast group). The canonical
+  instance has unbounded table capacity; mutation adds aging and bounded
+  capacity with eviction.
+
+grounding:
+  rfcs: []
+  papers: []
+  tutorials:
+    - path: ieee_8021d
+      cite: "IEEE Std 802.1D-2004, §7.8 (Learning Process) / §7.7 (Forwarding Process)"
+      role: canonical_spec
+      quote: >-
+        The Learning Process observes the source addresses of frames received
+        on each Port and updates the Filtering Database conditionally on the
+        state of the receiving Port, associating the source address with the
+        Port on which the frame was received. The Forwarding Process forwards a
+        received frame whose destination address specifies a single end station
+        to the single Port associated with that address in the Filtering
+        Database; a frame whose destination address is not in the Filtering
+        Database (unknown destination), or is a group (multicast or broadcast)
+        address, is forwarded to all Ports in the same VLAN other than the Port
+        on which it was received.
+      quote_source: patterns/P-L2LearningBridge/grounding/ieee_8021d.txt
+      grounds: ["R1_learn", "R2_known_forward", "R3_flood"]
+      relevance: |
+        IEEE 802.1D transparent bridging — the learning + flooding model: a
+        bridge learns source-MAC→port associations from observed traffic,
+        forwards known unicast toward the learned port, and floods unknown
+        unicast / broadcast / multicast to all other ports in the broadcast
+        domain. Basis for R1 (learn), R2 (known forward), R3 (flood).
+
+entities:
+  packet:
+    notes: "L2 frame; forwarding keyed on the Ethernet destination MAC."
+  mac_table:                                # the TPL `bucket`/state role
+    keyed_by_tuple: [src_mac]
+    attrs: {port: port}
+    capacity: ${mac_table_capacity}
+    eviction: ${eviction}
+    notes: "Learned source-MAC → port associations (data-plane state)."
+
+parameters:
+  mac_table_capacity:
+    type: int | unbounded
+    default: unbounded
+  eviction:
+    type: enum
+    values: [none, lru, aging]
+    default: none
+  member_ports:
+    type: list[port]
+    default: [1, 2, 3]
+    notes: "Ports in the broadcast domain (flood targets, minus ingress)."
+  faithfulness:
+    type: enum
+    values: [D9.0_learn_flood, D9.1_aging, D9.2_bounded]
+    default: D9.0_learn_flood
+
+rules:
+  - id: R1_learn_source
+    when: "header_present(ethernet)"
+    then:
+      - "insert(mac_table, hdr.ethernet.src → ingress_port)"
+    notes: "Every frame teaches the bridge its source MAC's location (overwrite on move)."
+  - id: R2_forward_known_unicast
+    when: "¬is_broadcast(hdr.ethernet.dst) ∧ exists(mac_table, by_key(hdr.ethernet.dst))"
+    given:
+      entry: by_key(hdr.ethernet.dst, mac_table)
+    then:
+      - forward(entry.port)
+    notes: |
+      Known unicast → forward to the learned port (the frame is NOT modified;
+      a bridge does not rewrite MACs or decrement anything). If the learned
+      port is the ingress port, the frame is filtered (not sent back).
+  - id: R3_flood_bum
+    when: "is_broadcast(hdr.ethernet.dst) ∨ ¬exists(mac_table, by_key(hdr.ethernet.dst))"
+    then:
+      - "flood(member_ports \\ {ingress_port})"
+    notes: |
+      Broadcast or unknown-unicast → flood to every member port except the
+      ingress port (BUM replication via a multicast group).
+
+invariants:
+  - id: learned_unicast_to_one_port
+    clause: stability
+    target: egress_port
+    while: "rule R2 fires"
+    notes: "A known unicast egresses exactly the learned port."
+  - id: flood_excludes_ingress
+    clause: stability
+    target: flood_set
+    while: "rule R3 fires"
+    notes: "Flooding never sends the frame back out the ingress port."
+  - id: frame_preservation
+    clause: persistence
+    target: "(hdr.ethernet.src, hdr.ethernet.dst, payload)"
+    while: "rule R2 ∨ R3 fires"
+    notes: "A transparent bridge forwards frames unmodified."
+
+test_scaffolding:
+  G1:
+    - id: flood_unknown_dst
+      generate: "Unknown dst MAC → flood to all member ports except ingress."
+    - id: forward_to_learned
+      generate: "prior=[src A on port X]; a later frame TO A → forward to port X."
+    - id: broadcast_flood
+      generate: "dst = ff:ff:ff:ff:ff:ff → flood to all member ports except ingress."
+  G2:
+    - id: learn_multiple_then_forward
+      generate: "prior teaches two MACs; a frame to one forwards to its learned port (not flood)."
+    - id: capacity_eviction
+      requires: "${mac_table_capacity} != unbounded"
+      generate: "Fill the table beyond capacity; assert the eviction policy."
+  G3:
+    - id: known_unicast_not_flooded
+      generate: "A learned destination is forwarded to ONE port, not flooded."
+  coverage_floor: {G1: 3, G2: 1, G3: 1}
+
+mutation_operators:
+  - id: enable_aging
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${eviction} == none"
+    effect: "${eviction} ← aging ∧ ${faithfulness} ← D9.1_aging"
+    d_axis_delta: {D5: +1, test_rigor: +1}
+  - id: shrink_capacity
+    axis: capacity
+    direction: harden
+    applicable_when: "${mac_table_capacity} != unbounded"
+    effect: "${mac_table_capacity} ← ${mac_table_capacity} / 4 ∧ ${faithfulness} ← D9.2_bounded"
+    d_axis_delta: {D2: +1}
+
+bridging_notes: |
+  Canonical implementation:
+    - A learn step: register/table keyed on hash(ethernet.src) storing the
+      ingress port; written on every packet (or a learning digest to the CP).
+    - A lookup on hash(ethernet.dst): hit → unicast to the stored port; miss or
+      broadcast → set the multicast group for the broadcast domain (the BMv2
+      mcast group must EXCLUDE the ingress port, or rely on the harness to
+      ignore input-port output).
+    - Frames are forwarded unmodified.
+  Anti-patterns:
+    * Rewriting MAC addresses (router behaviour).
+    * Flooding known unicast (missing or broken lookup).
+    * Flooding back out the ingress port.

@@ -1,0 +1,188 @@
+{
+  "oracle_hash": "224d6310838b81122fcf4cbc0d8c730102bbb6488310b0cddae1488a0ad287cb",
+  "instance": "aqm_fairqueue_disc-default",
+  "ran_at": "2026-05-30T00:04:16.209551Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "wrong_port_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_eligible_l4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "admit_below_threshold_passthrough",
+        "status": "pass"
+      },
+      {
+        "example_id": "admit_at_threshold_marked",
+        "status": "pass"
+      },
+      {
+        "example_id": "not_ect_at_threshold_tail_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "not_ect_below_threshold_admit",
+        "status": "pass"
+      },
+      {
+        "example_id": "ttl_exhausted_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "knobs_round_coupled_marking",
+        "status": "pass"
+      },
+      {
+        "example_id": "knobs_any_l4_eligibility_sketch_geometry",
+        "status": "pass"
+      },
+      {
+        "example_id": "knobs_not_ect_passthrough_account_on_deliver",
+        "status": "pass"
+      },
+      {
+        "example_id": "knobs_non_ipv4_passthrough",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "admission_precedes_marking": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "account_reflects_admission_not_delivery": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ipv4_checksum_validity_after_admit": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ce_persistence_no_unmark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "not_ect_never_marked": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "dscp_preserved_under_mark": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "stable_marking_decision": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "state_unchanged_on_reject": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "counter_persistence_within_lifetime": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "fair_round_gap_bounded": {
+        "kind": "fairness",
+        "gold": "probe",
+        "type": "EX",
+        "status": "ceiling",
+        "reason": "no multipath fan-out to probe"
+      },
+      "byte_accuracy_under_default_accounting": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "ttl_quantum_one": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "no_pipeline_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "admission_precedes_marking",
+      "account_reflects_admission_not_delivery",
+      "ipv4_checksum_validity_after_admit",
+      "ce_persistence_no_unmark",
+      "not_ect_never_marked",
+      "dscp_preserved_under_mark",
+      "stable_marking_decision",
+      "state_unchanged_on_reject",
+      "counter_persistence_within_lifetime",
+      "fair_round_gap_bounded",
+      "byte_accuracy_under_default_accounting",
+      "ttl_quantum_one",
+      "no_pipeline_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "afq_nsdi18",
+      "calendarq_nsdi20",
+      "sppifo_nsdi20",
+      "sketchlib_nsdi22",
+      "RFC3168",
+      "RFC8257",
+      "RFC8087"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

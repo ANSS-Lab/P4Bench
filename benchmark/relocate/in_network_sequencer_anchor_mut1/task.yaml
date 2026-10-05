@@ -1,0 +1,704 @@
+task_name: in_network_sequencer_anchor_mut1
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-InNetworkSequencer
+pattern_version: '1.0'
+seed:
+  n_groups: 1
+  non_sequenced_policy: forward
+  stamp_session: false
+  enable_session_reset: false
+  seq_width_bits: 32
+  faithfulness: D5.0_exact_monotone
+description: |
+  Implement an in-network sequencer on a single switch s1 (inspired by NOPaxos,
+  Li et al., OSDI'16, and Eris, Li et al., SOSP'17). The switch sits on the path
+  to a replica group and imposes a single global order on the requests of a
+  replicated service, so every replica applies them in one identical order.
+
+  ## Wire format
+
+  Sequenced traffic carries a sequencer header inside UDP (destination
+  UDP port 9000). The header has four fields:
+
+    | field     | width | meaning                                              |
+    |-----------|-------|------------------------------------------------------|
+    | group_id  | 16    | which sequencing group this request targets          |
+    | type      | 8     | message class: 1 = REQUEST; any other value is        |
+    |           |       | non-sequenced traffic                                 |
+    | session   | 32    | session/epoch id (carried on the wire; the switch     |
+    |           |       | does NOT modify it in this configuration)             |
+    | seq_no    | 32    | sequence number (the switch stamps this)              |
+
+  A frame whose UDP payload is not this header (no sequencer header present at
+  all) is malformed for this function.
+
+  ## Topology
+
+  One switch s1 with four hosts:
+    - c1 at s1.p1 — the client/proposer that sends requests into the switch.
+    - r1 at s1.p2, r2 at s1.p3, r3 at s1.p4 — the three replicas of the service.
+
+  The switch keeps a single sequence counter (there is one sequencing group,
+  group_id 0). Requests are replicated to the replica set {s1.p2, s1.p3, s1.p4}.
+
+  ## What the switch MUST do
+
+   1. **Order and replicate a REQUEST.** For a sequencer packet whose type is
+      REQUEST (1), the switch MUST:
+      a. advance the group's sequence counter to the next value and stamp that
+         NEW value into the packet's seq_no field. The counter starts before
+         any request has been handed out, so the FIRST request stamped carries
+         seq_no 1, the second 2, and so on — strictly increasing by exactly one
+         per request, with no gaps and no repeats.
+      b. replicate (multicast) the stamped packet to EVERY replica port
+         (s1.p2, s1.p3, s1.p4); every copy carries the same stamped seq_no. The
+         request must not be delivered to only one replica.
+
+      The session field is NOT modified in this configuration — only seq_no is
+      stamped.
+
+   2. **Forward non-sequenced traffic untouched.** A sequencer packet whose type
+      is NOT REQUEST is non-sequenced: it MUST be replicated to the replica set
+      unchanged — its seq_no field MUST NOT be modified, and it MUST NOT consume
+      a sequence number (the counter does not advance). Only REQUEST traffic is
+      ordered.
+
+   3. **The counter advances only on REQUESTs.** Neither a non-sequenced packet
+      nor a malformed frame may advance the sequence counter. If a non-sequenced
+      or malformed packet is processed between two REQUESTs, the second REQUEST
+      still receives the next consecutive sequence number, as if the
+      intervening packet had not been seen.
+
+   4. **Drop malformed frames.** A frame with no sequencer header (e.g. an ARP
+      frame, or UDP to a different port with no sequencer header) MUST be
+      dropped, and MUST NOT advance the sequence counter.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: c1
+    to: s1.p1
+  - from: s1.p2
+    to: r1
+  - from: s1.p3
+    to: r2
+  - from: s1.p4
+    to: r3
+hosts:
+  c1:
+    ip: 10.0.0.1
+    mac: 08:00:00:00:00:01
+    port: s1.p1
+  r1:
+    ip: 10.0.0.2
+    mac: 08:00:00:00:00:02
+    port: s1.p2
+  r2:
+    ip: 10.0.0.3
+    mac: 08:00:00:00:00:03
+    port: s1.p3
+  r3:
+    ip: 10.0.0.4
+    mac: 08:00:00:00:00:04
+    port: s1.p4
+test_cases:
+- name: stamp_first_request_cold_start
+  visibility: public
+  description: 'First REQUEST on a fresh switch. Cold start: the first handed-out sequence number is 1.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 1
+- name: stamp_second_request
+  visibility: public
+  description: A second REQUEST (one prior REQUEST already stamped) receives seq_no 2.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 2
+- name: non_sequenced_forwarded_untouched
+  visibility: public
+  description: A non-sequenced packet (type 0) is replicated to the replica set with its seq_no left unchanged — no stamp.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 0
+        session: 1
+        seq_no: 777
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: unchanged
+- name: stamp_third_request
+  visibility: hidden
+  description: Third REQUEST in a train (two priors) gets seq_no 3 — strict +1 counting.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 63
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 3
+- name: multicast_replication_correct
+  visibility: hidden
+  description: A single REQUEST must be replicated to ALL three replica ports, each copy carrying the same stamped seq_no (1) — not unicast to one replica.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 1
+- name: session_field_left_untouched
+  visibility: hidden
+  description: 'The session field is NOT stamped in this configuration: an ordered REQUEST carries seq_no stamped (2) but its session field is forwarded unchanged (the value it arrived with).'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 2
+      Sequencer.session:
+        action: unchanged
+- name: non_sequenced_distinct_type_untouched
+  visibility: hidden
+  description: A non-sequenced packet of a different type (3) is also forwarded with its seq_no unchanged — only type 1 (REQUEST) is ordered.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 3
+        session: 1
+        seq_no: 777
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: unchanged
+- name: counter_not_burned_by_off_class
+  visibility: hidden
+  description: 'A non-sequenced packet processed between two REQUESTs must NOT consume a sequence number: REQUEST(1), non-sequenced, REQUEST → the last REQUEST gets seq_no 2 (NOT 3).'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 63
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 0
+        session: 1
+        seq_no: 999
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 2
+- name: off_class_first_then_two_requests
+  visibility: hidden
+  description: 'A non-sequenced packet seen BEFORE any REQUEST does not consume number 1: non-sequenced, REQUEST(→1), REQUEST(→2). The test packet gets seq_no 2.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 0
+        session: 1
+        seq_no: 5
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 63
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 2
+- name: monotone_train_continues_to_five
+  visibility: hidden
+  description: 'A longer ordered train: four prior REQUESTs (1,2,3,4) then a fifth gets seq_no 5 — strict monotonicity continues with no gaps.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 63
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 62
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 61
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 5
+- name: drop_malformed_arp
+  visibility: hidden
+  description: A non-sequencer frame (ARP — no sequencer header) MUST be dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 10.0.0.2
+        psrc: 10.0.0.1
+  expected:
+    behavior: drop
+- name: drop_udp_without_sequencer_header
+  visibility: hidden
+  description: A UDP packet to a non-sequencer port (53) has no sequencer header and MUST be dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 64
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: malformed_does_not_burn_counter
+  visibility: hidden
+  description: 'A malformed frame seen before a REQUEST must not advance the counter: a dropped ARP then a REQUEST → the REQUEST still gets seq_no 1.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: ff:ff:ff:ff:ff:ff
+    - ARP:
+        pdst: 10.0.0.2
+        psrc: 10.0.0.1
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:01
+        dst: 08:00:00:00:00:f0
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.255
+        ttl: 30
+    - UDP:
+        sport: 5000
+        dport: 9000
+    - Sequencer:
+        group_id: 0
+        type: 1
+        session: 1
+        seq_no: 0
+  expected:
+    behavior: multicast
+    output_ports:
+    - s1.p2
+    - s1.p3
+    - s1.p4
+    transformations:
+      Sequencer.seq_no:
+        action: change_to
+        value: 1

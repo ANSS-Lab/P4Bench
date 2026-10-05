@@ -1,0 +1,1169 @@
+# P-BinaryNeuralNet — in-switch binarized neural network (BNN) inference
+#
+# TPL v1.0 task pattern. The SECOND occupant of the
+# (D3:ml-inference × P11:ml-inference) cell of the NF design-space
+# map — the ML-inference row of the `relocate` frontier — alongside, and
+# structurally DISTINCT from, P-DecisionTreeInfer. Where P-DecisionTreeInfer
+# stresses the match-action ENCODING of arithmetic comparisons (range/ternary
+# feature tables → decision table), this pattern stresses the BIT-PARALLEL
+# ARITHMETIC of a binarized neural network: XNOR-popcount neurons over a
+# binarized header-derived feature vector. Same (D3,P11) framing, same
+# per-packet stateless feature-vector → class-output conventions; an
+# orthogonal data-plane redesign challenge (Boolean linear algebra, not tree
+# encoding), so the two do NOT duplicate mechanics.
+#
+# target_capability = relocate: BNN inference (the N3IC NIC/host-offload
+# design) is relocated DOWN into the switch match-action pipeline. The
+# relocate failure mode is acute here: v1model has NO native popcount and no
+# vector ALU, so the SUT must REDESIGN the XNOR-popcount neuron — a host-side
+# bitwise-AND + __builtin_popcount loop — into a loop-free, stage-bounded
+# match-action form (popcount as a sum of bit-slices or a small lookup table
+# over the XNOR result) with no fixed-function precedent to copy.
+#
+# Grounded in N3IC (Siracusano et al., NSDI '22 — in-network BNN
+# inference) as the canonical implementation and the Binarized Neural
+# Networks method (Courbariaux et al., NeurIPS '16) for the XNOR-popcount
+# neuron semantics, plus the in-network ML-inference lineage. Instances are
+# produced by binding the parameters below.
+
+pattern_id: P-BinaryNeuralNet
+version: "1.0"
+
+nf_categories:                                                # NF-category tags (ID:name pairs)
+  descriptive:  [D3:ml-inference]                             # D3 family "ML inference" — binary neural nets run in-pipeline (the design-space table names BNNs explicitly)
+  prescriptive: [P11:ml-inference]                            # P11 "ML inference" — model inference in match-action pipeline; `relocate` row in the design-space table
+
+target_capability: relocate                                   # host/NIC-side BNN inference (N3IC) relocated down into the switch pipeline
+
+summary: >
+  An in-switch binarized neural network (BNN) classifier. For each
+  classifiable packet the switch extracts a small fixed-width feature
+  vector from header fields, BINARIZES each feature to a single bit
+  (sign / threshold: bit = 1 iff feature ≥ its per-feature binarization
+  threshold, else 0), and evaluates a pre-trained BNN installed by the
+  control plane. Each neuron computes XNOR(input_bits, stored_weight_bits)
+  then POPCOUNT of the result, and fires its activation bit iff the
+  popcount meets the neuron's threshold (popcount ≥ activation_threshold
+  → output bit 1, else 0) — the XNOR-popcount neuron of Courbariaux et al.
+  One (or, when ${layer_count} == 2, two) layer(s) of such neurons produce
+  an output bit vector that is decoded to a class index. That class drives
+  forwarding through a control-plane class-action map: `forward` (steer to
+  the class's egress port), `drop` (the anomaly / blocked class), or `mark`
+  (stamp the class id into the IPv4 DSCP/diffserv field, recomputing the
+  IPv4 checksum). A packet missing a required feature header is handled per
+  ${unclassified_action}. The pattern is STATELESS — every verdict is a
+  PURE function of the current packet's binarized features and the
+  control-plane-installed weights — which bounds the oracle cost (the
+  headline `inference_determinism` invariant). Its difficulty lives in the
+  relocate redesign: v1model has no native popcount, so the bit-parallel
+  XNOR-popcount neuron must be re-expressed as a sum of bit-slices or a
+  small XNOR-result lookup table, kept narrow enough to compile (the
+  `popcount_fidelity` invariant); the binarization tie-break must match the
+  model exactly (`binarization_fidelity` — the silent misclassification);
+  the payload must round-trip unmodified; and the IPv4 checksum must be
+  recomputed after a DSCP mark. Faithfulness anchors at D5.0 (a single
+  small layer, few narrow neurons, forward-only, exact sign binarization,
+  uniform workload) and ladders through D5.1 (more / wider neurons, +drop
+  class, strict binarization fidelity), D5.2 (two layers + mark action),
+  and D5.3 (full feature width, two wide layers, tight model capacity,
+  adversarial on-threshold feature workload).
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: n3ic_siracusano_nsdi22
+      title: "Re-architecting Traffic Analysis with Neural Network Interface Cards (N3IC)"
+      where: "NSDI 2022 (Siracusano et al.)"
+      role: canonical_implementation
+      relevance: |
+        The canonical design for running a (binary) neural network on the
+        data path — the spine of every rule and invariant here. N3IC shows
+        that a trained Binary Neural Network can be executed in commodity
+        network hardware (SmartNIC / programmable switch) by reducing each
+        neuron to bitwise XNOR + popcount, because binary weights and binary
+        activations turn the dot-product of a neuron into XNOR-then-count and
+        a sign activation into a popcount threshold. The clauses below bind
+        directly on the pattern's structure:
+
+          - Binary neuron as XNOR-popcount. N3IC's data-plane neuron computes
+            the bitwise XNOR of the binarized input vector against the stored
+            binary weight vector and counts the set bits (popcount); the
+            neuron fires when that count crosses a threshold. This IS the
+            pattern's R-fire neuron (the `popcount_fidelity` and
+            `binarization_fidelity` invariants), and the control-plane-
+            installed weight vectors ARE the `${weights}` the seed binds.
+
+          - Popcount has no native primitive. N3IC dwells on REALISING the
+            popcount on hardware that lacks a population-count instruction —
+            it is built from additions of bit-slices (or table lookups over
+            partial results). This is the pattern's headline relocate
+            redesign and the explicit FEASIBILITY caveat: wide neurons make
+            the bit-slice sum / lookup table blow up the pipeline, so the
+            pattern keeps neuron width small (≤ ${feature_width} bits) and
+            `popcount_fidelity` is the load-bearing invariant.
+
+          - Small fixed model in the pipeline. N3IC keeps the model tiny
+            (few small layers) precisely so it fits the line-rate budget;
+            this grounds the small ${neuron_count} / ${layer_count} surface
+            and the model-capacity axis. The data-plane program is model-
+            agnostic — it implements the XNOR-popcount-threshold neuron, and
+            the control plane installs the specific weights and thresholds.
+
+          - Header-derived feature vector. N3IC feeds the network a compact
+            feature vector derived from traffic; this pattern's per-packet
+            header-derived binarized feature vector is the stateless,
+            single-packet specialisation (flow-level / sliding-window
+            feature accumulation is stateful and out of scope, deferred to
+            the P3 flow-tracking patterns, which keeps the oracle a pure
+            `classify(features) -> class` function).
+      common_knowledge_baseline_used: |
+        Concrete BMv2 / v1model implementation — binarizing each feature with a
+        ternary/range match table or a comparison action, packing the
+        per-feature bits into a metadata bit-string, computing XNOR as
+        `~(a ^ b)` masked to the neuron width, realising popcount as a sum
+        of single-bit slices (or a small table keyed on the XNOR result),
+        comparing against the activation threshold, decoding the output
+        bit vector to a class id, the class-action table mapping the class
+        to mark_to_drop / egress_spec / DSCP-write, and the
+        update_checksum after a DSCP mark — is widely known P4-on-v1model
+        practice rather than N3IC-cited, and is flagged `[common-knowledge
+        baseline]` in `bridging_notes:`.
+
+    - cite: courbariaux_binarized_nn_neurips16
+      title: "Binarized Neural Networks (training NNs with weights and activations constrained to +1/-1)"
+      where: "NeurIPS 2016 (Courbariaux, Hubara, Soudry, El-Yaniv, Bengio)"
+      role: domain_concepts
+      relevance: |
+        The BNN method N3IC executes — the source of the neuron SEMANTICS
+        this pattern must reproduce exactly. The clauses that bind:
+
+          - Binarization (sign). Activations and weights are constrained to
+            ±1, encoded as a single bit (1 ↦ +1, 0 ↦ −1). The feature
+            binarization step (bit = sign of feature relative to its
+            threshold) and the per-feature tie-break (`ge` vs `gt`) are this
+            ±1 sign convention — basis for `binarization_fidelity`.
+
+          - XNOR-popcount dot product. With ±1 operands the dot product of
+            an input vector and a weight vector equals
+            (#agreements − #disagreements) = 2·popcount(XNOR) − N, so a
+            neuron's pre-activation is an affine function of the XNOR
+            popcount. Thresholding the pre-activation against the (folded
+            batch-norm) bias therefore reduces to a popcount ≥ threshold
+            test — basis for the `popcount ≥ activation_threshold` fire
+            rule and the `popcount_fidelity` invariant. This identity is
+            what justifies REPLACING multiply-accumulate with XNOR + count,
+            and hence the whole relocate feasibility argument.
+
+          - Deterministic inference. At inference time the binarization and
+            the sign activation are deterministic functions of the inputs
+            and the (fixed) trained parameters — basis for the pure-function
+            `inference_determinism` invariant.
+      common_knowledge_baseline_used: |
+        The folding of batch-norm + bias into a single integer popcount
+        threshold per neuron (so the data plane only ever compares a count
+        to a constant) is standard BNN-deployment practice and is treated as
+        a control-plane compile step that produces the per-neuron
+        activation_threshold; flagged `[common-knowledge baseline]` in
+        `bridging_notes:`.
+
+  rfcs: []                                                    # ML inference is a research / engineering NF with no IETF data-plane normative source.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet or cross-packet state. Every classification
+      derives from the current packet's binarized feature vector, the
+      ingress port, and the control-plane-installed weights + class-action
+      tables. The pattern is STATELESS — no `flow` / `window` rows are
+      maintained. Per-packet header-feature BNN inference is the N3IC model;
+      flow-level / sliding-window feature accumulation is stateful and out
+      of scope (it composes with the P3 flow-tracking patterns), which is
+      what keeps the oracle a pure `classify(features) -> class` function.
+
+  bnn_model:                                                  # TPL `bucket` — aggregate state across a class of packets (the trained BNN compiled to entries)
+    type: bucket
+    keyed_by_tuple: [layer_index, neuron_index]               # which neuron's weight vector + threshold this row holds
+    attrs:
+      weight_bits:          int                               # the neuron's binary weight vector, ${feature_width} bits (layer 0) / ${neuron_count} bits (layer 1)
+      activation_threshold: int                               # popcount-≥ threshold the neuron fires at (folded batch-norm + bias)
+    capacity: ${model_capacity}
+    populated_from: ${weights}                                # the trained BNN: per-neuron weight bit-vectors + thresholds the seed compiles to entries
+    notes: |
+      The trained BNN compiled to control-plane-installed state: one row per
+      neuron carrying its binary weight vector and its integer activation
+      threshold (the folded batch-norm + bias). The data-plane program is
+      model-agnostic — it implements the XNOR-popcount-threshold neuron and
+      the output decode, not the specific weights. `${weights}` is data, not
+      a difficulty knob (the knobs are neuron_count / layer_count /
+      feature_width / binarization fidelity, each with its own operator).
+
+  class_action_map:                                           # TPL `bucket` — per-class steering decision
+    type: bucket
+    keyed_by_tuple: [class_index]
+    attrs:
+      verdict:     "enum {forward, drop, mark}"               # which rule (R3/R1/R2) the resolved class fires
+      egress_port: port                                       # class egress port (forward + mark)
+      mark_value:  "int | none"                               # DSCP/diffserv value stamped (mark only)
+    capacity: ${num_classes}
+    populated_from: ${class_action_entries}                   # class → action rows the seed installs
+    notes: |
+      The class → forwarding-action table. Control-plane installed (an
+      operator policy: which classes forward where, which drop as the
+      anomaly/blocked class, which get stamped). Separates the model
+      (bnn_model) from the policy (class_action_map) so the same BNN can
+      drive different actions across instances.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  weights:
+    type: list[neuron_spec]
+    constraint: |
+      a list of neurons grouped by layer (${layer_count} layers); each
+      neuron_spec has layer_index ∈ [0, ${layer_count}); for layer 0,
+      weight_bits is a ${feature_width}-bit binary vector (one bit per
+      binarized feature) and there are exactly ${neuron_count} of them; for
+      layer 1 (only when ${layer_count} == 2), each weight_bits is a
+      ${neuron_count}-bit binary vector over the layer-0 activation bits;
+      every neuron has activation_threshold:int ∈ [0, width_of_its_layer];
+      the output bit vector of the final layer decodes to a class_index ∈
+      [0, ${num_classes}).
+    notes: |
+      The trained BNN the seed binds — the data the instantiation step
+      compiles into the per-neuron weight-vector + threshold rows. Bound by
+      the seed; carries no own operator (it is data). The parametric-
+      source invariant holds: the oracle reads weight_bits and
+      activation_threshold from runtime state, never bakes them as
+      source-level constants — so weight rebinding reuses the same
+      audited oracle.
+
+  binarization_thresholds:
+    type: list[binarization_spec]
+    constraint: |
+      length == ${feature_count}; each entry has feature_index ∈
+      [0, ${feature_count}), threshold:int, and tie_break ∈ {ge, gt}; the
+      threshold fits in the bit width of its feature field. Defines the
+      sign binarization of each raw feature into one bit.
+    notes: |
+      How each raw header feature is reduced to a single bit: bit = 1 iff
+      (read(feature) ≥ threshold) for tie_break==ge, or (> threshold) for
+      tie_break==gt. The ±1 sign of Courbariaux et al. The on-threshold
+      tie-break is the silent misclassification surface
+      (`binarization_fidelity`). Bound by the seed.
+
+  class_action_entries:
+    type: list[class_action_entry]
+    constraint: |
+      one entry per class index in use; each has class_index:int ∈
+      [0, ${num_classes}); verdict ∈ {forward, drop, mark}; egress_port:int
+      ∈ [1, 511] (required for forward/mark); mark_value:int ∈ [0, 63]
+      (required iff verdict == mark, the 6-bit DSCP field, else none).
+      verdict ∈ {drop} entries appear only when ${action_breadth} ∈
+      {forward_drop, forward_drop_mark}; verdict ∈ {mark} entries only when
+      ${action_breadth} == forward_drop_mark.
+    notes: |
+      The rows that populate `class_action_map`. Bound by the seed; the
+      harness installs the corresponding class-action table at task start.
+
+  num_classes:
+    type: int
+    range: "[2, 64]"
+    default: 2
+    notes: |
+      Number of distinct output classes the BNN can emit. Anchor instances
+      are binary (benign / anomaly). Coupled into the weights' output decode
+      and class_action_entries; not a standalone difficulty knob (the
+      difficulty is the neuron/layer/width structure).
+
+  feature_count:
+    type: int
+    range: "[1, 16]"
+    default: 4
+    notes: |
+      Number of header-derived input features — i.e. the number of bits in
+      the layer-0 input vector after binarization, and so the layer-0 neuron
+      width. `${feature_set}` must list exactly this many fields and
+      `${binarization_thresholds}` must have exactly this many entries.
+      More features means a wider input vector and wider popcount, so
+      `add_feature` hardens (feature-breadth axis). Coupled to
+      ${feature_width} (the layer-0 neuron width == feature_count).
+
+  feature_set:
+    type: list[header_field_ref]
+    constraint: |
+      length == ${feature_count}; each entry references a parseable header
+      field usable as a classification feature (e.g. ipv4.totalLen,
+      ipv4.protocol, ipv4.ttl, ipv4.diffserv, ipv4.flags, tcp.srcPort,
+      tcp.dstPort, tcp.flags, tcp.window, udp.length, udp.dstPort). Every
+      referenced header is in the parser's reachable set.
+    notes: |
+      Which header fields the classifier reads as features. Bound by the
+      seed. The instantiation step renders each into the corresponding
+      binarized input bit (via ${binarization_thresholds}).
+
+  feature_width:
+    type: int
+    range: "[1, 16]"
+    default: 4
+    notes: |
+      Width (in bits) of a layer-0 neuron's input/weight vector — equal to
+      ${feature_count}. THE feasibility knob: the popcount realised as a sum
+      of bit-slices (or a lookup table over the XNOR result) grows with this
+      width, so it is capped at 16 to keep the popcount compilable on
+      v1model (which has NO native popcount). `widen_feature_vector`
+      hardens, `narrow_feature_vector` eases (capacity axis — the resource
+      is popcount/XNOR bit width). Wide vectors risk the compile gate (see
+      `bridging_notes:` feasibility note).
+
+  neuron_count:
+    type: int
+    range: "[1, 16]"
+    default: 2
+    notes: |
+      Number of neurons in layer 0 (the hidden layer when ${layer_count} ==
+      2, or the output layer when ${layer_count} == 1). More neurons means
+      more XNOR-popcount-threshold units to realise and a wider intermediate
+      activation vector. `add_neuron` hardens, `remove_neuron` eases
+      (feature-breadth axis — more of the model surface to implement).
+
+  layer_count:
+    type: int
+    range: "[1, 2]"
+    default: 1
+    notes: |
+      Number of BNN layers. `1` is a single layer of ${neuron_count} neurons
+      whose activation bits decode directly to the class (the anchor). `2`
+      ADDS a second layer: layer-0 activation bits become the input vector
+      to layer-1 neurons (each a ${neuron_count}-bit XNOR-popcount-threshold
+      unit), whose output decodes to the class — a distinct extra
+      match-action stage absent at the anchor. `add_layer` hardens,
+      `remove_layer` eases (feature-breadth axis: a new mechanism to
+      implement). Capped at 2 to stay within the v1model stage budget.
+
+  activation_threshold_mode:
+    type: enum
+    values: [per_neuron, uniform]
+    default: per_neuron
+    notes: |
+      Whether each neuron carries its own popcount activation threshold
+      (`per_neuron`, the faithful folded-batch-norm case) or a single shared
+      threshold (`uniform`, an approximation). Coupled into the faithfulness
+      ladder; the per-neuron case is the exact N3IC/Courbariaux semantics.
+
+  binarization_fidelity:
+    type: enum
+    values: [exact_sign, coarse]
+    default: exact_sign
+    notes: |
+      Faithfulness of the feature binarization. `exact_sign` reproduces the
+      model's per-feature threshold and tie-break exactly (the ±1 sign of
+      Courbariaux et al.). `coarse` collapses several features to a shared
+      threshold / drops the tie-break — an approximation that mis-bins
+      on-threshold features. `tighten_binarization` hardens,
+      `loosen_binarization` eases (faithfulness axis — exact↔approximate
+      computation of the binarized feature bit).
+
+  default_class:
+    type: "int | reject"
+    default: 0
+    notes: |
+      The class an output bit vector that decodes to no installed class
+      resolves to — installed as the class-decode table's default action so
+      a decode miss does NOT fault. `reject` routes the miss to the
+      anomaly/blocked class when one exists. Coupled into the faithfulness
+      ladder rather than carrying its own operator pair. The
+      `default_class_fallback` test pins that a decode miss resolves
+      deterministically.
+
+  action_breadth:
+    type: enum
+    values: [forward_only, forward_drop, forward_drop_mark]
+    default: forward_only
+    notes: |
+      Which class verdicts the seed's table exercises. `forward_only` is the
+      anchor minimum (every class steers to a port — R3). `forward_drop`
+      adds the anomaly/blocked drop class (R1). `forward_drop_mark` adds the
+      DSCP-stamp action (R2) and its IPv4-checksum surface. Broader action
+      sets add reachable rules and bug surfaces, so `broaden_class_action`
+      hardens (feature-breadth axis).
+
+  unclassified_action:
+    type: enum
+    values: [drop, forward_default]
+    default: forward_default
+    notes: |
+      How a packet that lacks a required feature header (cannot be
+      binarized / classified) is handled: `forward_default` steers it to
+      `${default_egress_port}` (a passthrough), `drop` is closed-world
+      default-deny. Coupled into the faithfulness ladder, not a standalone
+      operator pair.
+
+  default_egress_port:
+    type: int
+    range: "[1, 511]"
+    enforced_when: "${unclassified_action} == forward_default"
+    notes: |
+      Egress port an unclassifiable packet is forwarded to under
+      `${unclassified_action} == forward_default`. Bound by the seed.
+
+  model_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of compiled model rows (per-neuron weight/threshold
+      rows + binarization rows + class-decode rows) the data plane supports.
+      `shrink_model_capacity_4x` tightens it from the anchor's `unbounded`,
+      forcing the SUT toward a compact encoding (a packed weight bit-string
+      + arithmetic XNOR-popcount) rather than a row-per-neuron unrolling
+      (capacity axis — distinct resource from `feature_width`, which moves
+      popcount bit width; both are capacity, so each carries its own pair).
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial]
+    default: uniform
+    notes: |
+      Distribution of feature values in the G1 traffic tests. `uniform` is
+      the anchor default. `zipfian` concentrates on a few hot classes.
+      `adversarial` packs feature values that sit EXACTLY on a binarization
+      threshold AND crafts vectors whose neuron popcounts sit EXACTLY on the
+      activation threshold (the two tie-break boundaries), where a
+      mis-encoded sign or an off-by-one popcount mis-classifies.
+      `raise_workload_skew` hardens (workload axis).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_anchor_single_layer, D5.1_wide_layer_drop, D5.2_two_layer_mark, D5.3_adversarial_bnn]
+    default: D5.0_anchor_single_layer
+    notes: |
+      The faithfulness ladder for this pattern. D5.0 is a single small layer
+      (few narrow neurons, forward-only, exact sign binarization, uniform
+      workload, explicit default class). D5.1 widens / adds neurons, adds
+      the drop class, and demands strict binarization fidelity. D5.2 adds
+      the second layer and the mark action. D5.3 takes the full feature
+      width, two wide layers, tight model capacity, and the adversarial
+      on-threshold workload. `tighten_faithfulness` walks the ladder up;
+      `loosen_faithfulness` walks it down (feature-breadth ladder).
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics: the first rule whose `when` evaluates true on the
+# incoming packet fires; subsequent rules are not evaluated for that packet.
+#
+# Shorthands used in the `when` clauses below:
+#   has_features  := header_present(ipv4) ∧ ∀ f ∈ ${feature_set}: header_present(f.header)
+#                    (every feature field's enclosing header parsed successfully)
+#   input_bits    := binarize(read(${feature_set}), ${binarization_thresholds})
+#                    -- one bit per feature: bit = 1 iff read(f) {≥|>} f.threshold
+#   class_index   := bnn_infer(input_bits, bnn_model, ${layer_count})
+#                    -- per neuron: popcount(XNOR(layer_input, weight_bits)) ≥
+#                       activation_threshold → activation bit; layer-0 bits feed
+#                       layer-1 when ${layer_count}==2; final layer's output bit
+#                       vector decodes to a class (or ${default_class} on miss).
+#   verdict       := class_action_map[class_index].verdict
+
+rules:
+
+  - id: R0_unclassifiable
+    when: |
+      ¬has_features
+    then:
+      - "forward(${default_egress_port}) if ${unclassified_action} == forward_default else drop"
+    notes: |
+      A packet that does not carry the required feature headers (e.g. a
+      non-IPv4 frame, or a non-TCP packet when a TCP feature is configured)
+      cannot be binarized / classified. It is handled per
+      `${unclassified_action}` — a deterministic passthrough or drop — and
+      the NF MUST NOT read the absent feature fields (an unspecified-value
+      read per P4-16 §8.25). `read_invalid_feature_guard` and the
+      `feature_read_safety` invariant pin this.
+
+  - id: R1_class_drop
+    when: |
+      has_features ∧ verdict == drop
+    given:
+      class_action_map: by_key(class_index)
+    then:
+      - drop
+    notes: |
+      The BNN's predicted class is the anomaly / blocked class (drop
+      verdict). The packet is dropped before any forwarding. Only reachable
+      when `${action_breadth} ∈ {forward_drop, forward_drop_mark}` (the seed
+      installs no drop-verdict classes otherwise). The D7-flavoured security
+      use of in-network inference (drop traffic the BNN flags). `class_drop`
+      exercises it.
+
+  - id: R2_class_mark
+    when: |
+      has_features ∧ verdict == mark
+    given:
+      class_action_map: by_key(class_index)
+    then:
+      - "set(ipv4.diffserv, class_action_map.mark_value)"     # stamp the predicted class id into DSCP/diffserv
+      - "set(ipv4.header_checksum, ipv4_checksum_recompute())"
+      - forward(class_action_map.egress_port)
+    notes: |
+      The predicted class is stamped into the IPv4 DSCP/diffserv byte for a
+      downstream consumer, then the packet is forwarded. Because the IPv4
+      header changed, the IPv4 header checksum MUST be recomputed — the #1
+      silent failure (`checksum_after_mark`, `envelope_checksum_validity`).
+      The PAYLOAD is untouched (`payload_persistence`). Only reachable when
+      `${action_breadth} == forward_drop_mark`.
+
+  - id: R3_class_forward
+    when: |
+      has_features ∧ verdict == forward
+    given:
+      class_action_map: by_key(class_index)
+    then:
+      - forward(class_action_map.egress_port)
+    notes: |
+      The anchor-band action: the BNN's predicted class steers the packet to
+      its class egress port. No header is rewritten — the inference NF is a
+      pure classifier-steerer here, so the whole packet (headers + payload)
+      round-trips byte-for-byte (`payload_persistence`). This is the default
+      verdict for every class at the `forward_only` anchor. Implementation
+      anti-patterns: keying the decision on a per-packet-varying field
+      instead of the binarized features (`inference_determinism`);
+      mis-realising the popcount so a neuron fires at the wrong count
+      (`popcount_fidelity`); mis-binarizing an on-threshold feature
+      (`binarization_fidelity`).
+
+# ─── Invariants (six canonical clauses) ─────────────────────────────────────
+
+invariants:
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No packet recirculates indefinitely. The BNN evaluation is a FIXED
+      number of logical stages regardless of model size — feature
+      binarization, one XNOR-popcount-threshold pass per layer
+      (${layer_count} ≤ 2), and an output decode — and every rule is a
+      single-pass forward or drop. There is NO recirculation. A program that
+      tries to iterate neurons via recirculation/resubmit (a naive host-side
+      loop transliteration) violates the bound; the unrolled, stage-bounded
+      XNOR-popcount form does not.
+
+  - id: popcount_fidelity
+    clause: stability
+    target: "(neuron_activation_bit, class_index)"
+    while: "has_features"
+    notes: |
+      THE relocate-redesign invariant. Each neuron's activation bit equals
+      [ popcount( XNOR(layer_input_bits, weight_bits) ) ≥ activation_threshold ],
+      where the XNOR is masked to EXACTLY the neuron width (${feature_width}
+      for layer 0, ${neuron_count} for layer 1) and the popcount counts all
+      and only those bits. Because v1model has no native popcount, the SUT
+      realises it as a sum of bit-slices or a lookup over the XNOR result;
+      an off-by-one in the bit-slice sum, a mask that includes stray bits, or
+      a count that overflows a too-narrow metadata field silently mis-fires
+      the neuron. Pins the XNOR-popcount identity of Courbariaux et al.
+      (dot product == 2·popcount(XNOR) − N) and the N3IC popcount-realisation
+      feasibility argument. `popcount_width_max` + `activation_boundary_value`
+      enumerate it.
+
+  - id: binarization_fidelity
+    clause: stability
+    target: input_bits
+    while: "has_features ∧ ∃ f ∈ ${feature_set}: read(f) is on its binarization threshold"
+    notes: |
+      A feature value sitting EXACTLY on its binarization threshold is
+      binarized per the model's documented tie-break (`ge`: read(f) ≥ t → 1;
+      `gt`: read(f) > t → 1) — the ±1 sign of Courbariaux et al. — and the
+      data-plane comparison must reproduce that tie-break exactly. An
+      off-by-one (≥ encoded as >, or a coarse shared threshold under
+      `${binarization_fidelity} == coarse`) flips the input bit, which can
+      cascade through the XNOR-popcount to a wrong class — and only on the
+      on-threshold packet, so the bug hides until a boundary input. The
+      silent misclassification for binarized inference.
+      `feature_boundary_value` and the adversarial workload enumerate it.
+
+  - id: inference_determinism
+    clause: stability
+    target: "(class_index, forward_decision)"
+    while: "has_features"
+    notes: |
+      Stable classification: two packets with identical binarized feature
+      vectors always produce the same class and the same forwarding action.
+      The BNN is a PURE function of the configured features and the
+      control-plane weights — no per-packet register state, no dependence on
+      a per-packet-varying field (IP id, source port when not a feature,
+      arrival order). Implementation anti-pattern: folding a non-feature field into
+      the input vector, or a non-deterministic output-decode tie-break.
+      `inference_determinism_repeat` witnesses it.
+
+  - id: payload_persistence
+    clause: persistence
+    target: "(packet_headers_except_diffserv, payload)"
+    while: "(R2 ∨ R3 ∨ R0-forward) fires"
+    free_under: ["ipv4.diffserv under R2 (the class mark)"]
+    notes: |
+      On every forwarded (non-dropped) packet the headers and payload are
+      delivered byte-for-byte identical to what arrived, EXCEPT the IPv4
+      DSCP/diffserv byte under the R2 mark action. The inference NF
+      classifies-and-steers (and optionally stamps one byte) — it does not
+      rewrite or truncate the packet. Pins the conditional-deparser surface.
+      `conditional_deparser_roundtrip` enumerates it.
+
+  - id: envelope_checksum_validity
+    clause: stability
+    target: ipv4.header_checksum
+    while: "R2 fires ∧ egress(packet)"
+    notes: |
+      Every marked packet carries a valid IPv4 header checksum on egress,
+      recomputed after the DSCP/diffserv write. Omitting `update_checksum`
+      after a header-field edit is the #1 silent failure in the v1model
+      bug catalogue's cross-cutting taxonomy: BMv2 emits a stale checksum the downstream
+      silently drops. `checksum_after_mark` catches it.
+
+  - id: feature_read_safety
+    clause: stability
+    target: forward_decision
+    while: "¬has_features"
+    notes: |
+      A packet missing a required feature header produces a DETERMINISTIC
+      decision (`unclassified_action`) and NEVER reads a feature field from
+      an absent / invalid header (an unspecified-value read per P4-16 §8.25 /
+      the bug-taxonomy "read from invalid header"). Pins that the classifier
+      degrades gracefully rather than binarizing garbage bytes.
+      `read_invalid_feature_guard` witnesses it.
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+# Materialised into task.yaml::test_cases at instantiation, following the
+# G1/G2/G3 test-goal rules and the v1model bug taxonomy for per-entry
+# materialisation.
+
+test_scaffolding:
+
+  G1:
+    - id: bnn_classify_golden
+      generate: |
+        Install a small BNN (weights + thresholds) and binarization
+        thresholds such that a specific header-derived feature vector
+        binarizes to a known input bit-string whose XNOR-popcount evaluation
+        yields class C with class_action verdict=forward, egress_port=P.
+        Send a packet producing that vector. Assert it is forwarded on P,
+        with all headers and payload byte-for-byte unchanged. (Anchor — the
+        golden inference path, G1-P1-T1.)
+
+    - id: bnn_classify_two_classes
+      generate: |
+        Install a BNN + class_action_map mapping two distinct binarized
+        feature vectors to two different classes → two different egress
+        ports. Send one packet for each. Assert each is steered to its
+        class's port. Confirms the BNN actually evaluates the binarized
+        features (XNOR-popcount) rather than steering on a constant.
+        (G1-P1-T1 per-class coverage.)
+
+    - id: bnn_default_class_fallback
+      generate: |
+        Send a packet whose binarized feature vector evaluates to an output
+        bit vector decoding to NO installed class. Assert it resolves to
+        `${default_class}` (the decode-table default action) and takes that
+        class's action — deterministically, never a decode-miss fault or a
+        forward on uninitialised metadata. (Pins the default-decode
+        mechanism; G1 state/branch coverage.)
+
+    - id: bnn_two_layer_eval
+      requires: "${layer_count} == 2"
+      generate: |
+        Install a two-layer BNN where the SECOND layer's verdict differs
+        from what reading layer 0 alone would suggest (the hidden-layer
+        activations must be combined by layer 1 to get the right class).
+        Send the crafted packet. Assert the class matches the full two-layer
+        evaluation, forcing the SUT to feed layer-0 activation bits into
+        layer-1 neurons rather than decoding layer 0 directly. (Second-layer
+        branch; N3IC multi-layer.)
+
+    - id: bnn_mark_class
+      requires: "${action_breadth} == forward_drop_mark"
+      generate: |
+        Send a packet that classifies to a mark-verdict class with
+        mark_value=V. Assert the egress packet has ipv4.diffserv=V, a valid
+        recomputed IPv4 header checksum, the same egress port, and the
+        payload byte-for-byte preserved. (R2 path; G1-P1-T3/T5
+        transformation assertions.)
+
+  G2:
+    - id: feature_boundary_value
+      generate: |
+        Send packets whose feature value is EXACTLY a binarization threshold
+        t (and t±1). Assert each binarizes per the model's documented
+        tie-break (ge: ≥t → bit 1; gt: >t → bit 1) and classifies per the
+        oracle — the on-threshold packet must NOT flip to an off-by-one
+        neighbour. (Pins `binarization_fidelity`; the silent
+        misclassification surface.)
+
+    - id: activation_boundary_value
+      generate: |
+        Craft an input bit vector whose XNOR-popcount against a neuron's
+        weight vector equals EXACTLY that neuron's activation_threshold (and
+        threshold±1). Assert the neuron fires per `popcount ≥ threshold` (on:
+        fires; threshold−1: does not) and the resulting class matches the
+        oracle. (Pins `popcount_fidelity` activation tie-break; off-by-one
+        on the count comparison.)
+
+    - id: popcount_width_max
+      generate: |
+        At the configured `${feature_width}`, send a packet whose input
+        vector and a neuron weight vector XNOR to ALL ONES (popcount ==
+        feature_width, the maximum) and one that XNORs to ALL ZEROS
+        (popcount == 0). Assert each classifies without the popcount sum
+        overflowing / wrapping into a wrong count, and the neuron fires
+        exactly when feature_width (or 0) meets its threshold. (Boundary;
+        popcount arithmetic width edge — the feasibility caveat.)
+
+  G3:
+    - id: inference_determinism_repeat
+      generate: |
+        Send the SAME binarized feature vector in N (≥3) packets, optionally
+        varying a NON-feature field (IP id, payload bytes). Assert every
+        packet gets the identical class and egress port — no flap. Catches an
+        implementation that folds a per-packet-varying field into the input vector
+        or uses a non-deterministic output-decode tie-break. (Pins
+        `inference_determinism`; G3 stability probe.)
+
+    - id: read_invalid_feature_guard
+      generate: |
+        Send (a) a non-IPv4 frame and (b) an IPv4 packet whose configured
+        feature lives in an absent upper-layer header (e.g. a tcp.dstPort
+        feature but the packet is ICMP). Assert the NF does NOT binarize or
+        forward based on unspecified feature bytes — it takes
+        `${unclassified_action}`. (P4-16 §8.25 unspecified-value read; bug
+        taxonomy "read from invalid header".)
+
+    - id: conditional_deparser_roundtrip
+      generate: |
+        Send a forward-classified packet with a distinctive payload. Assert
+        the egress byte layout is exactly the input headers (DSCP unchanged
+        under forward; only DSCP changed under mark) followed by the payload
+        byte-for-byte — no header dropped, duplicated, reordered, or
+        fixed-width-padded. Catches the common v1model conditional-deparser bug.
+
+    - id: checksum_after_mark
+      requires: "${action_breadth} == forward_drop_mark"
+      generate: |
+        Same setup as `bnn_mark_class`. After R2 writes ipv4.diffserv,
+        recompute the IPv4 header checksum over the 20-byte header from the
+        egress bytes and assert it matches. Catches the implementation that edits
+        DSCP but forgets the checksum recompute — the #1 silent failure per
+        the v1model bug catalogue's cross-cutting taxonomy.
+
+    - id: class_drop
+      requires: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+      generate: |
+        Install a drop-verdict (anomaly) class. Send a packet that
+        classifies to it; assert drop. Then send a packet that classifies to
+        a forward class; assert it still forwards (the drop is class-scoped,
+        not a blanket deny). (In-network-inference security use, R1; G3
+        default-deny.)
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Seven harden operators paired with seven ease counterparts; every operator
+# declares `direction` so parameter rebinding during difficulty recalibration
+# can pick from the matching pool depending on whether r > r* + δ (harden) or
+# r < r* − δ (ease). Every harden has an ease counterpart on the SAME axis.
+
+mutation_operators:
+
+  - id: widen_feature_vector
+    applicable_when: "${feature_width} < 16"
+    effect: "${feature_width} ← min(${feature_width} * 2, 16)   (and ${feature_count} ← ${feature_width}; extend ${feature_set} + ${binarization_thresholds} to match)"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${feature_width} ≤ 16 ∧ ${feature_width} ≥ 1 ∧ ${feature_count} == ${feature_width} ∧ len(${feature_set}) == ${feature_count}"
+    kind: parameter
+    notes: |
+      Widen the layer-0 input/weight vector — a wider popcount to realise as
+      a bit-slice sum / lookup. capacity axis (the resource is XNOR-popcount
+      bit width). Capped at 16 because wide popcounts risk the compile gate
+      on v1model (no native popcount). Activates more `popcount_width_max`
+      and `activation_boundary_value` boundaries.
+
+  - id: narrow_feature_vector
+    applicable_when: "${feature_width} > 1"
+    effect: "${feature_width} ← max(${feature_width} / 2, 1)   (and ${feature_count} ← ${feature_width}; trim ${feature_set} + ${binarization_thresholds} to match)"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${feature_width} ≥ 1 ∧ ${feature_width} ≤ 16 ∧ ${feature_count} == ${feature_width} ∧ len(${feature_set}) == ${feature_count}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `widen_feature_vector`. Halves (not
+      quarters) the width so the harden/ease asymmetry gives difficulty
+      recalibration a slower climb back after an over-widen.
+
+  - id: add_neuron
+    applicable_when: "${neuron_count} < 16"
+    effect: "${neuron_count} ← ${neuron_count} + 1   (extend ${weights} with one more layer-0 neuron; widen layer-1 weight vectors if ${layer_count}==2)"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${neuron_count} ≤ 16 ∧ ${neuron_count} ≥ 1"
+    kind: parameter
+    notes: |
+      Add a layer-0 neuron — one more XNOR-popcount-threshold unit and a
+      wider intermediate activation vector. feature-breadth axis (more of
+      the model surface must be implemented).
+
+  - id: remove_neuron
+    applicable_when: "${neuron_count} > 1"
+    effect: "${neuron_count} ← ${neuron_count} - 1   (drop a layer-0 neuron; narrow layer-1 weight vectors if ${layer_count}==2)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${neuron_count} ≥ 1 ∧ ${neuron_count} ≤ 16"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `add_neuron`.
+
+  - id: add_layer
+    applicable_when: "${layer_count} == 1"
+    effect: "${layer_count} ← 2   (add a second layer over the layer-0 activation bits; enforce ${activation_threshold_mode})"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${layer_count} == 2 ∧ ∃ neuron ∈ ${weights}: neuron.layer_index == 1"
+    kind: parameter
+    notes: |
+      Add the second BNN layer. Crossing from 1 to 2 layers ACTIVATES the
+      hidden→output mechanism (layer-0 activation bits become layer-1's
+      input vector) and the `bnn_two_layer_eval` test — a distinct extra
+      match-action stage. feature-breadth axis (adds a new mechanism). Capped
+      at 2 to stay within the v1model stage budget.
+
+  - id: remove_layer
+    applicable_when: "${layer_count} == 2"
+    effect: "${layer_count} ← 1   (drop layer 1; layer-0 activations decode directly to the class)"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${layer_count} == 1"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `add_layer`. Removes the second-layer stage
+      and skips `bnn_two_layer_eval`.
+
+  - id: broaden_class_action
+    applicable_when: "${action_breadth} ∈ {forward_only, forward_drop}"
+    effect: "${action_breadth} ← next_action_breadth(${action_breadth})"  # forward_only → forward_drop → forward_drop_mark
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+    kind: parameter
+    notes: |
+      Add reachable class verdicts: forward_drop activates R1 (the
+      anomaly-drop class and `class_drop`), forward_drop_mark activates R2
+      (the DSCP-mark action and its checksum surface via
+      `checksum_after_mark`). feature-breadth axis.
+
+  - id: narrow_class_action
+    applicable_when: "${action_breadth} ∈ {forward_drop, forward_drop_mark}"
+    effect: "${action_breadth} ← prev_action_breadth(${action_breadth})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${action_breadth} ∈ {forward_only, forward_drop}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `broaden_class_action`. Removes the
+      most-recently-added verdict and skips its `requires:`-guarded tests.
+
+  - id: tighten_binarization
+    applicable_when: "${binarization_fidelity} == coarse"
+    effect: "${binarization_fidelity} ← exact_sign ∧ ${activation_threshold_mode} ← per_neuron"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${binarization_fidelity} == exact_sign"
+    kind: parameter
+    notes: |
+      Demand exact per-feature sign binarization (the ±1 tie-break of
+      Courbariaux et al.) and per-neuron activation thresholds — the SUT
+      must reproduce the model's exact binning / threshold folding. A
+      fidelity (exact↔approximate computation) surface, not breadth.
+      faithfulness axis. Activates the on-threshold `feature_boundary_value`
+      sensitivity.
+
+  - id: loosen_binarization
+    applicable_when: "${binarization_fidelity} == exact_sign"
+    effect: "${binarization_fidelity} ← coarse ∧ ${activation_threshold_mode} ← uniform"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${binarization_fidelity} == coarse"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_binarization`. A coarse shared
+      threshold / dropped tie-break tolerates off-by-one on the boundary
+      packets, easing the binarization-fidelity demand.
+
+  - id: shrink_model_capacity_4x
+    applicable_when: "${model_capacity} ≠ unbounded ∧ ${model_capacity} > 64"
+    effect: "${model_capacity} ← ${model_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${model_capacity} ≥ 16"
+    kind: parameter
+    notes: |
+      Tighten the compiled-model table budget. The SUT cannot rely on a
+      row-per-neuron unrolling and must adopt a compact encoding (a packed
+      weight bit-string + arithmetic XNOR-popcount). capacity axis. Distinct
+      resource from `widen_feature_vector` (which moves popcount bit width) —
+      both capacity but on disjoint resources, so each carries its own pair.
+
+  - id: enlarge_model_capacity_2x
+    applicable_when: "${model_capacity} ≠ unbounded ∧ ${model_capacity} < 1048576"
+    effect: "${model_capacity} ← ${model_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${model_capacity} ≤ 1048576"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `shrink_model_capacity_4x`. Doubles (not
+      quadruples) for a slow climb back toward the target difficulty after an over-shrink.
+
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← next_skew(${workload_skew})"              # uniform → zipfian → adversarial
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} ∈ {zipfian, adversarial}"
+    kind: parameter
+    notes: |
+      Raise the feature-value distribution skew. `adversarial` packs values
+      sitting exactly on binarization thresholds AND crafts vectors whose
+      neuron popcounts sit exactly on the activation threshold (the two
+      tie-break boundaries), where a mis-encoded sign or an off-by-one
+      popcount mis-classifies. workload axis.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} ∈ {zipfian, adversarial}"
+    effect: "${workload_skew} ← prev_skew(${workload_skew})"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `raise_workload_skew`.
+
+  - id: tighten_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.0_anchor_single_layer, D5.1_wide_layer_drop, D5.2_two_layer_mark}
+    effect: |
+      ${faithfulness} ← next_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.1_wide_layer_drop then
+          ${feature_width} ← 8 ∧ ${neuron_count} ← 4 ∧
+          ${binarization_fidelity} ← exact_sign ∧
+          ${action_breadth} ← forward_drop ∧ ${workload_skew} ← zipfian ) ∧
+      ( if ${faithfulness}_post == D5.2_two_layer_mark then
+          ${layer_count} ← 2 ∧ ${activation_threshold_mode} ← per_neuron ∧
+          ${action_breadth} ← forward_drop_mark ) ∧
+      ( if ${faithfulness}_post == D5.3_adversarial_bnn then
+          ${feature_width} ← 16 ∧ ${neuron_count} ← 8 ∧
+          ${workload_skew} ← adversarial )
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.0_anchor_single_layer ∧
+      ( ${faithfulness} ≠ D5.1_wide_layer_drop
+        ∨ ∃ entry ∈ ${class_action_entries}: entry.verdict == drop ) ∧
+      ( ${faithfulness} ≠ D5.2_two_layer_mark
+        ∨ ( ${layer_count} == 2 ∧
+            ∃ entry ∈ ${class_action_entries}: entry.verdict == mark ) )
+    kind: parameter
+    notes: |
+      Lift the faithfulness ladder one band. D5.0 → D5.1 widens / adds
+      neurons, adds the drop class, demands exact sign binarization. D5.1 →
+      D5.2 adds the second layer + the mark action. D5.2 → D5.3 takes the
+      full feature width, two wide layers, and the adversarial on-threshold
+      workload. Couples several knobs per step, so its
+      `feasibility_postcondition` requires the drop/mark rows and the second
+      layer to exist before the bands that need them.
+
+  - id: loosen_faithfulness
+    applicable_when: |
+      ${faithfulness} ∈ {D5.1_wide_layer_drop, D5.2_two_layer_mark, D5.3_adversarial_bnn}
+    effect: |
+      ${faithfulness} ← prev_band(${faithfulness}) ∧
+      ( if ${faithfulness}_post == D5.0_anchor_single_layer then
+          ${feature_width} ← 4 ∧ ${neuron_count} ← 2 ∧ ${layer_count} ← 1 ∧
+          ${binarization_fidelity} ← exact_sign ∧
+          ${action_breadth} ← forward_only ∧ ${workload_skew} ← uniform ) ∧
+      ( if ${faithfulness}_post == D5.1_wide_layer_drop then
+          ${layer_count} ← 1 ∧ ${action_breadth} ← forward_drop ∧
+          ${workload_skew} ← zipfian ) ∧
+      ( if ${faithfulness}_post == D5.2_two_layer_mark then
+          ${feature_width} ← 8 ∧ ${neuron_count} ← 4 ∧
+          ${workload_skew} ← uniform )
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: |
+      ${faithfulness} ≠ D5.3_adversarial_bnn
+    kind: parameter
+    notes: |
+      Paired ease counterpart of `tighten_faithfulness`. Steps the ladder
+      back one band and reverts the entailed parameter bindings.
+
+  - id: ladder_input_form_to_python_ref
+    applicable_when: "'python_reference_impl' ∉ task.description"
+    effect: |
+      Append the Python oracle source (the XNOR-popcount classify(features)
+      reference) to task.description so the SUT sees a host-side reference
+      implementation in addition to the behavioural spec — the heaviest
+      hammer among the difficulty axes.
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "'python_reference_impl' ∈ task.description"
+    kind: rule
+    notes: |
+      From the starter operator library — laddering the input form from
+      behavioural spec to host-side reference EASES the SUT's job (it has a
+      Python XNOR + popcount loop to transliterate rather than redesign the
+      bit-parallel neuron from scratch). For a `relocate` ML task this is the
+      sharpest probe of the relocate failure mode: if the SUT still fails the compile gate WITH
+      the algorithm supplied, the bottleneck is the P4 popcount realisation,
+      not the model. Used sparingly; pairs with the harden revert below.
+
+  - id: revert_input_form_to_behavioural
+    applicable_when: "'python_reference_impl' ∈ task.description"
+    effect: "Strip the appended Python oracle source from task.description, leaving only the behavioural spec."
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "'python_reference_impl' ∉ task.description"
+    kind: rule
+    notes: |
+      Paired harden counterpart of `ladder_input_form_to_python_ref`. The
+      SUT must redesign the XNOR-popcount neuron from the behavioural spec
+      alone.
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  POPCOUNT / WIDTH FEASIBILITY CAVEAT (the headline relocate constraint):
+    v1model / P4-16 has NO native popcount (no population-count primitive)
+    and no vector ALU. Each neuron's popcount must be realised in the program
+    as either (a) a SUM OF BIT-SLICES — `count = bit0 + bit1 + ... + bit_{W-1}`
+    over the XNOR result, each slice a 1-bit extract widened to the count
+    field — or (b) a SMALL LOOKUP TABLE keyed on the W-bit XNOR result
+    returning the precomputed popcount. Both grow with the neuron width W
+    (${feature_width} for layer 0, ${neuron_count} for layer 1): the
+    bit-slice sum needs W adds and a count field wide enough to hold W (so
+    ⌈log2(W+1)⌉ bits); the lookup table needs 2^W rows. KEEP NEURON WIDTH
+    SMALL (W ≤ 16, enforced by the ${feature_width}/${neuron_count} ranges).
+    WIDE BNNs RISK THE COMPILE GATE — a 32-bit popcount table is 4 G rows and
+    a 32-term bit-slice sum bloats the pipeline; this is exactly the relocate
+    redesign N3IC solves and the difficulty lever `widen_feature_vector`
+    pulls. Every entry below is `[common-knowledge baseline]` rather than
+    N3IC/Courbariaux-cited.
+
+  Common implementations of this pattern in v1model P4:
+
+    Anchor band (D5.0_anchor_single_layer, layer_count=1, neuron_count=2,
+                 feature_count=feature_width=4, binarization_fidelity=
+                 exact_sign, action_breadth=forward_only,
+                 unclassified_action=forward_default):
+      - Parser: ethernet → (etherType==0x0800 ? ipv4 : accept) →
+        (ipv4.protocol selects tcp/udp if a transport feature is used).
+        Feature fields are read straight from the parsed headers.
+      - Binarization: per feature, one comparison (or a ternary/range match
+        table) `bit_f = (read(f) {>=|>} threshold_f)`; pack the
+        ${feature_count} bits into a metadata bit-string `in_vec`.
+      - Neuron (XNOR-popcount-threshold): for each neuron read its W-bit
+        weight vector `w` (control-plane installed). Compute
+        `x = ~(in_vec ^ w) & mask_W` (XNOR masked to width W), then
+        `cnt = popcount(x)` realised as the bit-slice sum (or LUT) above,
+        then `act_bit = (cnt >= threshold_neuron)`. Pack the neuron act bits
+        into `out_vec`.
+      - Output decode: an exact-match class-decode table keyed on `out_vec`
+        sets the class id; its default_action writes `${default_class}` (so
+        a decode miss does NOT fault).
+      - Class-action: a table keyed on the class id → {mark_to_drop (drop),
+        egress_spec=port (forward), set diffserv + update_checksum +
+        egress_spec (mark)}.
+      - The whole evaluation is a fixed handful of logical stages regardless
+        of model size — do NOT iterate neurons via recirculation (breaks the
+        `no_loop` stage bound). Unroll the (small) neuron set.
+      - Deparser: emit ethernet, ipv4 (and transport), then payload — all
+        headers re-emitted in order, only ipv4.diffserv possibly changed
+        (mark). Otherwise byte-for-byte round-trip.
+
+    D5.1 (wide_layer_drop): wider layer-0 vector (W=8) + more neurons (4),
+    a drop-verdict (anomaly) class wired to mark_to_drop, exact binarization.
+
+    D5.2 (two_layer_mark): add layer 1 — layer-0 activation bits become the
+    ${neuron_count}-bit input vector to the layer-1 neurons (same XNOR-
+    popcount-threshold form); the layer-1 output decodes to the class. Add
+    the mark action with update_checksum.
+
+    D5.3 (adversarial_bnn): full feature width (W=16 — the popcount
+    feasibility ceiling), two wide layers, tight model_capacity (a packed
+    weight bit-string + arithmetic popcount), and the adversarial
+    on-threshold workload that stresses the binarization sign tie-break and
+    the activation popcount tie-break together.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Realising popcount wrong — an off-by-one bit-slice sum, a mask that
+      includes stray bits beyond width W, or a count field too narrow to
+      hold W (the count wraps). The neuron mis-fires; `popcount_width_max` +
+      `activation_boundary_value` + `popcount_fidelity` catch it.
+
+    * Computing OR/AND/XOR instead of XNOR for the neuron match — the ±1
+      dot product needs XNOR (agreement), not XOR. Inverts every neuron.
+
+    * Mis-encoding a binarization threshold — `>=` encoded as `>` (or a
+      coarse shared threshold) flips an on-threshold feature bit. The silent
+      misclassification; `feature_boundary_value` + `binarization_fidelity`.
+
+    * Iterating neurons / layers via recirculation or resubmit instead of
+      unrolling the (small) fixed model — breaks the `no_loop` fixed-stage
+      bound and typically does not fit the pipeline. The unrolled XNOR-
+      popcount form is the data-plane redesign.
+
+    * Omitting the class-decode-table `default_action` — an out_vec with no
+      installed row table-misses and the class metadata is read
+      uninitialised. The `${default_class}` default must be installed
+      (`bnn_default_class_fallback`).
+
+    * Folding a non-feature, per-packet-varying field (IP id, a non-feature
+      port) into the input vector, or a non-deterministic output-decode
+      tie-break — splits one logical feature vector across classes.
+      `inference_determinism_repeat` catches it.
+
+    * Forgetting `update_checksum` for ipv4 after the DSCP/diffserv mark —
+      BMv2 emits a stale checksum the downstream silently drops.
+      `checksum_after_mark` + `envelope_checksum_validity` catch it.
+
+    * Reading a feature field from an absent header (e.g. tcp.dstPort on an
+      ICMP packet) without a `header_present` guard — an unspecified-value
+      read. `read_invalid_feature_guard` + `feature_read_safety` catch it.
+
+    * Re-emitting a fixed-length / truncated packet instead of the parsed
+      headers + payload — corrupts the steered packet even though forwarding
+      "works". `conditional_deparser_roundtrip` + `payload_persistence`.
+
+  v2-deferred (out of scope for this pattern, noted for reviewers):
+    * Flow-level / sliding-window feature accumulation (stateful, composes
+      with the P3 flow-tracking patterns) — this pattern is per-packet
+      header-feature BNN inference (the N3IC stateless model).
+    * Multi-bit / non-binary quantised networks, and floating-point neuron
+      arithmetic (v1model is integer; the BNN's ±1 weights/activations are
+      exactly what makes XNOR-popcount feasible — that is the whole point).
+    * Wide BNNs (neuron width > 16) whose popcount blows the compile budget
+      — capped by the ${feature_width}/${neuron_count} ranges; widening to
+      the cap is the `widen_feature_vector` difficulty lever, not a
+      supported steady state beyond 16.
+
+post_instantiation_hooks: |
+  After instantiation the instance must validate and the public tests
+  must agree with the oracle for the seed. Audit must
+  include a canonical example exercising the popcount at its
+  feasibility_postcondition extremes (feature_width=16 all-ones / all-zeros
+  XNOR) so a constant-baked popcount oracle is rejected.

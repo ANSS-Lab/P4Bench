@@ -1,0 +1,779 @@
+task_name: stateful_fw_nat44_chain_disc
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-StatefulFW-NAT44
+pattern_version: '1.0'
+seed:
+  internal_subnet: 10.0.1.0/24
+  public_ip: 203.0.113.1
+  mode: dynamic
+  port_pool_range:
+  - 13750
+  - 16250
+  conntrack_capacity: 256
+  eviction_policy: timeout
+  idle_timeout_s: 300
+  faithfulness: D5.1_reflexive_dynamic_nat
+  endpoint_independent_mapping: true
+  persistence_strict: false
+description: "A switch s1 sits at the boundary between a private network and the public\nInternet. It MUST simultaneously\
+  \ (a) hide every internal host behind a\nsingle public address, translating the source identifiers of outbound\ntraffic,\
+  \ and (b) act as a stateful packet filter \u2014 admitting inbound\ntraffic ONLY when it is the return of a session the\
+  \ internal side\ninitiated.\n\n## Topology and roles\n\n  - s1.internal \u2014 connection point facing the private side.\
+  \ The internal\n    host h1 lives in 10.0.1.0/24; the host used by tests holds the\n    address 10.0.1.5 and the hardware\
+  \ address 00:00:00:00:01:05.\n  - s1.external \u2014 connection point facing the public Internet. A single\n    external\
+  \ peer h2 holds 8.8.8.8 with hardware address\n    00:00:00:00:08:08.\n  - The public address advertised on the external\
+  \ side is 203.0.113.1;\n    no host owns this address directly \u2014 the switch terminates and\n    re-targets traffic\
+  \ addressed to it.\n  - The switch's own next-hop hardware address on the internal side is\n    00:00:00:00:00:01 (used\
+  \ as Ether.src on output internal frames is\n    implementation-detail; tests only check Ether.dst). On the external\n \
+  \   side it is 00:00:00:00:00:02.\n\nThe switch s1 is provisioned with a 200 Gbps Ethernet backplane and a\nseparate 1 Gbps\
+  \ management port (mgmt0) on a control VLAN; the\nmanagement-plane housekeeping rules consume roughly 3% of the on-chip\n\
+  TCAM budget. The benchmark scenarios in this task operate exclusively\non the s1.internal / s1.external data ports and do\
+  \ not exercise mgmt0.\n\n## Eligibility\n\nA packet is eligible for processing only when ALL of the following hold;\nthe\
+  \ checks short-circuit in the order listed, and a packet that fails an\nearlier check is silently discarded and MUST NOT\
+  \ alter any internal\nstate the switch keeps:\n\n  1. The packet is an IPv4 datagram.\n  2. The IPv4 payload is either TCP\
+  \ or UDP. (No other transport\n     protocol is in scope \u2014 ICMP and the rest are discarded.)\n\n## Outbound side (packets\
+  \ received on s1.internal)\n\nThe switch maintains a per-session table keyed by the outbound triple\n(internal IPv4 address,\
+  \ transport-layer source port, transport-layer\nprotocol). When a packet arrives on s1.internal:\n\n  - If the IPv4 source\
+  \ is NOT in 10.0.1.0/24, the packet is discarded.\n\n  - Otherwise the switch looks up the outbound triple in the session\n\
+  \    table.\n\n      * If a session already exists for this triple, the packet observed\n        at s1.external MUST satisfy\
+  \ ALL of:\n          * Its IPv4 source address has been replaced by 203.0.113.1.\n          * Its transport-layer source\
+  \ port (TCP source port if the\n            packet is TCP, UDP source port if it is UDP) has been\n            replaced\
+  \ by the session's external transport-layer port.\n          * Its Ethernet destination address has been replaced by the\n\
+  \            external peer's hardware address (00:00:00:00:08:08).\n          * Its IPv4 hop count is exactly one less than\
+  \ on ingress, and\n            the datagram remains a well-formed IPv4 packet that an\n            unmodified downstream\
+  \ receiver would accept.\n          * All other fields (the IPv4 destination, the transport-layer\n            destination\
+  \ port, sequence numbers, payload) are byte-\n            identical to the received packet.\n        The packet is forwarded\
+  \ out s1.external.\n\n      * If no session exists for this triple, the switch establishes one.\n        It chooses an external\
+  \ transport-layer port from the pool\n        [13750, 16250] that no live session is currently using,\n        records the\
+  \ session keyed by the outbound triple (and keyed in\n        reverse by the chosen external port for the inbound side),\
+  \ and\n        then applies the same transformations as the existing-session\n        case. The pool is drawn in ascending\
+  \ order; the first session\n        established gets external port 13750, the second gets\n        13751, and so on. The\
+  \ chosen external port is a\n        function ONLY of the outbound triple (internal IPv4, internal\n        port, protocol)\
+  \ \u2014 it is NOT influenced by the packet's\n        destination.\n\n\n      * If the pool is exhausted (every port in\
+  \ the pool is in use by a\n        live session), the packet is discarded.\n\n## Inbound side (packets received on s1.external)\n\
+  \nWhen a packet arrives on s1.external the switch first checks that the\nIPv4 destination address equals 203.0.113.1; if\
+  \ it does not, the packet\nis discarded. Otherwise the switch looks up the inbound triple (public\nIP, transport-layer destination\
+  \ port, protocol) in the session table.\n\n  - If the triple matches an established session, the packet observed\n    at\
+  \ s1.internal MUST satisfy ALL of:\n      * Its IPv4 destination address has been replaced by the session's\n        internal\
+  \ IPv4 address.\n      * Its transport-layer destination port has been replaced by the\n        session's internal transport-layer\
+  \ port.\n      * Its Ethernet destination address has been replaced by the\n        internal host's hardware address (00:00:00:00:01:05).\n\
+  \      * Its IPv4 hop count is exactly one less than on ingress, and the\n        datagram remains a well-formed IPv4 packet.\n\
+  \      * All other fields are byte-identical to the received packet.\n    The packet is forwarded out s1.internal.\n\n \
+  \ - If the triple matches no established session, the packet is\n    discarded. There is no inbound admit path that bypasses\
+  \ the session\n    table: every admitted inbound packet's session MUST have been\n    established by a prior outbound packet.\n\
+  \n## Session lifetime\n\nA session is established by an outbound packet. While packets continue\nto arrive on either side\
+  \ of an existing session, that session remains\nestablished. If neither direction of a session sees a packet for more\n\
+  than 300 seconds the session is considered idle and may be\nremoved, freeing its external port for reuse by a future session.\n\
+  Once a session has been removed, an inbound packet on the previously-\nbound external port has no matching session and is\
+  \ discarded.\n\nEach session record additionally carries a 4-byte `created_at` field\nthat records the wall-clock timestamp\
+  \ at which the record was\ninstalled. This field plays no role in admission, forwarding,\nexternal-port allocation, or session\
+  \ reclamation: the 300-second\nidle decision is keyed off the most recent packet timestamp on the\nsession, not off the\
+  \ install timestamp. Implementations MAY omit the\n`created_at` field entirely.\n\n## On discard\n\nA discarded packet produces\
+  \ NO output on any port and MUST NOT alter any\ninternal state the switch keeps in a way that affects future packet\nhandling\
+  \ \u2014 in particular, an inbound packet that fails any eligibility\ncheck or the public-IP / session lookup MUST NOT establish\
+  \ a new\nsession.\n"
+topology:
+  switches:
+  - name: s1
+    ports:
+      internal: 1
+      external: 2
+  links:
+  - from: h1
+    to: s1.internal
+  - from: s1.external
+    to: h2
+hosts:
+  h1:
+    ip: 10.0.1.5/24
+    mac: 00:00:00:00:01:05
+    port: s1.internal
+  h2:
+    ip: 8.8.8.8/24
+    mac: 00:00:00:00:08:08
+    port: s1.external
+test_cases:
+- name: outbound_udp_first_packet_installs_and_snat
+  visibility: public
+  description: First packet of a new outbound UDP flow from the internal host (10.0.1.5:5000) to an external peer (8.8.8.8:53).
+    The switch installs a fresh address-and-port translation mapping, rewrites the source to the public address 203.0.113.1
+    with a freshly-allocated external port from the configured pool (the first free port is 13750), decrements the TTL, and
+    forwards the packet out the external interface with the next-hop Ethernet destination set to the external peer.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 13750
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_udp_return_dnat
+  visibility: public
+  description: "After the canonical outbound UDP flow (10.0.1.5:5000 \u2192 8.8.8.8:53) has installed an ext_port=13750 mapping,\
+    \ the symmetric return packet (8.8.8.8:53 \u2192 203.0.113.1:13750) is DNAT-translated back to (10.0.1.5, 5000), the TTL\
+    \ is decremented, and it is forwarded out the internal interface with the internal host's MAC."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 13750
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: outbound_subsequent_packet_reuses_mapping
+  visibility: public
+  description: "After the canonical outbound UDP flow has been admitted once, a second packet on the SAME 5-tuple (10.0.1.5:5000\
+    \ \u2192 8.8.8.8:53) is translated using the SAME external port (13750) \u2014 the data plane does NOT re-allocate a new\
+    \ port for an existing flow."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 13750
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_unsolicited_dropped
+  visibility: public
+  description: An inbound TCP packet to 203.0.113.1:22000 with no prior matching outbound flow has no installed mapping AND
+    no explicit-permit rule, and MUST be dropped (default-deny on the external side).
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 22000
+        flags: SA
+  expected:
+    behavior: drop
+- name: outbound_tcp_first_packet_installs_and_snat
+  visibility: hidden
+  description: "First packet of a new outbound TCP flow (10.0.1.5:6000 \u2192 8.8.8.8:80, SYN). Translation is L4-agnostic\
+    \ \u2014 the source port is rewritten to the freshly-allocated external port 13750 and the source IP to 203.0.113.1; TTL\
+    \ decremented; output to external."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: change_to
+        value: 13750
+      TCP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_tcp_return_dnat
+  visibility: hidden
+  description: "Symmetric return of the TCP flow installed in test 5: 8.8.8.8:80 \u2192 203.0.113.1:13750 (SYN-ACK) is DNAT-translated\
+    \ to (10.0.1.5, 6000), TTL decremented, forwarded out the internal interface."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 13750
+        flags: SA
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: change_to
+        value: 6000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: outbound_from_foreign_subnet_dropped
+  visibility: hidden
+  description: "An outbound UDP packet whose IPv4 source (10.0.99.99) is OUTSIDE the configured internal subnet (10.0.1.0/24)\
+    \ MUST be dropped \u2014 the source-side admit predicate REQUIRES src \u2208 internal_subnet, regardless of state."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.99.99
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: drop
+- name: outbound_icmp_dropped
+  visibility: hidden
+  description: "An ICMP echo from the internal host is dropped \u2014 NAPT scope is TCP/UDP only; ICMP is not translated regardless\
+    \ of direction."
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_icmp_dropped
+  visibility: hidden
+  description: "An inbound ICMP echo addressed at the public IP MUST be dropped \u2014 same NAPT-scope rule on the inbound\
+    \ side."
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 1
+    - ICMP: {}
+  expected:
+    behavior: drop
+- name: inbound_wrong_dst_dropped
+  visibility: hidden
+  description: "An inbound UDP packet whose IPv4 destination is NOT the public IP (here directly addressed to the internal\
+    \ host 10.0.1.5) MUST be dropped \u2014 the public-IP gate sits before any mapping lookup."
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 10.0.1.5
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 5000
+  expected:
+    behavior: drop
+- name: endpoint_independent_mapping_check
+  visibility: hidden
+  description: "Two outbound UDP flows from the same internal (ip, sport, proto) but different destinations: the first to\
+    \ 8.8.8.8:53, the second to 1.1.1.1:53. The switch MUST translate BOTH to the SAME external port (13750) \u2014 the address-and-port\
+    \ mapping depends ONLY on the internal-side (ip, port, protocol), not on the destination."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 1.1.1.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 13750
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: second_outbound_flow_distinct_ext_port
+  visibility: hidden
+  description: "Two outbound UDP flows from the same internal host with DIFFERENT source ports (sport=5000 and sport=7000)\
+    \ MUST be translated to DIFFERENT external ports \u2014 the (public_ip, ext_port, proto) triple is unique per live flow.\
+    \ The first dynamically-installed flow received ext_port=13750; the second MUST receive ext_port=13751."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 7000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 13751
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_wrong_ext_port_dropped
+  visibility: hidden
+  description: "After the canonical outbound flow has installed ext_port=13750, an inbound packet to 203.0.113.1:16350 still\
+    \ has no matching mapping and MUST be dropped \u2014 only the assigned ext_port is valid, not arbitrary ports."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 16350
+  expected:
+    behavior: drop
+- name: bidirectional_consistency_inbound
+  visibility: hidden
+  description: "After an outbound flow has been admitted and its return packet consumed once, a second return packet (still\
+    \ 8.8.8.8:53 \u2192 203.0.113.1:13750) MUST continue to DNAT to the same internal endpoint \u2014 established mappings\
+    \ persist within the idle timeout."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  - port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 13750
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 13750
+  expected:
+    behavior: forward
+    output_port: s1.internal
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: change_to
+        value: 10.0.1.5
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: unchanged
+      UDP.dport:
+        action: change_to
+        value: 5000
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:01:05
+- name: inbound_random_source_default_deny
+  visibility: hidden
+  description: An inbound TCP packet from an unrelated external IP (192.0.2.50:80) addressed at 203.0.113.1:30000 with no
+    installed mapping and no explicit-permit rule MUST be dropped (default-deny on the external side, independent of source).
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 192.0.2.50
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 80
+        dport: 30000
+        flags: SA
+  expected:
+    behavior: drop
+- name: drop_does_not_consume_ext_port
+  visibility: hidden
+  description: "A discarded packet MUST NOT alter switch state. A foreign-source outbound UDP packet (10.0.99.99:5000 \u2192\
+    \ 8.8.8.8:53) is dropped at the subnet gate; a subsequent legitimate outbound flow (10.0.1.5:5000 \u2192 8.8.8.8:53) MUST\
+    \ still receive the FIRST pool port (13750) \u2014 the dropped packet neither installed a session nor advanced the external-port\
+    \ allocator."
+  prior_inputs:
+  - port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.99.99
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+    - IP:
+        src: 10.0.1.5
+        dst: 8.8.8.8
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.external
+    transformations:
+      IP.src:
+        action: change_to
+        value: 203.0.113.1
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      UDP.sport:
+        action: change_to
+        value: 13750
+      UDP.dport:
+        action: unchanged
+      Ether.dst:
+        action: change_to
+        value: 00:00:00:00:08:08
+- name: inbound_drop_installs_no_state
+  visibility: hidden
+  description: "Reflexive admission: inbound traffic never installs state. An unsolicited inbound UDP packet (8.8.8.8:53 \u2192\
+    \ 203.0.113.1:13750) with no prior outbound flow is dropped; because a discarded inbound packet MUST NOT establish a session,\
+    \ an identical second inbound packet to the same external port is STILL dropped \u2014 no inbound-created mapping ever\
+    \ exists."
+  prior_inputs:
+  - port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 13750
+  input:
+    port: s1.external
+    layers:
+    - Ether:
+        src: 00:00:00:00:08:08
+        dst: 00:00:00:00:00:02
+    - IP:
+        src: 8.8.8.8
+        dst: 203.0.113.1
+        ttl: 1
+        proto: 17
+    - UDP:
+        sport: 53
+        dport: 13750
+  expected:
+    behavior: drop
+- name: non_ipv4_dropped
+  visibility: hidden
+  description: A non-IPv4 frame on either side (here a bare Ethernet frame with an unrecognised EtherType payload) is dropped
+    unconditionally.
+  input:
+    port: s1.internal
+    layers:
+    - Ether:
+        src: 00:00:00:00:01:05
+        dst: 00:00:00:00:00:01
+  expected:
+    behavior: drop
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

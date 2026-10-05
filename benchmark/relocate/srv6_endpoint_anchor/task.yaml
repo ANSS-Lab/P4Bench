@@ -1,0 +1,235 @@
+task_name: srv6_endpoint_anchor
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-SRv6Endpoint
+pattern_version: '1.0'
+
+seed:
+  local_sids: ["2001:db8:a::1"]
+  faithfulness: D.end
+
+description: |
+  Implement an SRv6 segment endpoint on a single switch s1, executing the
+  "End" behaviour of RFC 8986 (SRv6 Network Programming) on IPv6 packets that
+  carry a Segment Routing Header (SRH), per RFC 8754.
+
+  The node owns the local SID 2001:db8:a::1. The SRH carries a Segment List of
+  IPv6 addresses and a "Segments Left" counter.
+
+  ## Forwarding policy (post-update IPv6 destination → egress)
+
+  After the End behaviour rewrites the destination, the packet is forwarded by
+  that new destination; the control plane installs these as table entries.
+
+    | new destination     | egress port | next-hop MAC      | egress-port MAC   |
+    |---------------------|-------------|-------------------|-------------------|
+    | 2001:db8:a::2       | s1.p2       | 08:00:00:00:02:02 | 08:00:00:00:02:00 |
+    | 2001:db8:a::3       | s1.p3       | 08:00:00:00:03:03 | 08:00:00:00:03:00 |
+
+  ## Required behaviour
+
+  For an IPv6 packet destined to the local SID 2001:db8:a::1 that carries an SRH
+  with Segments Left > 0, the switch executes the SRv6 End behaviour: it advances
+  the segment-routing state by one segment (Segments Left decreases by one and
+  the IPv6 destination becomes the segment that thereby becomes active),
+  decrements the IPv6 Hop Limit by one, and forwards the packet toward its new
+  destination per the policy above with the Ethernet source set to the egress
+  port's own MAC and the destination to the next-hop MAC. The addresses stored in
+  the segment list are not themselves modified.
+
+  A packet is dropped if it is not IPv6, carries no SRH, is not destined to the
+  local SID, or has Segments Left 0.
+
+  ## Topology
+
+  Segment-routed traffic arrives on s1.p1; the next segment is reached via
+  s1.p2 / s1.p3.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports: {p1: 1, p2: 2, p3: 3}
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1: {ip: "2001:db8:f::1", mac: "08:00:00:00:01:01", port: s1.p1}
+  h2: {ip: "2001:db8:a::2", mac: "08:00:00:00:02:02", port: s1.p2}
+  h3: {ip: "2001:db8:a::3", mac: "08:00:00:00:03:03", port: s1.p3}
+
+test_cases:
+
+# --- G1 ---
+
+  - name: end_basic
+    visibility: public
+    description: |
+      A packet to the local SID 2001:db8:a::1 with SRH Segments Left 1 and
+      segment list [2001:db8:a::2, 2001:db8:a::1].
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::1", hlim: 64}
+        - SRH:   {segleft: 1, addresses: ["2001:db8:a::2", "2001:db8:a::1"]}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IPv6.dst:    {action: change_to, value: "2001:db8:a::2"}
+        SRH.segleft: {action: decremented_by, delta: 1}
+        IPv6.hlim:   {action: decremented_by, delta: 1}
+        Ether.src:   {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst:   {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: end_multi_segment
+    visibility: public
+    description: |
+      A 3-segment list [2001:db8:a::2, 2001:db8:a::3, 2001:db8:a::1] with
+      Segments Left 2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::1", hlim: 64}
+        - SRH:   {segleft: 2, addresses: ["2001:db8:a::2", "2001:db8:a::3", "2001:db8:a::1"]}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IPv6.dst:    {action: change_to, value: "2001:db8:a::3"}
+        SRH.segleft: {action: decremented_by, delta: 1}
+
+  - name: end_hoplimit_decrement
+    visibility: public
+    description: |
+      A packet to the local SID with segment list [2001:db8:a::3,
+      2001:db8:a::1], Segments Left 1, arriving with Hop Limit 50.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::1", hlim: 50}
+        - SRH:   {segleft: 1, addresses: ["2001:db8:a::3", "2001:db8:a::1"]}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IPv6.dst:    {action: change_to, value: "2001:db8:a::3"}
+        IPv6.hlim:   {action: change_to, value: 49}
+        SRH.segleft: {action: change_to, value: 0}
+
+# --- G2 ---
+
+  - name: drop_segleft_zero
+    visibility: hidden
+    description: |
+      An SRH with Segments Left 0 (end of the segment path) is out of scope at
+      this band → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::1", hlim: 64}
+        - SRH:   {segleft: 0, addresses: ["2001:db8:a::2", "2001:db8:a::1"]}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: drop_not_local_sid
+    visibility: hidden
+    description: |
+      A packet whose IPv6 destination 2001:db8:a::9 is not a local SID → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::9", hlim: 64}
+        - SRH:   {segleft: 1, addresses: ["2001:db8:a::2", "2001:db8:a::9"]}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+# --- G3 ---
+
+  - name: drop_no_srh
+    visibility: hidden
+    description: |
+      A plain IPv6 packet to the local SID with no SRH → drop (no segment to
+      process).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::1", dst: "2001:db8:a::1", hlim: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+  - name: drop_non_ipv6
+    visibility: hidden
+    description: |
+      A non-IPv6 frame (IPv4) → drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.0.1", dst: "10.0.0.2", ttl: 64}
+        - UDP:   {sport: 4000, dport: 5000}
+    expected:
+      behavior: drop
+
+# --- G1 (hidden: End active transforms + forward-port coverage) ---
+
+  - name: end_hidden_p2_three_segment
+    visibility: hidden
+    description: |
+      A fresh 3-segment list [2001:db8:a::3, 2001:db8:a::2, 2001:db8:a::1]
+      to the local SID with Segments Left 2 and Hop Limit 55. End advances to
+      the segment that becomes active (2001:db8:a::2), forwarding via s1.p2.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::5", dst: "2001:db8:a::1", hlim: 55}
+        - SRH:   {segleft: 2, addresses: ["2001:db8:a::3", "2001:db8:a::2", "2001:db8:a::1"]}
+        - UDP:   {sport: 1111, dport: 2222}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        IPv6.dst:    {action: change_to, value: "2001:db8:a::2"}
+        SRH.segleft: {action: change_to, value: 1}
+        IPv6.hlim:   {action: decremented_by, delta: 1}
+        Ether.src:   {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst:   {action: change_to, value: "08:00:00:00:02:02"}
+
+  - name: end_hidden_p3_two_segment
+    visibility: hidden
+    description: |
+      A fresh 2-segment list [2001:db8:a::3, 2001:db8:a::1] to the local SID
+      with Segments Left 1 and Hop Limit 33. End advances to 2001:db8:a::3,
+      forwarding via s1.p3, exhausting Segments Left to 0.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IPv6:  {src: "2001:db8:f::7", dst: "2001:db8:a::1", hlim: 33}
+        - SRH:   {segleft: 1, addresses: ["2001:db8:a::3", "2001:db8:a::1"]}
+        - UDP:   {sport: 3333, dport: 4444}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        IPv6.dst:    {action: change_to, value: "2001:db8:a::3"}
+        SRH.segleft: {action: change_to, value: 0}
+        IPv6.hlim:   {action: decremented_by, delta: 1}
+        Ether.src:   {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst:   {action: change_to, value: "08:00:00:00:03:03"}

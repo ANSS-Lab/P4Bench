@@ -1,0 +1,500 @@
+task_name: overlay_gateway_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-OverlayGateway
+pattern_version: '1.0'
+seed:
+  acl_rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 192.168.1.66/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_acl_action: permit
+  tenant_subnet: 192.168.1.0/24
+  tenant_vni: 100
+  local_vtep_ip: 10.0.2.1
+  remote_vtep_ip: 10.0.2.9
+  vxlan_udp_port: 4789
+  fib_capacity: 1024
+  pipeline_order: acl_tunnel_route
+  tenant_port: 1
+  underlay_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: tenant
+    to: s1.p1
+  - from: s1.p2
+    to: underlay
+hosts:
+  tenant:
+    note: overlay tenant hosts in 192.168.1.0/24 + 192.168.2.0/24; plain inner frames; ingress on s1.p1
+  underlay:
+    note: VXLAN underlay; local VTEP 10.0.2.1, remote VTEP 10.0.2.9, VNI 100; ingress on s1.p2
+description: |-
+  Implement a VXLAN gateway for BMv2 (v1model) that enforces an access policy,
+  bridges between an overlay tenant network and a VXLAN underlay, and forwards
+  IPv4 traffic — all in a single pass.
+
+  Topology: port 1 faces the overlay/tenant side, where hosts send and receive
+  ordinary Ethernet/IPv4 frames (tenant hosts live in 192.168.1.0/24 and
+  192.168.2.0/24); port 2 faces the underlay, where traffic travels inside VXLAN
+  tunnels. This gateway's underlay address is 10.0.2.1 and it tunnels to a peer
+  at 10.0.2.9; the overlay segment it serves carries network identifier 100.
+
+  Required behaviour, per frame:
+
+  - Access policy. A frame's innermost addressing — the tenant 5-tuple, whether
+    the frame arrived plain from the tenant side or carried inside a tunnel from
+    the underlay side — is checked against an administrator-defined permit/deny
+    policy before anything else. A denied frame is dropped and leaves no trace.
+    Tenant host 192.168.1.66 is denied; everything else is permitted by default.
+
+  - Overlay/underlay bridging. A frame arriving from the tenant side is placed
+    into the tunnel toward the peer: it is wrapped so it travels the underlay as
+    tunnelled traffic carrying the segment's network identifier, with this
+    gateway as the tunnel source and the peer as the tunnel destination. A frame
+    arriving from the underlay side belonging to this gateway's tunnel and
+    segment is unwrapped back to the original tenant frame; tunnelled traffic
+    carrying a different segment identifier is dropped.
+
+  - Forwarding. A frame that survives the policy and bridging steps is delivered
+    toward its destination on the correct port toward the correct next hop, with
+    its L2/L3 integrity preserved. For tunnelled (outbound) traffic the gateway
+    forwards toward the tunnel peer. For unwrapped (inbound) traffic the gateway
+    forwards toward the recovered tenant destination, with its hop count
+    decremented; a frame with an expired hop count, or with no known route, is
+    dropped.
+
+  Both the P4 program and its table entries are yours to author. The gateway
+  must behave correctly across both directions: a frame is delivered to a tenant
+  host only after it is unwrapped and its recovered tenant destination is
+  resolved.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: encap_forward
+  visibility: public
+  goal_class: G1
+  description: 'A permitted tenant inner frame (192.168.1.10 -> 192.168.2.10) is VXLAN-encapsulated toward the tunnel peer and routed out the underlay port: an outer IP (this gateway''s underlay address -> the peer), a VXLAN header carrying the segment identifier, and the original inner frame carried verbatim. Ether.dst is rewritten to the underlay next hop.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.168.1.10
+        dst: 192.168.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      layers[1].IP.src:
+        action: change_to
+        value: 10.0.2.1
+      layers[1].IP.dst:
+        action: change_to
+        value: 10.0.2.9
+      layers[2].UDP.dport:
+        action: change_to
+        value: 4789
+      layers[3].VXLAN.vni:
+        action: change_to
+        value: 100
+      layers[5].IP.src:
+        action: change_to
+        value: 192.168.1.10
+      layers[5].IP.dst:
+        action: change_to
+        value: 192.168.2.10
+      layers[5].IP.ttl:
+        action: change_to
+        value: 64
+- name: decap_forward
+  visibility: public
+  goal_class: G1
+  description: A tunnelled frame arriving from the underlay with this gateway's segment identifier is unwrapped and the recovered tenant frame (dst 192.168.2.20) is routed to the tenant port with its hop count decremented; the recovered destination is unchanged.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 192.168.2.20
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.dst:
+        action: change_to
+        value: 192.168.2.20
+      IP.ttl:
+        action: change_to
+        value: 63
+- name: acl_deny_drop_encap
+  visibility: public
+  goal_class: G1
+  description: A tenant frame from the denied host (192.168.1.66) is dropped by the access policy before tunnelling or forwarding.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.168.1.66
+        dst: 192.168.2.10
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+  expected:
+    behavior: drop
+- name: wrong_vni_drop
+  visibility: hidden
+  goal_class: G2
+  description: A tunnelled frame arriving from the underlay carrying a DIFFERENT segment identifier (not this gateway's) is dropped at the tunnel boundary.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 200
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 192.168.2.20
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: drop
+- name: decap_inner_route_miss
+  visibility: hidden
+  goal_class: G2
+  description: A tunnelled frame whose recovered tenant destination has no known route is dropped after unwrapping.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 8.8.8.8
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: drop
+- name: decap_ttl_one_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A tunnelled frame whose recovered inner hop count is 1 is forwarded with an egress hop count of 0 (decremented exactly once).
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 192.168.2.20
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.dst:
+        action: change_to
+        value: 192.168.2.20
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: decap_ttl_zero_drop
+  visibility: hidden
+  goal_class: G2
+  description: A tunnelled frame whose recovered inner hop count is already 0 is dropped (expired).
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 192.168.2.20
+        ttl: 0
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: drop
+- name: acl_on_inner_decap
+  visibility: hidden
+  goal_class: G3
+  description: A tunnelled frame carrying the denied tenant host (192.168.1.66) as its inner source is dropped — the access policy inspects the inner addressing recovered from inside the tunnel, not the outer tunnel header.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.1.66
+        dst: 192.168.2.20
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 1234
+        dport: 80
+  expected:
+    behavior: drop
+- name: encap_route_keys_outer
+  visibility: hidden
+  goal_class: G3
+  description: A permitted tenant frame whose inner destination lies outside any local route is still encapsulated and forwarded toward the tunnel peer — the outbound forwarding decision is made on the tunnel destination, not the inner destination.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 192.168.1.11
+        dst: 203.0.113.5
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 5000
+        dport: 4000
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      layers[1].IP.src:
+        action: change_to
+        value: 10.0.2.1
+      layers[1].IP.dst:
+        action: change_to
+        value: 10.0.2.9
+      layers[2].UDP.dport:
+        action: change_to
+        value: 4789
+      layers[3].VXLAN.vni:
+        action: change_to
+        value: 100
+      layers[5].IP.src:
+        action: change_to
+        value: 192.168.1.11
+      layers[5].IP.dst:
+        action: change_to
+        value: 203.0.113.5
+      layers[5].IP.ttl:
+        action: change_to
+        value: 64
+- name: decap_udp_inner
+  visibility: hidden
+  goal_class: G3
+  description: A tunnelled UDP inner frame is unwrapped and routed to the tenant exactly like TCP — the bridging and forwarding do not depend on the inner L4 type.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+    - IP:
+        src: 10.0.2.9
+        dst: 10.0.2.1
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 49152
+        dport: 4789
+    - VXLAN:
+        vni: 100
+        flags: 8
+    - Ether:
+        src: aa:00:00:00:00:01
+        dst: aa:00:00:00:00:02
+    - IP:
+        src: 192.168.2.50
+        dst: 192.168.2.30
+        ttl: 64
+        proto: 17
+    - UDP:
+        sport: 3000
+        dport: 53
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+      IP.dst:
+        action: change_to
+        value: 192.168.2.30
+      IP.ttl:
+        action: change_to
+        value: 63
+- name: encap_non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame on the tenant port is dropped before classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:10
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.2.7
+        pdst: 10.0.2.1
+  expected:
+    behavior: drop
+- name: decap_non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame on the underlay port is dropped before classification.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 0a:00:00:00:00:09
+        dst: 08:00:00:00:02:02
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.2.7
+        pdst: 10.0.2.1
+  expected:
+    behavior: drop

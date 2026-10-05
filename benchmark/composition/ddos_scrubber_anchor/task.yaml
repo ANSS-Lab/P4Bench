@@ -1,0 +1,893 @@
+task_name: ddos_scrubber_anchor
+task_type: full_program
+complexity: high
+source: paper
+pattern: P-DDoSScrubber
+pattern_version: '1.0'
+seed:
+  acl_rules:
+  - priority: 100
+    action: deny
+    ipv4_src: 10.0.1.66/32
+  rule_count_capacity: 256
+  match_field_breadth: tuple5
+  priority_depth: 16
+  default_acl_action: permit
+  sketch_depth: 2
+  sketch_width: 64
+  counter_width_bits: 32
+  heavy_threshold: 8
+  heavy_capacity: 256
+  epoch_packets: 4096
+  cookie_secret: 0
+  protected_subnet: 10.0.2.0/24
+  untrusted_subnet: 10.0.1.0/24
+  fib_capacity: 1024
+  pipeline_order: acl_detect_cookie
+  untrusted_port: 1
+  protected_port: 2
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: untrusted
+    to: s1.p1
+  - from: s1.p2
+    to: protected
+hosts:
+  untrusted:
+    note: untrusted sources in 10.0.1.0/24; ingress on s1.p1
+  protected:
+    note: protected servers in 10.0.2.0/24; egress on s1.p2
+description: |-
+  Implement a DDoS scrubbing edge for BMv2 (v1model) that enforces an access
+  policy, detects high-rate sources, and challenges new connections to protected
+  servers with a stateless cookie -- all in a single pass.
+
+  Topology: port 1 faces the untrusted network (sources in 10.0.1.0/24); port 2
+  faces the protected servers (10.0.2.0/24).
+
+  Required behaviour, per IPv4 packet:
+
+  - Access policy. A packet's original addressing is checked against an
+    administrator-defined permit/deny policy before anything else. A denied
+    packet is dropped and leaves no trace -- it is neither measured nor
+    challenged. Source 10.0.1.66 is denied; everything else is permitted by
+    default.
+
+  - High-rate detection. The scrubber keeps a running per-source arrival
+    estimate (bounded, approximate) and treats a source as a high-rate offender
+    once its estimate reaches a fixed threshold. The packet that pushes a source
+    to the threshold already counts it as a high-rate offender. This measurement
+    is updated and consulted on the same packet, before the connection-challenge
+    decision.
+
+  - Connection challenge. For a new TCP connection attempt (a SYN with no prior
+    established connection) to a protected server:
+      * if the source is currently a high-rate offender, the attempt is dropped
+        (rate mitigation) -- detection takes precedence over challenging it;
+      * otherwise the scrubber answers the attempt itself with a challenge reply
+        directed back toward the source: it reflects the segment with its source
+        and destination IP addresses swapped and its source and destination ports
+        swapped, sets the TCP flags to SYN+ACK, sets the reply's sequence number
+        to a verifier value, and sets the reply's acknowledgement number to the
+        original segment's sequence number plus one. The verifier is a 32-bit
+        value computed deterministically from the connection's addressing as seen
+        arriving from the source -- the source IP, destination IP, IP protocol
+        number, source port, and destination port -- by the exact formula:
+
+            verifier = ( src_ip + dst_ip + protocol
+                         + ((src_port << 16) | dst_port) + K ) mod 2^32
+
+        where each IP address is taken as its 32-bit integer value, the protocol
+        number and the two ports are their numeric values, and the constant K is
+        0. The same connection therefore always yields the same verifier and
+        different connections yield different verifiers. The original attempt is
+        consumed and the scrubber keeps no per-connection state for it.
+    A later segment for that connection is treated as carrying a correct verifier
+    when its acknowledgement number minus one equals the verifier computed by the
+    formula above for its own 5-tuple (as seen arriving from the source). Such a
+    validated segment, or a segment belonging to a connection already admitted,
+    is delivered to the protected server: it leaves on the correct port toward
+    the correct next hop, with its hop count decremented and its L2/L3 integrity
+    preserved. A segment to a protected server that is not part of an admitted
+    connection and does not carry a correct verifier is dropped; so is any
+    segment with an expired hop count or with no known route.
+
+  Both the P4 program and its table entries are yours to author. The ordering is
+  load-bearing: a blocklisted source never reaches the detector or the challenge;
+  a high-rate source's new connection attempt is dropped before it would be
+  challenged.
+
+  Non-IPv4 frames are dropped.
+test_cases:
+- name: syn_cookie_challenge
+  visibility: public
+  goal_class: G1
+  description: A new TCP SYN from a non-heavy untrusted source (10.0.1.50:5000 -> 10.0.2.9:80) is answered by the scrubber with an originated challenge reply directed back toward the source (addresses and ports reversed, marked as a connection acknowledgement, carrying the per-connection verifier); the original SYN is consumed and never reaches the protected server. From the harness's vantage (the reply leaves on the ingress port) no packet appears on the server port.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: validated_ack_forward
+  visibility: public
+  goal_class: G1
+  description: 'A segment echoing back the correct per-connection verifier for an attempted connection (10.0.1.50:5000 -> 10.0.2.9:80) is delivered to the protected server: it leaves on the protected port with TTL decremented, Ether.dst rewritten to the next hop, and addresses/ports preserved.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 663225234
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.50
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: acl_deny_drop
+  visibility: public
+  goal_class: G1
+  description: A SYN from the blocklisted source (10.0.1.66) is dropped by the access policy before detection or challenge.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+- name: heavy_synflood_drop
+  visibility: hidden
+  goal_class: G2
+  description: A source (10.0.1.77) driven to the high-rate threshold by a burst of new SYNs is, on its next new SYN, dropped as a rate offender rather than challenged -- detection precedes the challenge on the same packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: below_threshold_challenged
+  visibility: hidden
+  goal_class: G2
+  description: A source (10.0.1.88) one short of the high-rate threshold still has its next new SYN challenged (not rate-dropped) -- the threshold is a >= boundary on the post-increment estimate.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.88
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: crossing_packet_is_heavy
+  visibility: hidden
+  goal_class: G2
+  description: The new SYN whose arrival pushes a source (10.0.1.99) exactly to the high-rate threshold is itself treated as a rate offender and dropped (post-increment, not pre-increment, read of the estimate).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.99
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: ttl_one_validated_forwards_zero
+  visibility: hidden
+  goal_class: G2
+  description: A cookie-validated segment with ttl==1 is forwarded to the protected server with egress ttl==0 (decremented exactly once).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.51
+        dst: 10.0.2.9
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 663225235
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.51
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: deny_short_circuits_detection
+  visibility: hidden
+  goal_class: G3
+  description: The blocklisted source (10.0.1.66) sending a burst of new SYNs is still dropped by the access policy on its next SYN -- the deny wins over both the rate-drop and the challenge; the source is never measured.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.66
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+- name: invalid_cookie_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-SYN ACK to a protected server carrying a verifier that does not match its connection (a guessed/forged value) is dropped -- only a correct per-connection verifier admits the flow.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.52
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 12345
+  expected:
+    behavior: drop
+- name: cookie_binds_sport
+  visibility: hidden
+  goal_class: G3
+  description: An ACK echoing a verifier minted for a DIFFERENT connection (same addresses, different source port 6000) is dropped on the 5000 connection -- the verifier binds all 5-tuple fields, so a cookie for one connection does not validate another.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 728761237
+  expected:
+    behavior: drop
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.53
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 6000
+        dport: 80
+        flags: S
+- name: established_benign_forward
+  visibility: hidden
+  goal_class: G3
+  description: Once a connection (10.0.1.54:5000 -> 10.0.2.9:80) is admitted by a validated verifier, a subsequent benign segment of that connection is forwarded to the protected server without re-challenge.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 663225238
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+      TCP.sport:
+        action: unchanged
+      TCP.dport:
+        action: unchanged
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+    - IP:
+        src: 10.0.1.54
+        dst: 10.0.2.9
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 80
+        flags: A
+        ack: 663225238
+- name: non_ipv4_drop
+  visibility: hidden
+  goal_class: G3
+  description: A non-IPv4 frame (ARP) is dropped before classification.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:00:11
+        dst: 08:00:00:00:01:01
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.7
+        pdst: 10.0.2.9
+  expected:
+    behavior: drop

@@ -1,0 +1,660 @@
+# P-IGMPSnooping — Data-plane IGMP snooping (multicast group membership from observed joins/leaves)
+#
+# TPL v1.0 task pattern. The multicast analogue of
+# P-L2LearningBridge: instead of learning unicast source-MAC→port associations,
+# the switch *snoops* IGMP control traffic to learn which ports have hosts that
+# joined which multicast groups, then forwards multicast DATA only to the
+# member port-set (a multicast group) rather than flooding the whole L2 domain.
+# A Membership Report (join) for group G on port P adds P to G's egress
+# port-set; a Leave for G on P removes P. Multicast data to a group with no
+# members is dropped (or sent to the mrouter port only). Grounded in RFC 4541
+# (snooping-switch behaviour) + RFC 2236 (IGMPv2 message types).
+#
+# An instance MUST ship a custom_headers.py (IGMP is not in the harness's
+# stock Scapy build set), and an implementation MUST configure a BMv2 multicast group (mcast_grp) per snooped port-set.
+
+pattern_id: P-IGMPSnooping
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing]                            # multicast group-membership-driven forwarding
+  prescriptive: [P1:forwarding]                         # match-action + per-group port-set replication
+target_capability: redesign                             # programmable redesign of a fixed-function L2 multicast/snooping ASIC
+summary: >
+  Data-plane IGMP snooping. The switch observes IGMP Membership Reports (joins)
+  and Leave Group messages and maintains, per multicast group, the set of egress
+  ports with at least one interested host (a per-group port bitmap in a
+  register). A join for group G arriving on port P adds P to G's port-set; a
+  Leave for G on P removes P. Multicast DATA destined to G is forwarded ONLY to
+  G's snooped member port-set via a multicast group (NOT flooded to the whole
+  L2 domain); if G has no members the data is dropped, or forwarded to the
+  router/mrouter port only when one is configured. The canonical instance snoops
+  IGMPv2 with no membership-interval timeout (expiry is modelled as explicit
+  Leave packets, never a wall-clock timer); mutation adds the mrouter
+  fallback port, bounded per-group state with eviction, IGMPv3 source-filter
+  reports, and a flood-on-unsnooped-group fallback.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC4541
+      cite: "RFC 4541 §2.1.1 / §2.1.2"
+      sections: ["2", "2.1.1", "2.1.2"]
+      role: normative_behaviour
+      quote: >-
+        A snooping switch should forward IGMP Membership Reports only to those
+        ports where multicast routers are attached. When a switch receives a
+        Leave message it must remove the port from the forwarding table entry for
+        the group. Packets with a destination IP address in the 224.0.0.X range
+        which are not IGMP must be forwarded on all ports.
+      grounds: [R1_classify, R2_join_add_port, R3_leave_remove_port, R4_data_to_members, R5_no_member, flood_link_local_control]
+      relevance: |
+        "Considerations for Internet Group Management Protocol (IGMP) and
+        Multicast Listener Discovery (MLD) Snooping Switches" — the canonical
+        snooping-switch behaviour the rules realise:
+          - §2.1.1  "A snooping switch should forward IGMP Membership Reports
+                 only to those ports where multicast routers are attached … and
+                 use the information to build its forwarding table." A Report
+                 received on a port establishes that port as a member of the
+                 reported group's egress set — basis for R2 (join → add port).
+          - §2.1.1  "When a switch receives a Leave message … it MUST remove
+                 the port from the forwarding table entry for the group." —
+                 basis for R3 (leave → remove port).
+          - §2.1.2  "Packets with a destination IP (DIP) address in the
+                 224.0.0.X range … MUST be forwarded on all ports." and the
+                 general rule that snooped multicast data is forwarded only to
+                 member ports — basis for R4 (data → member port-set) and R5
+                 (no-member behaviour: drop or mrouter-only). The 224.0.0.0/24
+                 link-local-control exemption is the flood_link_local_control
+                 mutation lever.
+    - id: RFC2236
+      cite: "RFC 2236 §2.1 / §3"
+      sections: ["2", "2.1", "3"]
+      role: normative_behaviour
+      quote: >-
+        There are three types of IGMP messages of concern to the host-router
+        interaction: Membership Query, Version 2 Membership Report (Type 0x16),
+        and Leave Group (Type 0x17). The Type field also distinguishes a Version 1
+        Membership Report (0x12) and a Membership Query (0x11). The Group Address
+        field in a Membership Report or Leave Group message contains the multicast
+        group address of the group being reported or left.
+      grounds: [R1_classify, R2_join_add_port, R3_leave_remove_port]
+      relevance: |
+        "Internet Group Management Protocol, Version 2" — the message-type
+        vocabulary the snooper keys on:
+          - §2.1  IGMP message Type field: 0x16 = Version 2 Membership Report
+                 (join), 0x17 = Leave Group, 0x12 = Version 1 Membership Report
+                 (also a join), 0x11 = Membership Query (router → hosts). The
+                 snooper distinguishes Report (add) from Leave (remove) from
+                 Query (router-port discovery / no membership change) — basis
+                 for the R1 message-type classification gate.
+          - §3   The Group Address carried in the Report/Leave is the multicast
+                 group whose port-set is updated — basis for keying the
+                 per-group port-set on the IGMP Group Address.
+        NOTE: IGMPv2 also defines a Group Membership Interval timeout; per the
+        harness's no-time_tick contract (no wall-clock ticks are injected),
+        membership EXPIRY is modelled exclusively as an explicit Leave packet in
+        the test train, never as an elapsed-time rule.
+
+  tutorials:
+    - path: ieee_8021d
+      role: baseline_topology
+      relevance: |
+        The transparent-bridge topology (one switch, several host ports in a
+        broadcast domain) carries over from P-L2LearningBridge: the snooper
+        sits in the same broadcast-domain shape, but learns per-GROUP port-sets
+        from IGMP control traffic rather than per-MAC unicast ports, and
+        replicates data to a member set rather than flooding. The BUM/multicast
+        replication convention (mcast_grp excluding the ingress port, or
+        relying on the harness to ignore input-port output) is reused.
+
+  papers: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic. Three packet roles are distinguished by header inspection:
+      (a) IGMP control (Report/Leave/Query) — updates membership state;
+      (b) IP multicast DATA (dst ∈ 224.0.0.0/4, non-IGMP) — forwarded per
+          membership; (c) everything else — out of scope (drop).
+
+  group_membership:                           # the TPL `bucket` role
+    keyed_by_tuple: [group_addr]
+    attrs:
+      member_ports: "set[port]"               # per-group egress port bitmap (register)
+    capacity: ${group_table_capacity}
+    eviction: ${eviction}
+    notes: |
+      Per-multicast-group set of egress ports that have at least one host that
+      issued a Membership Report and has not since issued a Leave. Materialised
+      as data-plane state (a per-group port bitmap in a register array, keyed by
+      a hash of the group address). This is the snooping analogue of
+      P-L2LearningBridge's mac_table, but the value is a port SET, not a single
+      port, and it drives multicast replication rather than unicast forwarding.
+
+  link:                                        # port-keyed router/mrouter state
+    keyed_by_tuple: [port]
+    attrs:
+      is_mrouter: bool
+    enforced_when: "${mrouter_port} != none"
+    notes: |
+      Optional multicast-router port discovery (RFC 4541 §2.1.1). When
+      configured, the mrouter port is the fallback egress for groups with no
+      snooped host members. Static in the canonical instance; not learned from
+      Queries unless ${learn_mrouter_from_query} lifts off false.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  member_ports:
+    type: list[port]
+    default: [1, 2, 3, 4]
+    notes: |
+      Ports in the broadcast / multicast domain. A group's snooped member set
+      is always a subset of these.
+
+  group_table_capacity:
+    type: int | unbounded
+    range: "[4, 65536]"
+    default: unbounded
+    notes: |
+      Max number of distinct multicast groups whose port-set is tracked.
+      shrink_group_capacity_4x exercises this axis; on overflow the
+      ${eviction} policy applies.
+
+  eviction:
+    type: enum
+    values: [none, lru, fifo]
+    default: none
+    enforced_when: "${group_table_capacity} != unbounded"
+    notes: "Policy when group_table_capacity is exceeded."
+
+  mrouter_port:
+    type: port | none
+    default: none
+    notes: |
+      RFC 4541 §2.1.1 multicast-router port. When set, multicast data for a
+      group with NO snooped host members is forwarded to this port instead of
+      being dropped (R5). When none, no-member data is dropped.
+
+  learn_mrouter_from_query:
+    type: bool
+    default: false
+    enforced_when: "${mrouter_port} != none"
+    notes: |
+      When true, an IGMP Membership Query (Type 0x11) received on a port marks
+      that port as an mrouter port (RFC 4541 §2.1.1). When false, the mrouter
+      port is static (the ${mrouter_port} binding).
+
+  no_member_action:
+    type: enum
+    values: [drop, mrouter_only]
+    default: drop
+    notes: |
+      Behaviour for multicast data to a group with an empty member set:
+      drop outright, or forward to ${mrouter_port} only (requires mrouter_port
+      != none). Set automatically by enable_mrouter_fallback.
+
+  flood_link_local_control:
+    type: bool
+    default: false
+    notes: |
+      RFC 4541 §2.1.2 — IPv4 link-local control range 224.0.0.0/24 is exempt
+      from snooping pruning and is flooded to all member_ports. When false the
+      canonical instance treats these like any other group (snoop-pruned),
+      narrowing feature breadth; enable to add the exemption.
+
+  report_filter_mode:
+    type: enum
+    values: [v2_membership, v3_source_filter]
+    default: v2_membership
+    notes: |
+      v2_membership  → IGMPv2: a Report (0x16/0x12) is an unconditional join,
+                       a Leave (0x17) an unconditional removal (RFC 2236).
+      v3_source_filter → IGMPv3: the Report carries a record type
+                       (MODE_IS_INCLUDE / TO_EX / etc.); an empty-source
+                       INCLUDE record is a Leave-equivalent. Widens the
+                       message-classification surface (RFC 3376 semantics).
+
+  faithfulness:
+    type: enum
+    values: [D5.0_v2_snoop, D5.1_mrouter, D5.2_bounded, D5.3_v3]
+    default: D5.0_v2_snoop
+    notes: |
+      Pattern-specific faithfulness ladder. D5.0 = plain IGMPv2 snoop with
+      drop-on-no-member; D5.1 adds the mrouter fallback; D5.2 adds bounded
+      group state with eviction; D5.3 adds IGMPv3 source-filter parsing.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters: control classification precedes data
+# forwarding so a Report/Leave updates state and is consumed (not data-routed).
+
+rules:
+
+  - id: R0_non_ip_multicast_passthrough_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The pattern scopes IPv4 IGMP snooping + IPv4 multicast data only. ARP,
+      IPv6, raw L2 frames are out of scope and dropped. (Unicast IPv4 is also
+      out of scope here — the snooper is a multicast-only NF; an instance may
+      narrow member_ports so unicast simply never appears in the train.)
+
+  - id: R1_igmp_report_join
+    when: |
+      header_present(ipv4) ∧ header_present(igmp)
+        ∧ match(hdr.igmp.type, {0x16, 0x12})
+    given:
+      grp: hdr.igmp.group_addr
+    then:
+      - "bind(group_membership, grp, member_ports ∪ {ingress_port})"
+      - drop
+    notes: |
+      RFC 4541 §2.1.1 / RFC 2236 §2.1 — a Membership Report (v2 0x16 or v1
+      0x12) for group `grp` arriving on `ingress_port` ADDS that port to grp's
+      egress member set (idempotent: re-joining an already-member port is a
+      no-op via set-union). The IGMP control packet itself is consumed
+      (dropped) — it is not multicast-data-forwarded. (RFC 4541 also permits
+      forwarding Reports to mrouter ports; the harness grades the membership
+      EFFECT on subsequent data, so consuming the control packet is the
+      gradable canonical behaviour. Forwarding Reports to mrouter ports is the
+      forward_reports_to_mrouter feature lever.)
+
+  - id: R2_igmp_leave_prune
+    when: |
+      header_present(ipv4) ∧ header_present(igmp)
+        ∧ match(hdr.igmp.type, 0x17)
+    given:
+      grp: hdr.igmp.group_addr
+      entry: by_key(grp, group_membership)   IF exists(group_membership, grp)
+    then:
+      - "bind(group_membership, grp, entry.member_ports \\ {ingress_port})"
+      - "evict(group_membership, grp)   IF (entry.member_ports \\ {ingress_port}) == ∅"
+      - drop
+    notes: |
+      RFC 4541 §2.1.1 — a Leave Group (0x17) for `grp` on `ingress_port` REMOVES
+      that port from grp's member set. If the set becomes empty the group entry
+      is evicted (no_orphan). A Leave for a group/port that is not a member is a
+      no-op. Per the no-time_tick contract, this explicit Leave is the ONLY way
+      membership expires — there is no group-membership-interval timer.
+
+  - id: R3_igmp_query_mrouter
+    when: |
+      header_present(ipv4) ∧ header_present(igmp)
+        ∧ match(hdr.igmp.type, 0x11)
+    enforced_when: "${learn_mrouter_from_query}"
+    then:
+      - "bind(link, ingress_port, {is_mrouter: true})"
+      - drop
+    notes: |
+      RFC 4541 §2.1.1 — a Membership Query (0x11) identifies a multicast-router
+      port. When ${learn_mrouter_from_query} is set, the ingress port is marked
+      as an mrouter port (no per-group membership change). When the guard is
+      off, a Query is simply consumed (drop) with no state change. Gated by
+      learn_mrouter_from_query; canonical instance uses a static mrouter_port.
+
+  - id: R4_multicast_data_to_members
+    when: |
+      header_present(ipv4) ∧ ¬header_present(igmp)
+        ∧ in_prefix(hdr.ipv4.dst, 224.0.0.0/4)
+        ∧ exists(group_membership, hdr.ipv4.dst)
+        ∧ value(group_membership[hdr.ipv4.dst].member_ports, size, > 0)
+    given:
+      entry: by_key(hdr.ipv4.dst, group_membership)
+    then:
+      - "forward(multicast_group(entry.member_ports \\ {ingress_port}))"
+    notes: |
+      RFC 4541 §2.1.2 — IP multicast DATA (dst in 224.0.0.0/4, not an IGMP
+      message) is replicated ONLY to the snooped member port-set for that
+      group, EXCLUDING the ingress port, via a BMv2 multicast group. The frame
+      is forwarded UNMODIFIED (a snooper does not rewrite or decrement). This is
+      the core gradable observable: which egress ports receive the data after a
+      train of joins/leaves. NOTE: this `forward` targets a multicast group
+      (mcast_grp), which an implementation MUST configure — multi-port replication is
+      the central mechanism and a compile-difficulty lever.
+
+  - id: R5_multicast_data_no_member
+    when: |
+      header_present(ipv4) ∧ ¬header_present(igmp)
+        ∧ in_prefix(hdr.ipv4.dst, 224.0.0.0/4)
+        ∧ ¬(exists(group_membership, hdr.ipv4.dst)
+              ∧ value(group_membership[hdr.ipv4.dst].member_ports, size, > 0))
+    then:
+      - "${no_member_action}"
+    notes: |
+      Multicast data to a group with NO snooped members: drop (canonical), or —
+      when ${no_member_action} == mrouter_only and an mrouter port exists —
+      forward to the mrouter port only (RFC 4541 §2.1.1). NEVER flood to all
+      ports: pruning unsnooped multicast is the whole point of snooping. The
+      224.0.0.0/24 link-local-control flood exemption (flood_link_local_control)
+      is layered ahead of this rule when enabled.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: data_to_member_set_only
+    clause: stability
+    target: egress_port_set
+    while: "rule R4 fires"
+    notes: |
+      RFC 4541 §2.1.2 — multicast data egresses EXACTLY the current snooped
+      member set for its group (minus the ingress port), never more. The
+      anti-pattern is flooding to all member_ports (no pruning) or to a stale
+      set; the join/leave train + data probe pins it.
+
+  - id: prune_excludes_ingress
+    clause: stability
+    target: egress_port_set
+    while: "rule R4 fires"
+    notes: |
+      Replication never sends the data back out the ingress port (reflection),
+      mirroring P-L2LearningBridge's flood_excludes_ingress.
+
+  - id: membership_monotone_under_no_control
+    clause: persistence
+    target: "group_membership[grp].member_ports"
+    while: "no IGMP Report/Leave for grp is observed"
+    free_under: ["R1_igmp_report_join", "R2_igmp_leave_prune", "evict"]
+    notes: |
+      A group's member set changes ONLY in response to a Report (add) or Leave
+      (remove) for that group — never spontaneously and never from data
+      traffic. (Data packets MUST NOT mutate membership; an oracle baking a
+      "learn from data" step is wrong here — unlike a unicast learning bridge,
+      a snooper learns from CONTROL traffic only.)
+
+  - id: leave_removes_then_drops
+    clause: stability
+    target: egress_port_set
+    while: "rule R2 then R4 fires for the same grp+port"
+    notes: |
+      After a Leave for grp on port P, subsequent data for grp MUST NOT egress
+      P (unless P re-joins). The drop_after_leave G1 case pins the prune effect
+      as a data observable.
+
+  - id: no_orphan_groups
+    clause: no_orphan
+    target: group_membership
+    notes: |
+      RFC 4541 — a group whose member set drops to empty (last Leave) is
+      evicted; under bounded ${group_table_capacity} the ${eviction} policy
+      bounds total live group entries so no membership is orphaned forever.
+
+# ─── Test scaffolding (KB test_case_generation_guide) ────────────────────────
+# Every functional case is a PACKET TRAIN: a sequence of IGMP control packets
+# that build/modify membership, then one (or more) multicast DATA probe whose
+# observed egress port-set is the gradable outcome. No time_tick — expiry is an
+# explicit Leave packet.
+
+test_scaffolding:
+
+  G1:
+    - id: join_then_data_to_member
+      generate: |
+        Train: Report(G=239.1.1.1) on port 2; then multicast DATA to 239.1.1.1
+        ingress on port 1. Assert DATA egresses ONLY port 2 (the joined port),
+        not flooded to ports 3/4.
+    - id: two_joins_then_data_to_both
+      generate: |
+        Train: Report(G) on port 2, Report(G) on port 3; then DATA to G on
+        port 1. Assert DATA egresses ports {2,3} exactly (member set union),
+        not port 4.
+    - id: drop_after_leave
+      generate: |
+        Train: Report(G) on port 2, Report(G) on port 3, Leave(G) on port 2;
+        then DATA to G on port 1. Assert DATA egresses ONLY port 3 (port 2
+        pruned), pinning the leave→prune→data observable.
+    - id: data_no_member_drop
+      generate: |
+        No prior Report for G. Send DATA to G on port 1. Assert DROP (no
+        member set; not flooded). (When mrouter_port set + mrouter_only, assert
+        egress = mrouter port instead.)
+    - id: distinct_groups_independent
+      generate: |
+        Train: Report(G1) on port 2, Report(G2) on port 3; DATA to G1 → only
+        port 2; DATA to G2 → only port 3. Asserts per-group port-set isolation.
+
+  G2:
+    - id: rejoin_idempotent
+      generate: |
+        Train: Report(G) on port 2 twice; DATA to G → egresses port 2 exactly
+        once (set-union join is idempotent; no duplicate replication).
+    - id: leave_nonmember_noop
+      generate: |
+        Train: Report(G) on port 2; Leave(G) on port 3 (never joined); DATA to
+        G → still egresses port 2 (Leave for a non-member is a no-op).
+    - id: capacity_eviction
+      requires: "${group_table_capacity} != unbounded"
+      generate: |
+        Join more distinct groups than ${group_table_capacity}; assert the
+        ${eviction} policy is honoured (oldest/LRU group's data is no longer
+        member-forwarded) and surviving groups still replicate correctly.
+    - id: link_local_control_flood
+      requires: "${flood_link_local_control}"
+      generate: |
+        DATA to 224.0.0.1 (link-local control) with NO snooped members; assert
+        FLOODED to all member_ports (RFC 4541 §2.1.2 exemption), not dropped.
+
+  G3:
+    - id: data_not_flooded_to_nonmembers
+      generate: |
+        Adversarial: a member exists on port 2 only; assert DATA to G NEVER
+        reaches ports 3/4 (snooping must prune; default-prune, not
+        default-flood). Catches a SUT that floods all multicast.
+    - id: control_not_data_forwarded
+      generate: |
+        Send a Report(G) on port 2 that would, if mis-handled as data, be
+        replicated. Assert the IGMP control packet itself is NOT
+        multicast-data-forwarded to member ports (it is consumed / mrouter-only).
+    - id: multicast_replication_compile_probe
+      generate: |
+        G3 v1model-bug probe (multicast feature). Force a two-member group and
+        assert correct mcast_grp replication. Targets the corpus's multicast
+        compile-gate failure mode: a SUT that sets standard_metadata.mcast_grp
+        but ships no multicast group / replication-list config, or builds a
+        conditional deparser around the replicated copies, fails the compile
+        gate or under-replicates.
+    - id: igmp_unknown_type_noop
+      generate: |
+        Send an IGMP packet with an unrecognised Type (e.g. 0x22 v3-report when
+        in v2_membership mode); assert no membership change and the packet is
+        consumed, not data-forwarded.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden paired with an ease on the SAME axis.
+
+mutation_operators:
+
+  # ── axis: feature-breadth — mrouter fallback for no-member groups ──
+  - id: enable_mrouter_fallback
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${mrouter_port} == none ∧ ${no_member_action} == drop"
+    effect: |
+      ${mrouter_port} ← (first port not in a typical host role, e.g. ${member_ports}[-1]) ∧
+      ${no_member_action} ← mrouter_only ∧
+      ${faithfulness} ← D5.1_mrouter
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "${mrouter_port} != none ∧ ${mrouter_port} ∈ ${member_ports}"
+    notes: |
+      Adds the RFC 4541 §2.1.1 mrouter fallback: no-member multicast data goes
+      to the router port instead of being dropped. Widens the data-disposition
+      surface (R5) and the data_no_member_drop case flips to mrouter-egress.
+
+  - id: disable_mrouter_fallback
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${mrouter_port} != none ∨ ${no_member_action} != drop"
+    effect: |
+      ${mrouter_port} ← none ∧ ${no_member_action} ← drop ∧
+      ${learn_mrouter_from_query} ← false
+    d_axis_delta: {D5: -1}
+    feasibility_postcondition: "${mrouter_port} == none ∧ ${no_member_action} == drop"
+    notes: "Reverts enable_mrouter_fallback: no-member data simply drops."
+
+  # ── axis: feature-breadth — IGMPv3 source-filter Report classification ──
+  - id: enable_v3_source_filter
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${report_filter_mode} == v2_membership"
+    effect: |
+      ${report_filter_mode} ← v3_source_filter ∧ ${faithfulness} ← D5.3_v3
+    d_axis_delta: {D5: +1, test_rigor: +1}
+    feasibility_postcondition: "${report_filter_mode} == v3_source_filter"
+    notes: |
+      Lifts message classification from IGMPv2 (Report=join, Leave=remove) to
+      IGMPv3 record-type parsing (MODE_IS_INCLUDE / TO_EX; empty-source INCLUDE
+      = leave-equivalent). Widens R1/R2's parsing surface; adds a v3-record G1
+      train and changes igmp_unknown_type_noop's recognised-type set.
+
+  - id: disable_v3_source_filter
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${report_filter_mode} == v3_source_filter"
+    effect: |
+      ${report_filter_mode} ← v2_membership ∧ ${faithfulness} ← D5.0_v2_snoop
+    d_axis_delta: {D5: -1}
+    feasibility_postcondition: "${report_filter_mode} == v2_membership"
+    notes: "Reverts to IGMPv2 unconditional Report/Leave classification."
+
+  # ── axis: strictness — link-local-control flood exemption (RFC 4541 §2.1.2) ──
+  - id: enable_link_local_control_exemption
+    axis: strictness
+    direction: ease
+    applicable_when: "¬${flood_link_local_control}"
+    effect: "${flood_link_local_control} ← true"
+    d_axis_delta: {D5: -1}
+    feasibility_postcondition: "${flood_link_local_control}"
+    notes: |
+      EASE: 224.0.0.0/24 control traffic is flooded to all member_ports rather
+      than snoop-pruned. Adds a fixed flood rule ahead of R4/R5 — a simpler,
+      always-flood path that removes a discrimination point (a SUT that floods
+      ALL multicast still passes link-local cases), so it eases the strictness
+      of the prune contract. Pairs with require_strict_prune.
+
+  - id: require_strict_prune
+    axis: strictness
+    direction: harden
+    applicable_when: "${flood_link_local_control}"
+    effect: "${flood_link_local_control} ← false"
+    d_axis_delta: {D5: +1}
+    feasibility_postcondition: "¬${flood_link_local_control}"
+    notes: |
+      HARDEN: removes the link-local-control flood exemption so EVERY multicast
+      group (including 224.0.0.0/24) is snoop-pruned to its member set. No
+      always-flood escape hatch — the data_not_flooded_to_nonmembers G3 probe
+      now bites on control-range groups too.
+
+  # ── axis: capacity — bounded per-group state with eviction ──
+  - id: shrink_group_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${group_table_capacity} != unbounded ∧ ${group_table_capacity} > 16"
+    effect: |
+      ${group_table_capacity} ← ${group_table_capacity} / 4 ∧
+      (${eviction} ← lru IF ${eviction} == none) ∧
+      ${faithfulness} ← D5.2_bounded
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${group_table_capacity} ≥ 4 ∧ ${eviction} != none"
+    notes: |
+      Shrinks the per-group port-set table and forces an eviction policy,
+      activating the capacity_eviction G2 case under register-pressure.
+
+  - id: enlarge_group_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${group_table_capacity} != unbounded"
+    effect: "${group_table_capacity} ← ${group_table_capacity} * 2"
+    d_axis_delta: {D2: -1}
+    feasibility_postcondition: "${group_table_capacity} ≤ 65536"
+    notes: |
+      Reverts capacity pressure; an instance can ladder back toward unbounded
+      to relieve the eviction-correctness burden.
+
+  # ── axis: workload — Report/Leave train churn (join/leave oscillation) ──
+  - id: raise_membership_churn
+    axis: workload
+    direction: harden
+    applicable_when: "true"
+    effect: |
+      Generate test trains with high join/leave oscillation per group (a port
+      joins, leaves, re-joins across the same group within one train) and many
+      interleaved distinct groups before each data probe, stressing
+      membership_monotone + leave_removes_then_drops on the final state.
+    d_axis_delta: {test_rigor: +1}
+    feasibility_postcondition: "true"
+    notes: |
+      Workload-skew harden: deepens the control train so the final member set
+      is reached only by correctly applying every add/remove in order. Catches
+      SUTs that learn-once or never prune.
+
+  - id: lower_membership_churn
+    axis: workload
+    direction: ease
+    applicable_when: "true"
+    effect: |
+      Generate flat trains: each group sees a single Report (no Leaves, no
+      re-joins) before its data probe — final membership equals first-join.
+    d_axis_delta: {test_rigor: -1}
+    feasibility_postcondition: "true"
+    notes: "Reverts churn: single-join-then-data trains only."
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  CUSTOM HEADER (REQUIRED). IGMP is not in the harness's stock Scapy build set;
+  an instance MUST ship custom_headers.py with an IGMP layer (Type:8, MaxRespTime:8,
+  Checksum:16, GroupAddr:32) bound under IPv4 proto 0x02, plus the IPv4 multicast
+  data packets (no IGMP layer, dst in 224.0.0.0/4). Harness constraints for
+  new-header tasks: the verifier needs custom_headers.py
+  for non-stock headers, and input-port output is excluded from grading
+  (reply-to-ingress is ungradable) — so R4's "minus ingress port" exclusion is
+  consistent with the harness, and the data probe must ingress on a port that is
+  NOT a member of the probed group (e.g. port 1) so the full member set is
+  observable on distinct egress ports.
+
+  MULTICAST REPLICATION (CORE MECHANISM + COMPILE LEVER). R4 forwards to a BMv2
+  multicast group. The canonical implementation:
+    - Membership state: a per-group register array (or bitmap) keyed on
+      hash(hdr.ipv4.dst / igmp.group_addr) storing a port bitmap; set the
+      ingress-port bit on Report, clear it on Leave.
+    - Replication: standard_metadata.mcast_grp = <group id>; the control plane
+      pre-installs mcast_grp → replication-list (the member_ports) entries, OR
+      the SUT recomputes a mcast_grp per observed member set. Multi-port
+      mcast_grp replication is GRADABLE but is a reliable compile-difficulty lever —
+      weaker SUTs set mcast_grp but omit the replication-list config (0/N
+      egress) or build a conditional deparser around copies and fail p4c. This
+      is the central reason the pattern lands toward the harder end of the
+      difficulty range.
+    - mcast group must EXCLUDE the ingress port (or rely on the harness ignoring
+      input-port output).
+
+  NO TIME_TICK. IGMPv2's Group Membership Interval timeout is NOT modelled as a
+  timer (the harness injects no time_tick / wall-clock). Membership expiry is
+  ALWAYS an explicit Leave packet in the test train. Do not author an `elapsed`
+  rule.
+
+  Anti-pattern implementations to reject:
+    * Learning membership from multicast DATA (unicast-bridge habit) — a snooper
+      learns from IGMP CONTROL only (membership_monotone invariant).
+    * Flooding all multicast to every member port (no pruning) — defeats the NF.
+    * Forwarding the IGMP control packet as multicast data to members.
+    * Sending data back out the ingress port (reflection).
+    * An `elapsed`/timer-based expiry rule — no time_tick is injected.
+    * Setting mcast_grp without a control-plane replication-list (0 egress).
+
+post_instantiation_hooks: |
+  For each instance, the public join/leave/data trains run through the oracle
+  for the seed must yield the expected outputs. The instance ships custom_headers.py (IGMP + IPv4-multicast) and that the seed's
+  mcast_grp / replication-list convention is documented in the task description.

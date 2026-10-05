@@ -1,0 +1,127 @@
+{
+  "oracle_hash": "3de7c2fa58f844b8cbe68fc06f7261d3c41ee3e0c288489327ffa7021f0116ea",
+  "instance": "port_range_classifier_anchor-default",
+  "ran_at": "2026-06-16T22:19:52.863975Z",
+  "canonical_examples": {
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "well_known_port_forwards_class1",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_hi_of_classA_inclusive",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_lo_of_classB_transition",
+        "status": "pass"
+      },
+      {
+        "example_id": "boundary_hi_of_classB_inclusive",
+        "status": "pass"
+      },
+      {
+        "example_id": "just_past_classB_falls_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "tcp_dynamic_port_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_l4_arp_to_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "default_deny_drops_dynamic",
+        "status": "pass"
+      },
+      {
+        "example_id": "proto_mismatch_misses_under_dport_proto",
+        "status": "pass"
+      },
+      {
+        "example_id": "proto_match_hits_under_dport_proto",
+        "status": "pass"
+      },
+      {
+        "example_id": "overlap_higher_priority_wins",
+        "status": "pass"
+      },
+      {
+        "example_id": "deny_block_range_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "range_boundary_inclusive": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "priority_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "default_action_correctness": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "classify_routes_to_named_port": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "classify_header_preservation": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "range_boundary_inclusive",
+      "priority_correctness",
+      "default_action_correctness",
+      "classify_routes_to_named_port",
+      "no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "RFC2475",
+      "RFC2979"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

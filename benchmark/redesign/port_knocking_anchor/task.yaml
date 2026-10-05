@@ -1,0 +1,868 @@
+task_name: port_knocking_anchor
+task_type: full_program
+complexity: medium
+source: synthesis
+pattern: P-PortKnocking
+pattern_version: '1.0'
+seed:
+  protected_service: 10.0.0.100
+  protected_port: 22
+  knock_sequence:
+  - 7000
+  - 8000
+  - 9000
+  reset_strict: false
+  expiry_window: unbounded
+  authorize_persists: true
+  state_capacity: unbounded
+  eviction_policy: none
+  default_action: drop
+  faithfulness: D5.0_fixed_sequence
+description: |
+  Implement a stateful port-knocking authorization gate in front of a protected
+  TCP service on a single switch s1. Inspired by the classic port-knocking /
+  Single-Packet-Authorization concept (M. Krzywinski, Linux Journal 2003).
+
+  The protected service is closed to every source by default: its traffic is
+  dropped until that source has proven itself by sending a secret, ORDERED
+  sequence of "knock" packets — packets aimed at three pre-agreed destination
+  ports, in the right order. The gate tracks each source's progress
+  independently, by the source's IPv4 address.
+
+  ## The protected service
+
+    - The protected service lives at IPv4 address 10.0.0.100, TCP port 22, and
+      is reached out switch port s1.p2.
+    - A packet is "service-bound" when its destination IPv4 address is
+      10.0.0.100 AND its TCP/UDP destination port is 22.
+
+  ## The knock sequence
+
+    - The secret sequence is the three destination ports 7000, then 8000, then
+      9000, sent IN THAT ORDER. These three ports are the "knock ports".
+    - A "knock" is any non-service packet from a source. It is judged against
+      that source's current position in the sequence.
+
+  ## Required behaviour
+
+  Process each packet as follows (first matching rule wins):
+
+   1. A frame that is not IPv4 is dropped.
+
+   2. SERVICE-BOUND traffic (destination 10.0.0.100, destination port 22):
+        - If the source has completed the full sequence 7000 → 8000 → 9000 in
+          order (it is AUTHORIZED), the packet is forwarded out s1.p2 to the
+          protected service. Once a source is authorized it STAYS authorized:
+          its later service packets are forwarded too.
+        - Otherwise the packet is dropped. The service is closed to any source
+          that has not completed the full ordered sequence.
+      The gate must consider BOTH the destination address and the destination
+      port: traffic to port 22 on any other host is not service-bound here.
+
+   3. A KNOCK (any non-service packet), judged against the source's progress:
+        - If its destination port is the source's EXPECTED NEXT knock port
+          (7000 when the source is at the start; then 8000; then 9000), the
+          source advances one step toward authorization. The knock packet
+          itself is dropped — knocks are never forwarded to any service.
+        - If its destination port is one of the knock ports {7000, 8000, 9000}
+          but NOT the expected next one (an out-of-order knock), the source's
+          progress is reset back to the start.
+        - If its destination port is none of the knock ports and it is not
+          service-bound (unrelated traffic), the source's progress is left
+          unchanged; the packet is dropped.
+
+  ## Invariants
+
+   - A service-bound packet from a source that has not completed the full
+     ordered sequence is ALWAYS dropped — regardless of what other sources are
+     doing on the switch at the same time.
+   - A source advances only when it hits its expected next knock port, and only
+     by one step at a time; hitting the knock ports out of order does not
+     advance it.
+   - An out-of-order knock port returns the source to the start of the
+     sequence.
+   - Each source is tracked independently by its IPv4 source address: one
+     source's knocks must never advance or authorize another source.
+
+  ## Topology
+
+  One switch s1 with three hosts:
+    - h1 at s1.p1 — a knocking client, IPv4 10.0.0.1.
+    - svc at s1.p2 — the protected service host, IPv4 10.0.0.100 (TCP 22).
+    - h2 at s1.p3 — a second knocking client, IPv4 10.0.0.2.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: svc
+  - from: h2
+    to: s1.p3
+hosts:
+  h1:
+    ip: 10.0.0.1
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  svc:
+    ip: 10.0.0.100
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h2:
+    ip: 10.0.0.2
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+test_cases:
+- name: full_sequence_then_service_forward
+  visibility: public
+  description: Source h1 sends the complete knock sequence 7000 -> 8000 -> 9000 in order, then a service-bound packet (10.0.0.100:22). The source is authorized, so the service packet forwards out s1.p2. Golden path.
+  prior_inputs:
+  - port: s1.p1
+    layers: &id001
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers: &id002
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers: &id003
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: partial_sequence_service_drop
+  visibility: public
+  description: 'Source h1 sends only the first two knocks (7000, 8000) then a service packet. Progress is 2 < 3, so the source is NOT authorized: the service packet is dropped (default-deny).'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: out_of_order_knock_no_advance
+  visibility: hidden
+  description: Source h1 sends the first knock (7000) then the THIRD knock port (9000), skipping 8000. 9000 is a knock-set port but the wrong next one, so it resets progress to 0. The source then sends 8000 and 9000 and a service packet; the run was never a clean in-order sequence, so the service packet is dropped.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: reset_on_wrong_knock_then_recover
+  visibility: hidden
+  description: Source h1 sends the first knock (7000), then a wrong knock-set port (9000) which resets progress to 0, then the entire sequence cleanly in order (7000 -> 8000 -> 9000), then a service packet. After the reset the fresh clean run authorizes, so the service packet forwards out s1.p2.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: lenient_noise_does_not_reset
+  visibility: hidden
+  description: 'Lenient reset (reset_strict=false): between two correct in-order knocks h1 injects a packet to an unrelated port (4242, not a knock port and not service). That noise leaves progress intact. h1 completes the sequence and the service packet forwards out s1.p2.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 4242
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: single_knock_then_service_drop
+  visibility: hidden
+  description: Source h1 sends only the first knock (7000) then a service packet. Progress 1 < 3 -> not authorized -> service packet dropped.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: authorized_grant_persists_second_service
+  visibility: hidden
+  description: 'Sticky grant (authorize_persists=true): after the full sequence, h1 sends two service packets. The grant persists, so the SECOND service packet still forwards out s1.p2 without re-knocking.'
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: grant_persists_across_intervening_noise
+  visibility: hidden
+  description: After authorizing, h1 sends an unrelated non-service packet (port 4242), then a service packet. Authorization is not revoked by stray traffic; the service packet forwards out s1.p2.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 4242
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: cold_service_packet_drop
+  visibility: public
+  description: 'No warm-up at all: a fresh source sends a service-bound packet. No knock progress exists, so it is dropped (default-deny).'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: two_sources_interleaved_isolation_B_drops
+  visibility: hidden
+  description: Source h1 (A) completes the full sequence while source h2 (B) sends only its first knock (7000); the two sources' knocks are interleaved. B then sends a service packet. A's progress must NOT authorize B, so B's service packet is dropped (per-source isolation, keyed on IPv4 src).
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: two_sources_interleaved_isolation_A_forwards
+  visibility: hidden
+  description: 'Paired with the B-drops case: under the SAME interleaving (A completes, B only knocks once), source A''s own service packet forwards out s1.p2 — A is authorized, B is not.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.2
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 8000
+        flags: S
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 9000
+        flags: S
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.100
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 50000
+        dport: 22
+        flags: S
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.src:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: knock_packet_never_forwarded
+  visibility: hidden
+  description: 'A single knock packet (to knock port 7000, destination is not the protected service) is a control signal: it is dropped, never forwarded.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 7000
+        flags: S
+  expected:
+    behavior: drop
+- name: wrong_dst_same_port_drop
+  visibility: hidden
+  description: h1 authorizes (full sequence) then sends a packet to port 22 but to a DIFFERENT destination host (10.0.0.200, not the protected service). Authorization is scoped to the protected service IP, so a port-22 packet to another host is not service-bound and is dropped.
+  prior_inputs:
+  - port: s1.p1
+    layers: *id001
+  - port: s1.p1
+    layers: *id002
+  - port: s1.p1
+    layers: *id003
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.0.1
+        dst: 10.0.0.200
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 22
+        flags: S
+  expected:
+    behavior: drop
+- name: non_ipv4_arp_drop
+  visibility: hidden
+  description: A non-IPv4 frame (ARP) is dropped and changes no knock state.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.0.1
+        pdst: 10.0.0.100
+  expected:
+    behavior: drop

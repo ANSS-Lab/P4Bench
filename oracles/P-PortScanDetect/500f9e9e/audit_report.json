@@ -1,0 +1,115 @@
+{
+  "oracle_hash": "61a2d38e7b7fc7c8028ccd1e29527f9dc0486dd72f0eecb21471c08e307a643e",
+  "instance": "port_scan_detect_anchor-default",
+  "ran_at": "2026-06-17T14:30:19.700611Z",
+  "canonical_examples": {
+    "passed": 11,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "at_threshold_still_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "above_threshold_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "repeated_destination_never_crosses",
+        "status": "pass"
+      },
+      {
+        "example_id": "control_reset_clears_verdict",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_scanner_action_mark_marks_not_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_scan_threshold_two_crosses_early",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_scan_threshold_two_at_threshold_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_scan_key_distinct_dst_port_flags_port_scan",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_estimator_and_persistence_scanner_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "knob_capacity_bitmap_rows_hash_skew_benign",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "distinct_estimate_monotone_within_window": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "scanner_latch_persistence": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "benign_forwarding_below_threshold": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "scanner_state_no_orphan": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "scan_decision_no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      }
+    },
+    "uncovered": [
+      "distinct_estimate_monotone_within_window",
+      "scanner_latch_persistence",
+      "benign_forwarding_below_threshold",
+      "scanner_state_no_orphan",
+      "scan_decision_no_loop"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "trw_sp04",
+      "opensketch_nsdi13"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

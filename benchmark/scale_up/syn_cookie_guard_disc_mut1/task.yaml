@@ -1,0 +1,858 @@
+task_name: syn_cookie_guard_disc_mut1
+task_type: full_program
+complexity: high
+source: rfc
+pattern: P-SYNCookieGuard
+pattern_version: '1.0'
+seed:
+  protected_servers:
+  - 10.0.2.2
+  whitelist:
+  - 10.0.9.0/24
+  - 10.0.1.0/24
+  cookie_faithfulness: D5.0_truncated_hash
+  faithfulness: D5.0_truncated_hash
+  cookie_hash_algo: custom_keyed
+  cookie_secret: 1516993677
+  state_capacity: unbounded
+  eviction_policy: none
+  idle_timeout_s: 300
+  cookie_validity_epochs: 1
+  epoch_period_s: 64
+  track_halfopen: false
+  halfopen_capacity: 1024
+  syn_rate_activation: false
+  syn_rate_threshold: 128
+  reference_impl_shown: false
+description: "A switch s1 stands in front of a single protected server and shields it from\nTCP SYN-flood resource exhaustion. Rather than letting every connection attempt\nconsume server-side connection\
+  \ state, the switch answers an unestablished\nconnection attempt with a stateless cryptographic challenge and only lets a\nflow through once the challenge is answered correctly. The approach follows the\n\
+  SYN-cookie mechanism described in RFC 4987 (TCP SYN Flooding Attacks and Common\nMitigations).\n\n## Topology and roles\n  - s1.p1 \u2014 the ingress side; connection attempts toward the server arrive\
+  \ here.\n    Both trusted and untrusted sources reach the switch on this port.\n      - A trusted internal client used in the tests holds 10.0.1.1 (hardware\n        address 08:00:00:00:01:01); it lies\
+  \ in the trusted prefix 10.0.1.0/24.\n      - An untrusted source used in the tests holds 10.0.3.1 (hardware address\n        08:00:00:00:03:01); it lies in no trusted prefix and is therefore\n      \
+  \  challenged.\n  - s1.p2 \u2014 the side facing the protected server, which holds 10.0.2.2\n    (hardware address 08:00:00:00:02:02).\n  - The protected server is 10.0.2.2; its TCP service is on port\
+  \ 80.\n  - Two trusted source prefixes \u2014 10.0.9.0/24 and 10.0.1.0/24 \u2014 are exempt\n    from the challenge (a source whose address lies in either prefix is never\n    challenged). Every other\
+  \ source is untrusted and subject to the challenge.\n  - A fixed secret value 0x5A6B7C8D is shared by the challenge and its\n    verification (it does not change during the task).\n\n## The cookie value\n\
+  \  For a connection attempt the switch derives a 32-bit cookie from the\n  connection's own identity and the shared secret, using 32-bit wrapping\n  arithmetic:\n\n      let k      = (source port << 16)\
+  \ | destination port\n      cookie     = (source IPv4 address + destination IPv4 address\n                    + k + 0x5A6B7C8D)  modulo 2^32\n\n  The four-tuple (source address, destination address, source\
+  \ port,\n  destination port) and the secret fully determine the cookie; nothing else\n  enters it. Two connection attempts that differ in any one of those fields\n  yield different cookies.\n\n## Behaviour,\
+  \ in priority order (first applicable wins)\n  1. A non-IPv4 frame is discarded.\n  2. A packet whose destination is not the protected server is forwarded\n     normally toward its next hop: its hop count\
+  \ is decremented by one and its\n     Ethernet destination is set to that next hop. The switch is transparent\n     outside the protected server.\n  3. A non-TCP packet addressed to the protected server\
+  \ is forwarded toward the\n     server in the same way (hop count decremented, Ethernet destination set to\n     the server). The challenge applies only to TCP.\n  4. A TCP packet addressed to the protected\
+  \ server whose source address lies\n     in either trusted prefix is forwarded to the server (hop count\n     decremented, Ethernet destination set to the server's). Trusted sources\n     are never challenged.\n\
+  \  5. A TCP packet addressed to the protected server that belongs to a\n     connection the switch has already admitted is forwarded to the server in\n     the same way.\n  6. A pure connection-open request\
+  \ to the protected server (the SYN flag set,\n     the ACK flag clear) for which no admitted connection exists is answered by\n     a switch-originated reply sent back toward the originator, and the original\n\
+  \     request is consumed (NOT forwarded to the server). The reply:\n        - is addressed back to the originator (the IPv4 addresses and the TCP\n          port numbers of the request are swapped);\n\
+  \        - has both the SYN and ACK flags set;\n        - carries, as its sequence number, the cookie for the request's\n          four-tuple;\n        - acknowledges the request (its acknowledgement\
+  \ number is the request's\n          sequence number plus one);\n        - is a complete, well-formed Ethernet/IPv4/TCP packet that an unmodified\n          receiver would accept (in particular both the\
+  \ IPv4 and the TCP\n          checksums are valid for the emitted bytes), with a fresh hop count.\n     Crucially, answering the request creates NO per-connection state on the\n     switch: an unanswered\
+  \ challenge leaves no footprint, which is what lets the\n     switch absorb a flood the server's own connection backlog could not.\n  7. A pure acknowledgement to the protected server (the ACK flag set,\
+  \ the SYN\n     flag clear) for which no admitted connection exists is admitted only if its\n     acknowledgement number, minus one, equals the cookie for its own\n     four-tuple. On a match the switch\
+  \ records the connection as admitted and\n     forwards the packet to the server (hop count decremented, Ethernet\n     destination set to the server's). The acknowledgement number minus one not\n   \
+  \  matching the cookie means the packet is NOT admitted.\n  8. Any other TCP packet addressed to the protected server (an acknowledgement\n     whose cookie does not check out, an unusual flag combination,\
+  \ a stray\n     segment) is discarded.\n\n## On discard\n  A discarded packet produces no output toward the server and MUST NOT create,\n  remove, or alter any admitted-connection record. In particular,\
+  \ a connection\n  is recorded as admitted ONLY by rule 7 (a correctly answered challenge) and\n  NEVER by rule 6 (a connection-open request).\n\n## Control plane\n  The next-hop forwarding information\
+  \ (which port and Ethernet address reach a\n  given destination) is supplied externally; the switch does not invent it.\n"
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+  links:
+  - from: h_cli
+    to: s1.p1
+  - from: s1.p2
+    to: h_srv
+hosts:
+  h_cli:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h_srv:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+test_cases:
+- name: syn_to_protected_not_forwarded
+  visibility: public
+  description: 'A pure SYN from an untrusted source (10.0.3.1, in no trusted prefix) to the protected server with no established connection MUST trigger a stateless cookie challenge: the guard answers with
+    a switch-originated SYN-ACK back toward the originator and does NOT forward the SYN onward to the server. Observable effect: no packet reaches the server port (the SYN-ACK leaves back toward the originator).
+    A guard that forwards the SYN to the server fails here.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  expected:
+    behavior: drop
+- name: valid_cookie_ack_admits_and_forwards
+  visibility: public
+  description: 'A returning ACK from the untrusted source whose acknowledgement number equals cookie+1 for its own 4-tuple validates the challenge: the guard pins the flow to the established table and forwards
+    the ACK to the server, decrementing TTL and rewriting the destination MAC to the server''s.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179077601
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: established_flow_data_forwards
+  visibility: hidden
+  description: After a flow is admitted by a valid cookie ACK, a subsequent data segment on the same 4-tuple is forwarded to the server via the established path (flow-admit), without re-challenging.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179077601
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40001
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179077601
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: whitelisted_source_bypasses_challenge
+  visibility: public
+  description: "A SYN from a source inside a trusted whitelist prefix (10.0.9.0/24) bypasses the cookie challenge entirely and is forwarded straight to the server \u2014 the whitelist rule fires before\
+    \ the challenge."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.9.9
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40050
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: trusted_internal_client_bypasses_challenge
+  visibility: hidden
+  description: "A SYN from the trusted internal client prefix (10.0.1.0/24, e.g. 10.0.1.1) is also exempt from the challenge and forwarded straight to the server \u2014 both trusted prefixes bypass. A guard\
+    \ that whitelists only 10.0.9.0/24 and omits the 10.0.1.0/24 prefix fails here."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40060
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: non_protected_destination_passthrough
+  visibility: hidden
+  description: "TCP to a destination that is NOT a protected server is forwarded transparently \u2014 the guard only challenges traffic to the protected set. Here a segment to the client subnet host is\
+    \ forwarded out the client-side port."
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.1.1
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 5000
+        dport: 7000
+        flags: S
+        seq: 268435456
+        ack: 0
+  expected:
+    behavior: forward
+    output_port: s1.p1
+    transformations:
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:01:01
+- name: syn_flood_allocates_no_state
+  visibility: hidden
+  description: "A burst of distinct-4-tuple SYNs from an untrusted source (a SYN flood) allocates NO established state \u2014 each is challenged and dropped onward. A legitimate flow that completes the\
+    \ cookie handshake AFTER the flood still admits, proving the flood neither filled nor poisoned the established table. This is the headline no-state-on-unvalidated-SYN property."
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41000
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41001
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41002
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41003
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41004
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41005
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41006
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 41007
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40010
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179667425
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: syn_without_validating_ack_no_establishment
+  visibility: hidden
+  description: An untrusted SYN is challenged but never followed by a validating ACK. A later data segment on that 4-tuple has no established entry (the SYN created none) and an acknowledgement number that
+    is not a valid cookie, so it is dropped by default-deny.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40003
+        dport: 80
+        flags: S
+        seq: 268435456
+        ack: 0
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40003
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 3735928559
+  expected:
+    behavior: drop
+- name: invalid_cookie_ack_dropped
+  visibility: hidden
+  description: "An untrusted ACK to the protected server carrying an acknowledgement number that is not a valid cookie (and with no established connection) MUST be dropped. The only path to admission is\
+    \ a cryptographically valid cookie \u2014 no default-open admit."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40004
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 305419896
+  expected:
+    behavior: drop
+- name: cookie_bound_to_4tuple_cross_replay_dropped
+  visibility: hidden
+  description: A cookie minted for flow A (source port 40001) is replayed inside an ACK on flow B's 4-tuple (source port 40002), both from the untrusted source. Because the cookie binds all four 4-tuple
+    fields, flow B recomputes a different cookie and the replay is dropped. Catches a partial-key or constant cookie.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40002
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179077601
+  expected:
+    behavior: drop
+- name: cookie_correct_for_4tuple_admits
+  visibility: hidden
+  description: 'The companion of the cross-replay test: the SAME flow B 4-tuple, but now carrying flow B''s own correct cookie+1, validates and forwards. Confirms the previous drop was due to 4-tuple binding,
+    not a blanket reject.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40002
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179143137
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: crafted_synack_not_mistaken_for_validated_ack
+  visibility: hidden
+  description: "A crafted SYN-ACK (both SYN and ACK flags set) from an untrusted source to the protected server with no state MUST be dropped \u2014 only a pure SYN gets a challenge and only a pure ACK\
+    \ with a valid cookie is admitted. A crafted SYN-ACK must not be mistaken for a validated ACK."
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40005
+        dport: 80
+        flags: SA
+        seq: 268435457
+        ack: 179077601
+  expected:
+    behavior: drop
+- name: crafted_xmas_segment_dropped
+  visibility: hidden
+  description: An XMAS segment (FIN+PSH+URG) from an untrusted source to the protected server with no state matches neither the challenge nor the admit rule and is dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40006
+        dport: 80
+        flags: FPU
+        seq: 268435457
+        ack: 0
+  expected:
+    behavior: drop
+- name: crafted_null_segment_dropped
+  visibility: hidden
+  description: A NULL segment (no TCP flags) from an untrusted source to the protected server with no state is dropped by default-deny.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40007
+        dport: 80
+        flags: ''
+        seq: 268435457
+        ack: 0
+  expected:
+    behavior: drop
+- name: spoofed_ack_flood_no_poison
+  visibility: hidden
+  description: A burst of untrusted ACKs with random acknowledgement numbers (a cookie-guessing flood) creates no established state; a legitimate cookie handshake that follows still admits. The flood must
+    not poison the established table.
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42000
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684354560
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42001
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684362479
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42002
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684370398
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42003
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684378317
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42004
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684386236
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42005
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684394155
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42006
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684402074
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 42007
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 2684409993
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40010
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 179667425
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+- name: prior_drop_does_not_contaminate_next_decision
+  visibility: hidden
+  description: 'Cross-packet contamination check (std_metadata.drop misread): after a flow is established and an unrelated invalid-cookie ACK is dropped, a data segment of the established flow MUST still
+    forward normally. A guard that reads standard_metadata.drop to decide the next packet fails here.'
+  prior_inputs:
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40020
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 180322785
+  - port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 64
+        proto: 6
+    - TCP:
+        sport: 40099
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 3134958849
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.3.1
+        dst: 10.0.2.2
+        ttl: 1
+        proto: 6
+    - TCP:
+        sport: 40020
+        dport: 80
+        flags: A
+        seq: 268435457
+        ack: 180322785
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.dst:
+        action: unchanged
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:02:02
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

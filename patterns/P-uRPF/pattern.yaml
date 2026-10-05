@@ -1,0 +1,679 @@
+# P-uRPF — Unicast Reverse Path Forwarding (anti-spoofing ingress filter)
+#
+# TPL v1.0 task pattern. An ingress anti-spoofing filter
+# layered IN FRONT of an ordinary destination-based forwarder. A first LPM
+# table keyed on the SOURCE address yields the expected ingress port(s) for
+# that source prefix; the packet's actual arrival port is checked against the
+# expectation (STRICT mode) or against mere routability (LOOSE / feasible-path
+# mode). A packet that survives the uRPF check then takes the normal dst-FIB
+# LPM forward. Two tables, one verdict gate, one forwarding step. Grounds on
+# RFC 3704 (BCP 84, strict vs loose/feasible-path uRPF) and RFC 2827 (BCP 38,
+# the ingress-filtering threat model).
+
+pattern_id: P-uRPF
+version: "1.0"
+nf_categories:                                          # NF-category tags (ID:name pairs)
+  descriptive:  [D7:security]                           # anti-spoofing ingress filter
+  prescriptive: [P4:policy]                             # composite-condition match-action (src-route ∧ ingress-port)
+target_capability: redesign                             # programmability redesigns a previously fixed-function RPF check
+summary: >
+  Unicast Reverse Path Forwarding: an ingress anti-spoofing filter that drops
+  packets whose source address is inconsistent with the path back to it before
+  the normal destination forward. A reverse-FIB LPM on the SOURCE address
+  yields the expected ingress port(s) for that source prefix; STRICT mode drops
+  the packet unless its actual ingress_port is among the expected ports (RFC
+  3704 §2.2), LOOSE / feasible-path mode drops only when the source matches no
+  reverse-FIB entry at all (RFC 3704 §2.4 / §2.3). Surviving packets take the
+  normal destination-based LPM forward with Ethernet rewrite. The canonical
+  instance is single-homed strict uRPF; mutation toggles strict↔loose, widens
+  to per-prefix multi-port feasible paths, adds a default-route exemption
+  knob (RFC 3704 §2.2 caveat), and scales the reverse-FIB.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  rfcs:
+    - id: RFC3704
+      cite: "RFC 3704 (BCP 84) §2.2 / §2.3 / §2.4"
+      sections: ["1", "2.1", "2.2", "2.3", "2.4", "3"]
+      role: normative_behaviour
+      quote: >-
+        In strict Reverse Path Forwarding the source address is looked up in the
+        FIB and the interface through which the packet was received is checked
+        against the best return path; if it does not match, the packet is
+        discarded. Feasible Path RPF relaxes this so the reverse lookup may yield
+        a set of acceptable interfaces and the packet passes if it arrived on any
+        of them. In loose Reverse Path Forwarding the source address must be in
+        the FIB, but the verification succeeds regardless of the interface. A
+        source whose only reverse match is the default route may be exempted.
+      grounds: [R1_strict_off_path_drop, R2_loose_unroutable_drop, R3_dst_lpm_forward, urpf_strict_port_match, exempt_default_route]
+      relevance: |
+        Ingress Filtering for Multihomed Networks (BCP 84) — the canonical
+        clauses every rule realises:
+          - §2.1  Ingress access lists: the baseline static-ACL form of
+                  ingress filtering uRPF generalises beyond.
+          - §2.2  Strict Reverse Path Forwarding: "the source address is
+                  looked up in the FIB and ... the interface through which the
+                  packet was received [is checked against] the best return
+                  path." A packet whose source's best reverse route does NOT
+                  point back out the arrival interface is discarded — basis
+                  for R3 (strict spoofed-drop, gated on
+                  ${urpf_mode} == strict) and the urpf_strict_port_match
+                  invariant. §2.2 also records the asymmetric-routing
+                  false-positive that motivates the loose / feasible-path
+                  relaxations and the ${exempt_default_route} caveat.
+          - §2.3  Feasible Path Reverse Path Forwarding: the reverse lookup
+                  may yield a SET of acceptable interfaces (all feasible
+                  return paths), and the packet passes if its ingress port is
+                  any member of that set — basis for the multi-port
+                  expected-set semantics in R3 and the
+                  expand_to_feasible_path operator.
+          - §2.4  Loose Reverse Path Forwarding: "the source address must be
+                  in the FIB, [but] ... the verification ... succeeds
+                  regardless of the interface." Loose mode drops ONLY when the
+                  source is unroutable (no reverse-FIB match) — basis for R2
+                  (loose unroutable-drop, gated on ${urpf_mode} == loose).
+          - §3    Clarifies that ingress filtering is an ingress-edge function;
+                  the dst-FIB forward (R4) is the ordinary forwarder uRPF
+                  fronts, not part of the check itself.
+    - id: RFC2827
+      sections: ["1", "4", "5"]
+      role: threat_model
+      relevance: |
+        Network Ingress Filtering: Defeating Denial of Service Attacks which
+        employ IP Source Address Spoofing (BCP 38) — the adversary model the
+        filter defends against:
+          - §4    The defended capability: an attacker forges a source address
+                  it is not entitled to use (typically to evade traceback in a
+                  DoS / reflection attack). Ingress filtering at the edge drops
+                  any packet "with a source address ... not [from] the
+                  legitimately reachable" prefix behind the arrival interface
+                  — the threat that R3 (strict) and R2 (loose) neutralise and
+                  that the drop_spoofed_source G3 case probes.
+          - §5    Notes the filter is stateless and per-packet (no flow state),
+                  fixing this NF as a `packet`-entity ingress ACL rather than a
+                  stateful tracker — basis for the entities block carrying only
+                  `packet` plus the two control-plane FIB buckets.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        The p4lang "basic" exercise topology (3 hosts, 1 switch, one LPM table
+        on the destination address) supplies the dst-FIB half (R4) verbatim.
+        uRPF adds a SECOND LPM table keyed on the source address whose action
+        records the expected ingress port(s) into metadata; the verdict gate
+        compares it against std.ingress_port before the destination forward.
+
+  papers: []
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; stateless. uRPF is a per-packet ingress ACL (RFC 2827 §5) — no
+      flow / connection state. Decisions derive from hdr.ipv4.src,
+      hdr.ipv4.dst, std.ingress_port, and the two control-plane FIBs.
+
+  reverse_route:                          # the TPL `bucket` role
+    keyed_by_lpm: hdr.ipv4.src
+    attrs:
+      expected_ingress_ports: "list[port]"   # the feasible return interface set (RFC 3704 §2.3)
+      prefix_len:             int            # 0..32
+    capacity: ${reverse_fib_capacity}
+    notes: |
+      A reverse-FIB entry. The LPM table is keyed on the 32-bit SOURCE
+      address; the LONGEST matching prefix yields the set of interfaces out of
+      which that source's return traffic would leave — equivalently the set of
+      interfaces it may legitimately arrive on. Single-homed strict uRPF
+      stores exactly one port per entry; feasible-path stores a set.
+
+  forward_route:                          # also a `bucket` (class) — the ordinary dst-FIB
+    keyed_by_lpm: hdr.ipv4.dst
+    attrs:
+      egress_port:  port
+      port_mac:     address               # egress port's own MAC for the L2 src rewrite
+      next_hop_mac: address               # next-hop MAC for the L2 dst rewrite
+      prefix_len:   int                   # 0..32
+    capacity: ${forward_fib_capacity}
+    notes: |
+      The destination FIB the forwarder fronts. Standard LPM on hdr.ipv4.dst →
+      (egress_port, next_hop_mac); first-match is LONGEST-prefix. Identical in
+      shape to P-IPv4Routing's single-next-hop FIB.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+
+parameters:
+
+  urpf_mode:
+    type: enum
+    values: [strict, loose, feasible_path]
+    default: strict
+    notes: |
+      strict        → drop unless std.ingress_port is the (single) expected
+                      port for the source prefix (RFC 3704 §2.2).
+      feasible_path → drop unless std.ingress_port ∈ the expected-port SET for
+                      the source prefix (RFC 3704 §2.3); strict is the
+                      one-element special case.
+      loose         → drop only if the source matches NO reverse-FIB entry;
+                      ingress port is not checked (RFC 3704 §2.4).
+
+  reverse_routes:
+    type: list[reverse_route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0,32],
+      expected_ingress_ports:list[port] with |list| ≥ 1; no two entries share
+      both prefix AND prefix_len. Under ${urpf_mode} == strict every entry's
+      list is a singleton.
+    notes: |
+      Control-plane reverse FIB keyed on the source address. Determines, per
+      source prefix, which ingress interface(s) are legitimate. A 0.0.0.0/0
+      entry is the catch-all reverse default (see ${exempt_default_route}).
+
+  forward_routes:
+    type: list[forward_route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0,32], egress_port:port,
+      port_mac:address, next_hop_mac:address; no two entries share both prefix
+      AND prefix_len.
+    notes: "Control-plane destination FIB. A default route is 0.0.0.0/0."
+
+  exempt_default_route:
+    type: bool
+    default: false
+    notes: |
+      RFC 3704 §2.2 caveat. When true, a source whose ONLY reverse-FIB match
+      is the 0.0.0.0/0 default route is treated as un-verifiable and PASSED
+      (the default route is not a real reverse path). When false (default), a
+      0.0.0.0/0 reverse entry counts as a normal match — its expected-port set
+      is enforced in strict / feasible_path and satisfies routability in loose.
+
+  reverse_fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Max reverse-FIB entries. shrink_reverse_fib_capacity_4x exercises this axis."
+
+  forward_fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: "Max destination-FIB entries."
+
+  default_action:
+    type: enum
+    values: [drop]
+    default: drop
+    notes: |
+      Behaviour on dst-FIB miss for a packet that PASSED the uRPF check.
+      v1.0: drop (no ICMP origination). The uRPF verdict's own drop is R1/R2,
+      not this miss-drop.
+
+  faithfulness:
+    type: enum
+    values: [D5.0_strict_single_homed, D5.1_feasible_path, D5.2_scale]
+    default: D5.0_strict_single_homed
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The uRPF verdict DROP (R1/R2) is
+# placed BEFORE the destination forward (R3): a spoofed/unroutable packet
+# matches the drop rule first and never reaches the FIB forward. The "pass"
+# outcome is not a standalone postcondition — it is the absence of a uRPF-drop
+# match, so the packet falls through to R3's forward (which carries the real
+# `forward`/`set`/`dec` actions). This keeps every `then` block in the v1.0
+# postcondition vocabulary (no synthetic "proceed" primitive).
+#
+# `urpf_verified(pkt)` abbreviates the active-mode source check, defined once:
+#   strict / feasible_path :=
+#       exists(reverse_route, lpm(hdr.ipv4.src, ${reverse_routes}))
+#         ∧ ¬( ${exempt_default_route}
+#              ∧ matched_reverse_prefix_len(hdr.ipv4.src, ${reverse_routes}) == 0 )
+#         ∧ ingress(reverse_route.expected_ingress_ports)   # std.ingress_port ∈ set
+#   loose :=
+#       exists(reverse_route, lpm(hdr.ipv4.src, ${reverse_routes}))
+#         ∧ ¬( ${exempt_default_route}
+#              ∧ matched_reverse_prefix_len(hdr.ipv4.src, ${reverse_routes}) == 0 )
+# The sole strict↔loose difference is the `ingress(...)` conjunct, present in
+# strict/feasible_path and ABSENT in loose.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      The pattern fronts IPv4 unicast forwarding only. ARP, IPv6, and any
+      other ether-type are out of scope and MUST NOT be forwarded.
+
+  - id: R1_urpf_drop_strict
+    when: |
+      header_present(ipv4) ∧ ¬(
+        exists(reverse_route, lpm(hdr.ipv4.src, ${reverse_routes}))
+          ∧ ¬( ${exempt_default_route} ∧ matched_reverse_prefix_len(hdr.ipv4.src, ${reverse_routes}) == 0 )
+          ∧ ingress(reverse_route.expected_ingress_ports)
+      )
+    enforced_when: "${urpf_mode} ∈ {strict, feasible_path}"
+    given:
+      reverse_route: by_lpm(hdr.ipv4.src, ${reverse_routes})
+    then:
+      - drop
+    notes: |
+      RFC 3704 §2.2 / §2.3, RFC 2827 §4 — the strict / feasible-path anti-spoof
+      DENY. Drops the packet unless the longest reverse match for its SOURCE
+      exists AND std.ingress_port is a member of that entry's expected-port set
+      (a singleton in strict, a feasible-path SET in feasible_path). `ingress`
+      is the v1.0 port-membership predicate. Fires on: no reverse match
+      (unroutable), or a reverse match whose expected-port set excludes the
+      arrival port (the spoof). The ${exempt_default_route} guard makes a
+      default-only reverse match NOT count as verifiable, so such a packet does
+      NOT drop here (it falls through to the forward) — RFC 3704 §2.2 caveat.
+      Placed before R3 so the spoofed packet never reaches the dst-FIB
+      (drop_precedes_forward).
+
+  - id: R2_urpf_drop_loose
+    when: |
+      header_present(ipv4) ∧ ¬(
+        exists(reverse_route, lpm(hdr.ipv4.src, ${reverse_routes}))
+          ∧ ¬( ${exempt_default_route} ∧ matched_reverse_prefix_len(hdr.ipv4.src, ${reverse_routes}) == 0 )
+      )
+    enforced_when: "${urpf_mode} == loose"
+    given:
+      reverse_route: by_lpm(hdr.ipv4.src, ${reverse_routes})
+    then:
+      - drop
+    notes: |
+      RFC 3704 §2.4 — loose / "any-FIB-match" uRPF DENY. Drops ONLY when the
+      source resolves to NO reverse-FIB entry (unroutable); std.ingress_port is
+      NOT examined. The `ingress(...)` conjunct present in R1 is deliberately
+      ABSENT here — that single omission is the strict↔loose difference the
+      toggle_urpf_to_loose operator moves and the loose_passes_off_path G1 case
+      pins. An off-path-but-routable source that R1 would drop falls through to
+      the forward under loose.
+
+  - id: R3_dst_lpm_forward
+    when: |
+      header_present(ipv4)
+        ∧ exists(forward_route, lpm(hdr.ipv4.dst, ${forward_routes}))
+    given:
+      forward_route: by_lpm(hdr.ipv4.dst, ${forward_routes})
+    then:
+      - set(hdr.ethernet.src, forward_route.port_mac)
+      - set(hdr.ethernet.dst, forward_route.next_hop_mac)
+      - dec(hdr.ipv4.ttl, 1)
+      - forward(forward_route.egress_port)
+    notes: |
+      The ordinary destination forward, reached ONLY for packets that survived
+      the uRPF gate (R1/R2 did not fire under the active mode). LONGEST-prefix
+      match on hdr.ipv4.dst → (egress_port, next_hop_mac); Ether.src ← egress
+      port MAC, Ether.dst ← next-hop MAC; TTL decremented by exactly one; the
+      IPv4 src/dst are PRESERVED (uRPF is a filter, not NAT). The TTL change
+      requires a checksum recompute (implementation responsibility — the same forgotten
+      -checksum bug as P-IPv4Routing).
+
+  - id: R4_no_forward_route
+    when: |
+      header_present(ipv4)
+        ∧ ¬exists(forward_route, lpm(hdr.ipv4.dst, ${forward_routes}))
+    then:
+      - "${default_action}"
+    notes: |
+      A uRPF-VERIFIED packet (R1/R2 did not fire) whose destination matches no
+      forward route is dropped (no 0.0.0.0/0 default present). Distinct from
+      the R1/R2 anti-spoof drop: this is an ordinary no-route miss, and the
+      pass_urpf_then_no_route G2 case separates the two drop causes.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  - id: urpf_strict_port_match
+    clause: stability
+    target: urpf_verdict
+    while: "rule R1 evaluates ∧ ${urpf_mode} ∈ {strict, feasible_path}"
+    enforced_when: "${urpf_mode} ∈ {strict, feasible_path}"
+    notes: |
+      RFC 3704 §2.2/§2.3 — R1 (strict/feasible drop) fires iff the packet does
+      NOT pass; equivalently a packet PASSES iff the longest reverse match for
+      its source exists AND std.ingress_port ∈ that entry's expected-port set.
+      Any other (source, ingress_port) pairing for which a reverse match exists
+      but the port disagrees MUST be dropped. Anti-pattern: keying the reverse
+      check on hdr.ipv4.dst, or ignoring std.ingress_port (that silently
+      degrades strict to loose).
+
+  - id: urpf_loose_routability
+    clause: stability
+    target: urpf_verdict
+    while: "rule R2 evaluates ∧ ${urpf_mode} == loose"
+    enforced_when: "${urpf_mode} == loose"
+    notes: |
+      RFC 3704 §2.4 — in loose mode the verdict is a pure routability test on
+      the source: PASS iff a reverse-FIB entry matches, DROP iff none does,
+      INDEPENDENT of std.ingress_port. A loose implementation that still
+      consults the ingress port is over-strict and fails loose_passes_off_path.
+
+  - id: drop_precedes_forward
+    clause: stability
+    target: forward_decision
+    while: "rule R1 fires ∨ rule R2 fires"
+    notes: |
+      RFC 3704 §3 — the anti-spoof DROP (R1/R2) is strictly upstream of the
+      destination forward (R3): a packet failing uRPF MUST NOT be emitted on
+      ANY egress port, even if its destination has a valid forward route. The
+      first-match rule order (R1/R2 before R3) enforces this. Implementation bug:
+      running the dst-FIB unconditionally and only conditionally suppressing
+      egress lets a spoofed packet leak when the suppression misfires.
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: matched_reverse_and_forward_prefix
+    while: "exists(reverse_route, lpm(hdr.ipv4.src, ${reverse_routes})) ∨ exists(forward_route, lpm(hdr.ipv4.dst, ${forward_routes}))"
+    notes: |
+      Both LPM tables select the LONGEST matching prefix. Using a ternary
+      table without prefix-length priorities selects the wrong reverse entry
+      when source prefixes overlap (e.g. a /24 carved out of a /16 that homes
+      on a different interface) — silently passing a spoof or dropping a
+      legitimate packet.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "rule R3 fires"
+    free_under: []
+    notes: "RFC 3704 — uRPF is a filter, not a translator: addresses MUST NOT change on a verified forward."
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: "TTL decrement on every forward (R3) bounds the path; no recirculation in this pattern."
+
+# ─── Test scaffolding ───────────────────────────────────────────────────────
+
+test_scaffolding:
+
+  G1:
+    - id: pass_strict_on_path_forward
+      generate: |
+        STRICT mode. Install a reverse_route for the source prefix expecting
+        ingress port P, and a forward_route for the destination. Send a packet
+        with that source arriving on port P. Assert: FORWARDED on the dst
+        route's egress; Ether.src ← port_mac; Ether.dst ← next_hop_mac; TTL
+        decremented by 1; src/dst unchanged.
+    - id: drop_strict_off_path
+      generate: |
+        STRICT mode, same reverse_route (expects port P). Send the SAME source
+        arriving on a DIFFERENT port Q ≠ P. Assert DROP (spoofed — the source
+        could not legitimately arrive on Q). RFC 3704 §2.2.
+    - id: loose_passes_off_path
+      requires: "${urpf_mode} == loose"
+      generate: |
+        LOOSE mode. reverse_route for the source expects port P. Send the
+        source arriving on a DIFFERENT port Q. Assert FORWARDED (loose checks
+        only that the source is routable, not the port) — the exact packet
+        that drop_strict_off_path drops. Pins the strict↔loose difference.
+    - id: pass_feasible_path_any_member
+      requires: "${urpf_mode} == feasible_path"
+      generate: |
+        FEASIBLE-PATH mode. reverse_route for the source expects the SET
+        {P, Q}. Send the source once on P and once on Q; assert BOTH forward.
+        Send it on a third port R ∉ {P,Q}; assert DROP. RFC 3704 §2.3.
+    - id: forward_longest_reverse_prefix
+      generate: |
+        Overlapping reverse prefixes (e.g. 10.0.0.0/8 expects port A and
+        10.0.2.0/24 expects port B). STRICT mode. Send a source in 10.0.2.x
+        arriving on B → forward; arriving on A → drop (the /24 wins, not the
+        /8). Tests lpm_longest_match_correctness on the reverse table.
+
+  G2:
+    - id: pass_urpf_then_no_route
+      generate: |
+        Source passes uRPF (on-path in strict, or routable in loose), but its
+        DESTINATION matches no forward_route (no 0.0.0.0/0 default). Assert
+        DROP via R4 — an ordinary no-route miss, distinct from the anti-spoof
+        drop. Confirms the verdict gate and the dst-FIB miss are separable.
+    - id: reverse_fib_capacity_overflow
+      requires: "${reverse_fib_capacity} != unbounded"
+      generate: |
+        Install ${reverse_fib_capacity} reverse_routes, attempt one more;
+        assert the extra install is rejected or evicts (impl-defined), then
+        send a source that would have matched the evicted entry and assert its
+        verdict reflects the now-absent entry (strict/feasible → drop).
+    - id: exempt_default_route_passes_unverifiable
+      requires: "${exempt_default_route}"
+      generate: |
+        Install ONLY a 0.0.0.0/0 reverse default (no specific reverse prefix
+        for the source). Send a source matching only the default. Assert it is
+        PASSED (treated as un-verifiable per RFC 3704 §2.2 caveat) rather than
+        port-checked against the default's nominal ports.
+
+  G3:
+    - id: drop_spoofed_source
+      generate: |
+        THREAT CASE (RFC 2827 §4). reverse_route for legitimate prefix
+        10.0.1.0/24 expects port P. An attacker on port Q forges a source in
+        10.0.1.x. STRICT/feasible: assert DROP (the forged source does not
+        belong behind Q). The headline anti-spoofing property.
+    - id: drop_unroutable_source
+      generate: |
+        Send a source matching NO reverse_route (e.g. a bogon / unallocated
+        prefix). Assert DROP in EVERY mode — strict, feasible_path, AND loose
+        (loose still drops the unroutable). RFC 3704 §2.4.
+    - id: drop_non_ipv4
+      generate: |
+        Send a non-IPv4 frame (ARP / IPv6 / raw ether-type). Assert DROP (R0);
+        the uRPF filter does not pass unparsed traffic to the forwarder.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# ≥5 operators; every harden is paired with an ease on the SAME axis.
+
+mutation_operators:
+
+  # ── strictness axis: strict ↔ loose ──────────────────────────────────────
+  - id: toggle_urpf_to_strict
+    axis: strictness
+    direction: harden
+    applicable_when: "${urpf_mode} == loose"
+    effect: |
+      ${urpf_mode} ← strict ∧ ${faithfulness} ← D5.0_strict_single_homed ∧
+      add the drop_strict_off_path G1 case
+    d_axis_delta: {D7: +1, test_rigor: +1}
+    feasibility_postcondition: |
+      every ${reverse_routes} entry has |expected_ingress_ports| == 1
+    notes: |
+      Harden the verdict: loose (routability only) → strict (port must match).
+      Activates urpf_strict_port_match; the SUT must now consult
+      std.ingress_port, not just the source-FIB match. Reverse of
+      toggle_urpf_to_loose on the same strictness axis.
+
+  - id: toggle_urpf_to_loose
+    axis: strictness
+    direction: ease
+    applicable_when: "${urpf_mode} ∈ {strict, feasible_path}"
+    effect: |
+      ${urpf_mode} ← loose ∧
+      drop the ingress-port term from the pass rule (R2 active, R1 inert) ∧
+      remove the drop_strict_off_path / pass_feasible_path_any_member cases
+    d_axis_delta: {D7: -1}
+    notes: |
+      Ease the verdict: strict/feasible → loose. The SUT no longer needs to
+      check the ingress port, only that the source resolves in the reverse
+      FIB. Activates urpf_loose_routability; the off-path packet that strict
+      dropped now forwards. Reverse of toggle_urpf_to_strict.
+
+  # ── feature-breadth axis: single-port ↔ feasible-path set ─────────────────
+  - id: expand_to_feasible_path
+    axis: feature-breadth
+    direction: harden
+    applicable_when: "${urpf_mode} == strict"
+    effect: |
+      ${urpf_mode} ← feasible_path ∧ ${faithfulness} ← D5.1_feasible_path ∧
+      widen ≥1 reverse_route's expected_ingress_ports to a 2+ port SET ∧
+      add the pass_feasible_path_any_member G1 case
+    d_axis_delta: {D7: +1, D5: +1, test_rigor: +1}
+    feasibility_postcondition: |
+      ∃ reverse_route with |expected_ingress_ports| ≥ 2
+    notes: |
+      Lift single-homed strict → multihomed feasible-path (RFC 3704 §2.3). The
+      verdict becomes set-membership instead of equality, so the implementation must
+      install a (src_prefix, ingress_port) match relation (e.g. one table entry
+      per feasible port, or a bitmap of allowed ports) rather than a single
+      expected-port action param. Reverse of collapse_to_single_homed.
+
+  - id: collapse_to_single_homed
+    axis: feature-breadth
+    direction: ease
+    applicable_when: "${urpf_mode} == feasible_path"
+    effect: |
+      ${urpf_mode} ← strict ∧ ${faithfulness} ← D5.0_strict_single_homed ∧
+      collapse every reverse_route to a single expected_ingress_port ∧
+      remove the pass_feasible_path_any_member case
+    d_axis_delta: {D7: -1, D5: -1}
+    feasibility_postcondition: |
+      every ${reverse_routes} entry has |expected_ingress_ports| == 1
+    notes: |
+      Reverse of expand_to_feasible_path: drop multihoming, return to a single
+      expected port per source prefix (equality check). The reverse table
+      becomes a plain LPM→one-port action.
+
+  # ── strictness axis (default-route caveat): exemption on ↔ off ────────────
+  # NOTE: distinct knob from urpf_mode but on the same strictness dimension —
+  # exempting the default route LOOSENS the check (fewer drops).
+  - id: enable_default_route_exemption
+    axis: strictness
+    direction: ease
+    applicable_when: |
+      ${exempt_default_route} == false ∧ 0.0.0.0/0 ∈ ${reverse_routes}
+    effect: |
+      ${exempt_default_route} ← true ∧
+      add the exempt_default_route_passes_unverifiable G2 case
+    d_axis_delta: {D7: -1}
+    feasibility_postcondition: "0.0.0.0/0 ∈ ${reverse_routes}"
+    notes: |
+      RFC 3704 §2.2 caveat — sources matching only the reverse default are
+      un-verifiable and pass. Loosens the check (more passes), so this is the
+      ease direction. Reverse of disable_default_route_exemption.
+
+  - id: disable_default_route_exemption
+    axis: strictness
+    direction: harden
+    applicable_when: "${exempt_default_route} == true"
+    effect: |
+      ${exempt_default_route} ← false ∧
+      remove the exempt_default_route_passes_unverifiable case
+    d_axis_delta: {D7: +1, test_rigor: +1}
+    notes: |
+      Treat the reverse default as a real path: a default-only source must now
+      satisfy the active mode's check (strict port-match or loose routability)
+      instead of being waved through. Tightens the filter. Reverse of
+      enable_default_route_exemption.
+
+  # ── workload axis: flat ↔ overlapping reverse prefixes ────────────────────
+  - id: inflate_reverse_fib_overlapping
+    axis: workload
+    direction: harden
+    applicable_when: "'forward_longest_reverse_prefix_stress' ∉ test_scaffolding.G1"
+    effect: |
+      Generate ${reverse_routes} so ≥30% of source prefixes overlap (a /8 plus
+      several /16s and /24s within it, homing on DIFFERENT ingress ports) ∧
+      add G1 test `forward_longest_reverse_prefix_stress` requiring 3 levels of
+      reverse-LPM tie-break.
+    d_axis_delta: {D2: +1, test_rigor: +1}
+    feasibility_postcondition: "${reverse_fib_capacity} ≥ 64 ∨ ${reverse_fib_capacity} == unbounded"
+    notes: |
+      Stresses lpm_longest_match_correctness on the REVERSE table — the subtle
+      case where a more-specific source prefix homes on a different interface
+      than its covering aggregate. Reverse of flatten_reverse_fib.
+
+  - id: flatten_reverse_fib
+    axis: workload
+    direction: ease
+    applicable_when: |
+      ∃ overlapping prefixes in ${reverse_routes}
+    effect: |
+      Regenerate ${reverse_routes} as disjoint, non-overlapping source prefixes
+      (no prefix is contained in another) ∧ remove any
+      forward_longest_reverse_prefix_stress case.
+    d_axis_delta: {D2: -1}
+    notes: |
+      Reverse of inflate_reverse_fib_overlapping: a flat reverse FIB removes
+      the LPM tie-break burden — any reasonable match strategy yields the right
+      verdict. Eases the workload axis.
+
+  # ── capacity axis: shrink ↔ enlarge the reverse FIB ───────────────────────
+  - id: shrink_reverse_fib_capacity_4x
+    axis: capacity
+    direction: harden
+    applicable_when: "${reverse_fib_capacity} ≠ unbounded ∧ ${reverse_fib_capacity} > 64"
+    effect: "${reverse_fib_capacity} ← ${reverse_fib_capacity} / 4"
+    d_axis_delta: {D2: +1}
+    feasibility_postcondition: "${reverse_fib_capacity} ≥ 16"
+    notes: |
+      Tighten the reverse-FIB capacity axis; the implementation can no longer assume an
+      unbounded TCAM for the anti-spoof table. Reverse of
+      enlarge_reverse_fib_capacity_2x.
+
+  - id: enlarge_reverse_fib_capacity_2x
+    axis: capacity
+    direction: ease
+    applicable_when: "${reverse_fib_capacity} ≠ unbounded ∧ ${reverse_fib_capacity} < 524288"
+    effect: "${reverse_fib_capacity} ← ${reverse_fib_capacity} * 2"
+    d_axis_delta: {D2: -1}
+    feasibility_postcondition: "${reverse_fib_capacity} ≤ 1048576"
+    notes: |
+      Reverse of shrink_reverse_fib_capacity_4x: relax the reverse-FIB capacity
+      bound, easing the capacity axis.
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations to v1model P4:
+
+    Canonical (urpf_mode: strict, single-homed, no default exemption):
+      - Parser: select(etherType) — 0x0800 → parse_ipv4, else accept with
+        ipv4 invalid (R0 drops via the pre-check gate).
+      - Reverse table `urpf_check`: LPM on hdr.ipv4.srcAddr → action
+        set_expected_port(port): meta.expected_ingress_port = port. A miss
+        (no reverse match) defaults to "no expected port" → drop.
+      - Verdict gate: if (meta.matched_reverse &&
+        std.ingress_port == meta.expected_ingress_port) proceed; else
+        mark_to_drop. In loose mode the gate is just (meta.matched_reverse).
+      - Forward table `ipv4_fib`: LPM on hdr.ipv4.dstAddr → action
+        ipv4_forward(port, port_mac, next_hop_mac): egress_spec=port;
+        Ether.src=port_mac; Ether.dst=next_hop_mac; ipv4.ttl=ipv4.ttl-1.
+      - MyComputeChecksum: incremental update for the TTL change (the same
+        forgotten-checksum bug as P-IPv4Routing).
+
+    Feasible-path / multihomed (urpf_mode: feasible_path):
+      - Either (a) a two-field exact/ternary entry per (src_prefix,
+        allowed_ingress_port) so a source with K feasible ports installs K
+        entries, OR (b) the action stores an allowed-port BITMAP and the gate
+        tests (bitmap >> std.ingress_port) & 1. Equality-on-single-port is the
+        strict special case.
+
+  Anti-pattern implementations to reject:
+    * Keying the reverse check on hdr.ipv4.dstAddr (that is just the forward
+      FIB again — no anti-spoofing happens).
+    * Ignoring std.ingress_port in strict mode (silently degrades strict to
+      loose; drop_strict_off_path catches it).
+    * Running the forward FIB unconditionally and only suppressing egress on a
+      uRPF fail — a misfire leaks a spoofed packet (drop_precedes_forward).
+    * Consulting the ingress port in loose mode (over-strict;
+      loose_passes_off_path catches it).
+    * Ternary instead of LPM on the source address — wrong reverse entry wins
+      under overlapping prefixes.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance and
+  hand-run the public tests through the oracle for the seed. The strict /
+  loose / feasible_path verdict for each (source, ingress_port) pair is the
+  load-bearing expectation — confirm the oracle reads ${urpf_mode} from
+  runtime state (parametric-source contract) so a single audited oracle serves
+  all three modes via parameter rebinding.

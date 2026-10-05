@@ -1,0 +1,1522 @@
+# P-TelemetryRouter — Edge: IPv4 Unicast Router ∘ INT Metadata Stamping (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-IPv4Routing (destination-based LPM
+# forwarder, RFC 1812) with P-INTMetadata (per-hop In-band Network
+# Telemetry metadata stamping, p4.org INT-MD spec) into a single
+# telemetry-stamping router — the "tap-and-forward" edge switch that
+# stamps every routed packet with INT metadata reflecting its OWN
+# routing decision and then forwards it on the FIB-resolved egress port.
+#
+# The value of this *chained* pattern (versus instantiating P-IPv4Routing
+# and P-INTMetadata independently) is the STAGE-ORDERING / CROSS-CUTTING
+# contract between the stamp stage and the route stage — a contract that
+# is invisible when the components are tested in isolation:
+#   (a) the metadata slot's egress_port (and any egress-derived field such
+#       as hop_latency / egress_ts) MUST equal the FIB-computed egress
+#       port — the stamp READS the routing decision, so it must run AFTER
+#       the FIB resolves egress_spec, not before (stamp_reflects_routing_decision);
+#   (b) the source/transit push grows ipv4.totalLen by the inserted INT
+#       bytes AND the route stage decrements TTL, so the IPv4 header
+#       checksum must be recomputed EXACTLY ONCE over BOTH changes
+#       (stamp_grows_length_single_checksum);
+#   (c) the TTL is decremented EXACTLY ONCE even though both stages touch
+#       the packet (ttl_decrement_once_across_stages);
+#   (d) a packet the FIB drops (no-route / TTL-exhausted / broadcast /
+#       martian) MUST be dropped WITHOUT an INT shim emitted — no telemetry
+#       leak on the drop path (non_routed_not_stamped).
+# See `bridging_notes:` for the v1model failure modes this composition
+# exposes that neither standalone pattern reaches.
+#
+# The cross-axis
+# `composition` target_capability tag is used because this
+# NF chains two distinct programmable primitives — P-IPv4Routing (redesign
+# of the fixed-function L3 forwarder) and P-INTMetadata (scale_up of the
+# ASIC telemetry primitive by per-packet stamping) — into a single composed
+# NF whose structural failure modes are stamp↔route ordering interactions,
+# not the per-stage failures of either constituent.
+
+pattern_id: P-TelemetryRouter
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D5:routing, D4:telemetry]           # composed NF straddles destination-based forwarding and telemetry
+  prescriptive: [P1:forwarding, P9:telemetry]        # LPM forwarder ∘ per-hop INT metadata stamping
+target_capability: composition                          # chained composition of two primitives; failure modes are stamp↔route stage-ordering, cross-cutting
+summary: >
+  Telemetry-stamping edge router composing per-hop In-band Network
+  Telemetry (INT) metadata stamping with an IPv4 unicast LPM forwarder in a
+  single pipeline pass. An ingress IPv4 packet is routed by a control-plane
+  FIB (longest-prefix-match → TTL decrement → Ethernet rewrite), and on the
+  forwarded path the switch — playing an INT source / transit / sink role —
+  stamps a per-hop metadata slot whose egress_port (and egress-derived
+  fields) reflect the FIB's routing decision, decrements the INT
+  remaining-hop-count, and (at a sink) strips the INT stack and emits a
+  telemetry report on a dedicated collector port while the original packet
+  continues to its routed egress. The composition's load-bearing contract
+  is stamp↔route ordering: the stamp reads the routing decision (so it runs
+  AFTER the FIB), the source/transit push grows ipv4.totalLen while the
+  route decrements TTL (so the checksum is recomputed exactly once over
+  both), TTL is decremented exactly once across the two stages, and a
+  packet the FIB drops is never stamped. Faithfulness ladder: D5.0 INT-MD
+  source stamp + single-next-hop static FIB → D5.1 + ECMP routing and/or
+  transit append and/or wider metadata → D5.2 + sink strip-report-route
+  dual output and/or INT-MX out-of-band export. The parameter-rebinding mutation surface
+  lifts the INT role / metadata breadth / hop-count budget / sample rate /
+  timestamp width / conditional emit and the FIB capacity / multipath mode
+  / hash family / martian filtering independently, so the same composed
+  oracle covers everything from a 3-field single-slot source tap over a
+  3-prefix FIB to a multi-role INT-MX switch over an ECMP-distributed
+  scaled FIB.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: marple_sigcomm17
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-INTMetadata. Marple (SIGCOMM 2017) harvests
+        per-packet performance metadata — ingress / egress times, queue
+        occupancies, hop latencies — at line rate, which is exactly the
+        per-hop metadata-field set the INT-MD stamp emits in this
+        composition. The composition's signature
+        stamp_reflects_routing_decision invariant binds that field set to
+        the FIB-resolved egress port; Marple grounds the
+        `metadata_fields` parameter's value list (the fields that can be
+        stamped on the routed path).
+
+    - cite: pint_sigcomm20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-INTMetadata. PINT (SIGCOMM 2020) bounds the
+        per-packet telemetry overhead by sampling / coding; cited here as
+        the motivation for the `sample_rate` parameter (which routed
+        packets are stamped) and the `faithfulness: D5.2_int_mx_or_sink`
+        out-of-band-export mode. On the routed path, sampling decides
+        which forwarded packets carry an INT slot — and the deparser MUST
+        NOT leak an INT shim onto the unsampled-but-routed packets, the
+        composed conditional-deparser surface.
+
+    - cite: contra_nsdi20
+      role: scaling_approach
+      relevance: |
+        Inherited from P-IPv4Routing. Contra (NSDI 2020) documents the
+        realistic FIB scales (10²–10⁴ prefixes per switch) that motivate
+        the `fib_capacity` parameter and the `shrink_fib_capacity_4x`
+        harden operator on the routing half of this composition. Cited as
+        the engineering ceiling for scaled-FIB instances.
+
+  rfcs:
+    - id: RFC1812
+      sections: ["4.2.2", "5.2.1", "5.2.2", "5.3.1", "5.3.4", "5.3.5", "5.3.7"]
+      role: canonical_spec
+      quote: "When a router forwards a packet, it MUST reduce the TTL by at least one."
+      relevance: |
+        Inherited from P-IPv4Routing. Requirements for IP Version 4
+        Routers — canonical for the routing half AND for the composition's
+        stamp↔route ordering contract:
+          - §5.2.1   Forwarding algorithm step ordering (validate →
+                     forward decision → TTL → checksum → L2 rewrite →
+                     transmit). In this composition the INT stamp is
+                     interposed AFTER the forward decision is resolved (so
+                     it can read the egress port) and BEFORE the checksum
+                     is finalised (so the totalLen growth and TTL change
+                     fold into one recompute).
+          - §5.2.2.5 Header-checksum recompute when the header changes —
+                     basis for stamp_grows_length_single_checksum and
+                     ip_checksum_validity.
+          - §5.3.1   TTL decrement-by-one and TTL-exhausted discard —
+                     basis for R2 and ttl_decrement_once_across_stages.
+          - §4.2.2.9 / §5.3.4 Longest-prefix-match FIB semantics, no-route
+                     ⇒ drop — basis for R5/R7/R8 and
+                     lpm_longest_match_correctness.
+          - §5.3.7   Martian source filtering — basis for R4 (guard-gated).
+          - §5.3.5   Limited-broadcast discard — basis for R3.
+
+    - id: RFC2992
+      sections: ["1", "2.2", "3"]
+      role: normative_behaviour
+      relevance: |
+        Inherited from P-IPv4Routing. Hash-threshold ECMP keys a flow on
+        the 5-tuple and pins every packet of one flow to one next-hop
+        (§2.2) — the binding property `ecmp_flow_consistency` enforces on
+        the routed path when `multipath_mode != none`. Enumerates the hash
+        families the `hash_algo` parameter and `swap_hash_to_xor_fold`
+        operator target. In the composition the chosen ECMP next-hop is
+        ALSO what the INT slot's egress_port must reflect — so the stamp
+        must read the post-ECMP egress, not the LPM-group base.
+
+  tutorials:
+    - path: tutorials/exercises/basic
+      role: baseline_topology
+      relevance: |
+        Inherited from P-IPv4Routing. The canonical p4lang/tutorials
+        "basic" exercise — a 3-host / single-switch topology with a single
+        LPM table on hdr.ipv4.dstAddr whose action rewrites Ethernet
+        src/dst, decrements TTL, and forwards to the matched egress port.
+        Supplies the routing-stage topology and L2-rewrite convention this
+        composition layers the INT stamp on top of.
+
+
+  posts:
+    - url: https://github.com/p4lang/p4-applications/blob/master/telemetry/specs/INT.mdk
+      role: normative_behaviour
+      section: "INT dataplane specification — roles, modes, hop-count, sink"
+      relevance: |
+        Inherited from P-INTMetadata. The p4.org INT dataplane
+        specification defines the three roles (Source, Transit, Sink) and
+        the per-hop metadata field set (Node ID, ingress / egress
+        interface, ingress / egress timestamp, hop latency, egress TX link
+        utilisation, queue / buffer occupancy). The "egress interface"
+        field is the one this composition binds to the FIB egress decision
+        (stamp_reflects_routing_decision). The clause "Each transit node
+        must decrement the Remaining Hop Count field appropriately"
+        underpins no_orphan_hop_count on the routed transit path.
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      Atomic; the INT mechanism is per-packet stateless and the FIB
+      forwarder derives every decision from hdr.ipv4 fields,
+      std.ingress_port, and the control-plane tables. The composition is a
+      pure two-stage *pipeline* (route-decision → stamp), distinct from
+      P-StatefulFW-NAT44 whose composition value is a shared stateful
+      entity. The load-bearing per-packet datum that crosses the stage
+      boundary is the FIB-resolved egress port, which the stamp stage
+      reads.
+
+  route:                                   # plays the TPL `bucket` role — prefix / class
+    keyed_by_lpm: hdr.ipv4.dst
+    attrs:
+      nexthop_group_id: int
+      prefix_len:       int               # for tie-break diagnostics; the LPM primitive selects longest
+    capacity: ${fib_capacity}
+    notes: |
+      A FIB entry (reused from P-IPv4Routing). The LPM table is keyed on
+      the destination address; the matched entry yields a
+      nexthop_group_id. The resolved egress port is what the INT slot's
+      egress_port field must equal.
+
+  nexthop_group:                           # also a `bucket` — a set of one or more next-hops
+    keyed_by_tuple: [group_id]
+    attrs:
+      nexthops:   "list[(egress_port: port, next_hop_mac: address, weight: int)]"
+      port_mac:   "list[address]"          # per-egress source MAC for the L2 rewrite
+    notes: |
+      A multipath group (reused from P-IPv4Routing). Singletons
+      (|nexthops| == 1) handle non-ECMP routes; |nexthops| > 1 enables
+      ECMP picking per ${multipath_mode}. The post-ECMP egress is the
+      stamped egress_port.
+
+  flow:
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.ipv4.proto
+      - meta.l4_srcPort
+      - meta.l4_dstPort
+    enforced_when: "${multipath_mode} != none ∨ ${sample_rate} > 1"
+    notes: |
+      Flow tuple used (a) by ECMP hashing on the routed path to pin every
+      packet of one flow onto one next-hop (RFC 2992 §2.2), and (b) by the
+      INT source's sampling decision (hash(5tuple) mod sample_rate). Not
+      materialised as data-plane state; both hashes are recomputed per
+      packet.
+
+  link:                                    # plays the TPL `link` role — per-egress-port state
+    keyed_by_tuple: [egress_port]
+    attrs:
+      tx_utilisation: int                  # harness-supplied; consulted by the egress_tx_util metadata field if enabled
+    notes: |
+      Per-egress-port state the stamp stage *reads* to populate certain
+      metadata fields (egress_tx_utilisation). Not written by the pattern;
+      the harness supplies it as standard-metadata-equivalent attributes.
+      Reused from P-INTMetadata. The egress port whose state is read is the
+      FIB-resolved egress — another facet of stamp_reflects_routing_decision.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+# Two parameter families — INT (role / metadata_* / sample_* / report_*) and FIB
+# (routes / fib_* / multipath / hash / martian). No name collides between the two
+# halves except `faithfulness`, which is composed (derived) below.
+
+parameters:
+
+  # ── INT stamp stage (from P-INTMetadata) ─────────────────────────────────
+
+  role:
+    type: enum
+    values: [source, transit, sink, source_and_sink, multi]
+    default: source
+    notes: |
+      Which INT role(s) this router plays on the forwarded path. Anchor is
+      `source`: every routed IPv4 packet gains a one-slot INT stamp
+      reflecting its FIB egress, then forwards (single output — the
+      cleanest "telemetry tap" router). `transit` appends to an existing
+      stack and routes; `sink` strips + reports + routes (dual output);
+      `source_and_sink` does both on a single switch; `multi` dispatches
+      per ingress port. Per the INT spec a device "can play one or more
+      roles".
+
+  metadata_fields:
+    type: list[str]
+    constraint: |
+      non-empty list whose elements are each drawn from the 9-value
+      field-set enum {switch_id, ingress_ts, egress_ts, hop_latency,
+      queue_id, queue_depth, egress_tx_util, ingress_port, egress_port};
+      no duplicates; ordering is the on-wire stamp order. MUST contain
+      egress_port whenever the seed intends to exercise
+      stamp_reflects_routing_decision directly (the anchor includes it).
+    default: [switch_id, egress_port, egress_ts]
+    notes: |
+      Which per-hop metadata fields to stamp. The anchor set deliberately
+      includes egress_port so the signature stamp↔route binding is
+      directly observable. `expand_metadata_fields` widens it;
+      `shrink_metadata_fields` narrows it.
+
+  max_hop_count:
+    type: int
+    range: "[1, 16]"
+    default: 8
+    notes: |
+      Initial remaining-hop-count the source seeds into the INT shim. A
+      transit that decrements it to zero MUST NOT append further metadata
+      (INT.mdk; no_orphan_hop_count). `shrink_max_hop_count_2x` surfaces
+      the routed overflow-passthrough rule R10.
+
+  sample_rate:
+    type: int
+    range: "[1, 1024]"
+    default: 1
+    notes: |
+      Stamp every Nth routed packet at the source. `sample_rate = 1`
+      stamps every routed packet (anchor); higher values exercise the
+      conditional-deparser surface — an unsampled packet is STILL routed
+      but MUST NOT carry an INT shim. `increase_sample_rate_4x` hardens it.
+
+  bit_width_timestamp:
+    type: enum
+    values: [32, 48]
+    default: 48
+    notes: |
+      Bit-width on the ingress_ts / egress_ts metadata fields. v1model's
+      ingress_global_timestamp is 48 bits; a `(bit<32>)` cast silently
+      drops the upper 16. `truncate_timestamp_to_32bit` surfaces this with
+      a corresponding G3 test. Reused from P-INTMetadata.
+
+  conditional_emit_predicate:
+    type: enum
+    values: [always, hop_latency_exceeds_threshold, queue_depth_exceeds_threshold, none]
+    default: always
+    enforced_when: "${role} ∈ {sink, source_and_sink, multi}"
+    notes: |
+      What the SINK reports on. `always` (anchor): every INT-bearing
+      routed packet triggers a telemetry report. The threshold predicates
+      lift to congestion-monitoring deployment and exercise the
+      conditional-deparser surface (the report's emit is gated on the
+      threshold check). `none` strips but does not report. Reused from
+      P-INTMetadata.
+
+  report_threshold:
+    type: int
+    range: "[0, 1000000000]"
+    default: 0
+    enforced_when: "${conditional_emit_predicate} ∈ {hop_latency_exceeds_threshold, queue_depth_exceeds_threshold}"
+    notes: |
+      Threshold the conditional emit predicate compares against (ns for
+      hop_latency, queue-depth cells for queue_depth). Anchor pins it to 0
+      with predicate `always`.
+
+  report_port:
+    type: port
+    default: 99
+    enforced_when: "${role} ∈ {sink, source_and_sink, multi}"
+    notes: |
+      Egress port the sink emits the telemetry report on (a collector
+      port the harness configures). DISTINCT from the FIB-routed egress
+      the stripped original packet exits on — the composition's
+      sink_strips_then_routes invariant asserts BOTH outputs on different
+      ports. Reused from P-INTMetadata.
+
+  # ── FIB / routing stage (from P-IPv4Routing) ─────────────────────────────
+
+  routes:
+    type: list[route_entry]
+    constraint: |
+      every entry has prefix:ipv4_cidr, prefix_len ∈ [0, 32],
+      nexthop_group_id:int; LPM relation well-formed (no two entries share
+      both prefix AND prefix_len). A default route is 0.0.0.0/0.
+    notes: |
+      Control-plane-installed FIB. The matched entry's resolved egress is
+      what the INT slot's egress_port reflects.
+
+  nexthop_groups:
+    type: dict[int, nexthop_group_t]
+    constraint: "every value has |nexthops| ≥ 1; weights are positive ints"
+
+  fib_capacity:
+    type: int | unbounded
+    range: "[16, 1048576]"
+    default: unbounded
+    notes: |
+      Maximum number of FIB route entries. `shrink_fib_capacity_4x`
+      exercises this axis (Contra-realistic 10⁴ → 256). Reused from
+      P-IPv4Routing.
+
+  max_nexthop_group_size:
+    type: int
+    range: "[1, 64]"
+    default: 1
+    notes: |
+      Largest ECMP group size the FIB can host. Drives ECMP scaffolding
+      and the implementation's group-indexing structure. Reused from P-IPv4Routing.
+
+  multipath_mode:
+    type: enum
+    values: [none, ecmp_hash_3tuple, ecmp_hash_5tuple]
+    default: none
+    notes: |
+      none → singleton next-hops only (anchor). ecmp_hash_3tuple /
+      ecmp_hash_5tuple → hash-based ECMP. WCMP and ICMP origination are out
+      of scope for this composition (kept on standalone P-IPv4Routing) to
+      bound the composed oracle surface.
+
+  hash_algo:
+    type: enum
+    values: [crc16, crc32, xor_fold]
+    default: crc16
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      Hash family used by ECMP on the routed path. xor_fold is the
+      weakest, used by `swap_hash_to_xor_fold` to harden hash quality.
+      Reused from P-IPv4Routing.
+
+  martian_filter_enabled:
+    type: bool
+    default: false
+    notes: |
+      RFC 1812 §5.3.7 source-address filtering on the routed path. When
+      true, R4 drops packets with source ∈ {127.0.0.0/8, 0.0.0.0/8,
+      224.0.0.0/4, 255.255.255.255} — and they are NEVER stamped (the
+      drop precedes the stamp). Reused from P-IPv4Routing.
+
+  # ── Composition (derived) ────────────────────────────────────────────────
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_int_md_static_route       # anchor — INT-MD source stamp + single-next-hop FIB
+      - D5.1_int_md_ecmp_route         # + ECMP routing and/or transit append and/or wider metadata
+      - D5.2_int_mx_or_sink_route      # + sink strip-report-route dual output and/or INT-MX out-of-band export
+    default: D5.0_int_md_static_route
+    notes: |
+      Composition faithfulness ladder. DERIVED from
+      (role, multipath_mode, int_mx mode): enable_ecmp_5tuple,
+      lift_role_to_sink, and lift_to_int_mx advance it as a side-effect; it
+      is not moved by a standalone operator. D5.0 is the clean source-tap
+      router (route → stamp one slot → forward); D5.1 adds ECMP flow
+      consistency and the transit-append-then-route path; D5.2 adds the
+      sink dual-output (strip + report + route) and INT-MX out-of-band
+      export — the composition's strongest stage interactions.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The packet flows ROUTE-DECISION → STAMP:
+# validity / TTL / broadcast / martian / no-route guards are hoisted FIRST (a
+# guarded packet drops regardless of INT role, and MUST NOT be stamped), then the
+# routed paths fuse the INT role action (source push | transit append | sink
+# strip-report) with the FIB forward. The stamp always reads the FIB-resolved
+# egress port — so in every routed rule the metadata slot's egress_port is the
+# port the forward(...) targets.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP, any non-IPv4 ether-type — dropped, never stamped.
+      The routing stage is IPv4-only and the INT shim is layered over the
+      IPv4 packet. Lifted from P-IPv4Routing R0 / P-INTMetadata R0. G3
+      parser-edge / conditional-deparser anchor (a dropped packet must
+      carry no INT bytes).
+
+  - id: R1_invalid_header_drop
+    when: |
+      header_present(ipv4) ∧ (
+        hdr.ipv4.version ≠ 4
+        ∨ hdr.ipv4.ihl < 5
+        ∨ hdr.ipv4.totalLen < (hdr.ipv4.ihl * 4)
+        ∨ ¬checksum_valid(ipv4)
+      )
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.2.2 IP header validation — lifted from P-IPv4Routing R1.
+      A malformed header is neither routed nor stamped.
+
+  - id: R2_ttl_exhausted_drop
+    when: "header_present(ipv4) ∧ hdr.ipv4.ttl ≤ 1"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.1 — TTL-exhausted discard, lifted from P-IPv4Routing
+      R2. Hoisted above the stamp: a TTL≤1 packet drops and MUST NOT be
+      stamped (non_routed_not_stamped). ICMP origination is out of scope.
+
+  - id: R3_limited_broadcast_dst_drop
+    when: "header_present(ipv4) ∧ hdr.ipv4.dst == 255.255.255.255"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.1 — limited-broadcast destination MUST be discarded.
+      Lifted from P-IPv4Routing R5; dropped (not stamped) before any role
+      action.
+
+  - id: R4_martian_src_drop
+    when: |
+      header_present(ipv4) ∧
+      (  match(hdr.ipv4.src, 127.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 0.0.0.0/8)
+       ∨ match(hdr.ipv4.src, 224.0.0.0/4)
+       ∨ hdr.ipv4.src == 255.255.255.255
+      )
+    enforced_when: "${martian_filter_enabled}"
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.7 — source-address filtering on the routed path,
+      lifted from P-IPv4Routing R6 (guard-gated). A martian-source packet
+      is never routed and never stamped.
+
+  - id: R5_no_route_drop
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      hdr.ipv4.dst ≠ 255.255.255.255 ∧
+      ¬is_directed_broadcast(hdr.ipv4.dst) ∧
+      ¬exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.4 — a validated packet with no matching FIB route
+      (including no 0.0.0.0/0 default) is dropped at the routing stage and
+      MUST NOT be stamped. The composition's `non_routed_not_stamped`
+      anchor on the no-route branch: a stamp-before-route implementation would
+      have already pushed an INT shim by the time the FIB misses.
+
+  - id: R6_directed_broadcast_dst_drop
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      is_directed_broadcast(hdr.ipv4.dst)
+    then:
+      - drop
+    notes: |
+      RFC 1812 §5.3.5.2 — directed broadcasts SHOULD NOT be forwarded by
+      default; dropped, not stamped. Lifted from P-IPv4Routing R7.
+
+  - id: R7_source_push_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      ¬header_present(int_shim) ∧
+      ${role} ∈ {source, source_and_sink, multi} ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes})) ∧
+      match(hash(packet.5tuple) mod ${sample_rate}, 0)
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - set(hdr.int_shim.remaining_hop_count, ${max_hop_count})
+      - set(hdr.int_shim.instruction_bitmap, bitmap_of(${metadata_fields}))
+      - emit(int_metadata_slot(${metadata_fields},
+                               std.ingress_global_timestamp,
+                               nexthop_group.nexthops[i].egress_port,
+                               std.enq_qdepth))
+      - dec(hdr.int_shim.remaining_hop_count, 1)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Source push THEN route — the FIB resolves the egress index i FIRST,
+      then the INT slot is stamped with egress_port == the resolved
+      nexthop egress (NOT std.ingress_port, NOT a pre-FIB egress_spec) —
+      the composition's signature stamp_reflects_routing_decision binding.
+      TTL is decremented exactly once; the IPv4 totalLen grows by the INT
+      shim+slot bytes; the header checksum is recomputed once over BOTH
+      (stamp_grows_length_single_checksum). `nexthop_index_for` collapses
+      to i=0 when multipath_mode == none. Subsumes P-IPv4Routing R3 fused
+      with P-INTMetadata R2.
+
+  - id: R8_source_sample_skip_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      ¬header_present(int_shim) ∧
+      ${role} ∈ {source, source_and_sink, multi} ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes})) ∧
+      ¬match(hash(packet.5tuple) mod ${sample_rate}, 0)
+    enforced_when: "${sample_rate} > 1"
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Sample-skip THEN route — a routed packet NOT selected for stamping
+      is forwarded normally with NO INT shim. The deparser MUST NOT emit
+      an INT shim on this path (the common v1model conditional-deparser leak in
+      composed form). Only active when sample_rate > 1; at the anchor
+      (sample_rate == 1) every routed packet is stamped by R7.
+
+  - id: R9_transit_append_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      header_present(int_shim) ∧
+      ${role} ∈ {transit, multi} ∧
+      value(hdr.int_shim.remaining_hop_count, >, 0) ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - emit(int_metadata_slot(${metadata_fields},
+                               std.ingress_global_timestamp,
+                               nexthop_group.nexthops[i].egress_port,
+                               std.enq_qdepth))
+      - dec(hdr.int_shim.remaining_hop_count, 1)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Transit append THEN route — the transit appends its own metadata
+      slot (egress_port == this hop's FIB egress) and decrements the INT
+      hop count, then routes. Only fires when remaining_hop_count > 0 (R10
+      overflow guard takes precedence). Subsumes P-INTMetadata R4 fused
+      with P-IPv4Routing R3.
+
+  - id: R10_transit_overflow_passthrough_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      header_present(int_shim) ∧
+      ${role} ∈ {transit, multi} ∧
+      value(hdr.int_shim.remaining_hop_count, ==, 0) ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes}))
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      INT.mdk overflow guard fused with routing: when remaining_hop_count
+      is exhausted the transit MUST NOT append further metadata, but the
+      packet is STILL routed normally. no_orphan_hop_count depends on this.
+      Subsumes P-INTMetadata R3 fused with P-IPv4Routing R3.
+
+  - id: R11_sink_emit_strip_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      header_present(int_shim) ∧
+      ${role} ∈ {sink, source_and_sink, multi} ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes})) ∧
+      value(${conditional_emit_predicate}_witness(stack), ==, true)
+    enforced_when: "${conditional_emit_predicate} ≠ none"
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    then:
+      - emit(telemetry_report(hdr.int_metadata_stack))
+      - forward(${report_port})
+      - set(hdr.int_shim.is_valid, false)
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    notes: |
+      Sink emit-strip THEN route — TWO outputs from one input: a telemetry
+      report on ${report_port} (the assembled stack) AND the original
+      packet, INT shim STRIPPED, routed on its FIB egress with TTL
+      decremented and L2 rewritten. The stripped copy's totalLen shrinks
+      back by the removed INT bytes and the checksum is recomputed once
+      over the strip + TTL change. sink_strips_then_routes anchors on this.
+      Subsumes P-INTMetadata R5 fused with P-IPv4Routing R3.
+
+  - id: R12_sink_strip_only_and_route
+    when: |
+      header_present(ipv4) ∧ hdr.ipv4.ttl > 1 ∧
+      header_present(int_shim) ∧
+      ${role} ∈ {sink, source_and_sink, multi} ∧
+      exists(route, lpm(hdr.ipv4.dst, ${routes})) ∧
+      value(${conditional_emit_predicate}_witness(stack), ==, false)
+    then:
+      - set(hdr.int_shim.is_valid, false)
+      - "i ← nexthop_index_for(flow, nexthop_group, ${multipath_mode}, ${hash_algo})"
+      - dec(hdr.ipv4.ttl, 1)
+      - set(hdr.ethernet.src, nexthop_group.port_mac[i])
+      - set(hdr.ethernet.dst, nexthop_group.nexthops[i].next_hop_mac)
+      - forward(nexthop_group.nexthops[i].egress_port)
+    given:
+      route:          by_lpm(hdr.ipv4.dst, ${routes})
+      nexthop_group:  by_key(route.nexthop_group_id)
+      flow:           deduce_from_packet                   IF ${multipath_mode} != none
+    notes: |
+      Sink strip-without-report THEN route — the emit predicate did not
+      fire (e.g., hop_latency below threshold). The sink still removes the
+      INT shim/stack (the downstream consumer must NOT see INT headers)
+      and routes the original on its FIB egress, but emits NO telemetry
+      report. Catches implementations that gate the strip on the same predicate
+      that gates the emit, leaking INT shims downstream when the threshold
+      isn't breached. Subsumes P-INTMetadata R6 fused with P-IPv4Routing R3.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  # ── Composition-specific (the stamp↔route ordering contract) ─────────────
+
+  - id: stamp_reflects_routing_decision
+    clause: stability
+    target: int_metadata_slot.egress_port
+    while: "R7 ∨ R9 fires (a stamped + routed path)"
+    enforced_when: "egress_port ∈ ${metadata_fields}"
+    notes: |
+      The composition's SIGNATURE invariant. The egress_port stamped into
+      the INT metadata slot (and any egress-derived field — hop_latency,
+      egress_tx_util, egress_ts) MUST equal the FIB-resolved egress port
+      the packet is forwarded on. Catches the dominant composition bug:
+      stamping the INT slot BEFORE the FIB resolves egress_spec (so the
+      stamped port is zero / stale / the ingress port). Invisible in either
+      standalone pattern — P-INTMetadata stamps std.egress_spec without a
+      real FIB behind it; P-IPv4Routing has no INT slot to bind. The
+      cross-stage read-after-write ordering contract.
+
+  - id: stamp_grows_length_single_checksum
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ (R7 ∨ R9) fires (source/transit push, routed)"
+    notes: |
+      On the source-push / transit-append path the IPv4 packet changes in
+      TWO places in one pass — ipv4.totalLen grows by the inserted INT
+      shim+slot bytes AND ipv4.ttl decrements at the routing stage. The
+      egress header checksum MUST be valid over BOTH changes (single
+      recompute). This is the common v1model #1-silent-failure "checksum after
+      modification" pattern in its composed form: an implementation that recomputes
+      after the TTL decrement but before the length growth (or in two
+      separate update_checksum blocks that clobber each other) emits a
+      stale checksum BMv2 forwards but real peers reject. The single most
+      valuable invariant this composition adds over its constituents.
+
+  - id: ttl_decrement_once_across_stages
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "R7 ∨ R8 ∨ R9 ∨ R10 ∨ R11 ∨ R12 fires (any forwarded path)"
+    notes: |
+      RFC 1812 §5.3.1 — TTL decremented by EXACTLY one per forward, on
+      EVERY routed path, even though both the INT stamp stage and the FIB
+      stage touch the packet. Catches double-decrement (e.g., a TTL-- in
+      an INT-role action AND in an inherited router-forward block). The
+      composed sharpening of P-IPv4Routing's ttl_quantum_one.
+
+  - id: sink_strips_then_routes
+    clause: stability
+    target: routed_egress_packet
+    while: "R11 ∨ R12 fires (sink path, routed)"
+    enforced_when: "${role} ∈ {sink, source_and_sink, multi}"
+    notes: |
+      On the sink path the routed (downstream) copy MUST carry NO valid
+      INT shim/stack AND MUST egress on the FIB-resolved port (NOT
+      ${report_port}); the telemetry report (R11 only) is a SEPARATE output
+      on ${report_port}. Catches conflating the report port with the routed
+      egress, leaving the INT shim on the routed copy, or routing the
+      report instead of the original. The composed analogue of
+      P-INTMetadata's sink_strips_shim, sharpened by a real FIB egress
+      decision the routed copy must honour.
+
+  - id: non_routed_not_stamped
+    clause: no_orphan
+    target: hdr.int_shim
+    notes: |
+      A packet the routing stage drops — no-route (R5), TTL-exhausted (R2),
+      limited / directed broadcast (R3/R6), martian source (R4), non-IPv4
+      (R0) — MUST be dropped WITHOUT an INT shim emitted; the deparser
+      leaks no INT bytes on any drop path. Catches a stamp-before-route
+      implementation that pushes the INT shim unconditionally and only later
+      discovers the FIB miss / guard. The composed conditional-deparser
+      leak — the constituent P-INTMetadata can only test the no-INT-path
+      leak, never the routed-drop leak.
+
+  # ── INT-stage invariants (from P-INTMetadata) ────────────────────────────
+
+  - id: no_orphan_hop_count
+    clause: no_orphan
+    target: hdr.int_metadata_stack
+    notes: |
+      The INT metadata stack MUST NOT grow beyond ${max_hop_count} slots;
+      a transit at remaining_hop_count == 0 refuses to append (R10).
+      Catches `bit<8>` unsigned-underflow wraparound. Lifted from
+      P-INTMetadata.
+
+  - id: sink_strips_shim
+    clause: persistence
+    target: hdr.int_shim.is_valid
+    while: "R11 ∨ R12 fires"
+    free_under: ["is_valid: false"]
+    notes: |
+      After the sink fires, the routed downstream packet MUST NOT carry a
+      valid INT shim. Catches the common v1model conditional-deparser bug where the
+      deparser emits hdr.int_shim regardless of validity. Lifted from
+      P-INTMetadata.
+
+  - id: payload_preservation
+    clause: persistence
+    target: "ipv4_payload_bytes_minus_int_layer"
+    while: "any rule fires"
+    free_under: []
+    notes: |
+      The original IPv4 payload (excluding the INT shim/stack bytes
+      source/transit insert and sink removes) MUST be byte-identical on
+      egress to ingress. Catches implementations that rewrite payload bytes when
+      re-emitting under the INT layer. Lifted from P-INTMetadata.
+
+  - id: timestamp_bit_width_fidelity
+    clause: stability
+    target: stamped_timestamp_high_bits
+    while: "R7 ∨ R9 fires"
+    enforced_when: "${bit_width_timestamp} == 48"
+    notes: |
+      When bit_width_timestamp == 48, the stamped timestamp MUST preserve
+      the full 48 bits of std.ingress_global_timestamp. A `(bit<32>)` cast
+      silently drops the upper 16. Lifted from P-INTMetadata.
+
+  - id: hop_count_monotone
+    clause: stability
+    target: hdr.int_shim.remaining_hop_count
+    while: "R7 ∨ R9 fires"
+    notes: |
+      The remaining-hop-count MUST strictly decrease at each hop that
+      appends metadata. Catches read-before-write order bugs. Lifted from
+      P-INTMetadata.
+
+  - id: stack_length_matches_metadata_emits
+    clause: stability
+    target: hdr.int_metadata_stack.length
+    while: "egress(packet)"
+    notes: |
+      The length field in the INT shim MUST equal the number of metadata
+      slots actually emitted in the deparser. Catches pre-computing the
+      length before the per-hop append. Lifted from P-INTMetadata.
+
+  # ── Routing-stage invariants (from P-IPv4Routing) ────────────────────────
+
+  - id: lpm_longest_match_correctness
+    clause: stability
+    target: forward_decision
+    while: "(R7..R12) fires ∧ exists(route, lpm(hdr.ipv4.dst, ${routes}))"
+    notes: |
+      RFC 1812 §5.2.1 / §5.3.4 — the chosen next-hop belongs to the
+      LONGEST matching prefix. Catches keying the FIB with a ternary table
+      lacking prefix-length priorities. Lifted from P-IPv4Routing. In this
+      composition a wrong LPM result ALSO corrupts the stamped egress_port.
+
+  - id: ip_addr_preservation
+    clause: persistence
+    target: "(hdr.ipv4.src, hdr.ipv4.dst)"
+    while: "(R7..R12) fires (routed paths)"
+    free_under: []
+    notes: |
+      RFC 1812 §5.2.1 — IP src/dst MUST NOT be modified during unicast
+      forwarding. Distinguishes the telemetry router from NAT / tunnels.
+      Lifted from P-IPv4Routing.
+
+  - id: ip_checksum_validity
+    clause: stability
+    target: hdr.ipv4.hdrChecksum
+    while: "egress(packet) ∧ (R8 ∨ R10 ∨ R11 ∨ R12) fires"
+    notes: |
+      RFC 1812 §5.2.2.5 — header checksum MUST be valid on egress after
+      the TTL change on the non-length-changing routed paths (sample-skip,
+      overflow-passthrough, sink strip+route). The length-changing paths
+      (R7/R9) are covered by the stronger
+      stamp_grows_length_single_checksum. Lifted from P-IPv4Routing.
+
+  - id: ether_rewrite_correctness
+    clause: stability
+    target: "(hdr.ethernet.src, hdr.ethernet.dst)"
+    while: "egress(packet) ∧ (R7..R12) fires"
+    notes: |
+      RFC 1812 §5.2.1 — on every routed forward, egress Ethernet src MUST
+      be the egress port's MAC and dst MUST be the next-hop's MAC. Applies
+      to the routed copy on all forwarded paths (including the sink's
+      stripped original). Lifted from P-IPv4Routing.
+
+  - id: ecmp_flow_consistency
+    clause: stability
+    target: chosen_nexthop_index
+    while: "(R7..R12) fires ∧ ${multipath_mode} != none ∧ |nexthop_group.nexthops| > 1"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2.2 — every packet of one flow lands on the same next-hop
+      index within its group, and (composition) every packet of one flow
+      stamps the SAME egress_port. Catches hashing on a per-packet-varying
+      field (IP id, TTL). Lifted from P-IPv4Routing.
+
+  - id: ecmp_traffic_distribution
+    clause: fairness
+    target: traffic_per_nexthop_within_group
+    while: "(R7..R12) fires ∧ ${multipath_mode} ∈ {ecmp_hash_3tuple, ecmp_hash_5tuple}"
+    enforced_when: "${multipath_mode} != none"
+    notes: |
+      RFC 2992 §2 — under a uniform hash, flows distribute uniformly
+      across the K next-hops (per-nexthop share within ±20% of 1/K over
+      1000 random flows). Lifted from P-IPv4Routing.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Single-pass: neither the INT stamp stage nor the FIB re-enters
+      ingress. TTL decrement on every forward bounds any path. An implementation
+      that recirculates a source-stamped packet to re-stamp it would reset
+      remaining_hop_count each pass and grow the stack unbounded — the
+      bounded-step trace cap surfaces it. Lifted from both constituents.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ─────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The v1model bug
+# taxonomy guides what to probe. The composition's
+# distinctive entries are the STAMP↔ROUTE probes (stamp_reflects_routing_egress,
+# stamp_grows_length_single_checksum, deparser_no_int_leak_on_drop) that neither
+# standalone pattern can express.
+
+test_scaffolding:
+
+  G1:
+    - id: stamp_reflects_routing_egress
+      generate: |
+        Install a single FIB route for the destination to a known egress
+        port P (singleton next-hop). With ${role} == source and
+        sample_rate == 1, send a plain IPv4 packet (TTL=64) covered by the
+        route. Assert: (a) the packet egresses on P; (b) the INT slot is
+        present with exactly one metadata slot whose egress_port field ==
+        P; (c) ipv4.ttl decremented by 1; (d) Ethernet src ← port_mac[P],
+        dst ← next_hop_mac; (e) the IPv4 checksum valid on egress. The
+        composition's signature golden path — anchors
+        stamp_reflects_routing_decision.
+
+    - id: distinct_prefixes_distinct_stamped_egress
+      generate: |
+        Install ≥ 2 FIB prefixes to different egress ports A and B. Send a
+        source-role packet to each; assert each egresses on its prefix's
+        port AND its INT slot's egress_port field equals that same port.
+        Catches an implementation that stamps a constant / ingress port regardless
+        of the FIB result.
+
+    - id: sink_emit_report_and_route
+      requires: "${role} ∈ {sink, source_and_sink, multi} ∧ ${conditional_emit_predicate} == always"
+      generate: |
+        Send an INT-bearing packet (full shim + stack) whose dst is FIB-
+        routable to port P, to a sink-role switch. Assert TWO outputs: (a)
+        a telemetry report on ${report_port} carrying the assembled stack,
+        and (b) the original packet, INT shim STRIPPED
+        (hdr.int_shim.is_valid == false), routed on P with TTL-1 and L2
+        rewrite. Anchors sink_strips_then_routes.
+
+    - id: transit_append_reflects_egress
+      requires: "${role} ∈ {transit, multi}"
+      generate: |
+        Send a packet already carrying an INT shim with one slot and
+        remaining_hop_count == ${max_hop_count}-1, FIB-routable to port P.
+        Assert the egress packet has TWO slots, the second carrying
+        egress_port == P, remaining_hop_count decremented by 1, routed on
+        P with TTL-1. Tests R9 + hop_count_monotone +
+        stamp_reflects_routing_decision on the transit path.
+
+    - id: longest_prefix_priority_on_stamped_path
+      generate: |
+        Install overlapping FIB prefixes (10.0.0.0/8 → port A, 10.0.2.0/24
+        → port B). Send a source-role packet to 10.0.2.x; assert it
+        egresses on B AND its INT slot's egress_port == B (not A). Tests
+        lpm_longest_match_correctness through the composed pipeline.
+
+  G2:
+    - id: ttl_exhausted_not_stamped
+      generate: |
+        Send a packet with ipv4.ttl == 1 (post-decrement zero ⇒ drop per
+        R2) whose dst IS FIB-routable, to a source-role switch. Assert
+        drop AND that no INT shim / metadata bytes appear anywhere. Pin
+        BOTH the TTL=1 drop and (separately) a TTL=2 forward-with-stamp to
+        isolate the guard. Tests non_routed_not_stamped on the TTL branch.
+
+    - id: hop_count_overflow_passthrough_routed
+      requires: "${role} ∈ {transit, multi}"
+      generate: |
+        Send an INT-bearing packet with remaining_hop_count == 0 and a
+        full stack, FIB-routable to port P. Assert the egress packet is
+        routed on P (TTL-1, L2 rewrite) but the stack is UNCHANGED — no new
+        slot, no hop-count wraparound. Tests R10 + no_orphan_hop_count.
+
+    - id: sample_skip_routed_no_shim
+      requires: "${role} ∈ {source, source_and_sink, multi} ∧ ${sample_rate} > 1"
+      generate: |
+        Send ${sample_rate} * 4 routable packets with distinct 5-tuples.
+        Assert ~1/${sample_rate} gain an INT shim AND all of them (sampled
+        and unsampled) are routed on their FIB egress; the unsampled ones
+        egress with NO INT shim header present. Tests R8 +
+        conditional-deparser on the unsampled-but-routed branch.
+
+    - id: fib_capacity_overflow
+      requires: "${fib_capacity} != unbounded"
+      generate: |
+        Install ${fib_capacity} FIB routes successfully; attempt one more.
+        Assert reject (or observable eviction: a packet to the evicted
+        prefix now drops, unstamped). Mirrors P-IPv4Routing fib overflow.
+
+  G3:
+    - id: stamp_grows_length_single_checksum
+      generate: |
+        With ${role} == source, send a routable plain IPv4 packet. Assert
+        the egress IPv4 header checksum is VALID over BOTH the totalLen
+        growth (added INT shim+slot bytes) AND the TTL decrement, AND that
+        ipv4.src / ipv4.dst are unchanged and totalLen == original +
+        int_bytes. The common v1model #1-silent-failure probe in its composed form —
+        anchors stamp_grows_length_single_checksum. An implementation with two
+        separate checksum updates (one per change) that clobber each other
+        fails here.
+
+    - id: deparser_no_int_leak_on_drop
+      generate: |
+        Send (a) a no-route packet (dst not in ${routes}), (b) a non-IPv4
+        frame, and (c) a TTL=1 routable packet, each to a source-role
+        switch. Assert each is dropped AND no INT shim / metadata bytes are
+        emitted on any output. Probes the common v1model conditional-deparser bug on
+        the routed-drop path — anchors non_routed_not_stamped (the leak the
+        standalone INT pattern cannot reach because it has no real FIB
+        drop).
+
+    - id: stamp_egress_not_ingress_port
+      generate: |
+        Install a FIB route whose egress port P differs from the packet's
+        ingress port I (P ≠ I). Send a source-role packet on port I covered
+        by the route. Assert the INT slot's egress_port == P (NOT I, NOT 0).
+        Catches the read-before-write bug of stamping std.ingress_port or a
+        pre-FIB egress_spec. Sharpens stamp_reflects_routing_decision.
+
+    - id: timestamp_full_48bit_preservation
+      requires: "${bit_width_timestamp} == 48"
+      generate: |
+        Send a routable plain IPv4 packet to a source-role switch. Assert
+        the stamped timestamp field equals std.ingress_global_timestamp's
+        full 48-bit value including the upper 16 bits. Catches a
+        `(bit<32>)` truncation. Tests timestamp_bit_width_fidelity.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease so parameter rebinding can move
+# difficulty in either direction. Operators move exactly one axis
+# (single-axis displacement); faithfulness is DERIVED and bumped as a side-effect
+# of the role / ECMP / int-mx operators rather than by a standalone operator.
+
+mutation_operators:
+
+  # ── INT role (drives the composition's faithfulness ladder) ───────────────
+  - id: lift_role_to_sink
+    applicable_when: "${role} ∈ {source, source_and_sink}"
+    effect: |
+      ${role} ← (source ⇒ source_and_sink; source_and_sink ⇒ multi) ∧
+      ${faithfulness} ← D5.2_int_mx_or_sink_route
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${role} ∈ {source_and_sink, multi}"
+    notes: |
+      Add the sink (and, at multi, transit) role on top of the source tap.
+      Activates the sink_strips_then_routes dual-output stage interaction
+      (R11/R12) — the composition's strongest harden: one input yields a
+      telemetry report on ${report_port} AND a stripped+routed original on
+      the FIB egress. Bumps faithfulness to D5.2. Pairs with
+      collapse_role_to_source.
+
+  - id: collapse_role_to_source
+    applicable_when: "${role} ∈ {source_and_sink, multi, transit, sink}"
+    effect: |
+      ${role} ← source ∧
+      ${faithfulness} ← recompute_from(role, multipath_mode, int_mx)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Collapse to the single-output source-tap anchor (route → stamp one
+      slot → forward). Recomputes the derived faithfulness. Pairs with
+      lift_role_to_sink.
+
+  # ── INT-MX faithfulness (out-of-band export) ──────────────────────────────
+  - id: lift_to_int_mx
+    applicable_when: "${faithfulness} != D5.2_int_mx_or_sink_route"
+    effect: "${faithfulness} ← D5.2_int_mx_or_sink_route"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Switch the routed path to INT-MX (eMbed Instructions): the source
+      embeds only the instruction bitmap and metadata is exported
+      out-of-band via mirror to ${report_port} rather than appended to the
+      packet body — so the routed packet size stays constant while a mirror
+      copy carries the per-hop metadata. Tests the implementation's ability to
+      dispatch into a mirror session AND honour the FIB egress on the
+      original. Pairs with relax_to_int_md.
+
+  - id: relax_to_int_md
+    applicable_when: "${faithfulness} == D5.2_int_mx_or_sink_route ∧ ${role} ∈ {source, transit}"
+    effect: "${faithfulness} ← recompute_from(role, multipath_mode, int_mx=false)"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Drop back to classic in-packet INT-MD append. Pairs with
+      lift_to_int_mx. (Guarded to source/transit so it does not silently
+      undo a sink dual-output lift.)
+
+  # ── INT metadata-field breadth ────────────────────────────────────────────
+  - id: expand_metadata_fields
+    applicable_when: "len(${metadata_fields}) < 6"
+    effect: |
+      ${metadata_fields} ← append(${metadata_fields},
+                                  next of {hop_latency, queue_id,
+                                           queue_depth, egress_tx_util,
+                                           ingress_ts, ingress_port})
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "len(${metadata_fields}) ≤ 9 ∧ no duplicates"
+    notes: |
+      Add the next metadata field to the stamped slot — widens the per-hop
+      slot, pressures deparser ordering, and adds egress-derived fields
+      (hop_latency, egress_tx_util) that ALSO bind to the FIB egress. Pairs
+      with shrink_metadata_fields.
+
+  - id: shrink_metadata_fields
+    applicable_when: "len(${metadata_fields}) > 1"
+    effect: "${metadata_fields} ← truncate_last(${metadata_fields})"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "len(${metadata_fields}) ≥ 1 ∧ egress_port ∈ ${metadata_fields}"
+    notes: |
+      Drop the last metadata field (never below egress_port, which the
+      signature invariant needs). Pairs with expand_metadata_fields.
+
+  # ── INT hop-count budget ──────────────────────────────────────────────────
+  - id: shrink_max_hop_count_2x
+    applicable_when: "${max_hop_count} > 2"
+    effect: "${max_hop_count} ← ${max_hop_count} / 2"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${max_hop_count} ≥ 1"
+    notes: |
+      Halve the hop budget — surfaces the routed overflow-passthrough rule
+      R10 earlier. Pairs with enlarge_max_hop_count_2x.
+
+  - id: enlarge_max_hop_count_2x
+    applicable_when: "${max_hop_count} < 16"
+    effect: "${max_hop_count} ← ${max_hop_count} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${max_hop_count} ≤ 16"
+    notes: "Double the hop budget. Pairs with shrink_max_hop_count_2x."
+
+  # ── INT sample rate ────────────────────────────────────────────────────────
+  - id: increase_sample_rate_4x
+    applicable_when: "${sample_rate} < 256"
+    effect: "${sample_rate} ← ${sample_rate} * 4"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${sample_rate} ≤ 1024"
+    notes: |
+      Stamp less frequently — surfaces the conditional-deparser leak on
+      the unsampled-but-routed branch (R8): the deparser must route those
+      packets WITHOUT an INT shim. Pairs with decrease_sample_rate_4x.
+
+  - id: decrease_sample_rate_4x
+    applicable_when: "${sample_rate} > 1"
+    effect: "${sample_rate} ← ${sample_rate} / 4"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${sample_rate} ≥ 1"
+    notes: "Stamp more frequently. Pairs with increase_sample_rate_4x."
+
+  # ── INT timestamp width ─────────────────────────────────────────────────────
+  - id: truncate_timestamp_to_32bit
+    applicable_when: "${bit_width_timestamp} == 48 ∧ ('ingress_ts' ∈ ${metadata_fields} ∨ 'egress_ts' ∈ ${metadata_fields})"
+    effect: "${bit_width_timestamp} ← 32"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Force the timestamp field to 32 bits — a `(bit<32>)` cast silently
+      drops the upper 16 of std.ingress_global_timestamp. Pairs with
+      extend_timestamp_to_48bit.
+
+  - id: extend_timestamp_to_48bit
+    applicable_when: "${bit_width_timestamp} == 32"
+    effect: "${bit_width_timestamp} ← 48"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Restore the full 48-bit timestamp. Pairs with truncate_timestamp_to_32bit."
+
+  # ── INT conditional emit (sink only) ────────────────────────────────────────
+  - id: enable_conditional_emit_hop_latency
+    applicable_when: "${conditional_emit_predicate} == always ∧ ${role} ∈ {sink, source_and_sink, multi}"
+    effect: |
+      ${conditional_emit_predicate} ← hop_latency_exceeds_threshold ∧
+      ${report_threshold} ← 1000000
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${role} ∈ {sink, source_and_sink, multi}"
+    notes: |
+      Lift the sink to threshold-based reporting — activates the
+      conditional-deparser surface on the report emit (R11 vs R12), while
+      the strip+route still happens on both branches. Pairs with
+      disable_conditional_emit.
+
+  - id: disable_conditional_emit
+    applicable_when: "${conditional_emit_predicate} ≠ always"
+    effect: "${conditional_emit_predicate} ← always ∧ ${report_threshold} ← 0"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Return to always-emit at the sink. Pairs with enable_conditional_emit_hop_latency."
+
+  # ── Routing multipath (also bumps faithfulness) ─────────────────────────────
+  - id: enable_ecmp_5tuple
+    applicable_when: "${multipath_mode} == none"
+    effect: |
+      ${multipath_mode} ← ecmp_hash_5tuple ∧
+      ${max_nexthop_group_size} ← max(${max_nexthop_group_size}, 4) ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_int_md_ecmp_route)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${max_nexthop_group_size} ≥ 2"
+    notes: |
+      Activate ECMP on the routed path — ecmp_flow_consistency +
+      ecmp_traffic_distribution. Sharpens stamp_reflects_routing_decision:
+      the stamped egress_port must be the POST-ECMP next-hop, not the LPM
+      group base. Pairs with disable_ecmp.
+
+  - id: disable_ecmp
+    applicable_when: "${multipath_mode} != none"
+    effect: |
+      ${multipath_mode} ← none ∧
+      ${faithfulness} ← recompute_from(role, multipath_mode, int_mx)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "every nexthop_group is a singleton OR the harness collapses to i=0"
+    notes: "Collapse the routed path to single-next-hop. Pairs with enable_ecmp_5tuple."
+
+  # ── Routing FIB capacity ─────────────────────────────────────────────────────
+  - id: shrink_fib_capacity_4x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} > 64"
+    effect: "${fib_capacity} ← ${fib_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 16 ∧ |${routes}| ≤ ${fib_capacity}"
+    notes: "Tighten the FIB budget (Contra-realistic 10⁴ → 256). Pairs with enlarge_fib_capacity_2x."
+
+  - id: enlarge_fib_capacity_2x
+    applicable_when: "${fib_capacity} ≠ unbounded ∧ ${fib_capacity} < 524288"
+    effect: "${fib_capacity} ← ${fib_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${fib_capacity} ≤ 1048576"
+    notes: "Loosen the FIB budget. Pairs with shrink_fib_capacity_4x."
+
+  # ── ECMP hash family ─────────────────────────────────────────────────────────
+  - id: swap_hash_to_xor_fold
+    applicable_when: "${multipath_mode} != none ∧ ${hash_algo} ∈ {crc16, crc32}"
+    effect: "${hash_algo} ← xor_fold"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "ecmp_traffic_distribution still observable within ±25% over 1000 random flows"
+    notes: "Weaker hash → worse uniformity, stresses copy-the-textbook implementations. Pairs with swap_hash_to_crc16."
+
+  - id: swap_hash_to_crc16
+    applicable_when: "${multipath_mode} != none ∧ ${hash_algo} ≠ crc16"
+    effect: "${hash_algo} ← crc16"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Restore the canonical RFC 2992 hash. Pairs with swap_hash_to_xor_fold."
+
+  # ── Routing martian filter ───────────────────────────────────────────────────
+  - id: enable_martian_filter
+    applicable_when: "${martian_filter_enabled} == false"
+    effect: "${martian_filter_enabled} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Activate R4 + the martian-src drop on the routed path (and the
+      non_routed_not_stamped probe on the martian branch). Pairs with
+      disable_martian_filter.
+
+  - id: disable_martian_filter
+    applicable_when: "${martian_filter_enabled} == true"
+    effect: "${martian_filter_enabled} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Deactivate martian filtering. Pairs with enable_martian_filter."
+
+  # ── Workload: FIB overlap stress ─────────────────────────────────────────────
+  - id: inflate_fib_with_overlapping_prefixes
+    applicable_when: "'longest_prefix_priority_stress' ∉ test_scaffolding.G2"
+    effect: |
+      Generate ${routes} so ≥ 30% of installed prefixes overlap (a /16
+      plus several /24s and /32s within it). Add G2 test
+      longest_prefix_priority_stress requiring 3 levels of LPM tie-break
+      through the composed pipeline, asserting the stamped egress_port
+      matches the longest-prefix egress at each level.
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${fib_capacity} ≥ 64 ∨ ${fib_capacity} == unbounded"
+    notes: "Test-rigor harden on lpm_longest_match_correctness + stamp_reflects_routing_decision. Pairs with aggregate_fib_prefixes."
+
+  - id: aggregate_fib_prefixes
+    applicable_when: "'longest_prefix_priority_stress' ∈ test_scaffolding.G2 ∨ overlap-fraction(${routes}) > 0"
+    effect: |
+      Aggregate ${routes} into disjoint prefixes (route summarisation),
+      removing overlaps; remove longest_prefix_priority_stress if present.
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "|${routes}| ≥ 1"
+    notes: "Test-rigor ease. Pairs with inflate_fib_with_overlapping_prefixes."
+
+  # ── Algebra-breadth: multi-switch INT transit chain ──────────────────────────
+  - id: expand_topology_multi_switch
+    applicable_when: "'multi_switch' ∉ topology"
+    effect: |
+      Expand to 2 switches in a chain (h1 — s1 — s2 — h2): s1 is the INT
+      source+router, s2 is the INT transit (or sink) + router. Add G1 test
+      transit_through_two_switches asserting cumulative TTL decrement of 2,
+      per-hop L2 rewrite, a 2-slot INT stack where slot k's egress_port is
+      switch k's FIB egress, and (sink at s2) the report on ${report_port}.
+    axis: algebra-breadth
+    direction: harden
+    feasibility_postcondition: "the harness supports multi-switch topologies"
+    notes: |
+      Lift single-switch → multi-hop — the natural INT topology where the
+      stack accumulates one slot per routing hop. Pairs with
+      collapse_topology_single_switch.
+
+  - id: collapse_topology_single_switch
+    applicable_when: "'multi_switch' ∈ topology"
+    effect: "Collapse to a single switch; remove transit_through_two_switches."
+    axis: algebra-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Return to single-switch. Pairs with expand_topology_multi_switch."
+
+  # ── Input-form: spec noise ────────────────────────────────────────────────────
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the noisify_spec_low protocol shared with the constituent patterns:
+        • 1 distractor clause about deployment / out-of-scope behaviour that
+          is true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, subnet,
+          metadata field) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Presentation-noise harden. Pairs with denoisify_spec."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Presentation-noise ease. Pairs with noisify_spec_low / _medium / _high."
+
+  - id: noisify_spec_medium
+    applicable_when: "spec_noise.intensity ∈ {none, low}"
+    effect: |
+      Apply noisify_spec_low, then additionally:
+        • 1 misleading implementation hint — plausible "common practice"
+          framing that, if followed, violates a stated rule of THIS task
+          (e.g., suggesting the INT slot be stamped in the parser / before
+          the FIB lookup "to keep ingress timestamps fresh" — which would
+          break stamp_reflects_routing_decision);
+        • 1 restate-with-drift — paraphrase one rule using different
+          vocabulary / framing; do not mark as a restatement.
+      Same hard constraints as noisify_spec_low.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Stronger presentation-noise harden. Pairs with denoisify_spec."
+
+# ─── Bridging notes (advisory; not LLM-visible) ─────────────────────────────
+
+bridging_notes: |
+  Common implementations from this composed pattern to v1model P4:
+
+    Anchor (faithfulness=D5.0_int_md_static_route, role=source,
+            multipath_mode=none, sample_rate=1, bit_width_timestamp=48,
+            metadata_fields=[switch_id, egress_port, egress_ts],
+            max_hop_count=8, fib_capacity unbounded, no martians):
+      - Pre-stage gate: if (!hdr.ipv4.isValid()) drop; if (hdr.ipv4.ttl <= 1)
+        drop. Non-IPv4 and TTL-exhausted drop before any table — and MUST
+        NOT push the INT shim (non_routed_not_stamped).
+      - Stage 1, FIB: one LPM table on hdr.ipv4.dstAddr, action
+        ipv4_forward(port, port_mac, next_hop_mac) that sets
+        standard_metadata.egress_spec = port, rewrites Ethernet src/dst,
+        and decrements ipv4.ttl ONCE. Default action = drop (R5 no-route,
+        unstamped).
+      - Stage 2, INT source stamp: AFTER the FIB action resolves
+        egress_spec, set hdr.int_shim.setValid(), seed remaining_hop_count
+        = max_hop_count-1, instruction_bitmap, length=1, and push ONE
+        metadata slot whose egress_port field = standard_metadata.egress_spec
+        (the FIB-resolved port — NOT std.ingress_port, NOT a constant). This
+        read-after-FIB ordering IS the composition: a program that stamps
+        in the parser or before the LPM apply stamps a zero/stale port and
+        fails stamp_reflects_routing_decision.
+      - Deparser (LOAD-BEARING):
+          packet.emit(hdr.ethernet);
+          packet.emit(hdr.ipv4);
+          packet.emit(hdr.int_shim);            // gated on .isValid()
+          packet.emit(hdr.int_metadata_stack);  // gated on .isValid()
+          packet.emit(hdr.l4_payload);
+        Never emit int_shim/stack on the drop path or the unsampled path.
+      - MyComputeChecksum (LOAD-BEARING): a SINGLE update_checksum over the
+        final IPv4 header — totalLen now includes the INT bytes AND ttl is
+        decremented. Do NOT write two separate updates (one for TTL, one
+        for the length growth) that clobber each other
+        (stamp_grows_length_single_checksum). The composition's sharpest
+        v1model-bug trap. The implementation must also bump hdr.ipv4.totalLen by the INT
+        shim+slot byte count.
+
+    +ECMP (multipath_mode=ecmp_hash_5tuple, faithfulness D5.1):
+      - ecmp_group LPM table → sets meta.ecmp_group_id + size; ecmp_select
+        on (group_id, hash_index) → L2 rewrite + egress_spec. hash_index =
+        hash(5-tuple) % size via the BMv2 `hash` extern. The INT stamp must
+        read the POST-select egress_spec (the chosen next-hop), so the stamp
+        stage runs after ecmp_select. Hash only flow-stable fields.
+
+    +transit (role=transit/multi, faithfulness D5.1):
+      - When hdr.int_shim.isValid() on ingress and remaining_hop_count > 0,
+        APPEND a slot (egress_port = FIB egress) and decrement the hop
+        count; at 0, route without appending (R10). The append still
+        follows the FIB resolution.
+
+    +sink (role=sink/source_and_sink/multi, faithfulness D5.2):
+      - When hdr.int_shim.isValid() and the emit predicate fires:
+        clone3/clone the assembled stack to ${report_port} as a telemetry
+        report, THEN setInvalid() the int_shim + stack on the original and
+        route it on its FIB egress (TTL-1, L2 rewrite). TWO outputs on
+        DIFFERENT ports (sink_strips_then_routes). Shrink totalLen back by
+        the removed INT bytes and recompute the checksum once.
+
+    +INT-MX (faithfulness D5.2, role source/transit):
+      - Source embeds only the instruction bitmap; transit nodes mirror a
+        report to ${report_port} via clone3 rather than appending to the
+        body — the routed packet size stays constant while the original is
+        still forwarded on the FIB egress.
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Stamping the INT slot's egress_port from std.ingress_port, a constant,
+      or a pre-FIB egress_spec (e.g., in the parser or before the LPM apply)
+      — the dominant composition bug. stamp_reflects_routing_decision /
+      stamp_egress_not_ingress_port catch it.
+    * Two separate IPv4 checksum recomputations on the source-push path (one
+      after TTL, one after the totalLen growth) — the second clobbers the
+      first. stamp_grows_length_single_checksum catches it.
+    * Forgetting to bump hdr.ipv4.totalLen by the inserted INT bytes — the
+      packet's length field disagrees with its wire length; downstream
+      parsers mis-frame. Caught by the length assertion in the G3 checksum
+      probe.
+    * Pushing the INT shim BEFORE the FIB decides drop/forward, so a
+      no-route / TTL-exhausted / martian / non-IPv4 packet leaks an INT shim
+      on the (eventual) drop path. non_routed_not_stamped catches it.
+    * Emitting the INT shim on the unsampled-but-routed branch (sample_rate
+      > 1) — sample_skip_routed_no_shim catches it.
+    * Decrementing TTL twice (once in the FIB forward, once in an INT-role
+      action) — ttl_decrement_once_across_stages catches it.
+    * Routing the telemetry report instead of (or in addition to) the
+      stripped original, or sending the stripped original to ${report_port}
+      — sink_strips_then_routes catches it.
+    * Leaving the INT shim valid on the sink's routed copy — sink_strips_shim
+      catches it.
+
+  v2 deferrals (out of scope for this v1.0 composition):
+    * WCMP weighted multipath (kept on standalone P-IPv4Routing).
+    * ICMP error origination on TTL exhaustion / no-route — would add a
+      THIRD origination surface alongside the telemetry report; pairs better
+      as a separate composition.
+    * PINT probabilistic bit-budget coding (kept on standalone
+      P-INTMetadata's faithfulness ladder) — its per-packet hash arg-min is
+      orthogonal to the stamp↔route binding this composition exists to test.
+    * INT XD (eXport Data) fully out-of-band mode and cross-switch fragment
+      reassembly when the INT stack pushes a packet over MTU mid-transit.
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must all
+       pass validation.
+
+    2. For anchor instances (role=source, multipath none, sample_rate 1,
+       D5.0_int_md_static_route, 3-field metadata including egress_port), the
+       resulting task SHOULD be behaviourally a "route the packet, then stamp
+       one INT slot reflecting that routing decision, then forward" telemetry
+       tap. Cross-check by hand-running the public test set through the
+       oracle for the seed; in particular verify stamp_reflects_routing_egress
+       fails a stamp-before-route reference and that
+       deparser_no_int_leak_on_drop fails a stamp-before-route reference (the
+       composition's reason for existing).
+
+    3. The composed oracle reuses the audited P-IPv4Routing
+       (oracles/P-IPv4Routing/c62a53ea) and P-INTMetadata
+       (oracles/P-INTMetadata/1b2a4993) oracles for the routed-path and
+       stamping ground truth respectively (content-addressed oracle
+       reuse). When the composed oracle is synthesised, the new audited
+       surface is ONLY the stamp↔route glue: binding the stamped egress_port
+       (and egress-derived fields) to the FIB-resolved egress, the single
+       checksum over the totalLen growth + TTL decrement, and the
+       drop-before-stamp ordering. Confirm the oracle audit exercises
+       stamp_reflects_routing_decision and stamp_grows_length_single_checksum
+       at their extremes — the behaviours absent from either constituent.
+
+    4. This composite occupies the (D5:routing ∪ D4:telemetry,
+       P1:forwarding ∪ P9:telemetry) cell (stamp-then-forward). A harder
+       variant is most naturally reached by lift_role_to_sink (the
+       dual-output sink path) + enable_ecmp_5tuple + the stamp↔route G3
+       probes, the hardest by
+       stacking sink + INT-MX + ECMP + tight hop-count/FIB capacities +
+       spec noise.

@@ -1,0 +1,1057 @@
+task_name: purr_frr_mut4
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-PURRFastReroute
+pattern_version: '1.0'
+seed:
+  frr_groups:
+  - prefix: 10.0.0.0
+    prefix_len: 16
+    primary_port: 4
+    backup_port: 2
+    primary_mac: 08:00:00:00:04:04
+    backup_mac: 08:00:00:00:02:02
+  - prefix: 10.0.2.0
+    prefix_len: 24
+    primary_port: 2
+    backup_port: 3
+    primary_mac: 08:00:00:00:02:02
+    backup_mac: 08:00:00:00:03:03
+  - prefix: 10.0.3.0
+    prefix_len: 24
+    primary_port: 3
+    backup_port: 4
+    primary_mac: 08:00:00:00:03:03
+    backup_mac: 08:00:00:00:04:04
+  - prefix: 10.0.4.0
+    prefix_len: 24
+    primary_port: 4
+    backup_port: 2
+    primary_mac: 08:00:00:00:04:04
+    backup_mac: 08:00:00:00:02:02
+  - prefix: 10.0.2.55
+    prefix_len: 32
+    primary_port: 4
+    backup_port: 2
+    primary_mac: 08:00:00:00:04:04
+    backup_mac: 08:00:00:00:02:02
+  - prefix: 10.0.4.77
+    prefix_len: 32
+    primary_port: 2
+    backup_port: 3
+    primary_mac: 08:00:00:00:02:02
+    backup_mac: 08:00:00:00:03:03
+  port_down:
+  - 2
+  - 3
+  frr_match_kind: lpm
+  frr_table_capacity: unbounded
+  port_down_capacity: 64
+  liveness_source: control_plane_table
+  cascaded_backup: true
+  ttl_decrement_strict: true
+  default_action_on_miss: drop
+  faithfulness: D5.2_cascaded_protection
+description: |
+  A switch s1 with four host-facing ports participates in a small fault-
+  tolerant overlay. Each of its four hosts is a directly attached peer
+  that the switch must keep reachable through any single egress-port
+  failure — and in some cases through simultaneous failures of multiple
+  egress ports. The forwarding mechanism is based on a fast-reroute
+  primitive inspired by "PURR: A Primitive for Reconfigurable Fast
+  Reroute" (CoNEXT 2019). Although the original PURR work targets
+  ASIC-class deployments at scale, the principle the switch must
+  implement here is the same one PURR isolates: every protected
+  destination network is associated, at install time, with TWO
+  next-hops — a "primary" choice and a "backup" choice — so that any
+  per-packet failover decision can be made by an in-pipeline demux
+  rather than by recirculation, control-plane up-calls, or any other
+  out-of-band mechanism.
+
+  The cluster operator has deliberately chosen a configuration in which
+  several FRR groups can experience concurrent port-down events. In the
+  configuration the harness presents to the data plane, more than one
+  of the four host-facing ports may be marked down at the same time —
+  so the program MUST NOT make any assumption about at most one failure
+  being active. (For clarity, "marked down" here is a property of a
+  port at the moment a packet arrives, not a topology-permanent state.)
+
+  ## Topology and roles
+
+    - s1.p1 — connection point for host h1. h1's IPv4 address is
+              10.0.1.1 and its hardware address is 08:00:00:00:01:01.
+    - s1.p2 — connection point for host h2. h2's IPv4 address is
+              10.0.2.2 and its hardware address is 08:00:00:00:02:02.
+    - s1.p3 — connection point for host h3. h3's IPv4 address is
+              10.0.3.3 and its hardware address is 08:00:00:00:03:03.
+    - s1.p4 — connection point for host h4. h4's IPv4 address is
+              10.0.4.4 and its hardware address is 08:00:00:00:04:04.
+
+  Although the physical ports may be reorganised by future operator
+  changes, the four-host arrangement above is fixed for the purposes of
+  this task.
+
+  ## Frame eligibility
+
+  A frame received on any of the four ports is eligible for further
+  inspection by the forwarding logic only when it carries an IPv4
+  datagram. Frames whose Ethernet payload is not IPv4 — for example
+  ARP requests/replies, IPv6 packets, raw LLDP advertisements, or any
+  unrecognised EtherType — MUST be discarded. Such frames MUST NOT
+  alter any internal state, MUST NOT be forwarded out any port, and
+  MUST NOT cause the switch to generate a response of any kind.
+  Discarded frames are silently dropped; the switch does not emit ICMP
+  errors in this task.
+
+  ## Forwarding decision (applies to each IPv4 datagram individually)
+
+  For every IPv4 datagram that has been admitted by the eligibility
+  check above, the switch performs the following decision procedure.
+  The steps are described separately for clarity but they execute in
+  the data plane as part of a single per-packet pipeline.
+
+    1. **Destination lookup against the protected-network set.** The
+       control plane installs, at the start of the task, a set of
+       "protected destination networks." Each entry of this set
+       specifies (a) a destination IPv4 prefix, (b) the primary
+       next-hop for that prefix (an egress port together with the
+       Ethernet destination address to write into the forwarded frame),
+       and (c) a backup next-hop with the same shape. The matching
+       entry for an incoming datagram is selected by **longest-prefix
+       match** on the IPv4 destination address: among the entries whose
+       prefix covers the datagram's destination, the entry with the
+       LARGEST prefix length wins. A datagram whose destination is not
+       covered by ANY installed entry MUST be discarded.
+
+    2. **Primary liveness probe.** The control plane separately
+       installs a list of egress ports that are currently to be treated
+       as "down." A port is considered up if and only if it is NOT in
+       that list. The data plane reads this list to determine whether
+       the matched entry's primary egress port is currently down.
+
+    3. **Primary path.** If the primary's egress port is up, the
+       primary next-hop is selected and used in the egress step below.
+
+    4. **Backup path.** Otherwise (the primary's egress port is down),
+       the switch examines whether the matched entry's BACKUP egress
+       port is itself in the down list.
+
+         4a. If the backup's port is UP, the backup next-hop is
+             selected.
+         4b. If the backup's port is ALSO down — that is, both ports
+             of the matched entry's pair are currently in the down
+             list — the datagram MUST be discarded. No alternative
+             path is taken and no third next-hop is consulted.
+
+  The phrasing "matched entry's pair" in clause 4 refers to the SAME
+  entry chosen at step 1 — i.e., the longest-prefix entry — even when
+  that entry happens to be a host route (/32) embedded inside a less-
+  specific entry (/24, /16) that would have chosen a different pair.
+  The shorter-prefix entry's pair MUST NOT be consulted as an
+  additional fallback. (This clause is what makes the longest-prefix
+  selection in step 1 binding rather than advisory.)
+
+  The mechanism in clauses 2–4 is the data-plane realisation of the
+  PURR primitive: no recirculation, no control-plane upcall, no
+  re-execution of the destination lookup; the decision uses exactly
+  one destination lookup followed by at most one primary-port liveness
+  check and at most one backup-port liveness check. The data plane
+  MUST NOT discard a packet, take a backup, or take a primary based
+  on a destination's liveness rather than its egress port's liveness;
+  the liveness probe is keyed on the PORT, not on the host.
+
+  ## Per-packet egress transformation (applies to admitted datagrams)
+
+  The frame that emerges on the chosen egress port MUST satisfy ALL of
+  the following requirements.
+
+    - The output is sent on the chosen next-hop's egress port (the
+      primary's port if the primary path was taken, or the backup's
+      port if the backup path was taken).
+    - The Ethernet destination address is rewritten to the chosen
+      next-hop's destination MAC. When the backup path is selected,
+      this is the BACKUP's destination MAC; it is NOT the primary's
+      MAC even though they belong to the same matched entry.
+    - The Ethernet source address is rewritten to the prior frame's
+      Ethernet destination address — i.e., the address that the frame
+      was sent TO on ingress is re-used as the address the switch
+      sends FROM on egress. (This convention is local to this
+      deployment; do not infer a port-specific MAC from it.)
+    - The IPv4 hop count is exactly one less than on ingress.
+    - Every other field of the packet — including but not limited to
+      the IPv4 source address, the IPv4 destination address, any L4
+      header (TCP/UDP/ICMP), and any payload — is byte-identical to
+      the received packet.
+
+  Discarded packets produce no output frame at any port and MUST NOT
+  alter any internal state. The switch keeps no per-flow or
+  per-destination counters, accumulates no telemetry, and emits no
+  notification of the drop; the switch's only job is to forward or
+  discard.
+
+  ## Control plane
+
+  For the duration of one task run the control plane installs:
+
+    - The set of protected destination networks (a list of entries,
+      each entry naming a destination prefix together with the
+      primary's and backup's egress port and destination MAC).
+    - The list of currently-down ports (a subset of the four
+      host-facing port identifiers).
+
+  The exact contents of both lists are part of the task's test fixture
+  and are supplied to the data plane by the test harness — they are
+  not communicated to the data plane by any out-of-band hint. The
+  switch's P4 program defines the table/match-action structures the
+  test harness uses to populate the data plane; the harness's
+  installer reads the structures from the compiled program's P4Info
+  and emits the install commands accordingly.
+
+  ## Notes on what is NOT part of this task
+
+    - The switch is not asked to perform any link-failure DETECTION;
+      the down list is supplied externally.
+    - The switch is not asked to emit ICMP errors on drop.
+    - The switch is not asked to maintain any per-flow state,
+      connection-tracking table, or rate-limiting counter.
+    - The switch is not asked to fragment, MTU-clamp, or otherwise
+      alter the IPv4 payload size.
+    - The switch is not asked to handle IPv6, MPLS, or any encapsulated
+      tunnel; ONLY IPv4 datagrams.
+
+  These exclusions are listed for clarity; do not interpret them as
+  requirements to add the corresponding mechanisms in disabled form.
+  The simplest data-plane realisation that satisfies the four
+  forwarding-decision steps and the per-packet egress transformation
+  above is the intended one.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: ipv4_to_10_0_4_4
+  visibility: public
+  description: Dest 10.0.4.4 — /24 match, primary p4 is up.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.4
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ipv4_to_10_0_3_3
+  visibility: public
+  description: Dest 10.0.3.3 — /24 match, primary p3 down, backup p4 up.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.3
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ipv4_to_10_0_3_77
+  visibility: hidden
+  description: Deeper into 10.0.3.0/24, same group.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.77
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ipv4_to_10_0_4_45_ttl10
+  visibility: hidden
+  description: Inside 10.0.4.0/24 (not the /32 host), TTL=10 — check decrement.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.45
+        ttl: 10
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ipv4_to_10_0_3_3_low_ttl
+  visibility: hidden
+  description: Same destination as ipv4_to_10_0_3_3, TTL=1.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.3
+        ttl: 1
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: change_to
+        value: 0
+- name: ipv4_to_10_0_3_3_different_src
+  visibility: hidden
+  description: Verdict must not depend on src.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.3.99
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: lpm_priority_32_over_24_forwards
+  visibility: public
+  description: Dest 10.0.2.55 — both /24 (cascaded-drop) and /32 (p4 up) match; the /32 MUST win, packet forwarded p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.55
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: lpm_priority_32_over_24_drops
+  visibility: public
+  description: Dest 10.0.4.77 — both /24 (p4 up) and /32 (cascaded-drop) match; the /32 MUST win, packet dropped.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.77
+        ttl: 64
+  expected:
+    behavior: drop
+- name: lpm_priority_24_over_16
+  visibility: hidden
+  description: Dest 10.0.3.99 — both /16 and /24 match; the /24 MUST win, packet forwarded p4 via the /24's backup.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.99
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: lpm_priority_16_fallback_only
+  visibility: hidden
+  description: Dest 10.0.5.5 — only the /16 catch-all matches; /16 wins, packet forwarded p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.5.5
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: lpm_priority_16_fallback_high_octet
+  visibility: hidden
+  description: Dest 10.0.255.99 — only the /16 catch-all matches; /16 wins, packet forwarded p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.255.99
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: ipv4_outside_10_slash_16
+  visibility: hidden
+  description: Dest 192.168.55.1 — outside any installed prefix.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 192.168.55.1
+        ttl: 64
+  expected:
+    behavior: drop
+- name: truncated_ipv4_header
+  visibility: hidden
+  description: EtherType=0x0800 with no IP payload (parser cannot extract IPv4).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2048
+  expected:
+    behavior: drop
+- name: double_down_to_10_0_2_2
+  visibility: public
+  description: Dest 10.0.2.2 — /24 matches, (primary=p2, backup=p3) both down → cascaded drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+  expected:
+    behavior: drop
+- name: double_down_to_10_0_2_200
+  visibility: hidden
+  description: Dest 10.0.2.200 — same cascaded-drop verdict.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.77
+        dst: 10.0.2.200
+        ttl: 64
+  expected:
+    behavior: drop
+- name: multi_down_10_0_3_x_uses_backup
+  visibility: hidden
+  description: 'Multi-port-down: p2+p3 down — 10.0.3.x''s group (primary=p3 down, backup=p4 up) MUST take backup.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.42
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: multi_down_10_0_2_x_drops_cascaded
+  visibility: hidden
+  description: 'Multi-port-down: p2+p3 down — 10.0.2.x''s group (primary=p2 down, backup=p3 down) MUST cascaded-drop.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.42
+        ttl: 64
+  expected:
+    behavior: drop
+- name: multi_down_10_0_4_x_uses_primary
+  visibility: hidden
+  description: 'Multi-port-down: p2+p3 down — 10.0.4.x''s group (primary=p4 up) MUST take primary regardless.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.4
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: arp_frame_drop
+  visibility: public
+  description: Non-IPv4 (ARP ethertype) frame.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+  expected:
+    behavior: drop
+- name: regression_conditional_deparser_smoke
+  visibility: hidden
+  description: Successful forward — output must be a well-formed Ether+IPv4 packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.3.3
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: regression_std_metadata_drop_smoke_part1
+  visibility: hidden
+  description: 'Pre-trace: a non-IPv4 frame is dropped.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+  expected:
+    behavior: drop
+- name: regression_std_metadata_drop_smoke_part2
+  visibility: hidden
+  description: After a prior-trace drop, a subsequent IPv4 forward must still succeed.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.4
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_7_7
+  visibility: hidden
+  description: 10.0.7.7 — only the /16 catch-all matches.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.7.7
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_99_42
+  visibility: hidden
+  description: 10.0.99.42 — only the /16 catch-all matches.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.99.42
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_128_1
+  visibility: hidden
+  description: 10.0.128.1 — only the /16 catch-all matches.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.128.1
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_200_200
+  visibility: hidden
+  description: 10.0.200.200 — only the /16 catch-all matches.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.200.200
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_1_99
+  visibility: hidden
+  description: 10.0.1.99 — only the /16 catch-all matches (10.0.1.0/24 is NOT an installed prefix).
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.5.5
+        dst: 10.0.1.99
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_16_fallback_10_0_6_6
+  visibility: hidden
+  description: 10.0.6.6 — only the /16 catch-all matches.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.6.6
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_lpm_adj_below_10_0_2_55
+  visibility: hidden
+  description: 10.0.2.54 — adjacent to the 10.0.2.55/32 entry; /24 wins, cascaded drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.54
+        ttl: 64
+  expected:
+    behavior: drop
+- name: l3_lpm_adj_above_10_0_2_55
+  visibility: hidden
+  description: 10.0.2.56 — adjacent to the 10.0.2.55/32 entry; /24 wins, cascaded drop.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.56
+        ttl: 64
+  expected:
+    behavior: drop
+- name: l3_lpm_adj_below_10_0_4_77
+  visibility: hidden
+  description: 10.0.4.76 — adjacent to the 10.0.4.77/32 entry; /24 wins, forward p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.76
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_lpm_adj_above_10_0_4_77
+  visibility: hidden
+  description: 10.0.4.78 — adjacent to the 10.0.4.77/32 entry; /24 wins, forward p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.4.78
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: ff:ff:ff:ff:ff:ff
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_alt_ingress_h2_to_h4
+  visibility: hidden
+  description: Same destination as ipv4_to_10_0_4_4, but ingress on s1.p2.
+  input:
+    port: s1.p2
+    layers:
+    - Ether:
+        src: 08:00:00:00:02:02
+        dst: 08:00:00:00:00:02
+    - IP:
+        src: 10.0.2.2
+        dst: 10.0.4.4
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:02
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_alt_ingress_h3_to_h4
+  visibility: hidden
+  description: Same destination, ingress on s1.p3.
+  input:
+    port: s1.p3
+    layers:
+    - Ether:
+        src: 08:00:00:00:03:03
+        dst: 08:00:00:00:00:03
+    - IP:
+        src: 10.0.3.3
+        dst: 10.0.4.4
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:03
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+- name: l3_alt_ingress_h4_to_h3
+  visibility: hidden
+  description: 10.0.3.42 (backup-path destination), ingress on s1.p4.
+  input:
+    port: s1.p4
+    layers:
+    - Ether:
+        src: 08:00:00:00:04:04
+        dst: 08:00:00:00:00:04
+    - IP:
+        src: 10.0.4.4
+        dst: 10.0.3.42
+        ttl: 64
+  expected:
+    behavior: forward
+    output_port: s1.p4
+    transformations:
+      Ether.dst:
+        action: change_to
+        value: 08:00:00:00:04:04
+      Ether.src:
+        action: change_to
+        value: 08:00:00:00:00:04
+      IP.ttl:
+        action: decremented_by
+        delta: 1
+scoring:
+  public_weight: 0.2
+  hidden_weight: 0.8

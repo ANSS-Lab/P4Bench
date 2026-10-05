@@ -1,0 +1,1144 @@
+# P-LBFailover — Edge: Stateful L4 Load Balancer ∘ Primary/Backup Fast-Reroute (Composed Pattern)
+#
+# TPL v1.0 task pattern composing P-StatefulLB (per-flow backend pinning
+# with DNAT, SilkRoad SIGCOMM '17) with P-PURRFastReroute (primary/backup
+# next-hop fast-reroute under per-port liveness, PURR CoNEXT '19) into a
+# single edge load balancer whose pinned backends are reached over
+# FRR-protected paths — the canonical "load balancer in front of a
+# resilient fabric": a flow is first pinned to a backend (its destination is
+# DNAT'd to the backend's address), and the path to THAT backend is then
+# protected by a (primary_port, backup_port) fast-reroute demux driven by
+# per-port liveness.
+#
+# The value of this *chained* pattern (versus instantiating P-StatefulLB and
+# P-PURRFastReroute independently) is the PIN ↔ PATH contract between the
+# stateful load-balancing stage and the structural-failover stage — a
+# contract that is invisible when the components are tested in isolation:
+#   (a) the LB pin executes BEFORE the FRR demux, and the FRR table keys on
+#       the POST-DNAT backend address — not on the VIP (pin_precedes_path);
+#   (b) the backend a flow is pinned to is identical on the primary AND the
+#       backup path — failover changes the egress port + dst-MAC, never the
+#       backend identity / DNAT'd dst (backend_pin_survives_failover);
+#   (c) the backend selection is independent of port liveness — a flow
+#       pinned to a backend whose primary port is down still goes to that
+#       SAME backend via its backup port; the LB does not "route around" a
+#       dead port by re-balancing to a different backend
+#       (failover_does_not_rebalance).
+# See `bridging_notes:` for the v1model failure modes this composition
+# exposes that neither standalone pattern reaches.
+#
+# The cross-axis `composition` target_capability tag is used because this
+# NF chains a scale_up primitive (P-StatefulLB scales per-flow connection
+# state) with a redesign primitive (P-PURRFastReroute moves a fixed-function
+# ASIC fast-reroute primitive into programmable logic) into a single
+# composed NF whose structural failure modes are pin↔path interactions, not
+# the per-stage failures of either constituent.
+
+pattern_id: P-LBFailover
+version: "1.0"
+nf_categories:                                       # NF-category tags (ID:name pairs)
+  descriptive:  [D1:stateful-flow-tracking, D5:routing]   # per-flow binding (LB) ∘ destination-based forwarding with failover (FRR)
+  prescriptive: [P3:flow-tracking, P7:resilience-and-failover]  # per-flow state + eviction ∘ fast-reroute / port-liveness
+target_capability: composition                          # chained composition of a scale_up (StatefulLB) and a redesign (PURR) primitive; failure modes are pin↔path stage-ordering, cross-cutting
+summary: >
+  Edge L4 load balancer composing per-flow backend pinning (P-StatefulLB)
+  with primary/backup fast-reroute (P-PURRFastReroute) in a single pipeline
+  pass. A TCP packet to the VIP is pinned to a backend per ${assign}
+  (hash / consistent-hash), its destination is DNAT'd to the backend's
+  address, and the packet is then forwarded over an FRR-protected path: the
+  FRR group keyed on the (post-DNAT) backend address yields a
+  (primary_port, backup_port, primary_mac, backup_mac); a per-port liveness
+  demux uses the primary while its egress port is up, otherwise the backup,
+  with TTL decrement and Ethernet rewrite. The composition's load-bearing
+  contract is the pin↔path ordering: the LB pin strictly precedes the FRR
+  lookup and the FRR keys on the backend (never the VIP); the pinned backend
+  is identical on primary and backup paths (failover changes port + dst-MAC,
+  not the backend); and backend selection is liveness-independent (failover
+  never re-balances a flow to a different backend). Faithfulness ladder:
+  D5.0 hash-pin + single backup-per-backend + control-plane liveness →
+  D5.1 + sticky persistence under pool change and/or cascaded double-down
+  drop → D5.2 + dataplane-register liveness. The parameter-rebinding mutation surface lifts
+  flow-table capacity / eviction / hash family / persistence / workload skew
+  on the LB half and cascaded protection / liveness source / TTL strictness
+  on the FRR half independently, so the same composed oracle covers
+  everything from an unbounded hash-pin LB over a single-failure fabric to a
+  bounded LRU-evicting consistent-hash LB over a cascaded-protection,
+  dataplane-liveness fabric.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+
+grounding:
+
+  papers:
+    - cite: silkroad_sigcomm17
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-StatefulLB. SilkRoad (SIGCOMM 2017) is the
+        textbook stateful L4 LB on programmable switching ASICs:
+        per-connection backend (DIP) pinning at line rate, the digest +
+        Bloom-filter trick that keeps live flows on their original backend
+        under DIP-pool changes, and the VIP / DIP / connection-consistency
+        vocabulary. Supplies the LB-half ground truth (pin → DNAT) and
+        motivates the `persistence_strict` / `assign` parameters and the
+        `enable_persistence` / `switch_to_consistent_hash` operators. Cited
+        as the canonical reference for the load-balancing stage; the
+        failover stage is PURR's contribution below.
+
+    - cite: purr_conext19
+      role: canonical_implementation
+      relevance: |
+        Inherited from P-PURRFastReroute. PURR (CoNEXT 2019) motivates the
+        two-table FRR primitive this composition layers behind the LB: a
+        forwarding entry emits a *pair* of next-hops (primary + backup) per
+        destination, and a per-port liveness lookup selects between them in
+        a single match-action demux — failover is "structural" (one
+        match-action lookup, no per-packet recirculation or probe) and
+        tolerates multiple concurrent failures with minimal memory. Supplies
+        the FRR-half ground truth (liveness demux → primary/backup forward +
+        L2 rewrite + TTL decrement) and motivates the `cascaded_backup`,
+        `liveness_source`, and `port_down` parameters. The contribution this
+        composition preserves: one-packet structural failover
+        (failover_bounded_latency), validated on Tofino but pure-table P4
+        that runs in BMv2 unchanged.
+
+  rfcs:
+    - cite: rfc793
+      title: "Transmission Control Protocol"
+      sections: ["§2.7 connection establishment and clearing"]
+      role: normative_behaviour
+      relevance: |
+        Grounds the connection-pinning flow key. The LB binds a connection to a
+        backend keyed on the TCP socket pair (src/dst IP + src/dst port + proto);
+        a connection's packets MUST pin to the same backend even after the active
+        backend set changes (backend_pin_survives_failover). RFC 1812 §5.3.1
+        (TTL decrement-by-one) informs the routed-path notes via the inherited
+        P-PURRFastReroute pattern.
+      quote: "A connection is fully specified by the pair of sockets at the ends."
+
+  tutorials:
+    - path: tutorials/exercises/load_balance
+      role: baseline_topology
+      relevance: |
+        Inherited from P-StatefulLB. The canonical 1-VIP / N-backend
+        topology and packet-flow conventions for L4 LB exercises. Supplies
+        the load-balancing-stage topology this composition reaches the FRR
+        backup-port set out of; reused directly when the pattern is
+        instantiated for `provenance: tutorial`.
+
+
+# ─── Entities and state declarations ────────────────────────────────────────
+
+entities:
+
+  packet:
+    notes: |
+      The unit of work. The pin decision derives from the flow 5-tuple and
+      the flow_state binding; the path decision derives from the post-DNAT
+      backend address, the control-plane-installed FRR group, and the
+      per-port liveness. No per-packet state beyond the flow binding.
+
+  flow:                                    # the LB key — reused from P-StatefulLB
+    key:
+      - hdr.ipv4.src
+      - hdr.ipv4.dst
+      - hdr.tcp.sport
+      - hdr.tcp.dport
+      - hdr.ipv4.proto
+
+  flow_state:                              # per-flow backend binding — reused from P-StatefulLB
+    keyed_by: flow
+    attrs:
+      bound_backend: address
+    capacity: ${flow_table_capacity}
+    eviction: ${eviction_policy}
+    notes: |
+      The connection table: flow.key → pinned backend address. Populated on
+      the first packet of a flow (R3) and read on every subsequent packet
+      (R4). The binding is committed only on a forwarded packet — a packet
+      dropped by the cascaded double-down rule (R2) does NOT commit a
+      binding (the deterministic ${assign} re-derives the same backend on
+      retry, so no orphan binding accrues).
+
+  frr_group:                               # plays the TPL `bucket` role — the FRR pair for one backend; reused from P-PURRFastReroute
+    keyed_by: bound_backend                # the post-DNAT backend address (NOT the VIP)
+    attrs:
+      primary_port:   port
+      backup_port:    port
+      primary_mac:    address
+      backup_mac:     address
+    capacity: ${frr_table_capacity}
+    notes: |
+      A control-plane-installed FRR binding, one per backend. Keyed on the
+      backend's address — the address the LB stage DNAT'd the packet to.
+      Each binding ships a (primary, backup) next-hop pair; the per-port
+      liveness demux in R3/R4 picks one per packet. ${frr_groups} MUST cover
+      every backend in ${backends} (validated at instantiation) — otherwise
+      a pinned flow would have no path.
+
+  link:                                    # per-port liveness — reused from P-PURRFastReroute
+    keyed_by: egress_port
+    attrs:
+      is_down: bool
+    capacity: ${port_down_capacity}
+    notes: |
+      The set of ports currently considered down. At
+      ${liveness_source} == control_plane_table a port is "down" iff it has
+      a `mark_down` table entry; at dataplane_register the bit is a register
+      slot the data plane flips on locally-detected loss-of-signal. The rule
+      surface is identical; only the population mechanism changes.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+# Two parameter families — LB (load-balancing stage) and FRR (failover stage).
+
+parameters:
+
+  # ── LB stage (from P-StatefulLB) ──────────────────────────────────────────
+
+  vip:
+    type: address
+    constraint: ipv4
+    notes: |
+      The virtual IP the load balancer fronts. Only TCP traffic to ${vip}
+      is load-balanced; everything else drops at the LB stage (R1).
+
+  backends:
+    type: list[address]
+    constraint: "len ≥ 2; every backend has an FRR group in ${frr_groups}"
+    notes: |
+      The backend (DIP) pool. The LB pins each flow to one backend and
+      DNATs the destination to it. |${backends}| ≥ 2 (a one-backend "pool"
+      is degenerate load balancing).
+
+  assign:
+    type: enum
+    values: [round_robin, hash_5tuple, consistent_hash]
+    default: round_robin
+    notes: |
+      Backend-selection function on the first packet of a flow. round_robin
+      is a single global selector advanced once per first-of-a-connection
+      admission (selector mod |backends|) — deterministic given the order of
+      new-flow admissions, so it is the cleanest ANCHOR choice (the binding
+      is predictable without depending on the SUT's hash). It is, however,
+      incompatible with two harden directions and is gated out of them: the
+      persistence invariant (a counter resets / desyncs across state resets)
+      and the cascaded double-down drop (R2's "drop without committing a
+      binding, re-derive on retry" property holds only for a FLOW-KEYED
+      assign — see R2 notes), so enable_persistence and enable_cascaded_backup
+      both require ${assign} ≠ round_robin. hash_5tuple and consistent_hash
+      are the flow-keyed alternatives; consistent_hash additionally survives
+      pool addition for the unaffected majority of flows.
+
+  flow_table_capacity:
+    type: int | unbounded
+    range: "[256, 1048576]"
+    default: unbounded
+    notes: |
+      Connection-table size. unbounded is the anchor (every flow fits);
+      `shrink_flow_capacity_4x` walks it down until eviction is forced.
+
+  eviction_policy:
+    type: enum
+    values: [none, FIFO_collision_displace, LRU]
+    default: none
+    notes: |
+      Eviction policy when the connection table is full. none requires
+      ${flow_table_capacity} == unbounded. FIFO_collision_displace is the
+      implementable bounded variant (a colliding flow displaces the resident
+      binding); LRU requires per-flow recency tracking (harder in P4).
+
+  persistence_strict:
+    type: bool
+    default: false
+    notes: |
+      When true, live flows MUST continue mapping to their original backend
+      even when a NEW backend is added to ${backends}
+      (persistence_under_pool_addition is enforced rather than advisory).
+      Incompatible with no backend-state; pairs with ${assign} ≠ a stateless
+      reassignment.
+
+  # ── FRR stage (from P-PURRFastReroute) ────────────────────────────────────
+
+  frr_groups:
+    type: list[frr_group_entry]
+    constraint: |
+      every entry has backend:ipv4_address ∈ ${backends}; primary_port,
+      backup_port ∈ valid port ids with primary_port ≠ backup_port;
+      primary_mac, backup_mac:mac_address. Every backend in ${backends} has
+      exactly one entry (the pinned-flow path-coverage requirement).
+    notes: |
+      Control-plane-installed FRR bindings, one per backend. Exact-keyed on
+      the backend address (backends are host addresses, so no LPM is
+      needed — this is why the composition fixes the match kind to exact and
+      omits P-PURRFastReroute's lpm match-kind axis).
+
+  port_down:
+    type: list[port]
+    constraint: "subset of topology ports; |port_down| ≤ ${port_down_capacity}"
+    default: []
+    notes: |
+      Ports currently considered down. Empty in the no-failure sub-scenario;
+      non-empty for backup-path / failover tests. Populated by the control
+      plane (anchor) or the data plane (dataplane-liveness band).
+
+  port_down_capacity:
+    type: int
+    range: "[1, 64]"
+    default: 64
+    notes: "Max ports markable down simultaneously. Anchor uses the default."
+
+  liveness_source:
+    type: enum
+    values: [control_plane_table, dataplane_register]
+    default: control_plane_table
+    notes: |
+      How link-down state reaches the demux. control_plane_table — a
+      `mark_down` table keyed on the egress port (anchor). dataplane_register
+      — a register array indexed by port id the data plane flips locally;
+      the implementation reads the register and tests value(link.is_down, ==, 1).
+
+  cascaded_backup:
+    type: bool
+    default: false
+    notes: |
+      When false, R3 uses the backup unconditionally if the primary is down
+      (even a black-holed backup port). When true, R3 additionally checks
+      the backup port's liveness and R2 drops when BOTH primary and backup
+      are down — PURR's N-1-protection mode.
+
+  ttl_decrement_strict:
+    type: bool
+    default: true
+    notes: |
+      When true, every forwarded packet (R3/R4) decrements hdr.ipv4.ttl by
+      exactly one and ttl_quantum_one is enforced. Anchor is true.
+
+  frr_table_capacity:
+    type: int | unbounded
+    range: "[16, 65536]"
+    default: unbounded
+    notes: |
+      Max FRR bindings. One per backend, so realistic values track
+      |${backends}|; retained as a parameter for symmetry with
+      P-PURRFastReroute but rarely the binding constraint in this
+      composition (the LB flow table is the tighter budget).
+
+  # ── Composition (derived) ─────────────────────────────────────────────────
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_pin_then_static_path        # anchor — hash-pin + single backup-per-backend + control-plane liveness
+      - D5.1_persistent_pin_cascaded     # + sticky persistence under pool change and/or cascaded double-down drop
+      - D5.2_dataplane_liveness          # + dataplane-register liveness source
+    default: D5.0_pin_then_static_path
+    notes: |
+      Composition faithfulness ladder. DERIVED from
+      (persistence_strict, cascaded_backup, liveness_source): the
+      enable_persistence / enable_cascaded_backup /
+      swap_liveness_to_dataplane_register operators advance it as a
+      side-effect; it is not moved by a standalone operator. D5.0 is the
+      clean pin-then-forward pipeline over single-failure protection;
+      D5.1 adds sticky pinning under pool change and the cascaded both-down
+      drop; D5.2 swaps the liveness source to a dataplane register. Seed
+      parameter, not a Table 1 design-space tag.
+
+# ─── Rules ──────────────────────────────────────────────────────────────────
+# First-match semantics. Order matters. The packet flows LB-stage → FRR-stage:
+# the LB pins the flow to a backend and DNATs the destination, then the FRR
+# demux (resolved in `given` via the backend's frr_group + per-port liveness)
+# selects the primary or backup egress. The cascaded double-down drop (R2) is
+# hoisted above the forward rules so first-match yields the drop before either
+# forward fires.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    then:
+      - drop
+    notes: |
+      ARP, IPv6, LLDP, any non-IPv4 ether-type — dropped. The LB key and the
+      FRR key are both IPv4, so non-IPv4 frames are out of the composition's
+      match domain. G3 parser-edge / conditional-deparser anchor.
+
+  - id: R1_non_vip_or_non_tcp_drop
+    when: |
+      header_present(ipv4) ∧
+      ( ¬match(hdr.ipv4.dst, ${vip}) ∨ ¬header_present(tcp) )
+    then:
+      - drop
+    notes: |
+      The LB stage admits ONLY TCP traffic to ${vip}. Anything not destined
+      for the VIP, and any non-TCP traffic to the VIP, is dropped before any
+      pin or path decision. Default-deny gate; lifted from P-StatefulLB R3 +
+      its header_present(tcp) precondition.
+
+  - id: R2_cascaded_double_down_drop
+    when: |
+      header_present(ipv4) ∧ match(hdr.ipv4.dst, ${vip}) ∧ header_present(tcp) ∧
+      ${cascaded_backup} ∧
+      exists(frr_group, key_match(backend_for(flow, ${assign}, flow_state), ${frr_groups})) ∧
+      exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1) ∧
+      exists(link, frr_group.backup_port)  ∧ value(link.is_down, ==, 1)
+    enforced_when: "${cascaded_backup}"
+    given:
+      flow:      deduce_from_packet
+      backend:   backend_for(flow, ${assign}, flow_state)    # existing binding if present, else ${assign}(${backends}, flow.key)
+      frr_group: by_key_match(backend, ${frr_groups})
+    then:
+      - drop
+    notes: |
+      Both the primary AND backup ports of the flow's pinned backend are
+      down. Only fires at ${cascaded_backup} == true; otherwise R3 absorbs
+      this case via its negated guard and the backup port (black-holed) is
+      "used". `backend` is resolved deterministically (existing binding, or
+      ${assign} on a new flow) WITHOUT committing a new binding — a dropped
+      packet leaves no flow_state, and a FLOW-KEYED ${assign} (hash_5tuple /
+      consistent_hash) re-derives the same backend on retry. This is why
+      enable_cascaded_backup requires ${assign} ≠ round_robin (a global
+      selector would desync if a binding is not committed). Lifted from
+      P-PURRFastReroute R4, re-keyed on the pinned backend.
+
+  - id: R3_new_flow_pin_and_forward
+    when: |
+      header_present(ipv4) ∧ match(hdr.ipv4.dst, ${vip}) ∧ header_present(tcp) ∧
+      ¬exists(flow_state, flow.key) ∧
+      ¬( ${cascaded_backup} ∧
+         exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1) ∧
+         exists(link, frr_group.backup_port)  ∧ value(link.is_down, ==, 1) )
+    given:
+      flow:       deduce_from_packet
+      backend:    ${assign}(${backends}, flow.key)
+      frr_group:  by_key_match(backend, ${frr_groups})
+      frr_path:   select_frr_path(frr_group, link, ${cascaded_backup})    # (egress_port, dst_mac): primary if primary up, else backup
+    then:
+      - bind(flow_state, flow.key, {bound_backend: backend})
+      - rewrite(hdr.ipv4.dst, backend)
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_path.dst_mac)
+      - forward(frr_path.egress_port)
+    notes: |
+      First packet of a new flow: select a backend per ${assign}, install the
+      binding, DNAT the destination to the backend, then forward over the
+      backend's FRR path. `select_frr_path` resolves the per-port liveness
+      demux — primary port + primary_mac when the primary is up, backup port
+      + backup_mac otherwise. Backend selection is liveness-INDEPENDENT
+      (failover_does_not_rebalance): a new flow whose backend's primary is
+      down still pins to that backend and exits the backup port.
+      Subsumes P-StatefulLB R1 fused with P-PURRFastReroute R2/R3.
+
+  - id: R4_existing_flow_forward
+    when: |
+      header_present(ipv4) ∧ match(hdr.ipv4.dst, ${vip}) ∧ header_present(tcp) ∧
+      exists(flow_state, flow.key) ∧
+      ¬( ${cascaded_backup} ∧
+         exists(link, frr_group.primary_port) ∧ value(link.is_down, ==, 1) ∧
+         exists(link, frr_group.backup_port)  ∧ value(link.is_down, ==, 1) )
+    given:
+      flow:       deduce_from_packet
+      backend:    flow_state[flow.key].bound_backend
+      frr_group:  by_key_match(backend, ${frr_groups})
+      frr_path:   select_frr_path(frr_group, link, ${cascaded_backup})
+    then:
+      - rewrite(hdr.ipv4.dst, backend)
+      - "dec(hdr.ipv4.ttl, 1)                IF ${ttl_decrement_strict}"
+      - set(hdr.ethernet.src, hdr.ethernet.dst)
+      - set(hdr.ethernet.dst, frr_path.dst_mac)
+      - forward(frr_path.egress_port)
+    notes: |
+      Subsequent packets of an established flow follow the pinned backend
+      (no re-selection, no re-binding) and re-evaluate the FRR path against
+      the CURRENT liveness. The pinned backend is the SAME on the primary and
+      backup paths (backend_pin_survives_failover): a failover changes only
+      frr_path.egress_port and frr_path.dst_mac. Subsumes P-StatefulLB R2
+      fused with P-PURRFastReroute R2/R3.
+
+# ─── Invariants ─────────────────────────────────────────────────────────────
+
+invariants:
+
+  # ── Composition-specific (the pin↔path contract) ─────────────────────────
+
+  - id: pin_precedes_path
+    clause: stability
+    target: forward_decision
+    while: "R3 ∨ R4 fires (any forwarded path)"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      The composition's MASTER invariant. The LB pin (backend selection +
+      DNAT) executes BEFORE the FRR demux, and the FRR group is keyed on the
+      POST-DNAT backend address — never on the VIP. Catches the dominant
+      composition bug: running the FRR lookup on the original VIP (so the
+      FRR table misses, or needs a VIP entry that defeats per-backend
+      protection) or letting the FRR demux pick an egress before the backend
+      is even chosen. The composed analogue of the routing-before-classify
+      bug in P-RouterACL, re-cast for a stateful DNAT stage.
+
+  - id: backend_pin_survives_failover
+    clause: persistence
+    target: "hdr.ipv4.dst (the DNAT'd backend address)"
+    while: "R3 ∨ R4 fires"
+    free_under: ["frr_path.egress_port", "hdr.ethernet.dst"]
+    enforced_when: "true"
+    notes: |
+      The destination a packet is DNAT'd to (the pinned backend) is
+      IDENTICAL whether the packet takes the primary or the backup path. A
+      failover changes the egress port and the dst-MAC ONLY — never the
+      backend identity. Catches the signature composition bug of conflating
+      "backup PATH" with "backup BACKEND": an implementation that DNATs to a different
+      address on the backup port has turned path failover into backend
+      failover, breaking connection consistency. The single most valuable
+      invariant this composition adds over its constituents.
+
+  - id: failover_does_not_rebalance
+    clause: stability
+    target: bound_backend
+    while: "R3 ∨ R4 fires"
+    free_under: []
+    enforced_when: "true"
+    notes: |
+      Backend selection is INDEPENDENT of port liveness. A flow pinned to
+      backend B stays on B even when B's primary port is down (it uses B's
+      backup port); a NEW flow's backend is chosen by ${assign} alone, not
+      steered away from backends whose primary is down. Catches the bug of
+      folding liveness into the LB hash ("don't pick a backend whose port is
+      down") — that is health-aware LB (a DIFFERENT composition); PURR-style
+      FRR protects the PATH to the chosen backend, not the choice itself.
+
+  - id: persistence_across_failover
+    clause: stability
+    target: "(bound_backend, frr_path.egress_port)"
+    while: "flow ∈ live_flows ∧ link.is_down state unchanged"
+    notes: |
+      Under a fixed liveness state, two packets of one flow land on the SAME
+      (backend, egress_port). Combines P-StatefulLB existing-flow consistency
+      with P-PURRFastReroute's per-packet failover determinism. Catches a
+      implementation that hashes the FRR demux (flow splits even on the unfailed
+      path) or re-derives the backend per packet under churn.
+
+  # ── LB-stage invariants (from P-StatefulLB) ──────────────────────────────
+
+  - id: src_addr_preservation
+    clause: persistence
+    target: "hdr.ipv4.src"
+    while: "R3 ∨ R4 fires"
+    free_under: []
+    notes: |
+      Only the DESTINATION is rewritten (DNAT to the backend). The source IP
+      is preserved across the pin + forward. NOTE: this DELIBERATELY relaxes
+      P-PURRFastReroute's `ip_addr_preservation` (which preserves BOTH src
+      and dst) on the dst field — the LB stage owns the destination rewrite
+      by design. An implementation that also rewrites src (SNAT) over-reaches.
+
+  - id: persistence_under_pool_addition
+    clause: persistence
+    target: flow_state[*].bound_backend
+    while: "flow ∈ live_flows"
+    free_under: ["add_backend(_)"]
+    enforced_when: "${persistence_strict}"
+    notes: |
+      Live flows continue mapping to their original backend even when a NEW
+      backend is added to ${backends}. Lifted from P-StatefulLB; consistent
+      hashing is the simpler weaker realisation that survives addition.
+
+  - id: no_orphan_flow_state
+    clause: no_orphan
+    target: flow_state
+    enforced_when: "${flow_table_capacity} ≠ unbounded"
+    notes: |
+      A bounded connection table MUST have an eviction policy that removes
+      stale bindings, else the table fills and new flows are blackholed.
+      Lifted from P-StatefulLB.
+
+  # ── FRR-stage invariants (from P-PURRFastReroute) ────────────────────────
+
+  - id: ttl_quantum_one
+    clause: stability
+    target: hdr.ipv4.ttl_decrement
+    while: "R3 ∨ R4 fires"
+    enforced_when: "${ttl_decrement_strict}"
+    notes: |
+      RFC 1812 §5.3.1 — TTL decremented by EXACTLY one per forward, on every
+      forwarded path (primary AND backup). Catches double-decrement. Lifted
+      from P-PURRFastReroute.
+
+  - id: ether_rewrite_correctness_on_primary
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "R3 ∨ R4 fires ∧ primary path taken"
+    notes: |
+      On the primary path, hdr.ethernet.dst MUST equal the backend's FRR
+      group's primary_mac. Lifted from P-PURRFastReroute.
+
+  - id: ether_rewrite_correctness_on_backup
+    clause: stability
+    target: hdr.ethernet.dst
+    while: "R3 ∨ R4 fires ∧ backup path taken"
+    notes: |
+      On the backup path, hdr.ethernet.dst MUST equal the backend's FRR
+      group's backup_mac — NOT primary_mac. The mac-confusion bug sends
+      packets out the correct backup port with the wrong dst-MAC. Lifted
+      from P-PURRFastReroute.
+
+  - id: failover_decision_per_packet
+    clause: stability
+    target: forward_decision
+    while: "exists(frr_group, backend) ∧ link.is_down state unchanged"
+    notes: |
+      Under a fixed liveness state, the primary-vs-backup choice for a given
+      backend is a deterministic function of the backend and the installed
+      liveness. Catches hashing / randomising the demux. Lifted from
+      P-PURRFastReroute.
+
+  - id: failover_bounded_latency
+    clause: bounded_latency
+    target: failover_response
+    bound: 1
+    notes: |
+      The first packet observing the primary's is_down == 1 MUST take the
+      backup — one-packet structural failover, not a deferred control-plane
+      upcall or a recirculation. Lifted from P-PURRFastReroute; ANDed with
+      no_loop it rules out recirculation-based failover.
+
+  - id: no_orphan_links
+    clause: no_orphan
+    target: link
+    notes: |
+      Every link (port-down binding) is sourced from a well-defined
+      population mechanism (control-plane table entry or dataplane register
+      slot); the pattern declares no implicit decay. Lifted from
+      P-PURRFastReroute.
+
+  - id: no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      No recirculation: neither the LB pin nor the FRR demux re-enters
+      ingress. Every packet egresses on a definite port or is dropped; TTL
+      decrement on every forward bounds any path. An implementation that recirculates
+      to re-apply the demux introduces a loop the bounded-step trace cap
+      surfaces.
+
+# ─── Test scaffolding (oracle-audit canonical examples) ─────────────────────
+# Materialised into task.yaml::test_cases at instantiation. The composition's
+# distinctive entries are the PIN↔PATH probes (pin_survives_failover,
+# new_flow_on_down_primary, checksum_after_dnat_and_ttl) that neither
+# standalone pattern can express. Following the test-generation conventions,
+# stateful tests use TTL=64 warm-ups via prior_inputs and a TTL=1 test packet.
+
+test_scaffolding:
+
+  G1:
+    - id: pin_then_forward_golden_path
+      rule_ref: G1-P1-T1                                     # one test per forwarding path
+      generate: |
+        Send a new TCP SYN to ${vip} whose ${assign}-selected backend Bi
+        has its primary_port UP. Assert: forward on Bi's primary_port;
+        hdr.ipv4.dst rewritten to Bi's address (DNAT); hdr.ethernet.dst ==
+        Bi's primary_mac; hdr.ethernet.src == prior dst-MAC; TTL decremented
+        by 1 IF ${ttl_decrement_strict}; hdr.ipv4.src unchanged; IPv4
+        checksum valid on egress. The composed golden path: LB pin → FRR
+        primary forward.
+
+    - id: existing_flow_same_backend
+      rule_ref: G1-P2-T2                                     # state accumulation
+      generate: |
+        Send 5 packets sharing one 5-tuple to ${vip} (warm-ups TTL=64 via
+        prior_inputs, test packet TTL=1). Assert all 5 DNAT to the same
+        backend and exit the same egress_port. Tests existing-flow pinning +
+        failover_decision_per_packet under unchanged liveness.
+
+    - id: pin_survives_failover
+      rule_ref: G1-P1-T5                                     # explicit transformation assertion (the signature composition probe)
+      generate: |
+        Establish flow F → backend Bi with Bi's primary_port UP (warm-up
+        TTL=64). Mark Bi's primary_port DOWN (add it to ${port_down}).
+        Resend F (test TTL=1). Assert: hdr.ipv4.dst is STILL Bi's address
+        (the backend did NOT change); egress_port == Bi's backup_port;
+        hdr.ethernet.dst == Bi's backup_mac. The composition's master probe —
+        an implementation that re-DNATs to a "backup backend" on failover, or that
+        re-balances the flow, fails here. Anchors
+        backend_pin_survives_failover + failover_does_not_rebalance.
+
+    - id: new_flow_on_down_primary
+      rule_ref: G1-P1-T1
+      generate: |
+        With backend Bi's primary_port already in ${port_down}, send a NEW
+        flow whose ${assign}-selected backend is Bi. Assert: the flow pins to
+        Bi anyway (DNAT dst == Bi's address) and forwards over Bi's
+        backup_port — the LB did NOT steer the new flow to a different
+        backend with a live primary. Anchors failover_does_not_rebalance on
+        the new-flow path.
+
+    - id: backend_distribution
+      rule_ref: G1-P1-T5
+      generate: |
+        Send 1000 distinct TCP SYNs (varied 5-tuples, all primaries up) to
+        ${vip}. Assert each backend in ${backends} receives within ±10% of
+        its expected share (1000 / |${backends}|). Tests ${assign} spread.
+
+    - id: persistence_under_pool_addition
+      rule_ref: G1-P2-T4
+      requires: "${persistence_strict}"
+      generate: |
+        Establish flow F → backend B0 (warm-up TTL=64). Add a new backend
+        B_new to ${backends} (+ its FRR group). Resend F (test TTL=1).
+        Assert F still DNATs to B0. Tests persistence_under_pool_addition.
+
+  G2:
+    - id: backup_path_uses_backup_mac
+      rule_ref: G1-P1-T5
+      generate: |
+        Send a flow whose pinned backend's primary_port IS in ${port_down},
+        with a source address chosen to defeat a 5-tuple-hash demux bug.
+        Assert hdr.ethernet.dst is EXACTLY the backup_mac, not primary_mac.
+        Tests ether_rewrite_correctness_on_backup through the pin stage.
+
+    - id: ttl_decrement_check
+      rule_ref: G2-P1-T2
+      requires: "${ttl_decrement_strict}"
+      generate: |
+        Send a packet on the primary path with ipv4.ttl = 10; assert egress
+        ttl == 9. Repeat with ttl = 1; assert egress ttl == 0 (forwarded,
+        not pre-dropped — matches P-PURRFastReroute's no-pre-drop convention).
+
+    - id: eviction_on_overflow
+      rule_ref: G2-P2-T3
+      requires: "${flow_table_capacity} ≠ unbounded ∧ ${eviction_policy} ≠ none"
+      generate: |
+        Open ${flow_table_capacity} + 1 distinct flows (warm-up TTL=64).
+        Send the overflow flow (test TTL=1), then re-send the OLDEST flow.
+        Under FIFO_collision_displace / LRU the evicted flow is treated as a
+        new flow (re-pinned). Tests no_orphan_flow_state.
+
+  G3:
+    - id: non_vip_dropped
+      rule_ref: G3-P1-T4                                     # default-deny gate
+      generate: |
+        Send a TCP SYN to a non-VIP IP. Assert drop (R1). The LB stage admits
+        only VIP traffic; nothing leaks to the FRR stage.
+
+    - id: non_ipv4_dropped
+      rule_ref: G3-P1-T1                                     # conditional-deparser / parser-edge anchor
+      generate: |
+        Send a non-IPv4 frame (ARP 0x0806 / IPv6 0x86DD). Assert drop (R0).
+        Targets the common v1model conditional-deparser bug (an implementation emitting a
+        degenerate header on the drop path breaks the parser↔deparser
+        boundary).
+
+    - id: checksum_after_dnat_and_ttl
+      rule_ref: G1-P4-T1                                     # the #1 v1model silent failure, composed form
+      generate: |
+        Send a routable VIP flow on the primary path. Assert the egress IPv4
+        header checksum is VALID over BOTH the DNAT destination rewrite AND
+        the TTL decrement, and that hdr.ipv4.src and totalLen are unchanged.
+        The #1 v1model silent-failure probe in its composed form: an implementation with
+        two separate checksum updates (one after DNAT, one after TTL) that
+        clobber each other emits a stale checksum BMv2 forwards but real
+        peers reject.
+
+    - id: cascaded_double_down_drop
+      rule_ref: G3-P1-T4
+      requires: "${cascaded_backup}"
+      generate: |
+        Pin a flow to backend Bi, then put BOTH Bi's primary_port and
+        backup_port in ${port_down}. Send the flow's packet. Assert drop
+        (R2) — the packet must NOT leak out a black-holed port. Probes the
+        cascaded N-1-protection drop.
+
+    - id: regression_std_metadata_drop_smoke
+      rule_ref: G3-P2-T2                                     # bug-driven: std_metadata.drop misread
+      generate: |
+        Send two consecutive packets: (a) a non-IPv4 frame R0 drops, then
+        (b) a VIP flow R3/R4 forwards. Assert (b) forwards normally — the
+        prior drop did NOT corrupt the per-packet decision via a misread of
+        standard_metadata.drop (the reserved-field cross-contamination bug).
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators ─────────────────────────────────────────────────────
+# Pairs every harden with a matching ease so difficulty recalibration can
+# move in either direction. Operators move exactly one axis (single-axis
+# displacement); faithfulness is DERIVED and bumped as a side-effect of the
+# persistence / cascaded / liveness operators rather than by a standalone
+# operator.
+
+mutation_operators:
+
+  # ── LB flow-table capacity ────────────────────────────────────────────────
+  - id: shrink_flow_capacity_4x
+    applicable_when: "${flow_table_capacity} ≠ unbounded ∧ ${flow_table_capacity} > 256"
+    effect: "${flow_table_capacity} ← ${flow_table_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${flow_table_capacity} ≥ 64 ∧ ${eviction_policy} ≠ none"
+    notes: "Tighten the connection-table budget until eviction is forced. Pairs with enlarge_flow_capacity_2x."
+
+  - id: enlarge_flow_capacity_2x
+    applicable_when: "${flow_table_capacity} ≠ unbounded"
+    effect: "${flow_table_capacity} ← ${flow_table_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${flow_table_capacity} ≤ 1048576"
+    notes: "Loosen the connection-table budget. Pairs with shrink_flow_capacity_4x."
+
+  # ── LB persistence (bumps faithfulness) ───────────────────────────────────
+  - id: enable_persistence
+    applicable_when: "${persistence_strict} == false"
+    effect: |
+      ${persistence_strict} ← true ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_persistent_pin_cascaded)
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${assign} ∈ {hash_5tuple, consistent_hash}"
+    notes: |
+      Enforce sticky pinning under pool addition. Activates the
+      persistence_under_pool_addition invariant + its G1 test. Pairs with
+      disable_persistence.
+
+  - id: disable_persistence
+    applicable_when: "${persistence_strict} == true"
+    effect: |
+      ${persistence_strict} ← false ∧
+      ${faithfulness} ← recompute_from(persistence_strict, cascaded_backup, liveness_source)
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Relax sticky pinning. Pairs with enable_persistence."
+
+  # ── LB eviction policy ────────────────────────────────────────────────────
+  - id: swap_eviction_to_LRU
+    applicable_when: "${eviction_policy} ≠ LRU ∧ ${flow_table_capacity} ≠ unbounded"
+    effect: "${eviction_policy} ← LRU"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${flow_table_capacity} ≥ 64"
+    notes: "LRU needs per-flow recency tracking (no native register timestamp arithmetic in P4). Pairs with swap_eviction_to_FIFO."
+
+  - id: swap_eviction_to_FIFO
+    applicable_when: "${eviction_policy} == LRU"
+    effect: "${eviction_policy} ← FIFO_collision_displace"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${flow_table_capacity} ≠ unbounded"
+    notes: "Drop back to the simpler collision-displace eviction. Pairs with swap_eviction_to_LRU."
+
+  # ── LB hash family ────────────────────────────────────────────────────────
+  - id: adopt_flow_keyed_assign
+    applicable_when: "${assign} == round_robin"
+    effect: "${assign} ← hash_5tuple"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Move off the deterministic global selector to a flow-keyed 5-tuple
+      hash — the SUT now chooses its own backend mapping (verified by
+      consistency, not by a fixed expected backend), and this is the
+      precondition the flow-keyed harden directions (enable_persistence,
+      enable_cascaded_backup) require. Pairs with revert_to_round_robin.
+
+  - id: revert_to_round_robin
+    applicable_when: "${assign} == hash_5tuple ∧ ${persistence_strict} == false ∧ ${cascaded_backup} == false"
+    effect: "${assign} ← round_robin"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: |
+      Return to the deterministic selector (only when no flow-keyed
+      direction is active). Pairs with adopt_flow_keyed_assign.
+
+  - id: switch_to_consistent_hash
+    applicable_when: "${assign} == hash_5tuple"
+    effect: "${assign} ← consistent_hash"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Consistent hashing (hash-ring across stages) survives pool addition for
+      the unaffected majority; the implementation complexity rises. Pairs with
+      switch_to_hash_5tuple.
+
+  - id: switch_to_hash_5tuple
+    applicable_when: "${assign} == consistent_hash"
+    effect: "${assign} ← hash_5tuple"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${persistence_strict} == false"
+    notes: "Drop back to plain 5-tuple hashing (incompatible with persistence under removal). Pairs with switch_to_consistent_hash."
+
+  # ── FRR cascaded protection (bumps faithfulness) ──────────────────────────
+  - id: enable_cascaded_backup
+    applicable_when: "${cascaded_backup} == false"
+    effect: |
+      ${cascaded_backup} ← true ∧
+      ${faithfulness} ← max(${faithfulness}, D5.1_persistent_pin_cascaded)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${assign} ≠ round_robin ∧ R2 is added to the active rule set ∧ a `cascaded_double_down_drop` G3 entry is materialised ∧ ${port_down_capacity} ≥ 2"
+    notes: |
+      Activate R2 and the both-down-drop semantics. The implementation must add a
+      second liveness check on the backup port. Requires a flow-keyed
+      ${assign} (hash_5tuple / consistent_hash) so R2's re-derivation-on-retry
+      property holds (a round_robin selector would desync if a packet is
+      dropped without committing its binding). Pairs with
+      disable_cascaded_backup.
+
+  - id: disable_cascaded_backup
+    applicable_when: "${cascaded_backup} == true"
+    effect: |
+      ${cascaded_backup} ← false ∧
+      ${faithfulness} ← recompute_from(persistence_strict, cascaded_backup, liveness_source)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "R2 is removed from the active rule set"
+    notes: "Strip cascaded protection (backup used even when itself down). Pairs with enable_cascaded_backup."
+
+  # ── FRR liveness source (bumps faithfulness) ──────────────────────────────
+  - id: swap_liveness_to_dataplane_register
+    applicable_when: "${liveness_source} == control_plane_table"
+    effect: |
+      ${liveness_source} ← dataplane_register ∧
+      ${faithfulness} ← max(${faithfulness}, D5.2_dataplane_liveness)
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "the harness can pre-populate the dataplane register at task start"
+    notes: |
+      Read the port-down bit from a register array indexed by port id rather
+      than from a table-match outcome. Catches implementations that conflate the two
+      abstractions. Pairs with swap_liveness_to_control_plane_table.
+
+  - id: swap_liveness_to_control_plane_table
+    applicable_when: "${liveness_source} == dataplane_register"
+    effect: |
+      ${liveness_source} ← control_plane_table ∧
+      ${faithfulness} ← recompute_from(persistence_strict, cascaded_backup, liveness_source)
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "the seed's port_down list is realisable as table entries"
+    notes: "Drop back to table-driven liveness. Pairs with swap_liveness_to_dataplane_register."
+
+  # ── FRR TTL strictness ────────────────────────────────────────────────────
+  - id: enable_strict_ttl_invariant
+    applicable_when: "${ttl_decrement_strict} == false"
+    effect: "${ttl_decrement_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "ttl_decrement_check is included in the G2 set"
+    notes: "Enforce exact TTL decrement-by-one on every forward. Pairs with relax_ttl_invariant."
+
+  - id: relax_ttl_invariant
+    applicable_when: "${ttl_decrement_strict} == true"
+    effect: |
+      ${ttl_decrement_strict} ← false ∧
+      ttl_quantum_one invariant moves to advisory
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "ttl_decrement_check is dropped from the G2 floor"
+    notes: "Tunnel-style seeds may not decrement TTL on the demux. Pairs with enable_strict_ttl_invariant."
+
+  # ── Workload skew ─────────────────────────────────────────────────────────
+  - id: inject_zipfian_workload
+    applicable_when: "workload_skew ≠ zipfian"
+    effect: |
+      Replace backend_distribution with a skewed variant: 80% of traffic to
+      20% of source IPs (Zipfian α=1.0); assert the per-backend share is
+      still within ±15% (loosened from ±10% for workload realism).
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Heavy-tailed source distribution stresses hash uniformity. Pairs with restore_uniform_workload."
+
+  - id: restore_uniform_workload
+    applicable_when: "workload_skew == zipfian"
+    effect: "Restore the uniform-5-tuple backend_distribution test (±10%)."
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+    notes: "Return to a uniform workload. Pairs with inject_zipfian_workload."
+
+  # ── Hidden-coverage: multi-failover-under-pinning ─────────────────────────
+  - id: add_failover_persistence_test
+    applicable_when: "'multi_failover_under_pinning' ∉ test_scaffolding.G1"
+    effect: |
+      Add a G1 test `multi_failover_under_pinning`: establish 3 flows pinned
+      to distinct backends; mark each backend's primary port down in turn;
+      assert every flow keeps its ORIGINAL backend (same DNAT'd dst) while
+      its egress migrates primary → backup. Probes PURR's multi-failure
+      tolerance combined with LB pin stability.
+    axis: hidden-coverage
+    direction: harden
+    feasibility_postcondition: "|${backends}| ≥ 3 ∧ ${port_down_capacity} ≥ 3"
+    notes: "Test-rigor harden on backend_pin_survives_failover. Pairs with drop_failover_persistence_test."
+
+  - id: drop_failover_persistence_test
+    applicable_when: "'multi_failover_under_pinning' ∈ test_scaffolding.G1"
+    effect: "Remove the `multi_failover_under_pinning` G1 test."
+    axis: hidden-coverage
+    direction: ease
+    feasibility_postcondition: "G1 still contains ≥ 3 entries"
+    notes: "Test-rigor ease. Pairs with add_failover_persistence_test."
+
+  # ── Input-form: spec noise ────────────────────────────────────────────────
+  - id: noisify_spec_low
+    applicable_when: "true"
+    effect: |
+      Inject low-intensity presentation noise into task.yaml::description per
+      the noisify_spec_low protocol shared with the constituent patterns:
+        • 1 distractor clause about deployment / out-of-scope behaviour that
+          is true and bears on no rule;
+        • 1 irrelevant-field claim naming a real artefact (a port, backend,
+          table) with an explicit "plays no role" disclaimer.
+      Hard constraints: rule truth-values, oracle output, and test corpus are
+      byte-identical to the clean baseline. Append injected text to
+      provenance.json::spec_noise.injected.
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: "Presentation-noise harden. Pairs with denoisify_spec."
+
+  - id: denoisify_spec
+    applicable_when: "spec_noise.intensity ∈ {low, medium, high}"
+    effect: |
+      Revert the most recent noisify_spec_* operator: remove its injected
+      clauses, restore the clean description, clear the corresponding
+      provenance.json::spec_noise.injected entries (most-recent first).
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "spec_noise.intensity != none"
+    notes: "Presentation-noise ease. Pairs with noisify_spec_low."
+
+# ─── Implementation notes (advisory; not LLM-visible) ───────────────────────
+
+bridging_notes: |
+  Common implementations of this composed pattern in v1model P4. Items marked
+  [common-knowledge baseline] are synthesised from internalised P4 /
+  networking knowledge rather than retrieved from a cited source.
+
+    Anchor (faithfulness=D5.0_pin_then_static_path, assign=hash_5tuple,
+            flow_table_capacity unbounded, eviction none, persistence false,
+            cascaded false, liveness control_plane_table, ttl strict):
+      - Pre-stage gate: parse ethernet/ipv4/tcp; if !hdr.ipv4.isValid() ||
+        hdr.ipv4.dstAddr != VIP || !hdr.tcp.isValid() → mark_to_drop().
+      - Stage 1, LB pin: register<bit<W>>(N) flow_table indexed by
+        hash(5-tuple). On a miss (slot empty/zero) compute the backend index
+        = hash(5-tuple) % |backends| (or a consistent-hash ring), store it,
+        and DNAT hdr.ipv4.dstAddr = backend_addr[idx]. On a hit, read the
+        stored backend and DNAT to it. [common-knowledge baseline — SilkRoad
+        digest+Bloom is the production realisation; a plain register suffices
+        at the anchor.]
+      - Stage 2, FRR demux: frr_table keyed EXACTLY on the (post-DNAT)
+        backend address → action set_frr(primary_port, backup_port,
+        primary_mac, backup_mac) into metadata. Then port_down table keyed on
+        meta.primary_port → mark_down() sets meta.primary_down=1
+        (default NoAction). If meta.primary_down==0: egress=primary_port,
+        dmac=primary_mac; else egress=backup_port, dmac=backup_mac.
+      - L2 + TTL: ether.src=ether.dst(old); ether.dst=dmac; ttl-- .
+      - MyComputeChecksum: a SINGLE incremental update over the FINAL header
+        (post-DNAT dst AND post-TTL). See the anti-pattern note — this is the
+        composition's sharpest v1model trap.
+
+      STAGE ORDERING is load-bearing: the frr_table MUST be keyed on the
+      DNAT'd backend address, so the LB stage must run (and write
+      hdr.ipv4.dstAddr) BEFORE the frr_table.apply(). A program that applies
+      the frr_table on the original VIP keys every flow into one (the VIP's)
+      FRR group — collapsing per-backend path protection — and breaks
+      pin_precedes_path the moment the backends sit behind different ports.
+
+    D5.1 (+persistence and/or +cascaded):
+      - persistence: keep the binding stable when a backend is added — a
+        plain modulo hash re-maps EVERY flow on |backends| change; use a
+        consistent-hash ring with a version counter so only the minority of
+        flows hashing to the new backend move. [common-knowledge baseline]
+      - cascaded: add a second port_down lookup on meta.backup_port into
+        meta.backup_down; if primary_down && backup_down → mark_to_drop()
+        (R2), else proceed. The both-down drop MUST be decided before the
+        backup forward.
+
+    D5.2 (+dataplane liveness):
+      - Replace the port_down table with register<bit<1>>(N) port_down_reg;
+        read port_down_reg.read(v, meta.primary_port) then
+        meta.primary_down=v (and the backup analogue at D5.1+ cascaded). The
+        harness pre-populates the register at init. [common-knowledge
+        baseline — the BMv2 register API is in v1model.p4.]
+
+  Anti-pattern implementations to reject during reference review:
+
+    * Re-DNATing to a DIFFERENT backend on the backup path (treating "backup
+      PATH" as "backup BACKEND"). The backend a flow is pinned to is fixed;
+      only the egress port + dst-MAC change on failover.
+      backend_pin_survives_failover catches it (pin_survives_failover test).
+    * Folding liveness into backend selection ("skip backends whose primary
+      is down"). That is health-aware LB, a different composition; PURR
+      protects the PATH, not the choice. failover_does_not_rebalance catches
+      it (new_flow_on_down_primary test).
+    * Keying the frr_table on the VIP instead of the post-DNAT backend
+      address (FRR before DNAT). pin_precedes_path catches it.
+    * Two separate IPv4 checksum recomputations (one after DNAT, one after
+      TTL) that clobber each other. checksum_after_dnat_and_ttl catches it —
+      the composition's #1 silent-failure trap, sharper than either
+      constituent because DNAT changes dst (a checksum-relevant field) AND
+      TTL in one pass.
+    * Also rewriting hdr.ipv4.src (SNAT) — this is a DNAT-only LB; src is
+      preserved. src_addr_preservation catches it.
+    * Hashing or randomising the FRR demux ⇒ a flow splits across primary and
+      backup even under stable liveness. failover_decision_per_packet /
+      persistence_across_failover catch it.
+    * Implementing failover via recirculate() + a "tried backup?" bit —
+      violates failover_bounded_latency even though it forwards correctly on
+      the second pass.
+    * Reading standard_metadata.drop to test "was this dropped?" — reserved-
+      field misread (a common v1model bug). Use mark_to_drop().
+    * Counter-based round_robin assignment — excluded by ${assign}; it breaks
+      the deterministic-re-derivation R2 relies on and is incompatible with
+      persistence.
+
+  v2 deferrals (out of scope for this v1.0 composition):
+    * Health-aware backend removal (DIP health checks that evict a dead
+      backend from the pool) — that is the P-StatefulLB persistence axis
+      under pool *removal*, NOT the PURR path-failover this composition
+      layers. A LB ∘ health-aware-pool composition is a distinct candidate.
+    * LPM-keyed FRR groups — backends are exact host addresses, so the
+      composition fixes match kind to exact and omits P-PURRFastReroute's
+      lpm axis. A LB over a routed (LPM) underlay is the P-UPFRouter-style
+      three-way chain, not this pairing.
+    * Routing non-VIP transit traffic through the same FRR fabric — would
+      make this StatefulLB ∘ IPv4Routing ∘ PURR; kept out to preserve a
+      clean two-oracle composition (non-VIP traffic drops at the LB gate).
+
+# ─── Post-instantiation hooks (advisory) ────────────────────────────────────
+
+post_instantiation_hooks: |
+  After instantiation:
+
+    1. The instance schema, parameter bindings, and oracle audit must all
+       pass.
+
+    2. The composed oracle reuses the audited P-StatefulLB and
+       P-PURRFastReroute oracles for the pin/DNAT and path/failover ground
+       truth respectively (oracles are content-addressed). In the composed
+       oracle, the new audited surface is ONLY the
+       pin↔path glue: (a) the LB output backend address becomes the FRR
+       lookup key; (b) the FRR group must exist for every backend; (c) the
+       cascaded double-down drop is re-keyed on the pinned backend. The
+       oracle audit exercises backend_pin_survives_failover and
+       pin_precedes_path at their extremes — the behaviours absent from
+       either constituent.
+
+    3. For anchor instances (D5.0_pin_then_static_path, hash_5tuple,
+       unbounded capacity, no persistence/cascade, control-plane liveness),
+       the resulting task SHOULD be behaviourally a "hash-pin to a backend,
+       then FRR-forward to it" edge LB. Running the public test set through
+       the oracle cross-checks this; in particular the
+       pin_survives_failover test FAILS a naive reference that re-DNATs on
+       the backup path (this is the composition's reason for existing).
+
+    4. This composite occupies the (D1:stateful-flow-tracking ∪ D5:routing,
+       P3:flow-tracking ∪ P7:resilience-and-failover) cell. The
+       moderate-difficulty range is most naturally reached by enable_cascaded_backup + the pin↔path G3 tests + a bounded
+       LRU flow table, the hard end by stacking cascaded + dataplane liveness
+       + consistent-hash persistence + tight capacity + spec noise.

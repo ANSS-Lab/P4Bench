@@ -1,0 +1,882 @@
+# P-SwitchMLAgg — In-Network Gradient Aggregation (SwitchML / ATP)
+#
+# TPL v1.0 task pattern, extracted from the specified sources.
+# This pattern occupies the (D2:in-network-compute, P10:in-network-compute)
+# cell of the NF design-space map and is the FIRST `relocate`-frontier
+# pattern in the catalogue. It is hard by design: it backs the claim that
+# `relocate` tasks fail for a structurally distinct reason — the SUT must redesign a
+# host/coordinator-side algorithm (Allreduce) for match-action + registers
+# + recirculation + multicast, with no prior data-plane design to copy.
+
+pattern_id:        P-SwitchMLAgg
+version:           "1.0"
+nf_categories:                          # NF-category tags (ID:name pairs)
+  descriptive:  [D2:in-network-compute]   # aggregation, in-pipeline KV cache, reductions
+  prescriptive: [P10:in-network-compute]  # aggregation, reduction; SwitchML-style — `relocate` row in the NF-category table
+target_capability: relocate             # programmability relocates a host/coordinator NF down into the switch
+
+summary: >
+  In-network Allreduce: distributed-training workers stream
+  parameter-update (gradient) vectors stamped with (job_id, slot_id,
+  worker_id) into a register-array of aggregation slots; the switch sums
+  (or maxes) each slot across the participating workers, tracks per-slot
+  contribution with a worker bitmap, and — once the slot's barrier is
+  satisfied (all workers in the window have contributed) — emits the
+  aggregated vector back to the workers and resets the slot. The pattern
+  parameterises the barrier degree (n_workers), the slot memory budget
+  (n_slots), the per-packet vector width, the aggregation op, the
+  faithfulness ladder (exact-integer → bounded-error fixed-point →
+  endpoint co-design), the barrier policy (strict vs eventually-consistent
+  best-effort with server fallback), worker-id collision / retransmission
+  handling, and slot-collision handling across jobs. Difficulty is
+  ceiling-dominated: the SUT must reconstruct exactly-once-per-worker
+  accumulation, barrier completion detection, and idempotent retransmit
+  handling on a primitive set with no loops and integer-only ALUs.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+grounding:
+
+  papers:
+
+    - cite: switchml_nsdi21
+      role: canonical_implementation
+      quote: "Our approach, SwitchML, reduces the volume of exchanged data by aggregating the model updates from multiple workers in the network."
+      quote_source: "SwitchML abstract (verbatim; cached at patterns/P-SwitchMLAgg/grounding/switchml_nsdi21.txt). Grounds the in-pipeline per-slot gradient accumulation + aggregate-and-emit rules R4 (accumulate) and R5 (complete-emit-reset)."
+      quote_status: "DRAFT — pending GS2 human verdict"
+      relevance: |
+        SwitchML (Sapio et al., NSDI '21) is the textbook in-pipeline
+        Allreduce: workers chunk their gradient vector into fixed-size
+        blocks and stream each block as a packet carrying a pool index
+        (the aggregation slot) plus a fixed number of integer values
+        (32 int32 per packet in their realisation). The switch keeps a
+        *pool* of aggregation slots in register arrays; each slot holds
+        the running partial sum plus a count/bitmap of which workers have
+        contributed. When the slot has seen all N workers it is the
+        authoritative aggregate — the switch multicasts it back and frees
+        the slot for the next block. This is the source of the
+        (job_id, slot_id, worker_id) packet stamp, the per-slot
+        worker-bitmap barrier (R3/R4/R5), the multicast-on-completion +
+        slot-reset discipline (R5), and the integer-only D5.0 anchor.
+        SwitchML's shadow-copy / two-slot-set scheme for distinguishing a
+        retransmission from a fresh block under packet loss is the source
+        of the `loss_tolerance` axis and the D5.2 co-design rung.
+
+    - cite: atp_nsdi21
+      role: scaling_approach
+      relevance: |
+        ATP (Lao et al., NSDI '21) generalises in-network aggregation to
+        the *multi-tenant, multi-job, best-effort* setting: aggregator
+        slots are allocated dynamically across rack switches, and when no
+        switch slot is available — or when two jobs collide on the same
+        slot — the contribution falls back to host-side aggregation rather
+        than blocking. This is the source of the `barrier_policy`
+        eventually-consistent mode, the `slot_collision_policy`
+        server-fallback behaviour (R2), the `job_id` component of the slot
+        key, and the framing that the relocate failure mode is the
+        SUT's inability to reconstruct the host-side dataflow's barrier +
+        collision semantics on the primitive set.
+
+  # No IETF RFC defines in-network gradient aggregation, and the upstream
+  # p4lang/tutorials repository ships no Allreduce exercise — both lists
+  # are intentionally empty (nothing is cited without being read).
+  rfcs:      []
+  tutorials: []
+
+# ─── Entities (pick from the 8 entity types) ───────────────────────────────
+entities:
+
+  packet:                       # per-packet, stateless — the gradient-update vector
+    key:
+      - hdr.switchml.job_id     # tenant / training-job identifier
+      - hdr.switchml.slot_id    # pool index — which aggregation slot this block targets
+      - hdr.switchml.worker_id  # which worker emitted this block
+    attrs:
+      vector: list[int]         # ${vector_width} integer values carried in the payload
+    notes: |
+      The on-the-wire update block. The custom SwitchML/ATP header is
+      modelled as `hdr.switchml`; the implementation chooses the concrete wire
+      encoding (raw ethertype vs UDP-encapsulated). worker_id is the
+      identity the barrier bitmap is keyed on; slot_id selects the
+      register-array index; job_id disambiguates tenants sharing a slot.
+
+  bucket:                       # aggregate state across the class of workers; one per (job, slot)
+    key:
+      - hdr.switchml.job_id
+      - hdr.switchml.slot_id
+    attrs:
+      agg_value:      list[int] # running aggregate over contributing workers' vectors
+      worker_bitmap:  int       # bit w set iff worker w has contributed this round
+      contrib_count:  int       # popcount(worker_bitmap); number of workers seen this round
+      occupant_job:   int       # job_id currently occupying the slot (collision detection)
+      generation:     int       # round/shadow-copy generation, only used under loss_tolerance
+    capacity: ${n_slots}
+    notes: |
+      The aggregation slot. The barrier lives here: a round is complete
+      when contrib_count reaches ${n_workers} (equivalently worker_bitmap
+      has all ${n_workers} bits set). agg_value is the partial reduction
+      under ${aggregation_op}. The implementation realises this as parallel
+      register arrays (one per vector lane) indexed by slot_id, plus a
+      bitmap register and a count register; the spec's contract is
+      exactly-once accumulation per worker per round and emit-then-reset
+      on barrier completion. `generation` is dormant unless
+      ${loss_tolerance} == shadow_copy, where two slot generations let the
+      switch tell a retransmitted block from a fresh next-round block.
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+parameters:
+
+  n_workers:
+    type: int
+    range: "[2, 256]"
+    default: 2
+    notes: |
+      Barrier degree — number of distinct workers that must contribute to
+      a slot before the aggregate is complete. The single most important
+      capacity/difficulty knob: larger N widens the bitmap the SUT must
+      track and the completion test it must get exactly right.
+
+  n_slots:
+    type: int
+    range: "[1, 65536]"
+    default: 4
+    notes: |
+      Memory-budget axis. Number of concurrent
+      aggregation slots in the pool. At small budgets concurrent jobs /
+      in-flight blocks collide on slots, forcing the collision-handling
+      path (R2). `shrink_slots_4x` divides this by four.
+
+  vector_width:
+    type: int
+    range: "[1, 256]"
+    default: 1
+    notes: |
+      Integer values carried per block and aggregated per packet. SwitchML
+      uses 32. Each lane costs a register access / SALU stage, so widening
+      pressures the per-pipeline stage budget and forces recirculation.
+
+  value_width_bits:
+    type: int
+    range: "[8, 64]"
+    default: 32
+    notes: Width of each aggregated integer lane. SwitchML uses int32.
+
+  aggregation_op:
+    type: enum
+    values: [sum, max]
+    default: sum
+    notes: |
+      The reduction. `sum` is Allreduce-sum (gradient averaging after a
+      host-side divide); `max` is an Allreduce-max reduction. Both are
+      associative + commutative, which is what licenses out-of-order
+      streaming accumulation.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_exact_integer          # exact int sum/max, no quantisation, no loss handling
+      - D5.1_fixed_point            # endpoint-quantised fixed-point values, bounded relative error
+      - D5.2_codesign               # full SwitchML co-design: shadow-copy loss tolerance + endpoint scaling
+    default: D5.0_exact_integer
+    notes: |
+      Faithfulness ladder, grounded in the canonical in-network-aggregation
+      rungs (D5.0_exact and D5.1 bounded-error fixed-point) and the NF
+      literature survey's D5 axis (D5.3
+      co-design = endpoint protocol changes, SwitchML's actual operating
+      point). D5.2_codesign here folds shadow-copy retransmit tolerance
+      together with endpoint quantisation — the real SwitchML contract.
+
+  barrier_policy:
+    type: enum
+    values: [strict, eventually_consistent]
+    default: strict
+    notes: |
+      `strict`               — SwitchML model: every slot must collect
+                               exactly ${n_workers} distinct workers before
+                               emit; a packet that collides with another
+                               job's in-progress slot is dropped (no
+                               fallback). Demands exact completion
+                               detection.
+      `eventually_consistent` — ATP best-effort: on slot collision the
+                               contribution falls back to host aggregation
+                               (forwarded unaggregated to the result
+                               collector) rather than blocking. Adds the
+                               fallback path but relaxes the all-or-nothing
+                               barrier.
+
+  worker_id_collision_handling:
+    type: enum
+    values: [bitmap_dedup, count_only]
+    default: bitmap_dedup
+    notes: |
+      `bitmap_dedup` — per-worker bit guards accumulation: a worker whose
+                       bit is already set (a retransmission) is NOT
+                       re-aggregated, so the sum stays exactly-once
+                       (idempotent under loss/retransmit). The correct,
+                       harder design.
+      `count_only`   — only a counter is kept; a retransmitted block is
+                       double-counted. The naive design the G3 dedup test
+                       discriminates against.
+
+  slot_collision_policy:
+    type: enum
+    values: [server_fallback, drop, overwrite]
+    default: drop
+    notes: |
+      How a block whose slot is occupied by a DIFFERENT job_id is handled.
+      `server_fallback` — forward unaggregated to the result collector
+                          (ATP best-effort); only valid under
+                          eventually_consistent.
+      `drop`            — discard (strict SwitchML; workers coordinate slot
+                          assignment so collisions are an error).
+      `overwrite`       — clobber the occupant (unsafe; for harden probes).
+
+  loss_tolerance:
+    type: enum
+    values: [none, shadow_copy]
+    default: none
+    notes: |
+      `none`        — no retransmit safety; a lost-then-resent block can be
+                      mistaken for a fresh round. Valid at D5.0/D5.1.
+      `shadow_copy` — SwitchML two-generation slot scheme: a slot keeps two
+                      generations so a retransmission of round k is
+                      distinguished from a fresh round k+1. Required at
+                      D5.2_codesign.
+
+  result_delivery:
+    type: enum
+    values: [multicast_all, unicast_each]
+    default: multicast_all
+    notes: |
+      How the completed aggregate returns to workers. `multicast_all`
+      replicates one result packet to the worker multicast group (SwitchML
+      default); `unicast_each` emits one copy per worker port.
+
+  workload_skew:
+    type: enum
+    values: [uniform, retransmit_heavy, adversarial_collision]
+    default: uniform
+    notes: |
+      Traffic distribution the tests stress. `retransmit_heavy` repeats
+      worker blocks to probe idempotence; `adversarial_collision` packs
+      multiple jobs onto the same slot to stress collision handling.
+
+  worker_ports:
+    type: list[port]
+    constraint: "len == ${n_workers}; distinct ingress ports, one per worker"
+    default: [1, 2]
+
+  result_multicast_group:
+    type: int
+    default: 1
+    notes: Multicast group id replicating the completed aggregate to ${worker_ports}.
+
+# ─── Rules (first-match priority) ──────────────────────────────────────────
+# State writes inside `then` are visible to subsequent rules on subsequent
+# packets only.
+
+rules:
+
+  - id: R0_non_aggregation_passthrough
+    when: "¬header_present(switchml)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+    notes: |
+      Non-aggregation traffic (ordinary IPv4, control, ARP) is forwarded
+      by the underlying L3 path, untouched by the aggregator. Non-IPv4
+      with no switchml header and no forwarding entry is dropped by the
+      implementation's default; the spec only binds the aggregation path.
+
+  - id: R1_duplicate_worker_idempotent
+    when: |
+      header_present(switchml) ∧
+      exists(bucket, key) ∧
+      value(bucket.occupant_job, ==, hdr.switchml.job_id) ∧
+      value(bucket.worker_bitmap[hdr.switchml.worker_id], ==, 1)
+    given:
+      bucket: by_key(job_id, slot_id)
+    then:
+      - drop
+    enforced_when: "${worker_id_collision_handling} == bitmap_dedup"
+    notes: |
+      Retransmission / duplicate from a worker already counted this round.
+      Under bitmap_dedup the block is NOT re-aggregated — accumulation
+      stays exactly-once (the `exactly_once_per_worker` stability
+      invariant). The implementation MAY instead re-emit the cached aggregate if
+      the slot is already complete; modelled here as a drop because the
+      multicast result is what carries the value back, not this path.
+      Under `count_only` this rule is disabled and the duplicate falls
+      through to R4, double-counting it — the failure the G3 dedup test
+      discriminates against.
+
+  - id: R2_slot_collision_fallback
+    when: |
+      header_present(switchml) ∧
+      exists(bucket, key) ∧
+      value(bucket.occupant_job, ≠, hdr.switchml.job_id)
+    given:
+      bucket: by_key(job_id, slot_id)
+    then:
+      - forward(result_collector)
+    enforced_when: "${barrier_policy} == eventually_consistent ∧ ${slot_collision_policy} == server_fallback"
+    notes: |
+      ATP best-effort collision handling: a block whose slot is held by a
+      different job is forwarded unaggregated to the host-side result
+      collector rather than blocking or corrupting the occupant's
+      aggregate. Under `barrier_policy == strict` (slot_collision_policy
+      drop) this rule is disabled and the colliding block is dropped by
+      the implementation default — the occupant's aggregate is never corrupted
+      either way (the `no_cross_job_contamination` stability invariant).
+
+  - id: R3_first_contribution
+    when: |
+      header_present(switchml) ∧
+      ¬exists(bucket, key)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(job_id, slot_id)
+    then:
+      - "bind(bucket, key, {agg_value: hdr.switchml.vector, worker_bitmap: bit(hdr.switchml.worker_id), contrib_count: 1, occupant_job: hdr.switchml.job_id, generation: 0})"
+    notes: |
+      First worker to land on an empty/reset slot opens the round: the
+      slot is seeded with this block's vector, the worker's bit, count 1,
+      and the occupying job_id. A single-worker job (${n_workers} == 1)
+      completes immediately — see R5's count test.
+
+  - id: R4_accumulate
+    when: |
+      header_present(switchml) ∧
+      exists(bucket, key) ∧
+      value(bucket.occupant_job, ==, hdr.switchml.job_id) ∧
+      value(bucket.worker_bitmap[hdr.switchml.worker_id], ==, 0) ∧
+      value(bucket.contrib_count, <, ${n_workers} - 1)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(job_id, slot_id)
+    then:
+      - "rewrite(bucket.agg_value, ${aggregation_op}(bucket.agg_value, hdr.switchml.vector))"
+      - "set(bucket.worker_bitmap[hdr.switchml.worker_id], 1)"
+      - "inc(bucket.contrib_count)"
+    notes: |
+      A new worker contributes but is NOT the last expected (count is
+      still below n_workers-1 after this). Reduce the vector lane-wise
+      under ${aggregation_op}, mark the worker's bit, bump the count. No
+      result is emitted — the partial aggregate persists in the slot.
+      Read-after-write ordering matters: the count must be incremented and
+      THEN compared in R5's guard, never the reverse (the G3 ordering
+      test).
+
+  - id: R5_complete_emit_reset
+    when: |
+      header_present(switchml) ∧
+      exists(bucket, key) ∧
+      value(bucket.occupant_job, ==, hdr.switchml.job_id) ∧
+      value(bucket.worker_bitmap[hdr.switchml.worker_id], ==, 0) ∧
+      value(bucket.contrib_count, ==, ${n_workers} - 1)
+    given:
+      packet: deduce_from_packet
+      bucket: by_key(job_id, slot_id)
+    then:
+      - "rewrite(bucket.agg_value, ${aggregation_op}(bucket.agg_value, hdr.switchml.vector))"
+      - "emit(result_block{job_id, slot_id, vector: bucket.agg_value} to ${result_delivery}(${result_multicast_group}, ${worker_ports}))"
+      - "evict(bucket, key)"
+    notes: |
+      The completing contribution: this worker is the last expected one
+      (count was n_workers-1, so after this fold the barrier is full).
+      Fold the final vector, emit the aggregated result block back to the
+      workers (multicast to ${result_multicast_group} for multicast_all,
+      or one copy per worker port for unicast_each), then reset the slot
+      so the next round/block can reuse it. emit + evict in declaration
+      order. For ${n_workers} == 1, R3 binds and this rule's
+      `contrib_count == 0` guard fires on the same packet path only if the
+      implementation re-checks post-bind; the implementation realises single-worker as an
+      immediate emit. The barrier completion is what the
+      `bounded_aggregation_latency` invariant binds.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: exactly_once_per_worker
+    clause: stability
+    binds: [bucket]
+    statement: |
+      Within a single round of a slot, each worker contributes to
+      agg_value at most once. A block from a worker whose bit is already
+      set (retransmission) does not change agg_value, worker_bitmap, or
+      contrib_count. This is the idempotence-under-loss guarantee that
+      makes the aggregate independent of the retransmission pattern.
+    enforced_when: "${worker_id_collision_handling} == bitmap_dedup"
+
+  - id: no_cross_job_contamination
+    clause: stability
+    binds: [bucket]
+    statement: |
+      A block stamped with job J never alters the agg_value, bitmap, or
+      count of a slot currently occupied by job J' ≠ J. Under strict
+      policy the colliding block is dropped; under eventually_consistent
+      it is forwarded to the collector. Either way the occupant's
+      aggregate is bit-identical to the no-collision baseline.
+    enforced_when: "true"
+
+  - id: barrier_monotonicity
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      Within a round, worker_bitmap only gains bits and contrib_count only
+      increases (monotone), until the round completes at R5. The only
+      `free_under` operation that clears them is the `evict(bucket, key)`
+      at R5 (round completion). No partial round is ever silently reset.
+    enforced_when: "true"
+
+  - id: aggregate_completeness
+    clause: persistence
+    binds: [bucket]
+    statement: |
+      At the instant R5 emits, agg_value equals the reduction under
+      ${aggregation_op} of exactly the ${n_workers} distinct workers'
+      vectors for that (job, slot) round — no worker omitted, none
+      double-counted. Under D5.1_fixed_point the equality holds within the
+      declared relative-error bound of the quantisation scale.
+    enforced_when: "true"
+
+  - id: bounded_aggregation_latency
+    clause: bounded_latency
+    binds: [bucket, packet]
+    statement: |
+      The aggregated result block is emitted within the same pipeline
+      traversal as the completing (n_workers-th) contribution — not on a
+      later packet, not deferred to a periodic sweep. Completion detection
+      and emit are co-located on the barrier-satisfying packet.
+    enforced_when: "true"
+
+  - id: slot_no_orphan
+    clause: no_orphan
+    binds: [bucket]
+    statement: |
+      Every occupied slot is eventually freed: under strict policy by R5
+      on barrier completion; under eventually_consistent additionally by
+      collision fallback so a slot is never wedged by an abandoned round.
+      No slot remains bound to a completed or abandoned round indefinitely.
+    enforced_when: "true"
+
+  - id: finite_recirculation
+    clause: no_loop
+    binds: [packet]
+    statement: |
+      Every block traverses the pipeline a bounded number of times (one
+      optional recirculation when ${vector_width} exceeds the per-stage
+      register-access budget). No infinite aggregation loop.
+    enforced_when: "true"
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Authored against the G1/G2/G3 test-goal framework and the v1model bug
+# taxonomy. Reachable v1model bug
+# anchors for this pattern: register read-after-write ordering (count
+# inc-then-check), conditional deparser (result-block emit branch),
+# multicast well-formedness (result_delivery), and standard_metadata.drop /
+# multicast on the passthrough vs aggregate split.
+
+test_scaffolding:
+
+  G1:                                  # functional correctness
+
+    - id: two_worker_sum_completes_and_resets
+      generate: |
+        Seed n_workers=2, vector_width=1, aggregation_op=sum,
+        faithfulness=D5.0_exact_integer. prior_inputs: one switchml block
+        from worker_0 (job=1, slot=0, value=10, TTL=64). Test packet: a
+        block from worker_1 (job=1, slot=0, value=32, TTL=1) that
+        satisfies the barrier. Assert (a) a result block carrying value
+        42 is delivered to BOTH worker ports (multicast_all), and (b) the
+        slot is reset — a subsequent worker_0 block for the same slot
+        re-opens a fresh round (binds value, not 42+value). Maps to
+        G1-P2-T2 (state accumulation) + G1-P2-T4 (state reset after the
+        completing event).
+
+    - id: partial_aggregation_no_premature_emit
+      generate: |
+        Seed n_workers=3. prior_inputs: blocks from worker_0 (value=5) and
+        worker_1 (value=7) for (job=1, slot=0), TTL=64. Test packet: a
+        non-aggregation IPv4 probe (TTL=1). Assert NO result block is
+        emitted on any worker port — the slot holds the partial sum 12 and
+        the barrier is not yet satisfied. Maps to G1-P2-T2 + the
+        bounded_aggregation_latency invariant (emit only on completion).
+
+    - id: multi_slot_isolation
+      generate: |
+        Seed n_slots>=2, n_workers=2. prior_inputs: worker_0 block to
+        (job=1, slot=0, value=100) and worker_0 block to
+        (job=1, slot=1, value=3), TTL=64. Test packet: worker_1 block to
+        (job=1, slot=1, value=4), TTL=1. Assert the result for slot=1 is
+        7 (3+4) and slot=0 is untouched (still a partial holding 100, no
+        emit). Slots must not cross-contaminate. Maps to G1-P2-T3
+        (cross-key independence).
+
+    - id: passthrough_traffic_unaffected
+      generate: |
+        Send a single ordinary IPv4 packet (no switchml header, TTL=1) to
+        a destination with a control-plane forwarding entry. Assert it
+        appears at the expected egress port with TTL decremented and MAC
+        rewritten — R0 forwards aggregation-irrelevant traffic untouched.
+        Maps to G1-P1-T1 (forwarding-path coverage) + G1-P1-T5 (explicit
+        transformation assertion).
+
+  G2:                                  # robustness / boundary
+
+    - id: barrier_degree_boundary_exact
+      generate: |
+        Seed n_workers=4. prior_inputs: blocks from worker_0..worker_2
+        (values 1,2,4) for (job=1, slot=0), TTL=64. Test packet: worker_3
+        (value=8), TTL=1 — the 4th and final worker. Assert the result is
+        emitted exactly on THIS packet (not the 3rd, not a 5th), value=15,
+        and the slot resets. Probes off-by-one on the completion test
+        (contrib_count == n_workers-1 at the guard, n_workers after the
+        fold). Maps to the G2 capacity-boundary rule.
+
+    - id: value_saturation_no_wrap
+      generate: |
+        Seed n_workers=2, value_width_bits=32, faithfulness=D5.0. Stage
+        worker_0 with value = 2^32 - 1 (prior_inputs, TTL=64). Test
+        packet: worker_1 with value = 5 (TTL=1). Assert the aggregate
+        saturates at 2^32 - 1 rather than wrapping to 4 — exact-integer
+        faithfulness requires saturating add, not modular wrap. Maps to
+        the counter-overflow G2 rule + the bug-taxonomy "counter overflow"
+        item.
+
+  G3:                                  # security / bypass + v1model bug anchors
+
+    - id: duplicate_worker_idempotent_dedup
+      requires: "${worker_id_collision_handling} == bitmap_dedup"
+      generate: |
+        Seed n_workers=2, workload_skew=retransmit_heavy. prior_inputs:
+        worker_0 block (job=1, slot=0, value=10), then the SAME worker_0
+        block AGAIN (retransmission), TTL=64. Test packet: worker_1 block
+        (value=32), TTL=1 — completes the barrier. Assert the result is 42,
+        NOT 52 — worker_0's duplicate was deduped via the bitmap and not
+        re-aggregated, and contrib_count reached exactly 2. Probes the
+        exactly_once_per_worker invariant; discriminates the naive
+        count_only design that double-counts.
+
+    - id: cross_job_slot_collision_no_contamination
+      requires: "${barrier_policy} == eventually_consistent ∧ ${slot_collision_policy} == server_fallback"
+      generate: |
+        Seed eventually_consistent + server_fallback, n_workers=2.
+        prior_inputs: worker_0 of job=1 binds (slot=0, value=100), TTL=64.
+        Test packet: a worker_0 block of job=2 targeting the SAME slot=0
+        (value=9), TTL=1. Assert (a) the job=2 block is forwarded to the
+        result-collector port unaggregated (not folded into job=1's slot),
+        and (b) job=1's slot still holds 100 untouched. Probes
+        no_cross_job_contamination.
+
+    - id: result_emit_conditional_deparser_well_formed
+      generate: |
+        Probes the v1model bug taxonomy's "conditional deparser". The result block
+        header is emitted ONLY on the barrier-completing packet (R5); on
+        partial-contribution packets (R4) no result header is emitted.
+        Stage exactly one completion via prior_inputs (n_workers=2,
+        worker_0 value=10). Test packet: worker_1 value=32 (TTL=1). Assert
+        (a) the emitted result packet has a bit-exact, well-formed
+        switchml result header carrying value 42 on each worker port, and
+        (b) a separately-staged partial-only run (worker_0 alone) emits NO
+        switchml result header and no garbage trailer. The deparser MUST
+        emit the result header conditionally on validity, never
+        unconditionally.
+
+    - id: completion_count_read_after_write_ordering
+      generate: |
+        Probes the v1model bug taxonomy's register read-after-write ordering. Seed
+        n_workers=2. The implementation must increment contrib_count and THEN test
+        completion against n_workers (or test contrib_count == n_workers-1
+        BEFORE the increment, consistently) — a check-then-inc inversion
+        emits the result one worker early or one worker late. prior_inputs:
+        worker_0 (value=10), TTL=64. Test packet: worker_1 (value=32),
+        TTL=1. Assert the result fires on worker_1 exactly (not on
+        worker_0's earlier packet, which would indicate an off-by-one
+        completion test). Cross-checks two_worker_sum_completes_and_reset's
+        timing under the ordering lens.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 2
+
+# ─── Mutation operators (4 required fields each) ───────────────────────────
+
+mutation_operators:
+
+  # === Barrier-degree axis (capacity) ======================================
+  - id: raise_worker_count_2x
+    applicable_when: "${n_workers} <= 128"
+    effect: "${n_workers} ← ${n_workers} * 2"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${n_workers} <= 256"
+    notes: |
+      Wider barrier → larger bitmap and a more error-prone completion
+      test. Pairs with `lower_worker_count_2x`.
+
+  - id: lower_worker_count_2x
+    applicable_when: "${n_workers} >= 4"
+    effect: "${n_workers} ← ${n_workers} / 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${n_workers} >= 2"
+
+  # === Slot memory-budget axis (capacity) ==================================
+  - id: shrink_slots_4x
+    applicable_when: "${n_slots} >= 4"
+    effect: "${n_slots} ← ${n_slots} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${n_slots} >= 1"
+    notes: |
+      Fewer slots → concurrent jobs/blocks collide, forcing the
+      collision-handling path. Pairs with `enlarge_slots_2x`.
+
+  - id: enlarge_slots_2x
+    applicable_when: "${n_slots} <= 32768"
+    effect: "${n_slots} ← ${n_slots} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${n_slots} <= 65536"
+
+  # === Vector-width axis (capacity / stage budget) =========================
+  - id: widen_vector_4x
+    applicable_when: "${vector_width} <= 64"
+    effect: "${vector_width} ← ${vector_width} * 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${vector_width} <= 256"
+    notes: |
+      More lanes per block → more register accesses per packet, pressuring
+      the per-stage budget and forcing recirculation. Pairs with
+      `narrow_vector_4x`.
+
+  - id: narrow_vector_4x
+    applicable_when: "${vector_width} >= 4"
+    effect: "${vector_width} ← ${vector_width} / 4"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${vector_width} >= 1"
+
+  # === Faithfulness ladder: D5.0 ↔ D5.1 ====================================
+  - id: lift_to_fixed_point
+    applicable_when: "${faithfulness} == D5.0_exact_integer"
+    effect: "${faithfulness} ← D5.1_fixed_point"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${value_width_bits} >= 16"
+    notes: |
+      Endpoint-quantised fixed-point values with a bounded relative-error
+      contract — the SUT must reason about the scale factor rather than
+      exact integers. Pairs with `revert_to_exact_integer`.
+
+  - id: revert_to_exact_integer
+    applicable_when: "${faithfulness} == D5.1_fixed_point"
+    effect: "${faithfulness} ← D5.0_exact_integer"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Faithfulness ladder: D5.1 ↔ D5.2 (full co-design) ===================
+  - id: lift_to_codesign
+    applicable_when: "${faithfulness} == D5.1_fixed_point"
+    effect: |
+      ${faithfulness}    ← D5.2_codesign
+      ${loss_tolerance}  ← shadow_copy
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${loss_tolerance} == shadow_copy"
+    notes: |
+      Full SwitchML co-design: shadow-copy retransmit tolerance plus
+      endpoint scaling. The hardest rung — the SUT must implement the
+      two-generation slot scheme. Pairs with `revert_from_codesign`.
+
+  - id: revert_from_codesign
+    applicable_when: "${faithfulness} == D5.2_codesign"
+    effect: |
+      ${faithfulness}    ← D5.1_fixed_point
+      ${loss_tolerance}  ← none
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Barrier-policy axis =================================================
+  - id: tighten_barrier_to_strict
+    applicable_when: "${barrier_policy} == eventually_consistent"
+    effect: |
+      ${barrier_policy}        ← strict
+      ${slot_collision_policy} ← drop
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${slot_collision_policy} ∈ {drop, overwrite}"
+    notes: |
+      Removes the server-fallback safety valve — every round must complete
+      exactly on-switch, demanding precise completion detection. Pairs
+      with `relax_barrier_to_eventually_consistent`.
+
+  - id: relax_barrier_to_eventually_consistent
+    applicable_when: "${barrier_policy} == strict"
+    effect: |
+      ${barrier_policy}        ← eventually_consistent
+      ${slot_collision_policy} ← server_fallback
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${slot_collision_policy} == server_fallback"
+
+  # === Worker-id collision / retransmission axis ===========================
+  - id: tighten_to_bitmap_dedup
+    applicable_when: "${worker_id_collision_handling} == count_only"
+    effect: "${worker_id_collision_handling} ← bitmap_dedup"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Requires exactly-once accumulation under retransmission — the SUT
+      must maintain and consult a per-worker bitmap. Pairs with
+      `relax_to_count_only`.
+
+  - id: relax_to_count_only
+    applicable_when: "${worker_id_collision_handling} == bitmap_dedup"
+    effect: "${worker_id_collision_handling} ← count_only"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Aggregation-op coverage axis ========================================
+  - id: switch_agg_op_to_max
+    applicable_when: "${aggregation_op} == sum"
+    effect: "${aggregation_op} ← max"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      Allreduce-max instead of sum — a non-canonical reduction the SUT is
+      less likely to have memorised. Coverage axis with a difficulty tilt.
+      Pairs with `revert_agg_op_to_sum`.
+
+  - id: revert_agg_op_to_sum
+    applicable_when: "${aggregation_op} == max"
+    effect: "${aggregation_op} ← sum"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Workload axis =======================================================
+  - id: raise_workload_skew
+    applicable_when: "${workload_skew} ∈ {uniform, retransmit_heavy}"
+    effect: "${workload_skew} ← adversarial_collision"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "true"
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} == adversarial_collision"
+    effect: "${workload_skew} ← uniform"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "true"
+
+  # === Input-form ladder (heaviest difficulty lever) ========================
+  - id: strip_to_behavioural_spec
+    applicable_when: "true"
+    effect: "remove any host-side Python Allreduce reference from the SUT-facing description; behavioural spec only"
+    axis: input-form
+    direction: harden
+    feasibility_postcondition: "true"
+    notes: |
+      The relocate-frontier default: no reference implementation, so the
+      SUT must redesign the host-side dataflow for the primitive set
+      unaided (the relocate failure mode). Pairs with
+      `show_host_reference_impl`.
+
+  - id: show_host_reference_impl
+    applicable_when: "true"
+    effect: "include a host-side Python Allreduce (sum/max over worker vectors) reference in the SUT-facing description"
+    axis: input-form
+    direction: ease
+    feasibility_postcondition: "true"
+
+# ─── Bridging notes (advisory; not visible to the SUT) ─────────────────────
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Default seed (n_workers=2, n_slots=4, vector_width=1, sum,
+                  D5.0_exact_integer, barrier_policy=strict,
+                  bitmap_dedup, loss_tolerance=none):
+      - One register per vector lane: `register<bit<32>>(${n_slots})` for
+        agg_value, plus `register<bit<32>>(${n_slots})` for worker_bitmap
+        and `register<bit<32>>(${n_slots})` for contrib_count (or fold
+        count into popcount of the bitmap). Index by slot_id.
+      - R3/R4/R5 are one SALU read-modify-write on the agg_value register
+        guarded by the bitmap read. The completion test compares
+        contrib_count (post-increment) against ${n_workers}.
+      - R5 result emit: clone/multicast the packet to
+        ${result_multicast_group} with the agg_value written back into the
+        switchml result header; then reset the three registers for that
+        slot (write 0).
+      - Underlying L3 forward (R0) is a plain ipv4_lpm table with
+        forward(port)/drop, independent of the aggregator.
+
+    barrier_policy=eventually_consistent (ATP):
+      - R2 server_fallback: `forward(result_collector)` for blocks whose
+        occupant_job ≠ this job. Slots additionally time out — at v1 this
+        is modelled as collision-fallback only; a periodic timeout sweep
+        needs a `time_tick` entity deferred to v2 (see below).
+
+    loss_tolerance=shadow_copy (D5.2_codesign, SwitchML §loss handling):
+      - Two slot generations per slot index; a block carries (or the
+        switch derives) a generation bit. A retransmission of round k
+        lands on generation k mod 2 and is deduped against the live
+        bitmap; a fresh round k+1 lands on the other generation. The
+        implementation keeps both generations live until the round-(k) result has
+        been acknowledged.
+
+    aggregation_op=max:
+      - R4/R5 fold uses lane-wise max instead of add; saturation is a
+        no-op (max never overflows). Otherwise identical control flow.
+
+  v2 deferral notes (not enforceable at v1.0):
+    - Time-driven slot timeout for eventually_consistent (ATP) — needs a
+      `time_tick` entity + `elapsed` guard; modelled at v1 as
+      collision-fallback only.
+    - Cross-switch / multi-rack aggregator allocation (ATP's hierarchical
+      aggregation across rack + spine) — single-switch only at v1; needs a
+      `cross_switch_partitioning` axis on a TPL v2 variant.
+    - Inline floating-point aggregation (FPISA, NSDI '22) — the
+      exponent/mantissa split across stages is out of scope; v1 stays
+      integer / fixed-point. D5.1/D5.2 model the endpoint-quantised
+      contract, not on-switch FP.
+
+  Common implementation bugs (anchors for G3 test design):
+    - check-then-inc completion test → result emitted one worker early or
+      late. Caught by completion_count_read_after_write_ordering.
+    - count_only instead of a per-worker bitmap → retransmitted blocks
+      double-counted. Caught by duplicate_worker_idempotent_dedup.
+    - colliding job folded into the occupant's slot → cross-job
+      contamination. Caught by cross_job_slot_collision_no_contamination.
+    - result header emitted unconditionally (not gated on R5) → partial
+      packets carry a garbage result trailer. Caught by
+      result_emit_conditional_deparser_well_formed.
+    - modular wrap instead of saturating add at D5.0 → aggregate wraps.
+      Caught by value_saturation_no_wrap.
+    - slot not reset after emit → next round accumulates onto the stale
+      aggregate. Caught by two_worker_sum_completes_and_resets' reset arm.
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - R0's L3-forward passthrough for non-aggregation traffic is a
+      pipeline-conventional scaffold (the basic_forwarding exercise
+      structure); neither SwitchML nor ATP specifies the co-resident
+      forwarding path, but a deployable switch must forward ordinary
+      traffic, so the spec binds it.
+    - The drop-on-strict-collision behaviour (R2 disabled under strict) is
+      inferred from SwitchML's assumption that workers coordinate slot
+      assignment so collisions are an error condition; the paper does not
+      state the on-switch action for an unexpected collision, so it is
+      flagged here rather than cited.
+    - Folding worker_id_collision_handling and barrier_policy into
+      explicit parameters (rather than leaving them implicit in the cited
+      designs) is an authoring choice that exposes the two designs'
+      differing assumptions as a single tunable surface.

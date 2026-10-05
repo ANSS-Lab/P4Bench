@@ -1,0 +1,159 @@
+{
+  "oracle_hash": "364ef709cf7b197086d9fdd624039640fd18853bfc354f77c31f1097717ab831",
+  "instance": "tls_sni_route_anchor_mut2-strict_deep_parse",
+  "ran_at": "2026-05-30T01:53:21.519634Z",
+  "canonical_examples": {
+    "passed": 22,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "route_exact_api",
+        "status": "pass"
+      },
+      {
+        "example_id": "route_exact_cdn",
+        "status": "pass"
+      },
+      {
+        "example_id": "route_sni_after_filler_extension",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_wrong_tcp_port",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_application_data_record",
+        "status": "pass"
+      },
+      {
+        "example_id": "r0_non_clienthello_handshake",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_unmatched_default_forward",
+        "status": "pass"
+      },
+      {
+        "example_id": "r5_unmatched_default_deny",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_sni_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "no_sni_lax_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "extensions_exceed_bound_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "non_hostname_nametype_strict_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_block_denylisted_sni",
+        "status": "pass"
+      },
+      {
+        "example_id": "r2_block_table_route_still_forwards",
+        "status": "pass"
+      },
+      {
+        "example_id": "r4_rewrite_dnat",
+        "status": "pass"
+      },
+      {
+        "example_id": "suffix_match_registrable_suffix",
+        "status": "pass"
+      },
+      {
+        "example_id": "suffix_match_other_domain_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "case_insensitive_match",
+        "status": "pass"
+      },
+      {
+        "example_id": "case_sensitive_miss_default",
+        "status": "pass"
+      },
+      {
+        "example_id": "sni_beyond_max_extension_count_drops",
+        "status": "pass"
+      },
+      {
+        "example_id": "sni_within_raised_max_extension_count_routes",
+        "status": "pass"
+      },
+      {
+        "example_id": "sni_beyond_prefix_bytes_drops",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "classification_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "tls_payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "envelope_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "parser_depth_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "classification_determinism",
+      "tls_payload_persistence",
+      "parser_depth_safety"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "rfc6066",
+      "rfc8446"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

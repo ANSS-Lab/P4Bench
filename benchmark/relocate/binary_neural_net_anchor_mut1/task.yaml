@@ -1,0 +1,485 @@
+task_name: binary_neural_net_anchor_mut1
+task_type: full_program
+complexity: medium
+source: paper
+pattern: P-BinaryNeuralNet
+pattern_version: '1.0'
+seed:
+  weights:
+  - layer_index: 0
+    neuron_index: 0
+    weight_bits: 2
+    activation_threshold: 2
+  - layer_index: 0
+    neuron_index: 1
+    weight_bits: 1
+    activation_threshold: 2
+  binarization_thresholds:
+  - feature_index: 0
+    threshold: 64
+    tie_break: ge
+  - feature_index: 1
+    threshold: 16
+    tie_break: ge
+  class_decode:
+  - out_vec: 0
+    class_index: 0
+  - out_vec: 1
+    class_index: 1
+  - out_vec: 2
+    class_index: 1
+  - out_vec: 3
+    class_index: 0
+  class_action_entries:
+  - class_index: 0
+    verdict: forward
+    egress_port: 2
+    mark_value: none
+  - class_index: 1
+    verdict: forward
+    egress_port: 3
+    mark_value: none
+  feature_set:
+  - ipv4.ttl
+  - ipv4.diffserv
+  feature_count: 2
+  feature_width: 2
+  num_classes: 2
+  neuron_count: 2
+  layer_count: 1
+  activation_threshold_mode: per_neuron
+  binarization_fidelity: exact_sign
+  action_breadth: forward_only
+  default_class: 0
+  unclassified_action: forward_default
+  default_egress_port: 4
+  model_capacity: unbounded
+  workload_skew: uniform
+  faithfulness: D5.0_anchor_single_layer
+description: |
+  A switch s1 acts as an in-network traffic classifier: it evaluates a small,
+  pre-trained binarized neural-network (BNN) model on every packet and steers the
+  packet to an egress port chosen by the model's predicted class, in the spirit of
+  running a trained classifier directly in the switch data path at line rate
+  (N3IC-style in-network ML inference). Clients reach s1 on port s1.p1; three
+  downstream ports s1.p2, s1.p3, s1.p4 lead to the per-class destinations.
+
+  The switch is a STATELESS function: every decision follows only from the current
+  packet's header fields and the fixed model + class-to-port mapping given below —
+  no per-flow or cross-packet state is kept. The same feature values always yield
+  the same class and the same egress port.
+
+  ## Features (each reduced to one bit)
+
+  The classifier reads two features from each IPv4 packet and reduces each to a
+  single bit by comparing it to a threshold. The bit is 1 when the field is
+  greater than OR EQUAL TO the threshold, and 0 otherwise (the comparison is
+  inclusive on the threshold value):
+
+    - bit f0 = 1 iff the IPv4 TTL is >= 64
+    - bit f1 = 1 iff the IPv4 DSCP/ToS byte is >= 16
+
+  These two bits form a 2-bit input vector. Bit f0 is the most-significant bit and
+  bit f1 the least-significant: input_vector = (f0<<1) | f1.
+
+  ## The model (one layer of two binary neurons)
+
+  The model has a single layer of two binary neurons over the 2-bit input vector.
+  Each neuron holds a fixed 2-bit binary weight vector and an integer activation
+  threshold (control-plane state, listed below). A neuron's output bit is computed
+  as follows:
+
+    1. Take the bitwise XNOR of the 2-bit input vector with the neuron's 2-bit
+       weight vector (XNOR(a,b) = NOT(a XOR b); a result bit is 1 where the input
+       bit and the weight bit AGREE).
+    2. Count how many of the 2 result bits are 1 (the population count).
+    3. The neuron's output bit is 1 if that count is greater than OR EQUAL TO the
+       neuron's activation threshold, else 0.
+
+  The two neuron output bits form a 2-bit output vector with neuron 0 as the
+  most-significant bit: output_vector = (neuron0_bit<<1) | neuron1_bit. That
+  output vector decodes to a class index by the decode table below. An output
+  vector not listed resolves to the default class 0.
+
+  Model weights and thresholds (control-plane state, install as entries):
+
+    | neuron | weight vector (f0 f1) | activation threshold |
+    |--------|-----------------------|----------------------|
+    | 0      | 1 0                  | 2                    |
+    | 1      | 0 1                  | 2                    |
+
+  Output-vector -> class decode:
+
+    | output vector (neuron0 neuron1) | class |
+    |---------------------------------|-------|
+    | 0 0                             | 0     |
+    | 0 1                             | 1     |
+    | 1 0                             | 1     |
+    | 1 1                             | 0     |
+
+  (Any output vector with no row resolves to the default class 0.)
+
+  ## Per-packet behaviour
+
+  Process every ingress packet by the first matching rule below.
+
+   1. **Not classifiable -> default port.** If the packet is not an IPv4 packet it
+      cannot be classified; forward it unchanged to the default port s1.p4. Do not
+      attempt to read feature fields that are not present.
+
+   2. **Classify and steer.** For a classifiable IPv4 packet, evaluate the model
+      above to get the predicted class, then forward the packet — unchanged — to
+      the port mapped to that class:
+
+        - class 0 -> forward to s1.p2
+        - class 1 -> forward to s1.p3
+
+      The packet is delivered byte-for-byte identical to what arrived (every
+      header and the payload unchanged); only the egress port differs by class. No
+      field is rewritten and the TTL is not decremented.
+
+  ## Class-to-port mapping (install as control-plane entries)
+
+    | Predicted class | Egress port |
+    |-----------------|-------------|
+    | 0               | s1.p2       |
+    | 1               | s1.p3       |
+
+  A packet that is not classifiable goes to the default port s1.p4 unchanged.
+
+  Grounding: N3IC (Re-architecting Traffic Analysis with Neural Network Interface
+  Cards, NSDI '22) and Binarized Neural Networks (Courbariaux et al., NeurIPS '16);
+  XNOR-popcount in-network ML inference.
+topology:
+  switches:
+  - name: s1
+    device_id: 0
+    ports:
+      p1: 1
+      p2: 2
+      p3: 3
+      p4: 4
+  links:
+  - from: h1
+    to: s1.p1
+  - from: s1.p2
+    to: h2
+  - from: s1.p3
+    to: h3
+  - from: s1.p4
+    to: h4
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: 08:00:00:00:01:01
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: 08:00:00:00:02:02
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: 08:00:00:00:03:03
+    port: s1.p3
+  h4:
+    ip: 10.0.4.4/24
+    mac: 08:00:00:00:04:04
+    port: s1.p4
+test_cases:
+- name: bnn_class0_both_low
+  visibility: public
+  goal_class: G1
+  description: A packet with both features below their thresholds (TTL < 64 and ToS < 16) classifies to class 0 and is forwarded UNCHANGED to s1.p2 — the golden class-0 path. Every header and the payload are delivered byte-for-byte.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 50
+        tos: 8
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: bnn_class1_tos_high
+  visibility: public
+  goal_class: G1
+  description: 'A packet whose only above-threshold feature is the DSCP/ToS byte (ToS >= 16, TTL < 64) classifies to class 1 and is steered to s1.p3. Same TTL region as the class-0 packet but a higher ToS: the classifier must read BOTH features.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 50
+        tos: 32
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: bnn_class1_ttl_high
+  visibility: hidden
+  goal_class: G1
+  description: A packet whose only above-threshold feature is the TTL (TTL >= 64, ToS < 16) fires the OTHER neuron -> class 1 -> s1.p3. A different single bit drives a different neuron.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 200
+        tos: 8
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: bnn_class0_both_high
+  visibility: hidden
+  goal_class: G1
+  description: 'A packet with BOTH features above their thresholds (TTL >= 64 and ToS >= 16) resolves (via the output decode) back to class 0 -> s1.p2, NOT class 1: the class is the joint XOR of both neuron activations, so a program that decodes a single neuron''s bit gets this wrong.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 200
+        tos: 32
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: feature_boundary_on_threshold
+  visibility: hidden
+  goal_class: G2
+  description: Both feature values sit EXACTLY on their binarization thresholds (TTL=64, ToS=16). Under the inclusive '>=' tie-break each binarizes to 1; the resulting all-ones input vector classifies to class 0 -> s1.p2. An off-by-one that treats '>=' as '>' would flip both bits and mis-steer this packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 64
+        tos: 16
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: feature_boundary_just_below
+  visibility: hidden
+  goal_class: G2
+  description: 'Each feature one unit BELOW its threshold (TTL=63, ToS=15) binarizes to 0 (all bits 0) -> class 0 -> s1.p2. The just-below partner of the on-threshold case: confirms the threshold comparison does not fire one step early.'
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 63
+        tos: 15
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: popcount_width_max
+  visibility: hidden
+  goal_class: G2
+  description: A packet whose binarized vector XNORs to ALL ONES against the first neuron's weights (population count == the full feature width of 2, the maximum) and to all zeros against the second neuron's weights classifies without the count overflowing or wrapping -> class 1 -> s1.p3. Exercises the popcount arithmetic at its width edge.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 200
+        tos: 8
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: bnn-probebnn-probebn
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: inference_determinism_noise
+  visibility: hidden
+  goal_class: G3
+  description: Identical feature values to the class-0 golden packet (TTL=50, ToS=8) but a different source port, dst port, length and payload (non-feature fields) -> still class 0 -> s1.p2. The decision must not depend on any non-feature field.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 50
+        tos: 8
+        proto: 6
+    - TCP:
+        sport: 51234
+        dport: 8080
+    - Raw:
+        load: a-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-payloada-different-p
+  expected:
+    behavior: forward
+    output_port: s1.p2
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: payload_roundtrip_forward
+  visibility: hidden
+  goal_class: G3
+  description: A forward-classified packet (class 1) with a distinctive payload is delivered to s1.p3 with every header and the payload byte-for-byte unchanged — the classifier steers, it does not rewrite the packet.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: 08:00:00:00:00:01
+    - IP:
+        src: 10.0.1.1
+        dst: 10.0.2.2
+        ttl: 50
+        tos: 32
+        proto: 6
+    - TCP:
+        sport: 40000
+        dport: 80
+    - Raw:
+        load: DISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-0xDEADBEEFDISTINCT-PAYLOAD-
+  expected:
+    behavior: forward
+    output_port: s1.p3
+    transformations:
+      IP.ttl:
+        action: unchanged
+      IP.tos:
+        action: unchanged
+      IP.dst:
+        action: unchanged
+- name: unclassifiable_arp_to_default
+  visibility: public
+  goal_class: G3
+  description: A non-IPv4 packet (ARP) carries none of the feature fields and cannot be classified; it is forwarded unchanged to the default port s1.p4.
+  input:
+    port: s1.p1
+    layers:
+    - Ether:
+        src: 08:00:00:00:01:01
+        dst: ff:ff:ff:ff:ff:ff
+        type: 2054
+    - ARP:
+        op: 1
+        psrc: 10.0.1.1
+        pdst: 10.0.2.2
+  expected:
+    behavior: forward
+    output_port: s1.p4

@@ -1,0 +1,894 @@
+# P-PortScanDetect — Per-Source Distinct-Destination Cardinality Scan Detection
+#
+# TPL v1.0 task pattern. A horizontal-scan / port-scan
+# detector: track, per source, the number of DISTINCT destinations (or distinct
+# destination ports) it contacts via a sketch / bitmap "row" keyed by the
+# source, estimate the distinct-destination cardinality, and once a source's
+# estimate crosses ${scan_threshold} mark it a scanner and drop/mark its
+# subsequent packets. Below the threshold the source is forwarded and its row
+# is updated. This is the `scale_up` superspreader/cardinality NF: a per-source
+# *exact* distinct-set does not fit in switch SRAM, so the implementation must share
+# approximate set-membership state under a hashed bitmap, exactly as the
+# in-network superspreader-detection line of work does.
+#
+# Detection window is PACKET-COUNT / CUMULATIVE with reset driven by a control
+# packet (NOT a wall-clock window) — see bridging_notes; the v1.0 evaluation
+# harness injects only packets and no time_tick, so a time-based window would
+# be ungradable. Extracted from the specified sources.
+# This pattern occupies the (D7:security, P9:telemetry) cell of the NF
+# design-space map.
+
+pattern_id:        P-PortScanDetect
+version:           "1.0"
+nf_categories:                          # NF-category tags (ID:name pairs)
+  descriptive:  [D7:security]           # scan detection / blocklisting is a security NF
+  prescriptive: [P9:telemetry]          # distinct-cardinality estimation via sketches — `scale_up` row
+target_capability: scale_up             # programmability scales per-source distinct-set tracking past the exact-match wall
+
+summary: >
+  Per-source horizontal-scan detection on a PISA pipeline: maintain a sketch /
+  bitmap row per source that approximates the number of DISTINCT destinations
+  (or distinct destination ports) the source has contacted within the current
+  detection window; when the estimated distinct-destination cardinality crosses
+  ${scan_threshold} bind the source as a scanner and drop (or mark) all of its
+  subsequent packets, otherwise forward the packet and update the row. The
+  detection window is packet-count / cumulative and is reset by an operator
+  control packet, never by wall-clock time. The pattern parameterises the
+  threshold strictness, the bitmap/sketch capacity and faithfulness (exact set
+  vs hashed bitmap vs HyperLogLog), the scanner-action (drop vs mark), the
+  scan key (distinct destination IP vs distinct destination port), and the
+  assumed workload skew. Difficulty moves primarily along threshold strictness,
+  sketch capacity/faithfulness, and workload skew — at tight capacity an exact
+  per-source destination set no longer fits, forcing the implementation into the shared
+  hashed bitmap where the cardinality-estimation property actually lives.
+
+# ─── Network-knowledge grounding ────────────────────────────────────────────
+grounding:
+
+  papers:
+
+    - cite: trw_sp04
+      id: jung_paxson_berger_balakrishnan_sp2004
+      title: "Fast Portscan Detection Using Sequential Hypothesis Testing"
+      role: threat_model
+      quote: >-
+        We use this insight to develop TRW (Threshold Random Walk), an online
+        detection algorithm that identifies malicious remote hosts. Using an
+        analysis of traces from two qualitatively different sites, we show that
+        TRW requires a much smaller number of connection attempts (4 or 5 in
+        practice) to detect malicious activity compared to previous schemes.
+      quote_source: patterns/P-PortScanDetect/grounding/trw_sp04.txt
+      relevance: |
+        Jung, Paxson, Berger, Balakrishnan (IEEE S&P 2004) — TRW (Threshold
+        Random Walk). The canonical formalisation of the threat: a horizontal
+        scanner is distinguished from a benign host by the number of DISTINCT
+        destinations it attempts to contact, because a scanner's connection
+        attempts hit a high fraction of non-existent / non-listening hosts
+        whereas a benign host's contacts are concentrated on a few live peers.
+        TRW accumulates a likelihood ratio over a host's successive distinct
+        destination attempts and declares "scanner" once the ratio crosses an
+        upper bound. The pattern's behavioural core abstracts TRW's per-source
+        distinct-destination accumulation into the cardinality counter
+        `value(source.distinct_dst_estimate, >, ${scan_threshold})`, and its
+        upper-threshold declaration into R3's one-shot `bind(... is_scanner)`.
+        TRW's per-attempt success/failure observation is the source of the
+        `${scan_key}` choice (distinct destination IP for horizontal scans vs
+        distinct destination port for vertical/port scans) and the threat_model
+        framing for the G3 adversarial tests.
+      role_note: canonical_implementation+threat_model
+
+    - cite: opensketch_nsdi13
+      id: yu_jose_miao_nsdi2013
+      title: "Software Defined Traffic Measurement with OpenSketch"
+      role: scaling_approach
+      relevance: |
+        OpenSketch operationalises distinct-counting / superspreader detection
+        on a programmable switch with a three-stage (hash → classify → count)
+        sketch pipeline, and gives the superspreader (distinct-destination
+        cardinality) measurement as a first-class task realised by a bitmap /
+        probabilistic-counter sketch indexed by a hash of the destination in
+        the source's row. This is the source of the `scale_up` framing (an
+        exact per-source destination set is too large for switch SRAM, so the
+        switch keeps a hashed bitmap and estimates cardinality), the
+        `bucket` set-membership-row entity, the `${bitmap_width}` /
+        `${rows}` capacity parameters, the `inc`/set-bit update shape of R1,
+        and the `linear_counting` / `hyperloglog` faithfulness ladder for the
+        distinct-count estimator.
+
+  # No IETF RFC normatively defines in-switch scan detection, and the upstream
+  # p4lang/tutorials repository ships no scan-detection exercise — both lists
+  # are intentionally empty (nothing is cited without being read).
+  rfcs:      []
+  tutorials: []
+
+# ─── Entities (pick from the 8 entity types) ───────────────────────────────
+entities:
+
+  packet:
+    notes: |
+      Atomic; no per-packet state. The scan decision derives from the source's
+      sketch row, the scanner blocklist, and the window accumulator — all
+      consulted from std/hdr fields plus control-plane-installed state.
+
+  flow:                         # per-source state: the row + the scanner verdict
+    key:
+      - hdr.ipv4.srcAddr        # the source under suspicion (the "row" key)
+    attrs:
+      distinct_dst_estimate: int   # estimated distinct-destination cardinality this window
+      is_scanner:            bool  # set once the estimate crossed ${scan_threshold}
+      window_id:             int   # which detection window this state belongs to
+    capacity: ${source_table_capacity}
+    notes: |
+      One logical row per source. `distinct_dst_estimate` is the cardinality
+      readout from the source's sketch bucket; `is_scanner` is the latched
+      verdict. Materialised as the sketch row + a 1-bit scanner flag; the
+      implementation's exact register layout is implementation surface — the spec's
+      contract is exactly one row update per forwarded packet (R1) and a
+      one-shot latch on the threshold-crossing packet (R3).
+
+  bucket:                       # per-source distinct-destination set-membership sketch
+    key:
+      - source_row_index        # 0 .. ${source_table_capacity}-1, from h_s(srcAddr)
+      - bitmap_column_index     # 0 .. ${bitmap_width}-1, from h_d(scan_key_value)
+    attrs:
+      bit: int                  # 0/1 membership bit (or a small counter for HLL registers)
+    capacity: ${source_table_capacity} × ${bitmap_width} × ${rows}
+    notes: |
+      The distinct-destination set-membership sketch. For each source row,
+      a ${bitmap_width}-wide bitmap (×${rows} independent hash rows) records
+      which distinct ${scan_key} values have been seen; the popcount / register
+      readout estimates the distinct cardinality. Index derivation, saturating
+      bit-set, and HLL bucket-max arithmetic are implementation surface; the spec
+      requires exactly one set-bit per (row, source) per NEW distinct
+      destination under R1.
+
+  window:                       # detection-window accumulator (packet-count / cumulative)
+    key:
+      - window_id
+    attrs:
+      n_packets: int            # packets observed since window start / last reset
+    capacity: 1                 # only the current window is mutable
+    notes: |
+      The detection window over which distinct destinations accumulate. It is a
+      PACKET-COUNT / CUMULATIVE window: it advances when n_packets reaches
+      ${window_packets}, and is reset to its zero state by an operator control
+      packet (R5). It is NOT a wall-clock window — the v1.0 harness injects no
+      time_tick, so a time-based window would be ungradable (see bridging_notes).
+
+# ─── Parameters ─────────────────────────────────────────────────────────────
+parameters:
+
+  scan_key:
+    type: enum
+    values: [distinct_dst_ip, distinct_dst_port]
+    default: distinct_dst_ip
+    notes: |
+      What "distinct destination" means. distinct_dst_ip → horizontal scan
+      (count distinct hdr.ipv4.dstAddr per source); distinct_dst_port → vertical
+      / port scan (count distinct L4 dst port per source). TRW (S&P '04) uses
+      distinct destination IPs; classic nmap port-scan detection uses ports.
+
+  scan_threshold:
+    type: int
+    range: "[2, 65535]"
+    default: 16
+    notes: |
+      Distinct-destination cardinality at which a source is declared a scanner.
+      Strictness axis: a tight (low) threshold flags more sources (and is more
+      sensitive to sketch over-estimate); a loose (high) threshold flags fewer.
+
+  scanner_action:
+    type: enum
+    values: [drop, mark]
+    default: drop
+    notes: |
+      What to do to a confirmed scanner's subsequent packets. drop → discard
+      (blocklist); mark → set a DSCP/marking bit and forward (observe / shunt).
+      Maps R4 to either `drop` or `set` + `forward`.
+
+  source_table_capacity:
+    type: int
+    range: "[16, 1048576]"
+    default: 4096
+    notes: |
+      Number of distinct source rows the sketch can track (the per-source-row
+      count). Capacity axis: at low capacity, sources collide into shared rows,
+      inflating distinct-destination estimates and stressing the estimator.
+      `shrink_capacity_4x` divides this by four.
+
+  bitmap_width:
+    type: int
+    range: "[8, 65536]"
+    default: 1024
+    notes: |
+      Columns W in each source's distinct-destination bitmap. Drives the
+      cardinality-estimate error (linear-counting / HLL bias). MUST be a power
+      of two so the destination hash can be truncated by mod-2^k. Faithfulness
+      axis: narrower W means more bit-collisions and larger over-estimate.
+
+  rows:
+    type: int
+    range: "[1, 8]"
+    default: 1
+    notes: |
+      Number of independent hash rows R over the bitmap (for HLL-style
+      multi-register estimation). Capped at 8 (one SALU/stage per row). For the
+      plain hashed-bitmap (linear-counting) estimator R=1 suffices.
+
+  distinct_estimator:
+    type: enum
+    values: [exact_set, linear_counting, hyperloglog]
+    default: linear_counting
+    notes: |
+      How distinct_dst_estimate is read out of the bucket. exact_set → a true
+      per-source destination set (only feasible at small capacity; D5.0).
+      linear_counting → popcount of a hashed bitmap, bias-corrected (D5.1).
+      hyperloglog → register-of-maxima estimator across ${rows} (D5.2).
+
+  hash_polynomial:
+    type: enum
+    values: [crc16, crc32, crc32c, custom_lfsr]
+    default: crc32
+    notes: |
+      Hash family for the destination → bitmap-column mapping (and the
+      source → row mapping). Hash-family axis.
+
+  window_packets:
+    type: int
+    range: "[16, 16777216]"
+    default: 65536
+    notes: |
+      Length of the detection window in PACKETS (cumulative). When the window
+      accumulator reaches this many packets the window advances and the sketch
+      + scanner verdicts reset (R5 also resets on an explicit control packet).
+      NOT a wall-clock duration — see bridging_notes.
+
+  control_reset_enabled:
+    type: bool
+    default: true
+    notes: |
+      When true, R5 is active: an operator control packet (a designated
+      ingress port / well-known header marker) resets the window, the sketch,
+      and all scanner verdicts to their zero state. This is the
+      packet-driven substitute for a wall-clock window expiry.
+
+  workload_skew:
+    type: enum
+    values: [uniform, zipfian, adversarial_collision]
+    default: zipfian
+    notes: |
+      Assumed destination distribution per source. adversarial_collision
+      crafts destinations that hash to the same bitmap column to suppress the
+      estimate (scan evasion) — the G3 robustness probe.
+
+  faithfulness:
+    type: enum
+    values:
+      - D5.0_exact_set          # true per-source destination set (small capacity only)
+      - D5.1_linear_counting    # hashed bitmap + linear-counting estimate
+      - D5.2_hyperloglog        # HLL register-of-maxima estimate across rows
+    default: D5.1_linear_counting
+
+  persistence_strict:
+    type: bool
+    default: true
+    notes: |
+      When true (default), the scanner_latch_persistence invariant is enforced:
+      once a source is latched as a scanner, it STAYS a scanner for the rest of
+      the window even if its estimate would (spuriously) read below threshold
+      on a later packet. Latch must be sticky within the window — a non-sticky
+      verdict lets a scanner slip a packet through whenever the estimate dips.
+
+# ─── Rules (first-match priority) ──────────────────────────────────────────
+# State writes inside `then` are visible to subsequent rules on subsequent
+# packets only.
+
+rules:
+
+  - id: R0_non_ipv4_drop
+    when: "¬header_present(ipv4)"
+    given:
+      packet: deduce_from_packet
+    then:
+      - drop
+    notes: |
+      Non-IPv4 frames carry no source/destination to track. Out of scope for
+      the scan detector. (Control packets, R5, are IPv4 + a control marker and
+      are matched ahead of this by rule order.)
+
+  - id: R5_window_reset_on_control
+    when: |
+      header_present(ipv4) ∧ ingress(control_port) ∧ ${control_reset_enabled}
+    given:
+      packet: deduce_from_packet
+      window: by_key(window_id)
+      bucket: by_hash(hdr.ipv4.srcAddr, ${rows})
+      flow:   by_key(hdr.ipv4.srcAddr)
+    then:
+      - "evict(bucket, all)"
+      - "evict(flow, all)"
+      - "bind(window, window_id_next, {n_packets: 0})"
+      - drop
+    enforced_when: "${control_reset_enabled}"
+    notes: |
+      Operator control packet (arriving on the designated control port) resets
+      the detection window: the sketch buckets, all per-source rows, and all
+      scanner verdicts are zeroed and a fresh window is opened. This is the
+      packet-count window's reset event — the substitute for a wall-clock
+      expiry (the v1.0 harness injects no time_tick). The control packet itself
+      is consumed (dropped), not forwarded.
+
+  - id: R4_scanner_blocked
+    when: |
+      header_present(ipv4) ∧ exists(flow, hdr.ipv4.srcAddr)
+        ∧ value(flow.is_scanner, ==, true)
+    given:
+      packet: deduce_from_packet
+      flow:   by_key(hdr.ipv4.srcAddr)
+    then:
+      - "${scanner_action}"
+    notes: |
+      A source already latched as a scanner: every subsequent packet from it is
+      acted on per ${scanner_action}. drop → discard (blocklist enforcement);
+      mark → `set(hdr.ipv4.diffserv, scanner_mark)` then forward. Fires ahead of
+      the cardinality-update rules so a confirmed scanner does not keep growing
+      the sketch (and so a sticky verdict cannot be undone — see
+      scanner_latch_persistence).
+
+  - id: R3_threshold_crossed
+    when: |
+      header_present(ipv4) ∧ ¬(exists(flow, hdr.ipv4.srcAddr) ∧ value(flow.is_scanner, ==, true))
+        ∧ value(flow.distinct_dst_estimate, >, ${scan_threshold})
+    given:
+      packet: deduce_from_packet
+      bucket: by_hash(hdr.ipv4.srcAddr, ${rows})
+      flow:   by_key(hdr.ipv4.srcAddr)
+    then:
+      - "inc(bucket[h(scan_key_value)])"
+      - "bind(flow, hdr.ipv4.srcAddr, {is_scanner: true, distinct_dst_estimate: aggregate(bucket, count_distinct)})"
+      - "${scanner_action}"
+    notes: |
+      The threshold-crossing packet. The source's estimated distinct-destination
+      cardinality (read from its bucket via the ${distinct_estimator}) has just
+      crossed ${scan_threshold}: latch is_scanner=true (one-shot — TRW's upper-
+      threshold declaration) and act on THIS packet per ${scanner_action}. The
+      row is still updated for this packet's destination before the latch.
+      `aggregate(bucket, count_distinct)` denotes the distinct-cardinality
+      readout (popcount/linear-counting for D5.1, register-max for D5.2, set
+      size for D5.0).
+
+  - id: R1_update_and_forward
+    when: |
+      header_present(ipv4) ∧ ¬(exists(flow, hdr.ipv4.srcAddr) ∧ value(flow.is_scanner, ==, true))
+        ∧ ¬value(flow.distinct_dst_estimate, >, ${scan_threshold})
+    given:
+      packet: deduce_from_packet
+      bucket: by_hash(hdr.ipv4.srcAddr, ${rows})
+      flow:   by_key(hdr.ipv4.srcAddr)
+      window: by_key(window_id)
+    then:
+      - "inc(bucket[h(scan_key_value)])"
+      - "bind(flow, hdr.ipv4.srcAddr, {distinct_dst_estimate: aggregate(bucket, count_distinct), is_scanner: false})"
+      - "inc(window.n_packets)"
+      - forward(lookup_egress(hdr.ipv4.dstAddr))
+    notes: |
+      The benign-path update + forward. The source is below threshold and not a
+      scanner: record this packet's ${scan_key} value into the source's sketch
+      row (a no-op set-bit if the destination was already seen this window —
+      the bitmap is idempotent on repeats, so distinct destinations, not raw
+      packet count, drive the estimate), refresh distinct_dst_estimate, advance
+      the window accumulator, and forward normally. `h(scan_key_value)` hashes
+      hdr.ipv4.dstAddr (scan_key==distinct_dst_ip) or the L4 dst port
+      (scan_key==distinct_dst_port).
+
+  - id: R2_window_rollover
+    when: |
+      header_present(ipv4) ∧ count_exceeds(window.n_packets, ${window_packets})
+    given:
+      packet: deduce_from_packet
+      window: by_key(window_id)
+      bucket: by_hash(hdr.ipv4.srcAddr, ${rows})
+      flow:   by_key(hdr.ipv4.srcAddr)
+    then:
+      - "evict(bucket, all)"
+      - "evict(flow, all)"
+      - "bind(window, window_id_next, {n_packets: 0})"
+    notes: |
+      Cumulative-window rollover. When the packet accumulator reaches
+      ${window_packets}, the sketch and all scanner verdicts reset and a fresh
+      window opens — distinct-destination counts are per-window. This is the
+      packet-count analogue of a time window; it never consults wall-clock time.
+      The current packet then re-enters the benign path (R1) under the fresh
+      window.
+
+# ─── Invariants (6 canonical clauses) ──────────────────────────────────────
+
+invariants:
+
+  - id: distinct_estimate_monotone_within_window
+    clause: persistence
+    target: bucket.bit
+    while: "within one detection window"
+    free_under: ["evict(bucket, all)"]
+    notes: |
+      Within a single detection window the set-membership bits are
+      monotonically non-decreasing (a destination, once seen, stays seen);
+      hence distinct_dst_estimate is non-decreasing within a window. The only
+      operation that may lower a bit is the window reset (R2 / R5). An implementation
+      that clears bits mid-window under-counts and lets a scanner evade.
+
+  - id: scanner_latch_persistence
+    clause: stability
+    target: flow.is_scanner
+    while: "rule R4 reachable ∧ within one detection window"
+    enforced_when: "${persistence_strict}"
+    notes: |
+      Once a source is latched is_scanner=true (R3), the verdict is STICKY for
+      the rest of the window: R4 fires on every subsequent packet regardless of
+      any later estimate read. A non-sticky verdict (re-deriving the verdict
+      from a possibly-dipping estimate each packet) lets a scanner slip packets
+      through — the classic latch bug. Reset only at the window boundary.
+
+  - id: benign_forwarding_below_threshold
+    clause: stability
+    target: forward_decision
+    while: "rule R1 fires ∧ ¬value(flow.is_scanner, ==, true)"
+    notes: |
+      A source below ${scan_threshold} that is not a latched scanner MUST be
+      forwarded to its normal egress, identical to a no-detector baseline. The
+      detector is fail-open below threshold: sketch state MUST NOT change the
+      egress port or drop a benign packet.
+
+  - id: scanner_state_no_orphan
+    clause: no_orphan
+    target: flow
+    notes: |
+      Every per-source row (and its scanner verdict) is removed by the next
+      window boundary (R2 packet rollover or R5 control reset). No verdict and
+      no sketch state persists across windows — distinct-destination counting
+      is per-window.
+
+  - id: scan_decision_no_loop
+    clause: no_loop
+    target: any_packet
+    notes: |
+      Every packet traverses the pipeline a bounded number of times (one
+      optional recirculation for multi-row HLL hashing). No packet is
+      re-injected into ingress by the detector.
+
+# ─── Test scaffolding (G1/G2/G3 → rule mapping) ────────────────────────────
+# Authored against the G1/G2/G3 test-goal framework and the v1model bug
+# taxonomy. Gradable in BMv2 --use-files as a
+# forward→drop (or forward→marked) transition once a source crosses the
+# distinct-destination threshold within a single packet train.
+
+test_scaffolding:
+
+  G1:                                  # functional correctness
+
+    - id: forward_below_threshold
+      generate: |
+        Send a TRAIN of ${scan_threshold} - 1 packets from one source, each to
+        a DISTINCT destination (TTL=64, increasing dstAddr). Assert EVERY packet
+        is forwarded to its normal egress with the no-detector L2/L3 transforms
+        — the source has not crossed the threshold so it stays benign. Maps to
+        G1-P1-T1 (forwarding-path coverage) + the benign_forwarding_below_
+        threshold invariant.
+
+    - id: forward_then_drop_on_threshold_crossing
+      generate: |
+        Send a TRAIN of ${scan_threshold} packets from one source to
+        ${scan_threshold} DISTINCT destinations. Assert the first
+        ${scan_threshold} - 1 packets FORWARD and the packet that crosses the
+        threshold (and every packet after it from that source) is acted on per
+        ${scanner_action} (drop, or marked+forwarded). This is the headline
+        forward→drop transition. Maps to G1-P2-T2 (state accumulation across a
+        packet train) + R3 + R4.
+
+    - id: repeated_destination_does_not_advance
+      generate: |
+        Send a TRAIN of 3·${scan_threshold} packets from one source all to the
+        SAME single destination. Assert NONE are dropped/marked — distinct-
+        destination cardinality is 1, not 3·threshold; raw packet count must
+        not advance the estimate. Probes that the bitmap is idempotent on
+        repeats (distinct-set semantics, not a packet counter). Maps to
+        G1-P2-T3 (cross-input independence) + distinct_estimate_monotone.
+
+    - id: per_source_isolation
+      generate: |
+        Interleave two sources A and B. A contacts ${scan_threshold} distinct
+        destinations (becomes a scanner); B contacts only 2 distinct
+        destinations. Assert A's later packets are dropped/marked while B's are
+        always forwarded — one source's distinct count must not contaminate
+        another's row. Maps to G1-P2-T3 (per-key isolation).
+
+    - id: window_reset_clears_verdict
+      requires: "${control_reset_enabled}"
+      generate: |
+        Drive a source to scanner status (TRAIN of ${scan_threshold} distinct
+        destinations → dropped). Then send a control packet on the control
+        port (R5). Then send one more packet from the same source to a fresh
+        destination. Assert it is FORWARDED again — the reset cleared the
+        verdict and the sketch. Maps to G1-P2-T4 (state reset / cold-start
+        after boundary) + scanner_state_no_orphan + R5.
+
+  G2:                                  # robustness / boundary
+
+    - id: exactly_at_threshold_boundary
+      generate: |
+        Send EXACTLY ${scan_threshold} distinct destinations from one source.
+        Assert the verdict matches the rule's strict ">" semantics at the
+        boundary: the packet whose distinct count first reads strictly greater
+        than ${scan_threshold} is the first acted-on packet, and the
+        threshold-1 case (forward_below_threshold) stays benign. Pins the
+        off-by-one boundary (>, not ≥). Maps to the G2 boundary rule.
+
+    - id: source_table_capacity_pressure
+      requires: "${distinct_estimator} != exact_set"
+      generate: |
+        Stage more than ${source_table_capacity} distinct sources, each below
+        threshold, via prior_inputs, then one test packet from a benign source.
+        Assert the benign source is still forwarded — capacity pressure (row
+        collisions) may inflate estimates but MUST NOT silently corrupt the
+        forward/drop verdict into dropping a confirmed-benign single-destination
+        source. Maps to the G2 capacity-boundary rule.
+
+    - id: bitmap_saturation_no_wrap
+      requires: "${distinct_estimator} == linear_counting"
+      generate: |
+        Drive a single source's bitmap toward full saturation (≫ ${bitmap_width}
+        distinct destinations) via prior_inputs, then one more distinct-dst
+        packet. Assert the estimate does not wrap to a small value (which would
+        let a heavy scanner read as benign): a saturated bitmap reads as "very
+        large", staying a scanner. Maps to the counter/bitmap-overflow G2 rule.
+
+  G3:                                  # security / bypass
+
+    - id: adversarial_hash_collision_evasion
+      requires: "${distinct_estimator} != exact_set ∧ ${rows} >= 2"
+      generate: |
+        Workload ${workload_skew} == adversarial_collision: the scanner crafts
+        ${scan_threshold} + 4 destinations that all hash to the SAME bitmap
+        column in row 0, sent via prior_inputs, plus one test packet. Assert the
+        multi-row (${rows} ≥ 2) estimator still flags the source — the
+        independent rows defeat single-row collision evasion. Probes hash-
+        discipline robustness (the scan-evasion threat from TRW). Maps to the
+        G3 adversarial-probe rule.
+
+    - id: low_volume_scanner_below_threshold_not_flagged
+      generate: |
+        A source contacts exactly ${scan_threshold} - 1 distinct destinations
+        across the whole window (a stealth low-and-slow probe that stays under
+        the bar), then a final legitimate packet from a DIFFERENT benign source.
+        Assert NEITHER source is dropped/marked and no verdict is latched —
+        the detector must not false-positive below the configured threshold.
+        Maps to the G3 default-allow / no-false-positive rule.
+
+    - id: scanner_no_state_leak_across_window
+      requires: "${control_reset_enabled}"
+      generate: |
+        A source becomes a scanner in window k (TRAIN → dropped). Force a window
+        reset (R5 control packet, or ${window_packets} rollover). Test packet:
+        a single packet from that source to a fresh destination in window k+1.
+        Assert it is FORWARDED — no scanner verdict and no sketch bit leaks
+        across the window boundary (scanner_state_no_orphan). A stale verdict
+        would permanently blocklist a recycled IP. Maps to the G3 state-leak
+        rule.
+
+    - id: conditional_mark_deparser_well_formed
+      requires: "${scanner_action} == mark"
+      generate: |
+        Probes the common v1model bug "conditional deparser": on the marked
+        (scanner) path the detector sets a DiffServ/marking bit and forwards;
+        the unmarked (benign) path forwards untouched. Assert (a) a benign
+        packet emerges bit-exact on its egress, and (b) a marked scanner packet
+        emerges with ONLY the marking field changed and a well-formed header
+        layout — the deparser must emit headers conditionally on isValid() and
+        must not corrupt the IPv4 header on the marking branch. Maps to the G3
+        deparser-wellformedness rule + the conditional-deparser bug.
+
+  coverage_floor:
+    G1: 3
+    G2: 1
+    G3: 1
+
+# ─── Mutation operators (5 required fields each) ───────────────────────────
+# Every harden is paired with an ease on the SAME axis. Axes exercised:
+# strictness (threshold), faithfulness (estimator/bitmap width), capacity
+# (source-table rows), hash-family, workload, feature-breadth (scan key,
+# scanner action).
+
+mutation_operators:
+
+  # === Strictness axis: threshold tightness ================================
+  - id: tighten_scan_threshold_4x
+    applicable_when: "${scan_threshold} >= 8"
+    effect: "${scan_threshold} ← ${scan_threshold} / 4"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${scan_threshold} >= 2"
+    notes: |
+      A tighter threshold flags more sources and is more sensitive to sketch
+      over-estimate, raising the precision bar on the cardinality readout.
+      Pairs with relax_scan_threshold_2x.
+
+  - id: relax_scan_threshold_2x
+    applicable_when: "${scan_threshold} <= 32767"
+    effect: "${scan_threshold} ← ${scan_threshold} * 2"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${scan_threshold} <= 65535"
+
+  # === Strictness axis: sticky-latch persistence ===========================
+  - id: enable_scanner_latch_persistence
+    applicable_when: "${persistence_strict} == false"
+    effect: "${persistence_strict} ← true"
+    axis: strictness
+    direction: harden
+    feasibility_postcondition: "${persistence_strict} == true"
+    notes: |
+      Enforces the sticky-verdict invariant: a latched scanner stays blocked
+      for the rest of the window. Forces the implementation to store an explicit latch
+      bit rather than re-derive the verdict each packet. Pairs with
+      relax_scanner_latch_persistence.
+
+  - id: relax_scanner_latch_persistence
+    applicable_when: "${persistence_strict} == true"
+    effect: "${persistence_strict} ← false"
+    axis: strictness
+    direction: ease
+    feasibility_postcondition: "${persistence_strict} == false"
+
+  # === Faithfulness axis: exact set ↔ hashed bitmap ↔ HLL ===================
+  - id: lift_estimator_to_linear_counting
+    applicable_when: "${distinct_estimator} == exact_set ∧ ${faithfulness} == D5.0_exact_set"
+    effect: |
+      ${distinct_estimator} ← linear_counting
+      ${faithfulness}       ← D5.1_linear_counting
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${bitmap_width} >= 8"
+    notes: |
+      Moves off the exact per-source destination set (which only fits at tiny
+      capacity) onto a hashed bitmap with a bias-corrected linear-counting
+      readout — the actual scale_up trick. Pairs with revert_estimator_to_exact.
+
+  - id: revert_estimator_to_exact_set
+    applicable_when: "${distinct_estimator} == linear_counting ∧ ${faithfulness} == D5.1_linear_counting"
+    effect: |
+      ${distinct_estimator} ← exact_set
+      ${faithfulness}       ← D5.0_exact_set
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${source_table_capacity} <= 4096"
+
+  - id: lift_estimator_to_hyperloglog
+    applicable_when: "${distinct_estimator} == linear_counting ∧ ${faithfulness} == D5.1_linear_counting"
+    effect: |
+      ${distinct_estimator} ← hyperloglog
+      ${faithfulness}       ← D5.2_hyperloglog
+      ${rows}               ← max(${rows}, 4)
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${rows} >= 4 ∧ ${bitmap_width} >= 64"
+    notes: |
+      Register-of-maxima HLL estimator across multiple rows — the implementation must
+      implement leading-zero counting and HLL bias correction. Pairs with
+      revert_estimator_to_linear_counting.
+
+  - id: revert_estimator_to_linear_counting
+    applicable_when: "${distinct_estimator} == hyperloglog ∧ ${faithfulness} == D5.2_hyperloglog"
+    effect: |
+      ${distinct_estimator} ← linear_counting
+      ${faithfulness}       ← D5.1_linear_counting
+      ${rows}               ← 1
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${bitmap_width} >= 8"
+
+  # === Faithfulness axis: bitmap width (estimate fidelity) =================
+  - id: shrink_bitmap_width_4x
+    applicable_when: "${bitmap_width} >= 32 ∧ ${distinct_estimator} != exact_set"
+    effect: "${bitmap_width} ← ${bitmap_width} / 4"
+    axis: faithfulness
+    direction: harden
+    feasibility_postcondition: "${bitmap_width} >= 8"
+    notes: |
+      A narrower bitmap raises bit-collision over-estimate, degrading the
+      distinct-count fidelity. Pairs with enlarge_bitmap_width_2x.
+
+  - id: enlarge_bitmap_width_2x
+    applicable_when: "${bitmap_width} <= 32768 ∧ ${distinct_estimator} != exact_set"
+    effect: "${bitmap_width} ← ${bitmap_width} * 2"
+    axis: faithfulness
+    direction: ease
+    feasibility_postcondition: "${bitmap_width} <= 65536"
+
+  # === Capacity axis: source-table rows ====================================
+  - id: shrink_capacity_4x
+    applicable_when: "${source_table_capacity} >= 64"
+    effect: "${source_table_capacity} ← ${source_table_capacity} / 4"
+    axis: capacity
+    direction: harden
+    feasibility_postcondition: "${source_table_capacity} >= 16"
+    notes: |
+      Fewer source rows force sources to collide into shared rows, inflating
+      per-source distinct estimates and stressing isolation. Pairs with
+      enlarge_capacity_2x.
+
+  - id: enlarge_capacity_2x
+    applicable_when: "${source_table_capacity} <= 524288"
+    effect: "${source_table_capacity} ← ${source_table_capacity} * 2"
+    axis: capacity
+    direction: ease
+    feasibility_postcondition: "${source_table_capacity} <= 1048576"
+
+  # === Hash-family axis ====================================================
+  - id: switch_hash_to_custom_lfsr
+    applicable_when: "${hash_polynomial} ∈ {crc16, crc32, crc32c}"
+    effect: "${hash_polynomial} ← custom_lfsr"
+    axis: hash-family
+    direction: harden
+    feasibility_postcondition: "${hash_polynomial} == custom_lfsr"
+    notes: |
+      custom_lfsr forces the implementation to implement its own per-row polynomial
+      rather than reuse a stock CRC, exposing cross-row hash-independence
+      assumptions. Pairs with revert_hash_to_crc32.
+
+  - id: revert_hash_to_crc32
+    applicable_when: "${hash_polynomial} != crc32"
+    effect: "${hash_polynomial} ← crc32"
+    axis: hash-family
+    direction: ease
+    feasibility_postcondition: "${hash_polynomial} == crc32"
+
+  # === Workload axis =======================================================
+  - id: raise_workload_skew_adversarial
+    applicable_when: "${workload_skew} ∈ {uniform, zipfian}"
+    effect: "${workload_skew} ← adversarial_collision"
+    axis: workload
+    direction: harden
+    feasibility_postcondition: "${workload_skew} == adversarial_collision"
+    notes: |
+      Adversarial destinations that hash-collide to suppress the estimate
+      (scan evasion). Pairs with lower_workload_skew.
+
+  - id: lower_workload_skew
+    applicable_when: "${workload_skew} == adversarial_collision"
+    effect: "${workload_skew} ← zipfian"
+    axis: workload
+    direction: ease
+    feasibility_postcondition: "${workload_skew} ∈ {uniform, zipfian}"
+
+  # === Feature-breadth axis: scan key (horizontal ↔ port scan) =============
+  - id: switch_scan_key_to_port
+    applicable_when: "${scan_key} == distinct_dst_ip"
+    effect: "${scan_key} ← distinct_dst_port"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${scan_key} == distinct_dst_port"
+    notes: |
+      Vertical/port scan: count distinct L4 destination ports per source. Adds
+      L4-parsing breadth (TCP/UDP port extraction + the unguarded-port hazard
+      from the bug taxonomy). Pairs with switch_scan_key_to_ip.
+
+  - id: switch_scan_key_to_ip
+    applicable_when: "${scan_key} == distinct_dst_port"
+    effect: "${scan_key} ← distinct_dst_ip"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${scan_key} == distinct_dst_ip"
+
+  # === Feature-breadth axis: scanner action (drop ↔ mark) ==================
+  - id: switch_scanner_action_to_mark
+    applicable_when: "${scanner_action} == drop"
+    effect: "${scanner_action} ← mark"
+    axis: feature-breadth
+    direction: harden
+    feasibility_postcondition: "${scanner_action} == mark"
+    notes: |
+      mark forwards the scanner's packet with a marking bit set instead of
+      dropping it, adding a conditional-rewrite + conditional-deparser branch
+      (the common v1model deparser-wellformedness hazard). Pairs with
+      switch_scanner_action_to_drop.
+
+  - id: switch_scanner_action_to_drop
+    applicable_when: "${scanner_action} == mark"
+    effect: "${scanner_action} ← drop"
+    axis: feature-breadth
+    direction: ease
+    feasibility_postcondition: "${scanner_action} == drop"
+
+# ─── Bridging notes (advisory; not visible to the SUT) ─────────────────────
+bridging_notes: |
+  Common implementations from this pattern to v1model P4:
+
+    Default seed (scan_key=distinct_dst_ip, distinct_estimator=linear_counting,
+                  scanner_action=drop, rows=1, bitmap_width=1024):
+      - One source-row sketch: a register<bit<1>> (or packed bit<W>) of width
+        ${bitmap_width}, addressed by (h_s(srcAddr) % source_table_capacity)
+        for the row and (h_d(dstAddr) % bitmap_width) for the column. Set the
+        bit on each packet; the distinct estimate is the per-row popcount with
+        the linear-counting correction  n̂ = -W·ln(1 - bits_set/W).
+      - A per-source scanner-latch: register<bit<1>>(source_table_capacity).
+        R4 reads it first; R3 sets it on the threshold-crossing packet.
+      - A window accumulator: register<bit<32>>(1) for n_packets; R2 rolls it
+        over at ${window_packets} and zeroes the sketch + latch registers.
+      - Forwarding base: an ipv4_lpm table with forward(port)/drop, consulted
+        only on the benign path (R1) and the mark path.
+
+    PACKET-COUNT WINDOW, NOT WALL-CLOCK (HARD CONSTRAINT):
+      - The detection window is driven by the packet accumulator (R2) and by an
+        operator control packet (R5), NEVER by standard_metadata timestamps.
+        The v1.0 evaluation harness injects only packets and no time_tick
+        so a wall-clock window would be
+        ungradable — every window transition the tests assert is reachable by a
+        packet train + an optional control packet. An implementation that keys the
+        window off ingress_global_timestamp is non-gradable under --use-files
+        and is the headline anti-pattern.
+
+    Gradability as a packet TRAIN:
+      - The headline observable is a forward→drop (or forward→marked) transition
+        on a single source within one input sequence: the first
+        ${scan_threshold}-1 distinct-destination packets forward, the crossing
+        packet and all subsequent same-source packets are dropped/marked.
+        prior_inputs (TTL=64 warmup) build the distinct-destination set; the
+        test packet (TTL=1) is the crossing or post-crossing packet whose
+        verdict is asserted.
+
+    distinct_estimator=hyperloglog (D5.2):
+      - ${rows} HLL registers per source; update is register[h_d>>k] ←
+        max(old, leading_zeros(h_d) + 1); estimate is the harmonic-mean HLL
+        formula with bias correction. Typically needs recirculation for the
+        per-row max across rows.
+
+    scanner_action=mark:
+      - On the scanner path set hdr.ipv4.diffserv (or a custom marking field)
+        and forward instead of drop. The deparser MUST emit the IPv4 header
+        on both branches; emitting conditionally-different header sets is the
+        common v1model conditional-deparser bug (caught by
+        conditional_mark_deparser_well_formed).
+
+  Common implementation bugs (anchors for G3/G2 test design):
+    - Counting raw packets instead of distinct destinations (no idempotent
+      set-bit) → a single-destination flood reads as a scan. Caught by
+      repeated_destination_does_not_advance.
+    - Non-sticky verdict (re-derive is_scanner from the estimate each packet)
+      → a scanner whose estimate momentarily dips slips a packet through.
+      Caught by scanner_latch_persistence + the latch invariant.
+    - Bitmap wrap on saturation → a heavy scanner's estimate wraps to a small
+      value and reads benign. Caught by bitmap_saturation_no_wrap.
+    - Stale state across window → a recycled IP stays permanently blocklisted,
+      or a fresh window inherits a prior scanner verdict. Caught by
+      scanner_no_state_leak_across_window + scanner_state_no_orphan.
+    - Single-row bitmap under adversarial hash collision → estimate suppressed,
+      scanner evades. Caught by adversarial_hash_collision_evasion (rows ≥ 2).
+    - Hashing an unguarded L4 port when scan_key=distinct_dst_port and the
+      packet is ICMP → P4-spec unspecified value (common v1model hash-extern misuse);
+      the implementation must guard the port hash with isValid(hdr.tcp/udp).
+
+  Synthesised gap-fills (common-knowledge baseline, not source-cited):
+    - R0_non_ipv4_drop and R1's forwarding-coupled update are pipeline-
+      conventional, adopted from the upstream p4lang/tutorials basic_forwarding
+      scaffold (no scan-detection exercise exists upstream).
+    - The packet-count window + control-packet reset (R2/R5) is a v1.0-harness
+      adaptation of TRW's time-based observation interval and OpenSketch's
+      epoch reset: both sources assume an interval-bounded measurement, but the
+      v1.0 harness cannot drive a wall-clock interval, so the window is made
+      packet-cumulative with an explicit control-packet reset.
+
+  v2 deferral notes (not enforceable at v1.0):
+    - Wall-clock detection window / rate-based scan detection (scans/second) —
+      needs a time_tick the harness does not inject. Deferred to a TPL v2
+      time-aware harness.
+    - TRW's full sequential-likelihood-ratio accumulation (per-attempt
+      success/failure weighting from connection RSTs) — needs bidirectional
+      connection-state correlation; v1.0 approximates it with the simpler
+      distinct-destination cardinality threshold.
+    - Cross-switch scanner-blocklist sharing — single-switch only at v1.0.
+
+post_instantiation_hooks: |
+  After instantiation, validate the instance (schema, bindings, oracle audit)
+  and hand-run the public tests through the oracle for the seed. Verify the forward→drop
+  transition is observable within one packet train and that no test relies on
+  a wall-clock window.

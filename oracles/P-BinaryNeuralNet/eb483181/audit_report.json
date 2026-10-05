@@ -1,0 +1,143 @@
+{
+  "oracle_hash": "0364b91adff3b46a3222fdfc5bc98968676c58b59eadff0ed1575f2e89b886ae",
+  "instance": "binary_neural_net_anchor_mut1-narrow_feature_vector",
+  "ran_at": "2026-06-17T04:21:52.226750Z",
+  "canonical_examples": {
+    "passed": 14,
+    "failed": 0,
+    "details": [
+      {
+        "example_id": "bnn_classify_golden_class0",
+        "status": "pass"
+      },
+      {
+        "example_id": "bnn_classify_two_classes_class1",
+        "status": "pass"
+      },
+      {
+        "example_id": "bnn_default_class_fallback",
+        "status": "pass"
+      },
+      {
+        "example_id": "read_invalid_feature_guard_no_tcp",
+        "status": "pass"
+      },
+      {
+        "example_id": "read_invalid_feature_guard_non_ipv4_drop",
+        "status": "pass"
+      },
+      {
+        "example_id": "class_drop_anomaly",
+        "status": "pass"
+      },
+      {
+        "example_id": "class_drop_is_class_scoped",
+        "status": "pass"
+      },
+      {
+        "example_id": "bnn_mark_class",
+        "status": "pass"
+      },
+      {
+        "example_id": "activation_boundary_on_threshold_fires",
+        "status": "pass"
+      },
+      {
+        "example_id": "activation_boundary_below_threshold_silent",
+        "status": "pass"
+      },
+      {
+        "example_id": "popcount_width_max_all_ones",
+        "status": "pass"
+      },
+      {
+        "example_id": "popcount_width_min_all_zeros",
+        "status": "pass"
+      },
+      {
+        "example_id": "bnn_two_layer_eval",
+        "status": "pass"
+      },
+      {
+        "example_id": "bnn_two_layer_eval_neuron_count_3",
+        "status": "pass"
+      }
+    ]
+  },
+  "invariant_coverage": {
+    "by_clause": {
+      "no_loop": {
+        "kind": "liveness",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "not decidable from finite traces / no clock"
+      },
+      "popcount_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "binarization_fidelity": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "inference_determinism": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "payload_persistence": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      },
+      "envelope_checksum_validity": {
+        "kind": "safety",
+        "gold": "script",
+        "type": "DB",
+        "positive": "witnessed",
+        "negative": "caught",
+        "status": "pass"
+      },
+      "feature_read_safety": {
+        "kind": "semantic",
+        "gold": "ceiling",
+        "type": "JB",
+        "status": "ceiling",
+        "reason": "target not resolvable to a field relation"
+      }
+    },
+    "uncovered": [
+      "no_loop",
+      "popcount_fidelity",
+      "binarization_fidelity",
+      "inference_determinism",
+      "payload_persistence",
+      "feature_read_safety"
+    ]
+  },
+  "grounding": {
+    "sources": [
+      "n3ic_siracusano_nsdi22",
+      "courbariaux_binarized_nn_neurips16"
+    ],
+    "passed": true,
+    "details": [
+      {
+        "status": "skipped",
+        "reason": "automated grounding cross-validation pending"
+      }
+    ]
+  },
+  "overall": "passed"
+}

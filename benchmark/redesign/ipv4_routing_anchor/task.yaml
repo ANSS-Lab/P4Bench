@@ -1,0 +1,332 @@
+task_name: ipv4_routing_anchor
+task_type: full_program
+complexity: low
+source: tutorial
+pattern: P-IPv4Routing
+pattern_version: '1.0'
+
+seed:
+  fib_capacity: unbounded
+  max_nexthop_group_size: 1
+  multipath_mode: none
+  hash_algo: crc16
+  ecmp_remap_algo: hash_threshold
+  martian_filter_enabled: false
+  emit_icmp_errors: false
+  default_action: drop
+  faithfulness: D5.0_static_fib
+
+description: |
+  Implement standard IPv4 unicast forwarding on a single switch s1, per the
+  router requirements of RFC 1812. The switch performs a longest-prefix-match
+  lookup on the IPv4 destination address against an installed forwarding
+  table and forwards matching packets out the matched port, rewriting the
+  Ethernet addresses and decrementing the IP time-to-live.
+
+  ## Forwarding table
+
+  Install these forwarding entries (you choose the control-plane
+  representation; the table is matched by longest-prefix on the IPv4
+  destination address). Each entry names the egress port, the next-hop's
+  MAC address (the new Ethernet destination), and the egress port's own MAC
+  address (the new Ethernet source):
+
+    | destination prefix | egress port | next-hop MAC        | egress-port MAC     |
+    |---------------------|-------------|---------------------|---------------------|
+    | 10.0.1.0/24         | s1.p1       | 08:00:00:00:01:01   | 08:00:00:00:01:00   |
+    | 10.0.2.0/24         | s1.p2       | 08:00:00:00:02:02   | 08:00:00:00:02:00   |
+    | 10.0.3.0/24         | s1.p3       | 08:00:00:00:03:03   | 08:00:00:00:03:00   |
+    | 10.0.2.7/32         | s1.p3       | 08:00:00:00:03:03   | 08:00:00:00:03:00   |
+
+  When a destination is covered by more than one entry, the LONGEST matching
+  prefix wins — e.g. 10.0.2.7 matches both 10.0.2.0/24 and 10.0.2.7/32, and
+  the /32 entry decides it (egress s1.p3).
+
+  ## What the switch MUST do
+
+   1. **Non-IPv4 drop.** Any frame that is not IPv4 (ARP, IPv6, raw
+      Ethernet, etc.) MUST NOT be forwarded — it is dropped (not emitted on
+      any port).
+
+   2. **TTL handling.** Read the IPv4 time-to-live:
+      a. If TTL == 0, the packet MUST be dropped before any forwarding.
+      b. Otherwise the packet is eligible to forward, and its TTL MUST be
+         decremented by EXACTLY one on egress. (A packet arriving with
+         TTL == 1 is forwarded with egress TTL == 0; decrement it once, do
+         not drop it, and do not decrement it twice.)
+
+   3. **Forward on a matching route.** For an eligible IPv4 packet whose
+      destination matches a forwarding entry by longest prefix, the switch
+      MUST:
+      a. send it out the matched egress port;
+      b. rewrite the Ethernet SOURCE address to the egress port's own MAC
+         (the "egress-port MAC" column) — NOT a copy of the incoming
+         Ethernet destination;
+      c. rewrite the Ethernet DESTINATION address to the next-hop MAC (the
+         "next-hop MAC" column);
+      d. leave the IPv4 source and destination addresses unchanged;
+      e. keep the IPv4 header checksum valid on egress (since the TTL
+         changed, the checksum must be updated accordingly).
+
+   4. **No route → drop.** An eligible IPv4 packet whose destination matches
+      no entry MUST be dropped.
+
+   5. **Limited broadcast drop.** An IPv4 packet whose destination is
+      255.255.255.255 MUST be dropped (RFC 1812 §5.3.5.1), regardless of the
+      forwarding table.
+
+   6. **Directed broadcast drop.** An IPv4 packet whose destination is the
+      all-ones host address of one of the configured subnets (for example
+      10.0.1.255, 10.0.2.255, or 10.0.3.255 for the /24 subnets above) MUST
+      be dropped (RFC 1812 §5.3.5.2 default behaviour) rather than forwarded.
+
+  ## Topology
+
+  One switch s1 with three hosts (reuses the canonical p4lang basic-
+  forwarding topology):
+    - h1 at s1.p1. IPv4 10.0.1.1, MAC 08:00:00:00:01:01. s1.p1 MAC 08:00:00:00:01:00.
+    - h2 at s1.p2. IPv4 10.0.2.2, MAC 08:00:00:00:02:02. s1.p2 MAC 08:00:00:00:02:00.
+    - h3 at s1.p3. IPv4 10.0.3.3, MAC 08:00:00:00:03:03. s1.p3 MAC 08:00:00:00:03:00.
+
+topology:
+  switches:
+    - name: s1
+      device_id: 0
+      ports:
+        p1: 1
+        p2: 2
+        p3: 3
+  links:
+    - {from: h1, to: s1.p1}
+    - {from: s1.p2, to: h2}
+    - {from: s1.p3, to: h3}
+
+hosts:
+  h1:
+    ip: 10.0.1.1/24
+    mac: "08:00:00:00:01:01"
+    port: s1.p1
+  h2:
+    ip: 10.0.2.2/24
+    mac: "08:00:00:00:02:02"
+    port: s1.p2
+  h3:
+    ip: 10.0.3.3/24
+    mac: "08:00:00:00:03:03"
+    port: s1.p3
+
+test_cases:
+
+# --- G1: functional correctness ---
+
+  - name: fwd_h1_to_h2
+    visibility: public
+    description: |
+      Golden path. IPv4 packet to 10.0.2.2 (matches 10.0.2.0/24) is
+      forwarded out s1.p2 with Ethernet src ← s1.p2 MAC, dst ← h2 MAC, and
+      TTL decremented by one.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+
+  - name: fwd_h1_to_h3
+    visibility: public
+    description: |
+      Distinct prefix. IPv4 packet to 10.0.3.3 (matches 10.0.3.0/24) is
+      forwarded out s1.p3 with the s1.p3 / h3 MAC rewrite and TTL decrement.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.3.3", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+        IP.src:    {action: unchanged}
+        IP.dst:    {action: unchanged}
+
+  - name: drop_ttl_zero
+    visibility: public
+    description: |
+      TTL boundary. An IPv4 packet arriving with TTL == 0 MUST be dropped
+      before forwarding, even though its destination (10.0.2.2) has a route.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 0}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: fwd_longest_prefix_priority
+    visibility: hidden
+    description: |
+      Longest-prefix-match. 10.0.2.7 is covered by both 10.0.2.0/24 (→ p2)
+      and 10.0.2.7/32 (→ p3). The /32 wins, so the packet MUST forward out
+      s1.p3 with the h3 MAC rewrite.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.7", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p3
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:03:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:03:03"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_within_subnet_other_host
+    visibility: hidden
+    description: |
+      The /24 prefix covers the whole subnet, not just the host address.
+      10.0.1.50 matches 10.0.1.0/24 → forwards out s1.p1 with the s1.p1 / h1
+      MAC rewrite.
+    input:
+      port: s1.p2
+      layers:
+        - Ether: {src: "08:00:00:00:02:02", dst: "08:00:00:00:02:00"}
+        - IP:    {src: "10.0.2.2", dst: "10.0.1.50", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p1
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:01:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:01:01"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_l4_payload_independence_udp
+    visibility: hidden
+    description: |
+      L3 forwarding is L4-agnostic in this task. A UDP packet to 10.0.2.2
+      forwards out s1.p2 exactly like the TCP golden path.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 64}
+        - UDP:   {sport: 5353, dport: 53}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+  - name: fwd_ttl_one_post_decrement_zero
+    visibility: hidden
+    description: |
+      TTL == 1 is forwarded (not dropped) with egress TTL == 0 — pins the
+      decrement-then-egress ordering against an off-by-one ttl > 1 gate.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.2", ttl: 1}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: change_to, value: 0}
+
+# --- G2: robustness / boundary ---
+
+  - name: drop_no_route
+    visibility: hidden
+    description: |
+      No matching prefix (no default route installed). 10.0.9.9 matches no
+      entry and MUST be dropped.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.9.9", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: drop
+
+  - name: fwd_adjacent_host_in_subnet
+    visibility: hidden
+    description: |
+      10.0.2.8 is in 10.0.2.0/24 but is NOT the /32-overridden 10.0.2.7, so
+      it forwards via the /24 → s1.p2 (not s1.p3). Boundary against the
+      longest-prefix override.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.8", ttl: 64}
+        - TCP:   {sport: 5000, dport: 80, flags: "S"}
+    expected:
+      behavior: forward
+      output_port: s1.p2
+      transformations:
+        Ether.src: {action: change_to, value: "08:00:00:00:02:00"}
+        Ether.dst: {action: change_to, value: "08:00:00:00:02:02"}
+        IP.ttl:    {action: decremented_by, delta: 1}
+
+# --- G3: security / bypass ---
+
+  - name: drop_non_ipv4_arp
+    visibility: hidden
+    description: |
+      A non-IPv4 frame (ARP) MUST NOT be forwarded — implicit drop.
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - ARP:   {pdst: "10.0.2.2", psrc: "10.0.1.1"}
+    expected:
+      behavior: drop
+
+  - name: drop_limited_broadcast_dst
+    visibility: hidden
+    description: |
+      Destination 255.255.255.255 (limited broadcast) MUST be dropped
+      unconditionally (RFC 1812 §5.3.5.1).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "ff:ff:ff:ff:ff:ff"}
+        - IP:    {src: "10.0.1.1", dst: "255.255.255.255", ttl: 64}
+        - UDP:   {sport: 68, dport: 67}
+    expected:
+      behavior: drop
+
+  - name: drop_directed_broadcast_dst
+    visibility: hidden
+    description: |
+      Destination 10.0.2.255 is the directed broadcast of the 10.0.2.0/24
+      subnet and MUST be dropped, not forwarded out s1.p2 (RFC 1812 §5.3.5.2).
+    input:
+      port: s1.p1
+      layers:
+        - Ether: {src: "08:00:00:00:01:01", dst: "08:00:00:00:01:00"}
+        - IP:    {src: "10.0.1.1", dst: "10.0.2.255", ttl: 64}
+        - UDP:   {sport: 5000, dport: 80}
+    expected:
+      behavior: drop
